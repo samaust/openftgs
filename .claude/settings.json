@@ -1,0 +1,36 @@
+{
+  "attribution": false,
+  "autoMemoryEnabled": false,
+  "disableClaudeAiConnectors": true,
+  "crossSessionInbound": "refuse",
+  "claudeMdExcludes": [
+    "/home/*/.claude/CLAUDE.md",
+    "/home/*/.claude/rules/**",
+    "/Users/*/.claude/CLAUDE.md",
+    "/Users/*/.claude/rules/**"
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "WebFetch|WebSearch|Bash|Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/clean_room_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/clean_room_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
