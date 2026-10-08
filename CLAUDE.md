@@ -53,6 +53,10 @@ Source log: every source you consult (a URL, a document, a third-party file or d
 - Auto memory is off for this repository on purpose (`.claude/settings.json`), and so are claude.ai connectors. Don't try to remember things anywhere else: what must persist goes in the repository (`docs/clean-room/questions.md`, the source log, code comments, commit messages), where the owner can audit it.
 - Your context is this file, the repository and the allowed sources. Don't read other projects on this machine or Claude Code's own files under `~/.claude/`.
 
+## Issues
+
+The issue tracker at github.com/samaust/openftgs is the owner's channel. Use `gh issue` to read and write there: a Q-n row that needs the owner's decision gets an issue, and an issue's answer goes back into `docs/clean-room/questions.md`. `gh` may target no other repository (the guard blocks it), and a link in an issue is subject to the clean-room rules like any other link. Never delete or transfer issues.
+
 ## Commits
 
 Small commits, one module or test group each. Each message cites the spec items it implements (for example `E11, D-14, U-13`) and any Q-n it relies on. Never commit `docs/paper/`, datasets, or anything derived from SelfCap (its license is non-commercial; §2.3).

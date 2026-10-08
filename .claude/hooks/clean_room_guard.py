@@ -59,6 +59,19 @@ FETCHING_COMMAND = re.compile(
     re.IGNORECASE,
 )
 
+# The project's own repository: gh may read and write its issues, and nothing else's.
+PROJECT_REPO = "samaust/openftgs"
+GH_INVOCATION = re.compile(r"(?:^|[\s;&|(`])gh\s", re.IGNORECASE)
+GH_REPO_FLAG = re.compile(r"""(?:^|\s)(?:-R|--repo)[=\s]+["']?([^\s"']+)""")
+GH_REPO_ENV = re.compile(r"""(?:^|[\s;&|(])GH_REPO=["']?([^\s"']+)""")
+GH_API_REPO = re.compile(r"""(?:^|[\s"'/])repos/([\w.-]+/[\w.-]+)""")
+GH_REPO_POSITIONAL = re.compile(
+    r"""\bgh\s+repo\s+(?:clone|fork|view|sync|edit|archive|delete|set-default)\s+["']?([^\s"'-][^\s"']*)""",
+    re.IGNORECASE,
+)
+GH_GIST = re.compile(r"\bgh\s+gist\b", re.IGNORECASE)
+GH_SEARCH = re.compile(r"\bgh\s+search\b", re.IGNORECASE)
+
 READ_TOOLS = {"Read", "Grep", "Glob", "LS", "NotebookRead"}
 PATH_FIELDS = ("file_path", "path", "notebook_path")
 
@@ -84,6 +97,38 @@ def names_forbidden(text):
     return bool(NAME.search(decoded))
 
 
+def normalize_repo(value):
+    """'https://github.com/Owner/Repo.git' or 'Owner/Repo' -> 'owner/repo'."""
+    value = value.strip().strip("\"'").lower()
+    value = re.sub(r"^(?:https?://)?(?:www\.)?github\.com[/:]", "", value)
+    value = re.sub(r"\.git$", "", value).strip("/")
+    return value
+
+
+def gh_repositories(command):
+    """Every repository a gh invocation in `command` is pointed at."""
+    repos = set()
+    if "gh api" in command or re.search(r"\bgh\s+api\b", command):
+        repos.update(GH_API_REPO.findall(command))
+    repos.update(GH_REPO_FLAG.findall(command))
+    repos.update(GH_REPO_ENV.findall(command))
+    repos.update(GH_REPO_POSITIONAL.findall(command))
+    return {normalize_repo(r) for r in repos}
+
+
+def gh_scoped_to_project(command):
+    """True when every gh invocation targets the project repository: explicitly,
+    or by default through the clone's git remote. None when there is no gh."""
+    if not GH_INVOCATION.search(command):
+        return None
+    if GH_GIST.search(command):
+        return False  # gists belong to anyone
+    repos = gh_repositories(command)
+    if GH_SEARCH.search(command) and not repos:
+        return False  # a GitHub-wide search
+    return repos <= {PROJECT_REPO}
+
+
 def check(tool, tool_input):
     """Return a reason string if the call must be blocked, else None."""
     if not isinstance(tool_input, dict):
@@ -102,10 +147,15 @@ def check(tool, tool_input):
 
     if tool == "Bash":
         command = str(tool_input.get("command", ""))
+        scoped = gh_scoped_to_project(command)
+        if scoped is False:
+            return f"gh may only target {PROJECT_REPO}; this command points it at another repository or at a GitHub-wide search."
         rest = OWN_CLASS.sub("", strip_allowed_urls(command))
         if not names_forbidden(rest):
             return None
-        if FETCHING_COMMAND.search(rest):
+        for m in FETCHING_COMMAND.finditer(rest):
+            if scoped and m.group(0).lower().startswith("gh"):
+                continue  # gh pointed at the project repository: its issues may name FreeTimeGS
             return "this command downloads, clones or searches for something that names FreeTimeGS or EasyVolcap."
         for token in re.split(r"""[\s'"=;&|()<>`]+""", rest):
             if ("/" in token or "\\" in token) and names_forbidden(token):

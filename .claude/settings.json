@@ -9,6 +9,25 @@
     "/Users/*/.claude/CLAUDE.md",
     "/Users/*/.claude/rules/**"
   ],
+  "permissions": {
+    "allow": [
+      "Bash(gh auth status *)",
+      "Bash(gh issue list *)",
+      "Bash(gh issue view *)",
+      "Bash(gh issue status *)",
+      "Bash(gh issue create *)",
+      "Bash(gh issue comment *)",
+      "Bash(gh issue edit *)",
+      "Bash(gh issue close *)",
+      "Bash(gh issue reopen *)",
+      "Bash(gh label list *)"
+    ],
+    "deny": [
+      "Bash(gh issue delete *)",
+      "Bash(gh issue transfer *)",
+      "Bash(gh gist *)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
