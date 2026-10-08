@@ -60,3 +60,17 @@ The issue tracker at github.com/samaust/openftgs is the owner's channel. Use `gh
 ## Commits
 
 Small commits, one module or test group each. Each message cites the spec items it implements (for example `E11, D-14, U-13`) and any Q-n it relies on. Never commit `docs/paper/`, datasets, or anything derived from SelfCap (its license is non-commercial; §2.3).
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues at github.com/samaust/openftgs via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root, created lazily. See `docs/agents/domain.md`.
