@@ -487,7 +487,7 @@ A gap found before a build, recorded on the tracker with the columns of `questio
 _Avoid_: draft Q-n, Q-n row (one that has a number), open question (the PRD section that lists candidates)
 
 **Q-n issue**:
-A GitHub issue labelled `q-n` that carries Q-n material: a decision issue titled `Q-<n>: …` for a numbered row that needs the owner's decision, or a candidates issue titled `Q-n candidates: …` for gaps found outside any PRD that have no number yet. docs/agents/issue-tracker.md
+A GitHub issue labelled `q-n` that carries Q-n material: a decision issue titled `Q-<n>: …` for a numbered row awaiting the owner's confirmation, or a candidates issue titled `Q-n candidates: …` for gaps found outside any PRD that have no number yet. docs/agents/issue-tracker.md
 _Avoid_: question issue, spec question, the `question` label (GitHub's generic one)
 
 **Allowed source**:
@@ -531,7 +531,7 @@ One of the eight §3.4 measurements of speed and memory run by `ftgs bench`, nev
 _Avoid_: perf test, profile, timing
 
 **Calibrated threshold**:
-A pass criterion or budget marked "calibrated" in the spec: set once from analytic expectations or the first reference run, then frozen; the first measured values go to questions.md as calibration data, and changing it needs a logged reason. §3.2, §3.4
+A pass criterion or budget marked "calibrated" in the spec: set once from analytic expectations or the first reference run, then frozen; the first measured values go to the Calibration data table of questions.md, and changing it needs a logged reason. §3.2, §3.4
 _Avoid_: tuned threshold, empirical limit, magic number
 
 **Exact optimization**:

@@ -55,11 +55,11 @@ Source log: every source you consult (a URL, a document, a third-party file or d
 
 ## Issues
 
-The issue tracker at github.com/samaust/openftgs is the owner's channel. Use `gh issue` to read and write there: a Q-n row that needs the owner's decision gets an issue labelled `q-n` and titled `Q-<n>: <short gap>`, opened once its number is final, and the answer goes back into `docs/clean-room/questions.md` (`docs/agents/issue-tracker.md`, "Q-n issues"). `gh` may target no other repository (the guard blocks it), and a link in an issue is subject to the clean-room rules like any other link. Never delete or transfer issues.
+The issue tracker at github.com/samaust/openftgs is the owner's channel. Use `gh issue` to read and write there: every new Q-n row gets a decision issue labelled `q-n` and titled `Q-<n>: <short gap>`, opened once its number is final, and the answer goes back into `docs/clean-room/questions.md` (`docs/agents/issue-tracker.md`, "Q-n issues"). `gh` may target no other repository (the guard blocks it), and a link in an issue is subject to the clean-room rules like any other link. Never delete or transfer issues.
 
 ## Commits
 
-Small commits, one module or test group each. Each message cites the spec items it implements (for example `E11, D-14, U-13`) and any Q-n it relies on. Work happens on a branch off `main`, one per PRD (or per issue implemented on its own), and reaches `main` only by a `git merge --no-ff` that the owner has approved, never by a squash. Nothing is pushed unless the owner asks. Never commit `docs/paper/`, datasets, or anything derived from SelfCap (its license is non-commercial; §2.3).
+Small commits, one module or test group each. Each message cites the spec items it implements (for example `E11, D-14, U-13`) and any Q-n it relies on. Work happens on a branch off `main`: an integration branch per PRD (or per issue implemented on its own), or a short branch for one small change (`q-<n>-answer` for an answer to a Q-n row, `docs-<slug>` for glossary and module docs, `setup-skills-repair`). Every branch reaches `main` only by a `git merge --no-ff` that the owner has approved, never by a squash. A commit that implements no spec item says so (`Spec items: none`). Nothing is pushed unless the owner asks. Never commit `docs/paper/`, datasets, or anything derived from SelfCap (its license is non-commercial; §2.3).
 
 ## Agent skills
 

@@ -5,7 +5,7 @@ Mock only at **system boundaries**, and prefer a real stand-in to a mock. In thi
 | Boundary | What sits there | Use in tests |
 | --- | --- | --- |
 | GPU rasterizer | gsplat (CUDA) | The pure-PyTorch reference backend (`render(..., backend="reference")`) on CPU. GPU-marked tests compare it with gsplat. Never mock the renderer. |
-| Downloaded weights | RoMa, DINOv2, the LPIPS networks | The real weights, in tests behind the marker `pyproject.toml` defines for them; CPU unit tests don't touch the network. |
+| Downloaded weights | RoMa, DINOv2, the LPIPS networks | The real weights, in tests carrying the weights marker of `pyproject.toml` (M0); tests without it don't touch the network. |
 | Separate programs | ffmpeg, COLMAP, BackgroundMattingV2 | A stub executable that records its input and writes the expected output, as U-37 does for COLMAP. |
 | Randomness | `torch.Generator` | A seeded generator passed through the public signature (`generator=` in §2.1). Never seed or patch the global generator. |
 | Datasets | Neural3DV, ENeRF-Outdoor, SelfCap | Generated mini-fixtures, like U-37's mini-archive. Real data only in dataset-gated tests, and nothing derived from SelfCap is ever committed. |

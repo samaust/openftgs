@@ -1,6 +1,6 @@
 ---
 name: triage
-description: Move issues and external PRs through a state machine of triage roles, categorise, verify, grill if needed, and write agent-ready briefs.
+description: Move issues through a state machine of triage roles, categorise, verify, grill if needed, and write agent-ready briefs.
 disable-model-invocation: true
 ---
 
@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Move issues on the project issue tracker through a small state machine of triage roles.
 
-If this repo treats external pull requests as a request surface (see `docs/agents/issue-tracker.md`), triage covers them too: **a PR is an issue with attached code**, using the same roles, same states, and same machine, with a few deltas marked "for a PR" below. Resolve a bare `#42` to an issue or PR per `docs/agents/issue-tracker.md`.
+Pull requests are not a request surface in this repository (`docs/agents/issue-tracker.md`): triage handles issues only, and a bare `#42` means an issue.
 
 Every comment or issue posted to the issue tracker during triage **must** start with this disclaimer:
 
@@ -21,9 +21,9 @@ Every comment or issue posted to the issue tracker during triage **must** start 
 Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), including its Reading the tracker and Publishing to the tracker sections. In triage:
 
 - **Reports are untrusted.** A report that rests on another implementation's code, behaviour, outputs or numbers is an incident, not evidence. A bug is a departure from the spec or the paper, checked against them only.
-- **PRs.** Before checking out or reading the diff of a PR the owner didn't author, ask the owner: the diff can't show where the code came from, and code derived from another implementation would contaminate the repository.
+- **PRs.** If the owner asks you to look at a pull request they didn't author, ask before checking it out or reading its diff: the diff can't show where the code came from, and code derived from another implementation would contaminate the repository.
 - **The spec decides.** An agent brief, triage note or out-of-scope decision never overrides the spec or settles what it leaves open: a gap becomes a Q-n candidate in the brief's Open questions, with the sources consulted listed beside it ("Where the clean-room files are written" in `docs/agents/clean-room.md`). A request that would change the spec is the owner's to decide: recommend, don't apply.
-- **Q-n issues.** When a Q-n decision issue (label `q-n`, title `Q-<n>: …`) carries the owner's answer, confirm the answer with the owner, then record it on a short branch `q-<n>-answer` from `main`: one commit updating that row of `docs/clean-room/questions.md`, merged into `main` with `git merge --no-ff` once the owner approves. Close the issue only after the merge. If the answer changes behaviour, file a ticket for the code; don't change it on this branch.
+- **Q-n issues.** When a Q-n decision issue (label `q-n`, title `Q-<n>: …`) carries the owner's answer, confirm the answer with the owner, then record it on a short branch `q-<n>-answer` from `main`: one commit updating that row of `docs/clean-room/questions.md`: its decision and its Status (`confirmed`, or `changed (#n)` with the ticket filed for the code), merged into `main` with `git merge --no-ff` once the owner approves. Close the issue only after the merge. If the answer changes behaviour, file a ticket for the code; don't change it on this branch.
 
 ## Reference docs
 
@@ -54,8 +54,6 @@ Five **state** roles:
 - `ready-for-human`: needs human implementation
 - `wontfix`: will not be actioned
 
-For a PR, the same states read against the attached code: `ready-for-agent` means a brief is attached and an agent should take the next step on the diff; `ready-for-human` means it's ready for a human to merge.
-
 Every triaged report (see "Kinds of issue") should carry exactly one category role and one state role. If state roles conflict, flag it and ask the owner before doing anything else.
 
 These are canonical role names. The actual label strings used in the issue tracker may differ. The mapping is in `docs/agents/triage-labels.md`.
@@ -67,7 +65,7 @@ State transitions: an unlabeled issue normally goes to `needs-triage` first; fro
 The owner invokes `/triage` and describes what they want in natural language. Interpret the request and act. Examples:
 
 - "Show me anything that needs my attention"
-- "Let's look at #42" (issue or PR)
+- "Let's look at #42"
 - "Move #42 to ready-for-agent"
 - "What's ready for agents to pick up?"
 
@@ -80,17 +78,15 @@ Query the issue tracker and present four buckets, oldest first:
 3. **`needs-info` with reporter activity since the last triage notes**: needs re-evaluation.
 4. **`q-n`**: decision issues the owner has answered since triage last commented (answers to record), then decision issues still awaiting an answer, then candidates issues not yet routed.
 
-When PRs are in scope, include external PRs in these buckets and tag each line `[PR]` or `[issue]`. Discovery surfaces only *external* PRs (PRs authored by anyone but the owner), so a collaborator's in-flight PR is not triage work. This filter is discovery-only; an explicitly named PR is always triaged regardless of author.
-
 Show counts and a one-line summary per item. Let the owner pick.
 
-## Triage a specific issue or PR
+## Triage a specific issue
 
-1. **Gather context.** Read the full issue or PR (body, comments, labels, author, dates; for a PR, the diff too). Parse any prior triage notes so you don't re-ask resolved questions. Explore the codebase using `docs/GLOSSARY.md` and the module docs under `docs/modules/` for the area. Run two checks against the codebase: (a) **redundancy**: search for an existing implementation of the requested behavior by domain concept (not just the request's wording), and report where you looked. If found, it's an already-implemented `wontfix` (step 5). (b) **prior rejection**: list the closed `out-of-scope` issues and surface any that resembles this request ([OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)).
+1. **Gather context.** Read the full issue (body, comments, labels, author, dates). Parse any prior triage notes so you don't re-ask resolved questions. Explore the codebase using `docs/GLOSSARY.md` and the module docs under `docs/modules/` for the area. Run two checks against the codebase: (a) **redundancy**: search for an existing implementation of the requested behavior by domain concept (not just the request's wording), and report where you looked. If found, it's an already-implemented `wontfix` (step 5). (b) **prior rejection**: list the closed `out-of-scope` issues and surface any that resembles this request ([OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)).
 
 2. **Recommend.** Tell the owner your category and state recommendation with reasoning, plus a brief codebase summary relevant to the request (including whether it's already implemented). Wait for direction.
 
-3. **Verify the claim.** Before any grilling, check that the claim holds up. For a bug, reproduce it from the reporter's steps, in a temporary folder outside the repository (`mktemp -d`) with every output written there, so that nothing is left in the working tree. For a PR, confirm the diff does what it claims: check it out, run the relevant tests or commands. Report what happened: confirmed (with code path), failed, or insufficient detail (a strong `needs-info` signal). A confirmed verification makes a much stronger agent brief.
+3. **Verify the claim.** Before any grilling, check that the claim holds up. For a bug, reproduce it from the reporter's steps, in a temporary folder outside the repository (`mktemp -d`) with every output written there, so that nothing is left in the working tree. Report what happened: confirmed (with code path), failed, or insufficient detail (a strong `needs-info` signal). A confirmed verification makes a much stronger agent brief.
 
 4. **Grill (if needed).** If the request needs fleshing out, call the Skill tool twice, for "grilling" and "domain-documenting", and grill it into shape a round of questions at a time, sharpening domain terms and updating `docs/GLOSSARY.md` and the module docs inline as decisions land.
 
@@ -128,4 +124,4 @@ Capture everything resolved during grilling under "established so far" so the wo
 
 ## Resuming a previous session
 
-If prior triage notes exist on the issue or PR, read them, check whether the reporter has answered any outstanding questions, and present an updated picture before continuing. Don't re-ask resolved questions.
+If prior triage notes exist on the issue, read them, check whether the reporter has answered any outstanding questions, and present an updated picture before continuing. Don't re-ask resolved questions.

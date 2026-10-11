@@ -88,7 +88,7 @@ The module, or the functions of it, and their behaviour at the §2.1 interface.
 
 ## Spec items
 
-The spec items this ticket implements (§n, E-n, D-n) and the Q-n rows it relies on, by identifier, or the PRD's Q-n candidates by title until they have numbers. Cite them; don't restate them.
+The spec items this ticket implements (§n, E-n, D-n) and the Q-n rows it relies on, by identifier, or the PRD's Q-n candidates by title until they have numbers. Cite them; don't restate them. Once an implement run records a candidate, its number is in the row of `docs/clean-room/questions.md` marked `(from #<PRD>: <title>)`, and, after the merge, in the PRD's `Recorded:` comment.
 
 ## Acceptance criteria
 
