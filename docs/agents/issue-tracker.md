@@ -18,6 +18,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
+- **Edit a comment**: find its id with `gh api repos/samaust/openftgs/issues/<number>/comments --jq '[.[] | {id, author: .user.login, body}]'`, then `gh api repos/samaust/openftgs/issues/comments/<id> --method PATCH -f body="..."`. Edit only comments this workflow posted.
 
 Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
 
