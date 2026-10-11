@@ -32,7 +32,7 @@ Find them with `gh issue list --label q-n --state open`.
 
 ## Out-of-scope record
 
-Rejected feature requests are recorded on the tracker, not in the repository: one canonical issue per rejected concept, labelled `wontfix` and `out-of-scope`, closed as not planned, with a decision comment (Decision, Reason citing the spec, Prior requests). Later requests for the same concept are closed with `Duplicate of #<canonical>`. List the record with `gh issue list --label out-of-scope --state closed`. Details: `.claude/skills/triage/OUT-OF-SCOPE.md`.
+Rejected feature requests are recorded on the tracker, not in the repository: one canonical issue per rejected concept, labelled `wontfix` and `out-of-scope`, closed as not planned, with a decision comment (Decision, Reason citing the spec, Prior requests). Later requests for the same concept are closed with `gh issue close <n> --duplicate-of <canonical>`. List the record with `gh issue list --label out-of-scope --state closed`. Details: `.claude/skills/triage/OUT-OF-SCOPE.md`.
 
 ## Unverified tickets
 
