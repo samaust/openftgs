@@ -476,7 +476,7 @@ _Avoid_: literature value, convention
 
 **Decision D-n**:
 A numbered design decision in the spec's Appendix B filling a gap the paper leaves, with rationale, alternatives and detecting test; configurable, never changed silently, and this project's decision record. §0, Appendix B
-_Avoid_: ADR, ambiguity-log row, assumption, choice
+_Avoid_: ambiguity-log row, assumption, choice
 
 **Question Q-n**:
 A numbered row in `docs/clean-room/questions.md` recording a provisional decision the implementer made where the spec is silent or ambiguous and the choice affects numbers, outputs or the public API; marked `# Q-n` in code and raised with the owner, who may turn it into a D-n. CLAUDE.md
