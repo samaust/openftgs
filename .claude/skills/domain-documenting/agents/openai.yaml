@@ -1,0 +1,3 @@
+interface:
+  display_name: "Domain documenting"
+  short_description: "Maintain docs/GLOSSARY.md and the module docs"

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Implement without subagents"
+  short_description: "Implement a PRD or ticket in this session"
+policy:
+  allow_implicit_invocation: false

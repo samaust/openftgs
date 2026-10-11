@@ -1,0 +1,5 @@
+interface:
+  display_name: "Conversation to PRD"
+  short_description: "Turn a conversation into a PRD"
+policy:
+  allow_implicit_invocation: false
