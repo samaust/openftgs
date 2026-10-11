@@ -19,6 +19,7 @@ As a subagent:
 
 - Log your sources as above. If you don't write files, list them under "Sources consulted" in your final report instead, so the agent that launched you logs them.
 - Record a gap as a Q-n row and a `# Q-n` marker like any session, and list every new Q-n in your final report: the agent that launched you tells the owner.
+- When the skill that launched you gives temporary IDs (`implement-with-subagents`, "Shared files": `Q-T<ticket>.<k>` for Q-n rows and their markers, `T<ticket>.<k>` for source-log rows), use those instead of numbers. The merger assigns the final numbers; never pick the next free number yourself.
 - When the spec seems wrong or contradicts itself, stop and report it rather than coding around it. When you meet a forbidden source, record the incident, stop, and report it first.
 
 The agent that launched the subagents relays every reported Q-n, stop and incident to the owner, in the session or as an issue (CLAUDE.md, "Issues"), and logs any sources a subagent reported without logging.
@@ -27,9 +28,9 @@ The agent that launched the subagents relays every reported Q-n, stop and incide
 
 `docs/clean-room/questions.md` and `docs/clean-room/source-log.md` change only on a branch, never as uncommitted edits on `main`, which would also stop the next implement run at its clean-tree check.
 
-- **New gaps found before a build** (while planning, grilling, triaging or drafting tickets) are **Q-n candidates**, recorded on the tracker next to the work they belong to: in the PRD's Open questions or a comment on the PRD, in an issue's agent brief, or, when there is no issue yet, in a new issue titled "Q-n candidates: <topic>" and labelled `needs-triage`. A candidate has the columns of `questions.md` (spec location, gap, provisional decision, rationale, alternatives, detecting test) but no number.
+- **New gaps found before a build** (while planning, grilling, triaging or drafting tickets) are **Q-n candidates**, recorded on the tracker next to the work they belong to: in the PRD's Open questions or a comment on the PRD, in an issue's agent brief, or, when there is no issue yet, in a new issue titled "Q-n candidates: <topic>" and labelled `q-n` ("Q-n issues" in `docs/agents/issue-tracker.md`). A candidate has the columns of `questions.md` (spec location, gap, provisional decision, rationale, alternatives, detecting test) but no number.
 - **Sources consulted before a build** are listed the same way, under "Sources consulted" in the same place: what each was and what was taken from it.
-- **The implement skills** record both as numbered rows in the first commit on the integration branch. They are the only writers that assign numbers, so numbering stays collision-free.
+- **The implement skills** record both as numbered rows in the first commit on the integration branch, each row marked `(from #<issue>: <title>)` so that a later run on the same PRD skips it. They are the only writers that assign numbers, so numbering stays collision-free. After the merge into `main`, they comment the final numbers on the PRD or issue (`Recorded: "<title>" → Q-7`).
 - **The owner's answer to an existing Q-n row** goes through a short branch `q-<n>-answer` from `main`: one commit updating that row, merged into `main` with `git merge --no-ff` once the owner approves. The issue closes after the merge. If the answer changes behaviour, the code follows in a ticket, not on this branch.
 
 ## Merging branches
