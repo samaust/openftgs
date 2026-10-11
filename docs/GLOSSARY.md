@@ -491,11 +491,11 @@ A GitHub issue labelled `q-n` that carries Q-n material: a decision issue titled
 _Avoid_: question issue, spec question, the `question` label (GitHub's generic one)
 
 **Allowed source**:
-Anything the implementer may read: the paper and project page, papers it cites, general Gaussian-splatting literature, dataset documentation and data files, and third-party software to the depth its §0 class permits. §0
+Anything the implementer may read: the paper and project page, papers it cites, general Gaussian-splatting literature, dataset documentation and data files, the source code and documentation of third-party software under a permissive license that allows commercial use, and the documentation of the rest. §0, CLAUDE.md
 _Avoid_: reference, dependency docs, whitelist
 
 **Forbidden source**:
-Anything from another FreeTimeGS implementation (the authors' code included), EasyVolcap in any form, any GPL or AGPL code, and the source code of software whose class allows documentation only. §0
+Anything from another FreeTimeGS implementation (the authors' code included) or EasyVolcap, whatever its license, and the source code of software under a copyleft, non-commercial or missing license. §0, CLAUDE.md
 _Avoid_: blacklist, upstream, the official repo
 
 **Source log**:
