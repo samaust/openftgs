@@ -184,11 +184,11 @@ Milestone M15 of docs/clean-room/milestones.md: performance architecture. Read C
 ## M16 · Differential harness
 
 Scope: the separate `ftgs_harness` package and this package's adapter.
-Spec: §3.3 in full (adapter contract, L0 to L3, report format); §2.2 formats; the `ftgs_harness` row of §2.1.
+Spec: §3.3 in full (adapter contract, L0 to L3, report format); §2.2 formats; the `ftgs_harness` row of §2.1. `ftgs_harness` depends on matplotlib, with the Agg backend, for the plots in `artifacts/` (owner decision, 2026-10-11; §2.3 lists no harness dependencies); `openftgs` does not.
 Tests: the harness run with this package as both A and B passes every level; the reference backend against gsplat passes L1 at its tier tolerances.
 
 ```text
-Milestone M16 of docs/clean-room/milestones.md: differential harness. Read CLAUDE.md and docs/clean-room/questions.md, then spec §3.3 in full, §2.2, and the ftgs_harness row of §2.1. Plan ftgs_harness as a package that imports nothing from openftgs: the adapter contract commands, harness_config.json in TrainConfig field names, the forward-query and answer formats, levels L0 to L3 with their case generation, comparisons, tolerances and statistics, and report.json, report.md and the artifacts folder exactly as the report format section shows. Plan this package's adapter executable. Plan the tests: the harness run with openftgs as both implementations, and L1 between the reference and gsplat backends treated as two implementations. State which levels need a GPU and how long an L3 run takes at the smallest configuration.
+Milestone M16 of docs/clean-room/milestones.md: differential harness. Read CLAUDE.md and docs/clean-room/questions.md, then spec §3.3 in full, §2.2, and the ftgs_harness row of §2.1. Plan ftgs_harness as a package that imports nothing from openftgs: the adapter contract commands, harness_config.json in TrainConfig field names, the forward-query and answer formats, levels L0 to L3 with their case generation, comparisons, tolerances and statistics, and report.json, report.md and the artifacts folder exactly as the report format section shows, with plots drawn by matplotlib on its Agg backend, a dependency of ftgs_harness only (owner decision, 2026-10-11). Plan this package's adapter executable. Plan the tests: the harness run with openftgs as both implementations, and L1 between the reference and gsplat backends treated as two implementations. State which levels need a GPU and how long an L3 run takes at the smallest configuration.
 ```
 
 ## M17 · Real-data runs and calibration
