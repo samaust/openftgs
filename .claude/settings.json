@@ -23,8 +23,7 @@
       "Bash(gh label list *)",
       "Bash(gh api repos/samaust/openftgs/issues/*)",
       "Bash(gh label create *)",
-      "Bash(.claude/skills/conversation-to-prd/scripts/create-provenance-label.sh)",
-      "Bash(.claude/skills/prd-to-tickets/scripts/create-provenance-label.sh)"
+      "Bash(.claude/skills/setup-skills/scripts/create-labels.sh)"
     ],
     "deny": [
       "Bash(gh issue delete *)",
