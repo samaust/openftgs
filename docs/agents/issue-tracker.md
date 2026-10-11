@@ -40,7 +40,7 @@ An implement run leaves a ticket open when its acceptance tests couldn't run on 
 
 To verify such a ticket later, on a machine that can run its tests:
 
-1. Check out `main`, which holds the merged code, from a clean working tree, and install the package.
+1. Check out `main`, which holds the merged code, from a clean working tree, and install the package. On another machine this needs `main` pushed to origin; if the ticket's comments say the commits are local only, ask the owner whether to push it first, and push only if they say yes.
 2. Run the ticket's acceptance tests, and the full suite of the marker they need.
 3. If they pass: comment the pytest summary and the machine (GPU model, dataset path) on the ticket, close it, and close the PRD once all its tickets are closed. Nothing is committed.
 4. If they fail: the ticket stays open; fix it with `/implement-without-subagents <ticket#>`, which branches from `main` like any other run.
