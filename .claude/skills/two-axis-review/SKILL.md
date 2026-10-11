@@ -43,7 +43,7 @@ Where the PRD and the project spec disagree, the project spec wins, and the disa
 This repository documents its standards in the files below; every one is on the list:
 
 - `CLAUDE.md`: file headers (SPDX; vendored files keep their own, D-65), `# Q-n` markers, commit messages, dependencies, what may never be committed, and the branch and merge rules.
-- Spec §2.1 and CLAUDE.md "Working from the spec": the public API is the §2.1 signatures plus the additions recorded as Q-n rows; each module's `__all__` lists exactly that API and every other name starts with an underscore; a public name with neither a §2.1 signature nor a Q-n row is a finding; modules import only from the bands below them.
+- Spec §2.1 and CLAUDE.md "Working from the spec": the public API is the §2.1 signatures plus the additions recorded as Q-n rows; each module's `__all__` lists exactly that API and every other name starts with an underscore; a public name with neither a §2.1 signature nor a Q-n row is a finding; modules import from the bands below them and, within a band, only from the modules before them in the order CLAUDE.md gives.
 - Spec §2.3: dependencies, versions and licenses.
 - CLAUDE.md "Clean-room rules" and `docs/agents/clean-room.md`: provenance (the source log, forbidden sources).
 - `.claude/skills/tdd/SKILL.md`, "Where expected values come from" and "House rules": the test standards.
