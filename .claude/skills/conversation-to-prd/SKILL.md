@@ -31,7 +31,7 @@ Both labels are created on GitHub by `/setup-skills`. If publishing fails becaus
 
 3. Write the PRD using the template below, then publish it to the project issue tracker. Apply both labels from the Labels section (`ready-for-agent` and `skill:conversation-to-prd`) - no need for additional triage.
 
-When the conversation planned a milestone of `docs/clean-room/milestones.md`, title the PRD "Mn · <milestone title>". Take Scope, Spec items and Tests that must pass from the milestone's entry and the approved plan, and put the plan's Q-n candidates under Open questions.
+When the conversation planned a milestone of `docs/clean-room/milestones.md`, title the PRD "Mn · <milestone title>". Take Scope, Spec items and Tests that must pass from the milestone's entry and the approved plan (for a milestone with a Done-when line instead of a Tests line, such as M0, M17 and M18, its Done-when criteria become the tests, each marked "added"), and put the plan's Q-n candidates under Open questions.
 
 <prd-template>
 

@@ -1,6 +1,6 @@
 ---
 name: two-axis-review
-description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match the project spec items it implements and the originating PRD?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the owner wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
+description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match the project spec items it implements and the originating PRD?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the owner wants to review a branch or work-in-progress changes, or asks to \"review since X\"."
 ---
 
 Two-axis review of the diff between `HEAD` and a fixed point the owner supplies:
@@ -33,8 +33,8 @@ Before going further, confirm the fixed point resolves (`git rev-parse <fixed-po
 
 The Spec axis checks two sources, in this order of authority:
 
-1. **The project spec**, `docs/spec/openftgs-spec.md`. Collect the spec items the commit messages cite (sections §n, equations E-n, decisions D-n, tests U-n, C-n, S-n, B-n, and Q-n rows in `docs/clean-room/questions.md`), plus any the owner passed as an argument. If the commits cite none, that is itself a Standards finding (CLAUDE.md, "Commits"): take the spec items from the PRD's "Spec items" section if there is a PRD, and otherwise ask the owner.
-2. **The originating PRD**, if there is one: the issue labelled `skill:conversation-to-prd` that the commit messages reference (`#123`, `Closes #45`) or the owner passed, with any `skill:prd-to-tickets` tickets the commits reference (a referenced ticket's parent issue is its PRD), fetched as `docs/agents/issue-tracker.md` describes.
+1. **The project spec**, `docs/spec/openftgs-spec.md`. Collect the spec items the commit messages cite (sections §n, equations E-n, decisions D-n, tests U-n, C-n, S-n, B-n, and Q-n rows in `docs/clean-room/questions.md`), plus any the owner passed as an argument. If the commits cite none, that is itself a Standards finding (CLAUDE.md, "Commits"): take the spec items from the "Spec items" section of the PRD, or of the agent brief for an issue implemented on its own, and ask the owner only if there is neither.
+2. **The originating PRD**, if there is one: the issue labelled `skill:conversation-to-prd` that the commit messages reference (`#123`, `Closes #45`) or the owner passed, with any `skill:prd-to-tickets` tickets the commits reference (a referenced ticket's parent issue is its PRD), fetched as `docs/agents/issue-tracker.md` describes. For an issue implemented on its own, its latest agent brief comment takes the PRD's place.
 
 Where the PRD and the project spec disagree, the project spec wins, and the disagreement is itself a finding. If neither spec items nor a PRD can be identified, the **Spec** sub-agent will skip and report "no spec available".
 
