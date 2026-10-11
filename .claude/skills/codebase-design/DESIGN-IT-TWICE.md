@@ -20,7 +20,7 @@ Show this to the owner, then immediately proceed to Step 2. The owner reads and 
 
 Spawn 3+ sub-agents in parallel. Each must produce a **radically different** interface for the deepened module.
 
-Prompt each sub-agent with a separate technical brief (file paths, coupling details, dependency category from [DEEPENING.md](DEEPENING.md), what sits behind the seam). Each brief starts with the line from the Subagents section of docs/agents/clean-room.md and states that the spec §2.1 public interface is fixed: the designs differ only behind it. The brief is independent of the owner's problem-space explanation in Step 1. Give each agent a different design constraint:
+Prompt each sub-agent with a separate technical brief (file paths, coupling details, dependency category from [DEEPENING.md](DEEPENING.md), what sits behind the seam). Each brief starts with the line from the Subagents section of docs/agents/clean-room.md and states that the public interface (the §2.1 signatures and any recorded in Q-n rows) is fixed: the designs differ only behind it. The brief is independent of the owner's problem-space explanation in Step 1. Give each agent a different design constraint:
 
 - Agent 1: "Minimize the interface: aim for 1–3 entry points max. Maximise leverage per entry point."
 - Agent 2: "Maximise flexibility: support many use cases and extension."

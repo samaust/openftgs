@@ -43,7 +43,7 @@ def test_u13_copies_compose_back_to_the_original_opacity(sigma, n):
 Characteristics:
 
 - Cites the §3 ID and states the property in its name or docstring
-- Uses the §2.1 public interface only
+- Uses the public interface only (§2.1, or a signature recorded as a Q-n row)
 - Takes cases, values and tolerances from the spec row
 - Survives internal refactors
 - Holds one spec item: several assertions are fine when the row states several (U-1 states three), each with the row's tolerance
@@ -81,7 +81,7 @@ The spec checks relocation through its outcome instead: U-13 renders before and 
 Red flags:
 
 - Mocking anything inside `openftgs`
-- Testing private functions
+- A spec test (one citing a §3 ID) that calls a private helper
 - Asserting on call counts or order
 - Expected values computed by the code under test, or by the same formula
 - Random inputs outside the row's stated domain

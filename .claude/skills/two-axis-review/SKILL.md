@@ -43,7 +43,7 @@ Where the PRD and the project spec disagree, the project spec wins, and the disa
 This repository documents its standards in the files below; every one is on the list:
 
 - `CLAUDE.md`: file headers (SPDX; vendored files keep their own, D-65), `# Q-n` markers, commit messages, dependencies, what may never be committed, and the branch and merge rules.
-- Spec §2.1: the public API is exactly its signatures, and modules import only from the bands below them.
+- Spec §2.1 and CLAUDE.md "Working from the spec": the public API is the §2.1 signatures plus the additions recorded as Q-n rows; each module's `__all__` lists exactly that API and every other name starts with an underscore; a public name with neither a §2.1 signature nor a Q-n row is a finding; modules import from the bands below them and, within a band, only from the modules before them in the order CLAUDE.md gives.
 - Spec §2.3: dependencies, versions and licenses.
 - CLAUDE.md "Clean-room rules" and `docs/agents/clean-room.md`: provenance (the source log, forbidden sources).
 - `.claude/skills/tdd/SKILL.md`, "Where expected values come from" and "House rules": the test standards.
@@ -80,7 +80,7 @@ Issue both sub-agent calls together, in the foreground, and aggregate the report
 
 - The full diff command and commit list.
 - The list of standards-source files you found in step 3, **plus the smell baseline from step 3** pasted in full (the sub-agent has no other access to it).
-- The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); (b) provenance: code that looks taken from a third-party source (non-obvious constants, a ported algorithm, a vendored-looking block) with no matching row in `docs/clean-room/source-log.md`, any source-log row that names a forbidden source, and vendored files without their own license header; and (c) any baseline smell you spot: name it and quote the hunk. Mark each finding hard (a documented standard, provenance included) or judgement (a baseline smell, always), and give it a severity: critical, major, minor or nit, the scale of the milestone review in `docs/clean-room/milestones.md`. A documented repo standard overrides the baseline, and no suggested fix may change a §2.1 signature, a number or an output. Skip anything tooling enforces. One or two lines per finding."
+- The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); (b) provenance: code that looks taken from a third-party source (non-obvious constants, a ported algorithm, a vendored-looking block) with no matching row in `docs/clean-room/source-log.md`, any source-log row that names a forbidden source, and vendored files without their own license header; and (c) any baseline smell you spot: name it and quote the hunk. Mark each finding hard (a documented standard, provenance included) or judgement (a baseline smell, always), and give it a severity: critical, major, minor or nit, the scale of the milestone review in `docs/clean-room/milestones.md`. A documented repo standard overrides the baseline, and no suggested fix may change a §2.1 signature, a number or an output. Private tests (named without a §3 ID, `.claude/skills/tdd/SKILL.md` "Private tests") are allowed; a spec test that calls a private helper is a finding. Skip anything tooling enforces. One or two lines per finding."
 
 **Spec sub-agent prompt** should include:
 

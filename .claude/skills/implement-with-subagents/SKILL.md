@@ -41,7 +41,7 @@ Subagents can't ask the owner anything; only you can. Every subagent prompt (exp
 When a subagent reports a question, a Q-n row, a spec contradiction or an incident:
 
 - Ask the owner in the session as soon as it arrives, with the subagent's recommendation as the first option; don't wait for the other subagents. Every new Q-n row also gets a decision issue, opened in step 9 once its number is final.
-- Hold that ticket, and every ticket it blocks, out of the frontier until the answer comes; keep the rest of the frontier moving.
+- Hold that ticket, and every ticket it blocks, out of the frontier until the answer comes; keep the rest of the frontier moving. A Q-n row that adds a public signature the spec omits doesn't hold anything: the work goes on with the provisional signature.
 - Send the answer back to the same subagent if it can still be resumed; otherwise give a new implementer subagent a context pointer to the answer (the Q-n row or the issue comment).
 
 ## Shared files
