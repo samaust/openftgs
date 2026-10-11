@@ -64,11 +64,11 @@ Milestone M3 of docs/clean-room/milestones.md: model and file I/O. Read CLAUDE.m
 ## M4 · Reference renderer (xhigh)
 
 Scope: `openftgs.render` with the pure-PyTorch `reference` backend on CPU.
-Spec: E2 and D-4, E5, E6 with every normative constant (D-6, D-31, D-32, D-11), §1.4 "World and camera frames" and "Images" (D-28), D-34, the `render` signature and `RenderOutput` in §2.1.
+Spec: E2 and D-4, E5, E6 with every normative constant (D-6, D-31, D-32), §1.4 "World and camera frames" and "Images" (D-28), D-34, the `render` signature and `RenderOutput` in §2.1.
 Tests: U-6; U-4, U-8 and U-20 on the reference backend; the render part of U-22.
 
 ```text
-Milestone M4 of docs/clean-room/milestones.md: the reference renderer. Read CLAUDE.md and docs/clean-room/questions.md, then spec E2 with D-4, E5, E6 in full including the list of normative details, D-6, D-11, D-31, D-32, D-34, §1.4 "World and camera frames" and "Images" with D-28, and the render signature and RenderOutput in §2.1. Plan src/openftgs/render.py with backend="reference": projection with the +0.5 pixel convention, the Jacobian clamp, the 3.33σ opacity-aware extent, α clamped at 0.999, the 1/255 skip, the exclusive stop when transmittance ≤ 1e-4, the det ≤ 0 and off-screen culls, D-32 pre-culling, SH color with the direction from the moved mean, background compositing, time_units raw and normalized, and the means2d and visible outputs. Keep it plain PyTorch and differentiable. Plan the tests: U-6, U-4 (reference tolerance), U-8 bitwise on the reference backend, U-20 for the projection cases, and the render comparison of U-22. List each constant with the spec line it comes from.
+Milestone M4 of docs/clean-room/milestones.md: the reference renderer. Read CLAUDE.md and docs/clean-room/questions.md, then spec E2 with D-4, E5, E6 in full including the list of normative details, D-6, D-31, D-32, D-34, §1.4 "World and camera frames" and "Images" with D-28, and the render signature and RenderOutput in §2.1. Plan src/openftgs/render.py with backend="reference": projection with the +0.5 pixel convention, the Jacobian clamp, the 3.33σ opacity-aware extent, α clamped at 0.999, the 1/255 skip, the exclusive stop when transmittance ≤ 1e-4, the det ≤ 0 and off-screen culls, D-32 pre-culling, SH color with the direction from the moved mean, background compositing, time_units raw and normalized, and the means2d and visible outputs. Keep it plain PyTorch and differentiable. Plan the tests: U-6, U-4 (reference tolerance), U-8 bitwise on the reference backend, U-20 for the projection cases, and the render comparison of U-22. List each constant with the spec line it comes from.
 ```
 
 ## M5 · gsplat renderer (xhigh)
