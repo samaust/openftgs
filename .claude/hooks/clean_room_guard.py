@@ -4,7 +4,7 @@
 
 Blocks tool calls that would reach another FreeTimeGS implementation or
 EasyVolcap: web searches that name them, fetches of URLs that name them
-(except the paper and the official project page), downloads and clones that
+(except the official project page), downloads and clones that
 name them, and reads and writes of local paths that name them.
 
 It is a tripwire, not a guarantee: a forbidden source that never names
@@ -31,12 +31,11 @@ NAME = re.compile(
     re.IGNORECASE,
 )
 
-# The only URLs that may name FreeTimeGS: the project page itself (not its
-# code links or demos) and the paper and supplementary on CVF open access.
+# The only URL that may name FreeTimeGS: the project page itself (not its
+# code links or demos). The paper is read on arXiv (2506.05348 v2), whose
+# URLs don't name it; the spec follows that version, not the CVF one.
 ALLOWED_URL = re.compile(
-    r"^https?://zju3dv\.github\.io/freetimegs/?(?:index\.html)?/?(?:[?#].*)?$"
-    r"|^https?://openaccess\.thecvf\.com/content/CVPR2025/"
-    r"(?:papers|html|supplemental)/Wang_FreeTimeGS_[^/?#]*$",
+    r"^https?://zju3dv\.github\.io/freetimegs/?(?:index\.html)?/?(?:[?#].*)?$",
     re.IGNORECASE,
 )
 
