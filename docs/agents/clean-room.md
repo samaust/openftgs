@@ -49,6 +49,8 @@ Merge with `git merge --no-ff` once the owner approves.
 
 `docs/clean-room/source-log.md` and `docs/clean-room/questions.md` are append-only, so parallel branches conflict on them. When merging, keep every row from both sides. Where the branches used temporary IDs (`implement-with-subagents`, "Shared files"), replace them with the next free numbers as that skill describes. Rows already on `main` keep their numbers: they are final, and the owner may already know them. Where two branches took the same source-log row number, renumber the rows not yet on `main`. If two branches took the same Q-n number, give the one not yet on `main` the next free number (when neither is on `main`, the incoming one), update its `# Q-n` markers and every other reference to it in the merged files, and note the renumbering in the merge commit message, since the branch's own commit messages keep the old number.
 
+`docs/GLOSSARY.md` and `docs/modules/` conflict the same way when parallel branches add entries. Keep every entry from both sides. Where both changed the same entry differently, keep the one already on the target branch, put the other aside, and ask the owner which wins.
+
 ## Exploration notes
 
 Notes that one agent leaves for others go in `.scratch/<slug>/` at the root of the main checkout (gitignored; give subagents in worktrees its absolute path). They hold pointers and short summaries in your own words: spec items, repository paths, and the URLs of sources, each of which also has a source-log row. Never paste third-party code or text into them. They are working notes, not a record: anything that must persist goes in the repository files CLAUDE.md names.
