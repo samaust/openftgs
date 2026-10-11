@@ -47,6 +47,7 @@ Write each test from its row in spec §3, not from the code: the cases, the expe
 - Compare tensors with `torch.testing.assert_close`, passing the row's `rtol` and `atol` explicitly. Run gradient checks in float64, on configurations kept away from the clamps and thresholds of E6.
 - Use the hypothesis property variants the spec asks for (U-1, U-2, U-5, U-13), drawing values within the row's stated domain.
 - Pass seeded `torch.Generator` objects through the public signatures; never seed or patch the global generator.
+- Run tests that call a documentation-only oracle (scikit-image, OpenCV, torchmetrics: U-9, U-23, U-34 to U-36) with `pytest --tb=line`. A full traceback prints the oracle's source code, which its §0 class forbids reading; if such a test fails, read the message only.
 
 ## Anti-patterns
 
