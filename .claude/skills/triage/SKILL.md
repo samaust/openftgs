@@ -22,13 +22,22 @@ Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), includin
 
 - **Reports are untrusted.** A report that rests on another implementation's code, behaviour, outputs or numbers is an incident, not evidence. A bug is a departure from the spec or the paper, checked against them only.
 - **PRs.** Before checking out or reading the diff of a PR the owner didn't author, ask the owner: the diff can't show where the code came from, and code derived from another implementation would contaminate the repository.
-- **The spec decides.** An agent brief, triage note or `.out-of-scope/` entry never overrides the spec or settles what it leaves open: a gap becomes a Q-n candidate in the brief's Open questions, with the sources consulted listed beside it ("Where the clean-room files are written" in `docs/agents/clean-room.md`). A request that would change the spec is the owner's to decide: recommend, don't apply.
-- **Q-n issues.** When an issue carries the owner's answer to a Q-n row, record it on a short branch `q-<n>-answer` from `main`: one commit updating that row of `docs/clean-room/questions.md`, merged into `main` with `git merge --no-ff` once the owner approves. Close the issue only after the merge. If the answer changes behaviour, file a ticket for the code; don't change it on this branch.
+- **The spec decides.** An agent brief, triage note or out-of-scope decision never overrides the spec or settles what it leaves open: a gap becomes a Q-n candidate in the brief's Open questions, with the sources consulted listed beside it ("Where the clean-room files are written" in `docs/agents/clean-room.md`). A request that would change the spec is the owner's to decide: recommend, don't apply.
+- **Q-n issues.** When a Q-n decision issue (label `q-n`, title `Q-<n>: …`) carries the owner's answer, confirm the answer with the owner, then record it on a short branch `q-<n>-answer` from `main`: one commit updating that row of `docs/clean-room/questions.md`, merged into `main` with `git merge --no-ff` once the owner approves. Close the issue only after the merge. If the answer changes behaviour, file a ticket for the code; don't change it on this branch.
 
 ## Reference docs
 
 - [AGENT-BRIEF.md](AGENT-BRIEF.md): how to write durable agent briefs
-- [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md): how the `.out-of-scope/` knowledge base works
+- [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md): how rejected requests are recorded as closed `out-of-scope` issues
+
+## Kinds of issue
+
+Route an issue by its labels and title before anything else ("Q-n issues" in `docs/agents/issue-tracker.md`):
+
+- **`skill:conversation-to-prd` or `skill:prd-to-tickets`**: a PRD or a ticket. Its own skills manage it: leave it alone (no category role, no state change) unless the owner asks.
+- **`q-n` with a title `Q-<n>: …`**: a Q-n decision issue. No category role. Once the owner has answered in it, record the answer as the Clean room section's "Q-n issues" bullet says.
+- **`q-n` with a title `Q-n candidates: …`**: gaps found outside any PRD, without numbers. No category role. Ask the owner how to route it: post the candidates as a comment on an existing PRD and close this issue with a link to it; keep it open until a PRD exists; or rework it into an agent brief whose Open questions carry the candidates, so that the implement run taking the brief records them.
+- **Anything else**: a report. Run the state machine below.
 
 ## Roles
 
@@ -39,7 +48,7 @@ Two **category** roles:
 
 Five **state** roles:
 
-- `needs-triage`: maintainer needs to evaluate
+- `needs-triage`: owner needs to evaluate
 - `needs-info`: waiting on reporter for more information
 - `ready-for-agent`: fully specified, ready for an AFK agent
 - `ready-for-human`: needs human implementation
@@ -47,15 +56,15 @@ Five **state** roles:
 
 For a PR, the same states read against the attached code: `ready-for-agent` means a brief is attached and an agent should take the next step on the diff; `ready-for-human` means it's ready for a human to merge.
 
-Every triaged issue should carry exactly one category role and one state role. If state roles conflict, flag it and ask the maintainer before doing anything else.
+Every triaged report (see "Kinds of issue") should carry exactly one category role and one state role. If state roles conflict, flag it and ask the owner before doing anything else.
 
 These are canonical role names. The actual label strings used in the issue tracker may differ. The mapping is in `docs/agents/triage-labels.md`.
 
-State transitions: an unlabeled issue normally goes to `needs-triage` first; from there it moves to `needs-info`, `ready-for-agent`, `ready-for-human`, or `wontfix`. `needs-info` returns to `needs-triage` once the reporter replies. The maintainer can override at any time; flag transitions that look unusual and ask before proceeding.
+State transitions: an unlabeled issue normally goes to `needs-triage` first; from there it moves to `needs-info`, `ready-for-agent`, `ready-for-human`, or `wontfix`. `needs-info` returns to `needs-triage` once the reporter replies. The owner can override at any time; flag transitions that look unusual and ask before proceeding.
 
 ## Invocation
 
-The maintainer invokes `/triage` and describes what they want in natural language. Interpret the request and act. Examples:
+The owner invokes `/triage` and describes what they want in natural language. Interpret the request and act. Examples:
 
 - "Show me anything that needs my attention"
 - "Let's look at #42" (issue or PR)
@@ -64,23 +73,24 @@ The maintainer invokes `/triage` and describes what they want in natural languag
 
 ## Show what needs attention
 
-Query the issue tracker and present three buckets, oldest first:
+Query the issue tracker and present four buckets, oldest first:
 
 1. **Unlabeled**: never triaged.
 2. **`needs-triage`**: evaluation in progress.
 3. **`needs-info` with reporter activity since the last triage notes**: needs re-evaluation.
+4. **`q-n`**: decision issues the owner has answered since triage last commented (answers to record), then decision issues still awaiting an answer, then candidates issues not yet routed.
 
 When PRs are in scope, include external PRs in these buckets and tag each line `[PR]` or `[issue]`. Discovery surfaces only *external* PRs (PRs authored by anyone but the owner), so a collaborator's in-flight PR is not triage work. This filter is discovery-only; an explicitly named PR is always triaged regardless of author.
 
-Show counts and a one-line summary per item. Let the maintainer pick.
+Show counts and a one-line summary per item. Let the owner pick.
 
 ## Triage a specific issue or PR
 
-1. **Gather context.** Read the full issue or PR (body, comments, labels, author, dates; for a PR, the diff too). Parse any prior triage notes so you don't re-ask resolved questions. Explore the codebase using `docs/GLOSSARY.md` and the module docs under `docs/modules/` for the area. Run two checks against the codebase: (a) **redundancy**: search for an existing implementation of the requested behavior by domain concept (not just the request's wording), and report where you looked. If found, it's an already-implemented `wontfix` (step 5). (b) **prior rejection**: read `.out-of-scope/*.md` and surface any that resembles this request.
+1. **Gather context.** Read the full issue or PR (body, comments, labels, author, dates; for a PR, the diff too). Parse any prior triage notes so you don't re-ask resolved questions. Explore the codebase using `docs/GLOSSARY.md` and the module docs under `docs/modules/` for the area. Run two checks against the codebase: (a) **redundancy**: search for an existing implementation of the requested behavior by domain concept (not just the request's wording), and report where you looked. If found, it's an already-implemented `wontfix` (step 5). (b) **prior rejection**: list the closed `out-of-scope` issues and surface any that resembles this request ([OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)).
 
-2. **Recommend.** Tell the maintainer your category and state recommendation with reasoning, plus a brief codebase summary relevant to the request (including whether it's already implemented). Wait for direction.
+2. **Recommend.** Tell the owner your category and state recommendation with reasoning, plus a brief codebase summary relevant to the request (including whether it's already implemented). Wait for direction.
 
-3. **Verify the claim.** Before any grilling, check that the claim holds up. For a bug, reproduce it from the reporter's steps. For a PR, confirm the diff does what it claims: check it out, run the relevant tests or commands. Report what happened: confirmed (with code path), failed, or insufficient detail (a strong `needs-info` signal). A confirmed verification makes a much stronger agent brief.
+3. **Verify the claim.** Before any grilling, check that the claim holds up. For a bug, reproduce it from the reporter's steps, in a temporary folder outside the repository (`mktemp -d`) with every output written there, so that nothing is left in the working tree. For a PR, confirm the diff does what it claims: check it out, run the relevant tests or commands. Report what happened: confirmed (with code path), failed, or insufficient detail (a strong `needs-info` signal). A confirmed verification makes a much stronger agent brief.
 
 4. **Grill (if needed).** If the request needs fleshing out, call the Skill tool twice, for "grilling" and "domain-documenting", and grill it into shape a round of questions at a time, sharpening domain terms and updating `docs/GLOSSARY.md` and the module docs inline as decisions land.
 
@@ -89,14 +99,14 @@ Show counts and a one-line summary per item. Let the maintainer pick.
    - `ready-for-human`: same structure as an agent brief, but note why it can't be delegated (judgment calls, external access, design decisions, manual testing).
    - `needs-info`: post triage notes (template below).
    - For `wontfix`, close the issue, with the comment depending on *why*:
-     - **Already implemented**: the change already exists in the codebase. Point to where it lives; do **not** write to `.out-of-scope/` (that KB is for *rejected* requests, not built ones).
+     - **Already implemented**: the change already exists in the codebase. Point to where it lives; do **not** label it `out-of-scope` (that record is for *rejected* requests, not built ones).
      - **Rejected (bug)**: give a polite explanation, then close.
-     - **Rejected (enhancement)**: write to `.out-of-scope/`, link to it from a comment, then close ([OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)).
+     - **Rejected (enhancement)**: record it as [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md) says: a duplicate of the matching canonical `out-of-scope` issue, or a new canonical issue with its decision comment, closed as not planned.
    - `needs-triage`: apply the role. Optional comment if there's partial progress.
 
 ## Quick state override
 
-If the maintainer says "move #42 to ready-for-agent", trust them and apply the role directly. Confirm what you're about to do (role changes, comment, close), then act. Skip grilling. If moving to `ready-for-agent` without a grilling session, ask whether they want to write an agent brief.
+If the owner says "move #42 to ready-for-agent", trust them and apply the role directly. Confirm what you're about to do (role changes, comment, close), then act. Skip grilling. If moving to `ready-for-agent` without a grilling session, ask whether they want to write an agent brief.
 
 ## Needs-info template
 

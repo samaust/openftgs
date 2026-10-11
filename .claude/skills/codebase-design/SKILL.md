@@ -1,6 +1,6 @@
 ---
 name: codebase-design
-description: Shared vocabulary for designing deep modules. Use when the user wants to design or improve a module's interface, find deepening opportunities, decide where a seam goes, make code more testable or AI-navigable, or when another skill needs the deep-module vocabulary.
+description: Shared vocabulary for designing deep modules. Use when the owner wants to design or improve a module's interface, find deepening opportunities, decide where a seam goes, make code more testable or AI-navigable, or when another skill needs the deep-module vocabulary.
 ---
 
 # Codebase Design
@@ -9,7 +9,7 @@ Design **deep modules**: a lot of behaviour behind a small interface, placed at 
 
 ## Clean room
 
-Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). In this repository the public interface of every module is fixed: spec §2.1 gives the module layout, the public signatures and the import bands. Design here works inside them: internal seams, private helpers, the layout inside a module. A design that would change a §2.1 signature, the module layout, or any number or output isn't decided here; it becomes a Q-n row for the owner (CLAUDE.md, "Working from the spec"). The sub-agents of [DESIGN-IT-TWICE.md](DESIGN-IT-TWICE.md) follow the Subagents section of the clean-room file.
+Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). In this repository the public interface of every module is fixed: spec §2.1 gives the module layout, the public signatures and the import bands. Design here works inside them: internal seams, private helpers, the layout inside a module. A design that would change a §2.1 signature, the module layout, or any number or output isn't decided here; it becomes a Q-n row for the owner during a build, or a Q-n candidate on the tracker before one ("Where the clean-room files are written" in `docs/agents/clean-room.md`). The sub-agents of [DESIGN-IT-TWICE.md](DESIGN-IT-TWICE.md) follow the Subagents section of the clean-room file.
 
 ## Glossary
 
@@ -19,7 +19,7 @@ Use these terms exactly: don't substitute "component," "service," "API," or "bou
 
 **Interface**: everything a caller must know to use the module correctly: the type signature, but also invariants, ordering constraints, error modes, required configuration, and performance characteristics. _Avoid_: API, signature (too narrow, they refer only to the type-level surface).
 
-**Implementation**: what's inside a module, its body of code. Distinct from **Adapter**: a thing can be a small adapter with a large implementation (a Postgres repo) or a large adapter with a small implementation (an in-memory fake). Reach for "adapter" when the seam is the topic; "implementation" otherwise.
+**Implementation**: what's inside a module, its body of code. Distinct from **Adapter**: a thing can be a small adapter with a large implementation (the gsplat render backend, a thin layer over gsplat's rasterizer) or a large adapter with a small implementation (a stub COLMAP executable in a test). Reach for "adapter" when the seam is the topic; "implementation" otherwise.
 
 **Depth**: leverage at the interface. The amount of behaviour a caller (or test) can exercise per unit of interface they have to learn. A module is **deep** when a large amount of behaviour sits behind a small interface, **shallow** when the interface is nearly as complex as the implementation.
 
@@ -30,6 +30,8 @@ Use these terms exactly: don't substitute "component," "service," "API," or "bou
 **Leverage**: what callers get from depth. More capability per unit of interface they learn. One implementation pays back across N call sites and M tests.
 
 **Locality**: what maintainers get from depth. Change, bugs, knowledge, and verification concentrate in one place rather than spreading across callers. Fix once, fixed everywhere.
+
+**In this repository.** These design terms sit beside the project's own vocabulary, which wins where they overlap. A *module* without qualification means a Python module of spec §2.1 (`openftgs.motion`); say *deep module* when the scale-agnostic sense above is meant. *Public API* and *signature* keep the meaning CLAUDE.md and the spec give them: the §2.1 public API is the set of public signatures. A module's *interface* in the sense above contains those signatures plus every invariant, ordering constraint and error mode a caller relies on.
 
 ## Deep vs shallow
 
@@ -70,33 +72,31 @@ When designing an interface, ask:
 
 ## Designing for testability
 
-Good interfaces make testing natural:
+Good interfaces make testing natural. In this repository the §2.1 signatures are fixed, so these rules shape private helpers and internal seams, and explain why the public ones look the way they do:
 
 1. **Accept dependencies, don't create them.**
 
-   ```typescript
-   // Testable
-   function processOrder(order, paymentGateway) {}
+   ```python
+   # Testable: the generator comes in through the signature, as §2.1 has it
+   def relocate(model, optimizer, stats, cfg, *, generator): ...
 
-   // Hard to test
-   function processOrder(order) {
-     const gateway = new StripeGateway();
-   }
+   # Hard to test: a hidden global generator
+   def relocate(model, optimizer, stats, cfg):
+       torch.manual_seed(0)
+       ...
    ```
 
-2. **Return results, don't produce side effects.**
+2. **Return results, don't produce side effects** (where the spec leaves the choice; its in-place methods such as `resize_` are fixed).
 
-   ```typescript
-   // Testable
-   function calculateDiscount(cart): Discount {}
+   ```python
+   # Testable: a private helper returns what it computed
+   def _copies_per_target(draws: Tensor, n_live: int) -> Tensor: ...
 
-   // Hard to test
-   function applyDiscount(cart): void {
-     cart.total -= discount;
-   }
+   # Hard to test: the helper writes into state it doesn't own
+   def _apply_draws(model, draws) -> None: ...
    ```
 
-3. **Small surface area.** Fewer methods = fewer tests needed. Fewer params = simpler test setup.
+3. **Small surface area.** Fewer functions = fewer tests needed. Fewer params = simpler test setup.
 
 ## Relationships
 
@@ -109,7 +109,7 @@ Good interfaces make testing natural:
 ## Rejected framings
 
 - **Depth as ratio of implementation-lines to interface-lines** (Ousterhout): rewards padding the implementation. We use depth-as-leverage instead.
-- **"Interface" as the TypeScript `interface` keyword or a class's public methods**: too narrow: interface here includes every fact a caller must know.
+- **"Interface" as a Python `Protocol` or a class's public methods**: too narrow: interface here includes every fact a caller must know.
 - **"Boundary"**: overloaded with DDD's bounded context. Say **seam** or **interface**.
 
 ## Going deeper

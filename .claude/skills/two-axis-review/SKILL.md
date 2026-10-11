@@ -1,9 +1,9 @@
 ---
 name: two-axis-review
-description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match the project spec items it implements and the originating PRD?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
+description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match the project spec items it implements and the originating PRD?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the owner wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
 ---
 
-Two-axis review of the diff between `HEAD` and a fixed point the user supplies:
+Two-axis review of the diff between `HEAD` and a fixed point the owner supplies:
 
 - **Standards**: does the code conform to this repo's documented coding standards?
 - **Spec**: does the code faithfully implement the project spec (`docs/spec/openftgs-spec.md`) and the originating PRD?
@@ -18,7 +18,7 @@ Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). Both sub
 
 ### 1. Pin the fixed point
 
-Whatever the user said is the fixed point (a commit SHA, branch name, tag, `main`, `HEAD~5`, etc.). If they didn't specify one, use `main` when the current branch is another branch; on `main`, ask.
+Whatever the owner said is the fixed point (a commit SHA, branch name, tag, `main`, `HEAD~5`, etc.). If they didn't specify one, use `main` when the current branch is another branch; on `main`, ask.
 
 Capture the diff command once, against the merge-base:
 
@@ -33,8 +33,8 @@ Before going further, confirm the fixed point resolves (`git rev-parse <fixed-po
 
 The Spec axis checks two sources, in this order of authority:
 
-1. **The project spec**, `docs/spec/openftgs-spec.md`. Collect the spec items the commit messages cite (sections §n, equations E-n, decisions D-n, tests U-n, C-n, S-n, B-n, and Q-n rows in `docs/clean-room/questions.md`), plus any the user passed as an argument. If the commits cite none, that is itself a Standards finding (CLAUDE.md, "Commits"): take the spec items from the PRD's "Spec items" section if there is a PRD, and otherwise ask the user.
-2. **The originating PRD**, if there is one: the issue labelled `skill:conversation-to-prd` that the commit messages reference (`#123`, `Closes #45`) or the user passed, with any `skill:prd-to-tickets` tickets the commits reference (a referenced ticket's parent issue is its PRD), fetched as `docs/agents/issue-tracker.md` describes.
+1. **The project spec**, `docs/spec/openftgs-spec.md`. Collect the spec items the commit messages cite (sections §n, equations E-n, decisions D-n, tests U-n, C-n, S-n, B-n, and Q-n rows in `docs/clean-room/questions.md`), plus any the owner passed as an argument. If the commits cite none, that is itself a Standards finding (CLAUDE.md, "Commits"): take the spec items from the PRD's "Spec items" section if there is a PRD, and otherwise ask the owner.
+2. **The originating PRD**, if there is one: the issue labelled `skill:conversation-to-prd` that the commit messages reference (`#123`, `Closes #45`) or the owner passed, with any `skill:prd-to-tickets` tickets the commits reference (a referenced ticket's parent issue is its PRD), fetched as `docs/agents/issue-tracker.md` describes.
 
 Where the PRD and the project spec disagree, the project spec wins, and the disagreement is itself a finding. If neither spec items nor a PRD can be identified, the **Spec** sub-agent will skip and report "no spec available".
 

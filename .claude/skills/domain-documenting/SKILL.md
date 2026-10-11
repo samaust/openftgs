@@ -43,31 +43,31 @@ One file per subject, named after the subject in glossary vocabulary (`density/r
 Never leave edits to `docs/GLOSSARY.md` or `docs/modules/` uncommitted on `main`: CLAUDE.md forbids committing on `main` directly, and uncommitted changes stop the next implement run at its clean-tree check.
 
 - **Already on a branch** (an integration branch during a build): edit there and commit with the work.
-- **On `main`** (planning, grilling, triage): before the first edit, check that the working tree is clean (if `git status --porcelain` lists anything, ask the user before going on), then create a short branch `docs-<slug>` from `main`. Make every edit of the session there, committing as terms are resolved. When the glossary and module-doc work of the current task is done (the end of a grilling or triage round, say), ask the user to approve merging it into `main` with `git merge --no-ff`. Once approved, merge, delete the branch (`git branch -d`) and return to `main`. If they don't approve, return to `main` and report the unmerged branch.
+- **On `main`** (planning, grilling, triage): before the first edit, check that the working tree is clean (if `git status --porcelain` lists anything, ask the owner before going on), then create a short branch `docs-<slug>` from `main`. Make every edit of the session there, committing as terms are resolved. When the glossary and module-doc work of the current task is done (the end of a grilling or triage round, say), ask the owner to approve merging it into `main` with `git merge --no-ff`. Once approved, merge, delete the branch (`git branch -d`) and return to `main`. If they don't approve, return to `main` and report the unmerged branch.
 
 Commit messages cite the spec items the new or changed entries reference.
 
 ## Clean room
 
-Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). A term the spec defines keeps the spec's name. Where the glossary, a module doc or the user disagrees with the spec, the spec wins and the disagreement goes to the owner; never edit the spec to match.
+Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). A term the spec defines keeps the spec's name. Where the glossary, a module doc or the owner disagrees with the spec, the spec wins and the disagreement goes to the owner; never edit the spec to match.
 
 ## During the session
 
 ### Challenge against the spec and the glossary
 
-When the user uses a term that conflicts with the spec or with `docs/GLOSSARY.md`, call it out immediately. Check the spec first: its names win. "The glossary reserves 'step' for Adam's per-tensor step counter; do you mean an iteration?"
+When the owner uses a term that conflicts with the spec or with `docs/GLOSSARY.md`, call it out immediately. Check the spec first: its names win. "The glossary reserves 'step' for Adam's per-tensor step counter; do you mean an iteration?"
 
 ### Sharpen fuzzy language
 
-When the user uses vague or overloaded terms, propose the precise canonical term, the spec's where it has one. "You're saying 'opacity': do you mean the base opacity σ or the effective opacity σ_eff(t)? The sampling score reads one, the rasterizer the other."
+When the owner uses vague or overloaded terms, propose the precise canonical term, the spec's where it has one. "You're saying 'opacity': do you mean the base opacity σ or the effective opacity σ_eff(t)? The sampling score reads one, the rasterizer the other."
 
 ### Discuss concrete scenarios
 
-When domain relationships are being discussed, stress-test them with specific scenarios. Invent scenarios that probe edge cases and force the user to be precise about the boundaries between concepts.
+When domain relationships are being discussed, stress-test them with specific scenarios. Invent scenarios that probe edge cases and force the owner to be precise about the boundaries between concepts.
 
 ### Cross-reference with the spec and the code
 
-When the user states how something works, check the spec first, then the code. If either disagrees, surface it: "You said growth also deletes primitives, but the spec's growth only adds them (§1.3 Growth); dead primitives are relocated, not deleted. Which do you mean?" Where the code departs from the spec, the spec wins: report it rather than documenting the code's behaviour.
+When the owner states how something works, check the spec first, then the code. If either disagrees, surface it: "You said growth also deletes primitives, but the spec's growth only adds them (§1.3 Growth); dead primitives are relocated, not deleted. Which do you mean?" Where the code departs from the spec, the spec wins: report it rather than documenting the code's behaviour.
 
 ### Update docs/GLOSSARY.md inline
 

@@ -1,6 +1,6 @@
 ---
 name: tdd
-description: "Test-driven development: the red → green loop, one test at a time, writing each test from its spec §3 row at the §2.1 public interface. Use when building or fixing code test-first, or when the user mentions TDD or red-green."
+description: "Test-driven development: the red → green loop, one test at a time, writing each test from its spec §3 row at the §2.1 public interface. Use when building or fixing code test-first, or when the owner mentions TDD or red-green."
 ---
 
 # Test-Driven Development
@@ -11,7 +11,7 @@ When exploring the codebase, read `docs/GLOSSARY.md` so test names and interface
 
 ## Clean room
 
-Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). A test whose expected value depends on a choice the spec doesn't make waits for its Q-n row; log every source you read to settle an expected value.
+Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). A test whose expected value depends on a choice the spec doesn't make is written against the provisional decision of its Q-n row, as CLAUDE.md says (record the row first if the gap is new), and cites the row; log every source you read to settle an expected value.
 
 ## What a good test is
 
@@ -25,7 +25,7 @@ A **seam** is the public boundary you test at: the interface where you observe b
 
 In this repository the seams are fixed. They are the public signatures of spec §2.1, and the tests that pin them are the §3 items (U-n, C-n, S-n, B-n, harness levels L0–L3) that the PRD or ticket lists, each with its pass criterion. Use those and don't ask again. A test the spec doesn't list (a regression test, an edge case the PRD agreed) goes at a §2.1 interface too, with its own independent source of truth.
 
-Ask only where the spec is silent: a test that needs a seam §2.1 doesn't provide. Propose the seam with a one-line note on what it catches and what it misses, and confirm it with the user or, when you run as a subagent and can't ask, stop and report the proposed seam to the agent that launched you. When the shape of an interface is itself in question, call the Skill tool with "codebase-design" for the vocabulary (it is a reference to consult, not a session to run); a change to a §2.1 signature is a Q-n row, never a test-driven decision.
+Ask only where the spec is silent: a test that needs a seam §2.1 doesn't provide. Propose the seam with a one-line note on what it catches and what it misses, and confirm it with the owner or, when you run as a subagent and can't ask, stop and report the proposed seam to the agent that launched you. When the shape of an interface is itself in question, call the Skill tool with "codebase-design" for the vocabulary (it is a reference to consult, not a session to run); a change to a §2.1 signature is a Q-n row, never a test-driven decision.
 
 ## Where expected values come from
 

@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # PRD to Tickets
 
-Break a PRD into a set of **tickets**, one per module or test group, each declaring the tickets that **block** it. The PRD must be an issue on the tracker, since the tickets become its sub-issues: if the work exists only as a plan or a conversation, stop and ask the user to publish it with `/conversation-to-prd` first.
+Break a PRD into a set of **tickets**, one per module or test group, each declaring the tickets that **block** it. The PRD must be an issue on the tracker, since the tickets become its sub-issues: if the work exists only as a plan or a conversation, stop and ask the owner to publish it with `/conversation-to-prd` first.
 
 ## Clean room
 
@@ -17,15 +17,15 @@ Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), includin
 Every ticket this skill publishes carries two labels:
 
 - `ready-for-agent`: the triage label from the configured vocabulary (unless instructed otherwise).
-- `skill:prd-to-tickets`: the provenance label, so anyone browsing the tracker can see this ticket was created by this skill. Always apply it, even when the triage label is changed or omitted.
+- `skill:prd-to-tickets`: the skill label, so anyone browsing the tracker can see this ticket was created by this skill. Always apply it, even when the triage label is changed or omitted.
 
-Before publishing the first ticket, make sure `skill:prd-to-tickets` exists on the tracker. On GitHub, run the bundled script [scripts/create-provenance-label.sh](scripts/create-provenance-label.sh) (the path is relative to this skill's directory) from the repo root. It creates the label, or updates it in place if it already exists, so it is safe to run every time. Run it; don't read it or retype its command.
+Both labels are created on GitHub by `/setup-skills`. If publishing fails because a label is missing, stop and ask the owner to run `/setup-skills`.
 
 ## Process
 
 ### 1. Gather context
 
-Fetch the PRD the user passes (an issue number or URL) and read its full body and comments, including any Q-n candidates posted there. Use the conversation context as well, but the PRD is the source.
+Fetch the PRD the owner passes (an issue number or URL) and read its full body and comments, including any Q-n candidates posted there. Use the conversation context as well, but the PRD is the source.
 
 ### 2. Explore the codebase (optional)
 
@@ -49,9 +49,9 @@ The build goes bottom-up along the dependency bands of spec §2.1, one milestone
 
 Give each ticket its **blocking edges**: the other tickets that must complete before it can start. They follow the §2.1 import bands: a ticket is blocked by the tickets for the modules it imports from, and a ticket for a test that needs several modules (such as a C-n comparing two render backends) is blocked by all of their tickets. A ticket with no blockers can start immediately.
 
-**Wide refactors are the exception to one ticket per module.** A **wide refactor** is one mechanical change (rename a column, retype a shared symbol) whose **blast radius** fans across the whole codebase, so a single edit breaks call sites in many modules at once and no single-module ticket can land green. Don't force it into one ticket; sequence it as **expand–contract**. First expand: add the new form beside the old so nothing breaks. Then migrate the call sites over in batches sized by blast radius (per package, per directory), each batch its own ticket blocked by the expand, keeping CI green batch to batch because the old form still exists. Finally contract: delete the old form once no caller remains, in a ticket blocked by every migrate batch. When even the batches can't stay green alone, keep the sequence and add a final integrate-and-verify ticket that every batch blocks; the tests are promised to pass only once it is done. The batches still land on the PRD's one integration branch.
+**Wide refactors are the exception to one ticket per module.** A **wide refactor** is one mechanical change (rename a column, retype a shared symbol) whose **blast radius** fans across the whole codebase, so a single edit breaks call sites in many modules at once and no single-module ticket can land green. Don't force it into one ticket; sequence it as **expand–contract**. First expand: add the new form beside the old so nothing breaks. Then migrate the call sites over in batches sized by blast radius (per package, per directory), each batch its own ticket blocked by the expand, keeping the tests passing batch to batch because the old form still exists. Finally contract: delete the old form once no caller remains, in a ticket blocked by every migrate batch. When even the batches can't stay green alone, keep the sequence and add a final integrate-and-verify ticket that every batch blocks; the tests are promised to pass only once it is done. The batches still land on the PRD's one integration branch.
 
-### 4. Quiz the user
+### 4. Quiz the owner
 
 Present the proposed breakdown as a numbered list. For each ticket, show:
 
@@ -60,7 +60,7 @@ Present the proposed breakdown as a numbered list. For each ticket, show:
 - **Spec items**: the spec items it implements, by identifier
 - **What it makes pass**: the §3 tests, by identifier, and the §2.1 interface they exercise
 
-Ask the user:
+Ask the owner:
 
 - Does the granularity feel right? (too coarse / too fine)
 - Are the blocking edges correct: does each ticket only depend on tickets that genuinely gate it?
@@ -70,14 +70,13 @@ Every spec item and test the source lists lands in at least one ticket; say whic
 
 If the breakdown comes out as a single ticket, say so and publish nothing: the PRD is then implemented as one ticket.
 
-Iterate until the user approves the breakdown.
+Iterate until the owner approves the breakdown.
 
 ### 5. Publish the tickets to the configured tracker
 
 Publish the approved tickets to the issue tracker:
 
 - Publish one issue per ticket in dependency order (blockers first) so each ticket's blocking edges can reference real issues. Make each ticket a sub-issue of the PRD, and record each blocking edge as a native "blocked by" dependency, with the operations in "Parent issues and blocking" in `docs/agents/issue-tracker.md`. The relationships live there, not in the ticket body. Apply the labels from the Labels section: `skill:prd-to-tickets` always, and `ready-for-agent` unless instructed otherwise; the tickets are agent-grabbable by construction.
-
 
 Apart from adding the tickets as its sub-issues and posting Q-n candidates as comments (see Clean room), do NOT close or modify the PRD (including its labels).
 

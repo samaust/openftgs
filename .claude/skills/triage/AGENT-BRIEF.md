@@ -1,40 +1,38 @@
 # Writing Agent Briefs
 
-An agent brief is a structured comment posted on a GitHub issue or PR when it moves to `ready-for-agent`. It is the authoritative statement of the task that an AFK agent will work from. The original body and discussion are context: the agent brief is the contract. It sits under the project spec (`docs/spec/openftgs-spec.md`), which wins wherever they differ.
+An agent brief is a structured comment posted on a GitHub issue when it moves to `ready-for-agent`. It is the authoritative statement of the task that an AFK agent will work from, usually through `/implement-without-subagents <issue>`. The original body and discussion are context: the agent brief is the contract. It sits under the project spec (`docs/spec/openftgs-spec.md`), which wins wherever they differ.
 
-The brief states **what the agent should do**, which stretches to both surfaces: for an issue, that's building the change from nothing; for a PR, it's what's left to do *to the existing diff*: finish it, close gaps, address review points. Same principles either way; the PR example below shows the difference.
+Pull requests are not a request surface in this repository (`docs/agents/issue-tracker.md`), so briefs are written for issues only.
 
 ## Principles
 
+### Cite the spec, don't restate it
+
+The spec already says what most code must do. The brief names the spec items the work implements (§n, E-n, D-n) and the §3 tests that pin it, by identifier, and never copies their numbers, equations or tolerances: a copy goes stale and invites a second source of truth.
+
 ### Durability over precision
 
-The issue may sit in `ready-for-agent` for days or weeks. The codebase will change in the meantime. Write the brief so it stays useful even as files are renamed, moved, or refactored.
+The issue may sit in `ready-for-agent` for days or weeks while the code changes around it. Write the brief so it stays useful:
 
-- **Do** describe interfaces, types, and behavioral contracts
-- **Do** name specific types, function signatures, or config shapes that the agent should look for or modify
-- **Don't** reference file paths: they go stale
-- **Don't** reference line numbers
-- **Don't** assume the current implementation structure will remain the same
+- **Do** name the §2.1 public interfaces involved: signatures, types, config fields.
+- **Do** name the module paths spec §2.1 fixes (`openftgs.density`); they don't go stale.
+- **Don't** name other file paths, line numbers or private functions.
+- **Don't** assume today's implementation structure will survive.
 
-### Behavioral, not procedural
+### Behavioural, not procedural
 
-Describe **what** the system should do, not **how** to implement it. The agent will explore the codebase fresh and make its own implementation decisions.
+Describe **what** the code should do at its public interface, not **how** to change it. The implementing agent explores the code fresh and makes its own implementation decisions, within the spec's latitude.
 
-- **Good:** "The `SkillConfig` type should accept an optional `schedule` field of type `CronExpression`"
-- **Bad:** "Open src/types/skill.ts and add a schedule field on line 42"
-- **Good:** "When a user runs `/triage` with no arguments, they should see a summary of issues needing attention"
-- **Bad:** "Add a switch statement in the main handler function"
+- **Good:** "With n = 1, `mcmc_split` returns the target's opacity and scales unchanged (E11; U-13's first case)."
+- **Bad:** "In the density module, move the clamp below the scale computation."
 
 ### Complete acceptance criteria
 
-The agent needs to know when it's done. Every agent brief must have concrete, testable acceptance criteria. Each criterion should be independently verifiable.
-
-- **Good:** "Running `gh issue list --label needs-triage` returns issues that have been through initial classification"
-- **Bad:** "Triage should work correctly"
+The agent needs to know when it's done. Acceptance criteria are the §3 tests that must pass, by identifier. A criterion the spec doesn't list is marked "added" and names its independent source of truth: a spec item or a worked example.
 
 ### Explicit scope boundaries
 
-State what is out of scope. This prevents the agent from gold-plating or making assumptions about adjacent features.
+State what is out of scope, citing the neighbouring spec items the work must not touch. This keeps the agent from gold-plating or drifting into adjacent decisions.
 
 ## Template
 
@@ -45,22 +43,20 @@ State what is out of scope. This prevents the agent from gold-plating or making 
 **Summary:** one-line description of what needs to happen
 
 **Current behavior:**
-Describe what happens now. For bugs, this is the broken behavior.
-For enhancements, this is the status quo the feature builds on.
+What happens now, at the public interface. For a bug, the departure from the
+spec, with the confirmed reproduction. For an enhancement, the status quo.
 
 **Desired behavior:**
-Describe what should happen after the agent's work is complete.
-Be specific about edge cases and error conditions.
+What should happen after the work is done, citing the spec items that define it.
+
+**Spec items:** §n, E-n, D-n the work implements; Q-n rows it relies on
 
 **Key interfaces:**
-- `TypeName`: what needs to change and why
-- `functionName()` return type: what it currently returns vs what it should return
-- Config shape: any new configuration options needed
+- The §2.1 signatures, types or config fields involved, and what changes at each
 
 **Acceptance criteria:**
-- [ ] Specific, testable criterion 1
-- [ ] Specific, testable criterion 2
-- [ ] Specific, testable criterion 3
+- [ ] <U-n> passes (one line per §3 test)
+- [ ] Added: <criterion>, with its source of truth (a spec item or a worked example)
 
 **Open questions:**
 - Q-n rows the work relies on, by number
@@ -70,8 +66,7 @@ Be specific about edge cases and error conditions.
 **Sources consulted:** what each was and what was taken from it (omit if none)
 
 **Out of scope:**
-- Thing that should NOT be changed or addressed in this issue
-- Adjacent feature that might seem related but is separate
+- Neighbouring spec items or behaviour this issue must not change
 ```
 
 ## Examples
@@ -82,33 +77,30 @@ Be specific about edge cases and error conditions.
 ## Agent Brief
 
 **Category:** bug
-**Summary:** Skill description truncation drops mid-word, producing broken output
+**Summary:** `mcmc_split` changes the scales of targets that receive no copy
 
 **Current behavior:**
-When a skill description exceeds 1024 characters, it is truncated at exactly
-1024 characters regardless of word boundaries. This produces descriptions
-that end mid-word (e.g. "Use when the user wants to confi").
+Called with n = 1 for some rows, `mcmc_split` returns their opacity unchanged
+but their scales multiplied by a factor slightly below one. Reproduced on the
+reference backend with a two-row input; U-13's first case fails.
 
 **Desired behavior:**
-Truncation should break at the last word boundary before 1024 characters
-and append "..." to indicate truncation.
+Rows with n = 1 come back unchanged, opacity and scales alike, as E11 implies
+for a target with no relocated copies.
+
+**Spec items:** E11, D-15, U-13. Q-n rows relied on: none.
 
 **Key interfaces:**
-- The `SkillMetadata` type's `description` field: no type change needed,
-  but the validation/processing logic that populates it needs to respect
-  word boundaries
-- Any function that reads SKILL.md frontmatter and extracts the description
+- `mcmc_split(opacity, scales, n)` in `openftgs.density`: no signature change;
+  only its values for n = 1
 
 **Acceptance criteria:**
-- [ ] Descriptions under 1024 chars are unchanged
-- [ ] Descriptions over 1024 chars are truncated at the last word boundary
-      before 1024 chars
-- [ ] Truncated descriptions end with "..."
-- [ ] The total length including "..." does not exceed 1024 chars
+- [ ] U-13 passes, including its n = 1 case
+- [ ] U-13's hypothesis variant passes
 
 **Out of scope:**
-- Changing the 1024 char limit itself
-- Multi-line description support
+- The clamp bounds and the dead test (D-14)
+- How targets are drawn (E10)
 ```
 
 ### Good agent brief (enhancement)
@@ -117,76 +109,31 @@ and append "..." to indicate truncation.
 ## Agent Brief
 
 **Category:** enhancement
-**Summary:** Add `.out-of-scope/` directory support for tracking rejected feature requests
+**Summary:** Add the custom CUDA implementation of the temporal slice
 
 **Current behavior:**
-When a feature request is rejected, the issue is closed with a `wontfix` label
-and a comment. There is no persistent record of the decision or reasoning.
-Future similar requests require the maintainer to recall or search for the
-prior discussion.
+`PerfConfig.slice_impl` offers eager and compiled implementations; "cuda" is a
+documented stub. B-1 on the reference scene shows the temporal slice above the
+share of an iteration at which D-50 calls for a custom operator.
 
 **Desired behavior:**
-Rejected feature requests should be documented in `.out-of-scope/<concept>.md`
-files that capture the decision, reasoning, and links to all issues that
-requested the feature. When triaging new issues, these files should be
-checked for matches.
+`slice_impl = "cuda"` runs a custom CUDA operator behind the same signature as
+the eager and compiled implementations (D-50, §2.4 "Kernels"). "auto" chooses
+it only where D-50's condition holds.
+
+**Spec items:** §2.4 "Kernels", D-50, B-1, U-28. Q-n rows relied on: none.
 
 **Key interfaces:**
-- Markdown file format in `.out-of-scope/`: each file should have a
-  `# Concept Name` heading, a `**Decision:**` line, a `**Reason:**` line,
-  and a `**Prior requests:**` list with issue links
-- The triage workflow should read all `.out-of-scope/*.md` files early
-  and match incoming issues against them by concept similarity
+- `PerfConfig.slice_impl`: its "cuda" value becomes real
+- The temporal slice's signature: unchanged
 
 **Acceptance criteria:**
-- [ ] Closing a feature as wontfix creates/updates a file in `.out-of-scope/`
-- [ ] The file includes the decision, reasoning, and link to the closed issue
-- [ ] If a matching `.out-of-scope/` file already exists, the new issue is
-      appended to its "Prior requests" list rather than creating a duplicate
-- [ ] During triage, existing `.out-of-scope/` files are checked and surfaced
-      when a new issue matches a prior rejection
+- [ ] U-28 passes for the CUDA implementation, as for eager and compiled
+- [ ] B-1 rerun reports the temporal slice's new share of an iteration
 
 **Out of scope:**
-- Automated matching (human confirms the match)
-- Reopening previously rejected features
-- Bug reports (only enhancement rejections go to `.out-of-scope/`)
-```
-
-### Good agent brief (PR)
-
-For a PR, "Current behavior" describes the state of the diff, and the brief asks the agent to finish or fix it rather than build from scratch.
-
-```markdown
-## Agent Brief
-
-**Category:** enhancement
-**Summary:** Finish the contributor's `--json` output flag for `triage list`
-
-**Current behavior:**
-The PR adds a `--json` flag that serializes the issue list to JSON. The happy
-path works and the diff matches the project's command structure. Two gaps
-remain: errors are still printed as human text (not JSON), and the new flag has
-no test coverage.
-
-**Desired behavior:**
-With `--json`, all output (including errors) is well-formed JSON on stdout,
-and the command's exit codes are unchanged. The existing human-readable output
-is untouched when the flag is absent.
-
-**Key interfaces:**
-- The command's error path should emit `{ "error": string }` under `--json`
-  instead of the plain-text error
-- Reuse the existing serializer the PR already added; don't introduce a second
-
-**Acceptance criteria:**
-- [ ] `triage list --json` emits valid JSON for both success and error cases
-- [ ] Exit codes match the non-JSON command
-- [ ] A test covers the `--json` success output and one error case
-- [ ] Default (non-JSON) output is byte-for-byte unchanged
-
-**Out of scope:**
-- Adding `--json` to any other command
-- Changing the JSON shape of the success payload the PR already defined
+- The eager and compiled implementations
+- CUDA graphs and any gsplat fork (excluded by D-50)
 ```
 
 ### Bad agent brief
@@ -194,21 +141,22 @@ is untouched when the flag is absent.
 ```markdown
 ## Agent Brief
 
-**Summary:** Fix the triage bug
+**Summary:** Fix the relocation bug
 
 **What to do:**
-The triage thing is broken. Look at the main file and fix it.
-The function around line 150 has the issue.
+Relocation is broken. Look at density.py and fix it. The function around
+line 150 has the issue; make the scales right.
 
 **Files to change:**
-- src/triage/handler.ts (line 150)
-- src/types.ts (line 42)
+- src/openftgs/density.py (line 150)
 ```
 
 This is bad because:
+
 - No category
-- Vague description ("the triage thing is broken")
-- References file paths and line numbers that will go stale
-- No acceptance criteria
+- Vague description ("relocation is broken", "make the scales right")
+- No spec items, so the agent can't tell right from wrong
+- A file path and line number that will go stale
+- No acceptance criteria: no §3 test named
 - No scope boundaries
-- No description of current vs desired behavior
+- No description of current vs desired behaviour

@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Conversation to PRD
 
-This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user; just synthesize what you already know.
+This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the owner; just synthesize what you already know.
 
 A PRD is a scoped work order under the project spec (`docs/spec/openftgs-spec.md`), not a replacement for it.
 
@@ -19,15 +19,15 @@ Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), includin
 Every PRD this skill publishes carries two labels:
 
 - `ready-for-agent`: the triage label from the configured vocabulary.
-- `skill:conversation-to-prd`: the provenance label, so anyone browsing the tracker can see this issue was created by this skill. It is not a triage label and does not change the "no additional triage" rule below.
+- `skill:conversation-to-prd`: the skill label, so anyone browsing the tracker can see this issue was created by this skill. It is not a triage label and does not change the "no additional triage" rule below.
 
-Before publishing, make sure label `skill:conversation-to-prd` exists on the tracker. On GitHub, run the bundled script [scripts/create-provenance-label.sh](scripts/create-provenance-label.sh) (the path is relative to this skill's directory) from the repo root. It creates the label, or updates it in place if it already exists, so it is safe to run every time. Run it; don't read it or retype its command.
+Both labels are created on GitHub by `/setup-skills`. If publishing fails because a label is missing, stop and ask the owner to run `/setup-skills`.
 
 ## Process
 
 1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the `docs/GLOSSARY.md` vocabulary throughout the PRD.
 
-2. List the seams: the §3 tests that must pass and the §2.1 interfaces they exercise. These are fixed by the spec, so don't ask about them. The one exception to "no interview": a test the conversation agreed on that needs a seam §2.1 doesn't provide. Propose that seam at the highest point you can, with a one-line note on what it catches and what it misses, and confirm it with the user before publishing.
+2. List the seams: the §3 tests that must pass and the §2.1 interfaces they exercise. These are fixed by the spec, so don't ask about them. The one exception to "no interview": a test the conversation agreed on that needs a seam §2.1 doesn't provide. Propose that seam at the highest point you can, with a one-line note on what it catches and what it misses, and confirm it with the owner before publishing.
 
 3. Write the PRD using the template below, then publish it to the project issue tracker. Apply both labels from the Labels section (`ready-for-agent` and `skill:conversation-to-prd`) - no need for additional triage.
 
@@ -49,7 +49,7 @@ The §3 tests that pin the work, by identifier (U-n, C-n, S-n, B-n, harness leve
 
 ## Decisions within the spec's latitude
 
-Choices the conversation made that change no numbers, outputs or public API: private names, file layout inside a module, test helpers, the order of the work. Anything that would change numbers, outputs or public API is not decided here; it is a Q-n row under Open questions.
+Choices the conversation made that change no numbers, outputs or public API: private names, file layout inside a module, test helpers, the order of the work. Anything that would change numbers, outputs or public API is not decided here; it is a Q-n candidate under Open questions.
 
 ## Open questions
 
