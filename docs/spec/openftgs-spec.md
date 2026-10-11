@@ -486,7 +486,39 @@ Reference outcomes, useful as targets but not settings: about 1 hour on an RTX 4
 
 The package is one importable library, `openftgs`, with a CLI named `ftgs`. Modules depend only downward: CLI → trainer → training mechanics → model and renderer → data, init and I/O. The differential harness is a separate package that talks to implementations only through files and commands.
 
-&#91;embedded content: package layers · 14 module groups\]
+Imports point downward; the harness sees only files and commands.
+
+```mermaid
+flowchart TB
+    harness["<b>ftgs_harness</b><br/>separate package, compares A vs B"]
+    subgraph Interface
+        cli["<b>cli · ftgs</b><br/>convert · cache · init · train · render · eval · export · bench"]
+    end
+    subgraph Orchestration
+        train["<b>train · Trainer</b><br/>iteration loop, sampler, calendar"]
+        eval["<b>eval · E16</b><br/>PSNR, SSIM, DSSIM, LPIPS"]
+    end
+    subgraph Mechanics
+        losses["<b>losses · E7–E9</b><br/>L1, SSIM, LPIPS, L_reg"]
+        density["<b>density · E10–E11, E17</b><br/>growth and relocation"]
+        optim["<b>optim · E12–E13</b><br/>Adam, schedules"]
+    end
+    subgraph Core["Core model"]
+        model["<b>model · §1.1</b><br/>nine stored tensors"]
+        motion["<b>motion, sh · E1–E5</b><br/>positions, opacity, color"]
+        render["<b>render · E6</b><br/>gsplat 1.5.3 | reference"]
+    end
+    subgraph Foundation
+        data["<b>data</b><br/>cameras, scenes"]
+        init["<b>init</b><br/>k-NN, RoMa extra"]
+        io["<b>io</b><br/>checkpoints, IF"]
+        types["<b>types, config</b><br/>dataclasses"]
+    end
+    harness -. "files and commands only" .-> cli
+    Interface --> Orchestration --> Mechanics --> Core --> Foundation
+```
+
+package layers · 14 module groups
 
 Each band imports only from the bands below it. The harness never imports the package; it works through the CLI and the file formats of §2.2.
 
@@ -1108,7 +1140,24 @@ Trajectories, not raw (μx, μt) pairs, are compared in S-2: shifting μt by δ 
 
 The harness compares two implementations, A (this package) and B (any other), through files, commands and metrics only; it imports neither. It runs four levels, from converter checks to multi-seed statistics, and writes a report that describes every failure as an observable symptom.
 
-&#91;embedded content: harness data flow · 2 adapters, 4 levels\]
+Two adapters, four comparison levels, one symptom report.
+
+```mermaid
+flowchart LR
+    gen["<b>Case generator</b><br/>FTGS-IF models<br/>render requests<br/>forward queries<br/>scenes, inits and harness config"]
+    A["<b>Adapter A</b><br/>this package<br/>info, export, import, render, forward, train"]
+    B["<b>Adapter B</b><br/>other implementation<br/>info, export, import, render, forward, train"]
+    L0["<b>L0 · converters</b><br/>round trips, schema"]
+    L1["<b>L1 · renders</b><br/>same model, 10 probes"]
+    L2["<b>L2 · forward</b><br/>seeded random queries"]
+    L3["<b>L3 · statistics</b><br/>multi-seed metrics"]
+    report["<b>Report</b><br/>report.json<br/>report.md<br/>artifacts/"]
+    gen --> A & B
+    A & B --> L0 & L1 & L2 & L3
+    L0 & L1 & L2 & L3 --> report
+```
+
+harness data flow · 2 adapters, 4 levels
 
 Every arrow is a file on disk: the harness writes the cases, each adapter answers with files, and only the harness computes comparisons and metrics.
 
