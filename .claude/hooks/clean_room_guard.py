@@ -69,8 +69,23 @@ GH_REPO_POSITIONAL = re.compile(
     r"""\bgh\s+repo\s+(?:clone|fork|view|sync|edit|archive|delete|set-default)\s+["']?([^\s"'-][^\s"']*)""",
     re.IGNORECASE,
 )
-GH_GIST = re.compile(r"\bgh\s+gist\b", re.IGNORECASE)
-GH_SEARCH = re.compile(r"\bgh\s+search\b", re.IGNORECASE)
+# What follows gh in command position, after any global flags (-R x, --repo=x).
+# gist and search count only there, so prose that mentions them doesn't; a
+# search also needs a subcommand after it (`gh search repos ...`).
+GH_LEADING_FLAGS = re.compile(r"""^(?:-{1,2}[\w-]+(?:[=\s]+[^-\s]\S*)?\s+)*""")
+GH_GIST_TAIL = re.compile(r"gist\b", re.IGNORECASE)
+GH_SEARCH_TAIL = re.compile(r"""search\s+[^\s`'")]""", re.IGNORECASE)
+# Separators between simple shell commands; a -R/--repo flag belongs to the gh
+# invocation only when it sits in the same simple command (not `ls -R`, `grep -R`).
+SHELL_SEPARATORS = re.compile(r"[;&|\n]+")
+# gh in command position: first in the simple command (after VAR=value
+# assignments or a wrapper such as env, sudo or xargs), or right after $( ( or `.
+# Prose that merely mentions gh, as in a commit message, doesn't match.
+GH_AT_COMMAND = re.compile(
+    r"(?:^|\$\(|[(`])\s*"
+    r"(?:(?:[A-Za-z_]\w*=\S*|(?:env|command|exec|time|nohup|sudo|xargs)(?:\s+-\S+)*)\s+)*gh\s",
+    re.IGNORECASE,
+)
 
 READ_TOOLS = {"Read", "Grep", "Glob", "LS", "NotebookRead"}
 PATH_FIELDS = ("file_path", "path", "notebook_path")
@@ -105,26 +120,63 @@ def normalize_repo(value):
     return value
 
 
+QUOTED = re.compile(r"""'[^']*'|"(?:[^"\\]|\\.)*\"""", re.DOTALL)
+SUBSTITUTION = re.compile(r"""\$\((?:[^()]|\([^()]*\))*\)|`[^`]*`""")
+SHELL_CODE_BEFORE = re.compile(r"""(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-c|eval)\s*$""")
+
+
+def neutralize_prose(command):
+    """Blank the quoted strings that contain whitespace (commit messages, issue
+    bodies), so prose that mentions gh doesn't count as a gh call. Kept: quoted
+    strings without whitespace (a repository name), the shell code given to
+    `sh -c` or `eval`, and the $( ) and backtick substitutions inside double
+    quotes, which the shell runs."""
+    def replace(m):
+        s = m.group(0)
+        if not re.search(r"\s", s):
+            return s
+        if SHELL_CODE_BEFORE.search(command[: m.start()]):
+            return " " + s[1:-1] + " "
+        if s[0] == '"':
+            subs = SUBSTITUTION.findall(s)
+            if subs:
+                return " " + " ; ".join(subs) + " "
+        return '""'
+    return QUOTED.sub(replace, command)
+
+
 def gh_repositories(command):
     """Every repository a gh invocation in `command` is pointed at."""
     repos = set()
     if "gh api" in command or re.search(r"\bgh\s+api\b", command):
         repos.update(GH_API_REPO.findall(command))
-    repos.update(GH_REPO_FLAG.findall(command))
+    for simple_command in SHELL_SEPARATORS.split(command):
+        if GH_AT_COMMAND.search(simple_command):
+            repos.update(GH_REPO_FLAG.findall(simple_command))
     repos.update(GH_REPO_ENV.findall(command))
     repos.update(GH_REPO_POSITIONAL.findall(command))
     return {normalize_repo(r) for r in repos}
 
 
+def gh_command_tails(command):
+    """The text after each gh in command position, global flags skipped."""
+    for simple_command in SHELL_SEPARATORS.split(command):
+        for m in GH_AT_COMMAND.finditer(simple_command):
+            tail = simple_command[m.end():]
+            yield tail[GH_LEADING_FLAGS.match(tail).end():]
+
+
 def gh_scoped_to_project(command):
     """True when every gh invocation targets the project repository: explicitly,
     or by default through the clone's git remote. None when there is no gh."""
+    command = neutralize_prose(command)
     if not GH_INVOCATION.search(command):
         return None
-    if GH_GIST.search(command):
+    tails = list(gh_command_tails(command))
+    if any(GH_GIST_TAIL.match(t) for t in tails):
         return False  # gists belong to anyone
     repos = gh_repositories(command)
-    if GH_SEARCH.search(command) and not repos:
+    if any(GH_SEARCH_TAIL.match(t) for t in tails) and not repos:
         return False  # a GitHub-wide search
     return repos <= {PROJECT_REPO}
 
