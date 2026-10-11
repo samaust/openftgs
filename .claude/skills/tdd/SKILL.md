@@ -1,6 +1,6 @@
 ---
 name: tdd
-description: "Test-driven development: the red → green loop, one test at a time, writing each test from its spec §3 row at the §2.1 public interface. Use when building or fixing code test-first, or when the owner mentions TDD or red-green."
+description: "Test-driven development: the red → green loop, one test at a time, writing each test from its spec §3 row at the public interface (§2.1, or a signature recorded as a Q-n row). Use when building or fixing code test-first, or when the owner mentions TDD or red-green."
 ---
 
 # Test-Driven Development
@@ -15,7 +15,7 @@ Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). A test w
 
 ## What a good test is
 
-Tests verify behavior through public interfaces, not implementation details. Code can change entirely; tests shouldn't. A good test reads like the spec item it pins: its name or docstring cites the §3 ID and states the property ("U-13: with n = 2 the new opacity is 1 − √(1 − σ)"), and it survives refactors because it doesn't care about internal structure.
+Spec tests verify behavior through public interfaces, not implementation details. Code can change entirely; spec tests shouldn't. A good test reads like the spec item it pins: its name or docstring cites the §3 ID and states the property ("U-13: with n = 2 the new opacity is 1 − √(1 − σ)"), and it survives refactors because it doesn't care about internal structure.
 
 See [tests.md](tests.md) for examples and [mocking.md](mocking.md) for what to stand in for at the system boundaries.
 
@@ -23,9 +23,13 @@ See [tests.md](tests.md) for examples and [mocking.md](mocking.md) for what to s
 
 A **seam** is the public boundary you test at: the interface where you observe behavior without reaching inside. Tests live at seams, never against internals.
 
-In this repository the seams are fixed. They are the public signatures of spec §2.1, and the tests that pin them are the §3 items (U-n, C-n, S-n, B-n, harness levels L0–L3) that the PRD or ticket lists, each with its pass criterion. Use those and don't ask again. A test the spec doesn't list (a regression test, an edge case the PRD agreed) goes at a §2.1 interface too, with its own independent source of truth.
+In this repository the public seams are the public API: the signatures of spec §2.1 plus the additions recorded as Q-n rows (CLAUDE.md, "Working from the spec"). The tests that pin them are the §3 items (U-n, C-n, S-n, B-n, harness levels L0–L3) that the PRD or ticket lists, each with its pass criterion. Use those and don't ask again. A test the spec doesn't list (a regression test, an edge case the PRD agreed) goes at a public interface too, with its own independent source of truth.
 
-Ask only where the spec is silent: a test that needs a seam §2.1 doesn't provide. Propose the seam with a one-line note on what it catches and what it misses, and confirm it with the owner or, when you run as a subagent and can't ask, stop and report the proposed seam to the agent that launched you. When the shape of an interface is itself in question, call the Skill tool with "codebase-design" for the vocabulary (it is a reference to consult, not a session to run); a change to a §2.1 signature is a Q-n row, never a test-driven decision.
+Where a §3 row targets something the spec names but gives no signature for (a function of `openftgs.motion`, `openftgs.sh` or `openftgs.eval`, say), propose the signature as a provisional Q-n row, one row per module, and test at it; carry on with the provisional signature instead of waiting for the owner. Changing a signature §2.1 lists is never a test-driven decision: stop and ask, or, as a subagent, stop and report it. When the shape of an interface is in question, call the Skill tool with "codebase-design" for the vocabulary (it is a reference to consult, not a session to run).
+
+## Private tests
+
+A private helper (its name starts with an underscore, and it is absent from the module's `__all__`) may have tests of its own when its numerics or invariants are worth pinning directly: the float64 path of E11, the tie order of a k-NN search, a clamp in logit space. Such a test lives in the same file as the module's spec tests, is named `test_<helper>_…` without a §3 ID, and follows every rule below except the one about surviving refactors: it changes or goes when its helper does. It never stands in for a §3 row, which is always pinned at the public interface when its target is public.
 
 ## Where expected values come from
 
@@ -46,7 +50,7 @@ Write each test from its row in spec §3, not from the code: the cases, the expe
 
 ## Anti-patterns
 
-- **Implementation-coupled**: mocks internal collaborators, tests private functions, or verifies through a side channel (reading a stored tensor the public interface doesn't promise). The tell: the test breaks when you refactor but behavior hasn't changed.
+- **Implementation-coupled**: a spec test that mocks internal collaborators, reaches a private helper, or verifies through a side channel (reading a stored tensor the public interface doesn't promise). The tell: the test breaks when you refactor but behavior hasn't changed. Private tests (above) are coupled by design and are kept apart from spec tests by their names.
 - **Tautological**: the expected value is recomputed the way the code computes it (E11's formula rewritten in the test, a reference value produced by calling the code under test), so the test passes by construction and can never disagree with the code. Expected values come from the sources above.
 - **All tests first**: writing all tests first, then all implementation. Bulk tests verify _imagined_ behavior: you test the _shape_ of things rather than behavior at the public interface, the tests go insensitive to real changes, and you commit to test structure before understanding the implementation. Work **one test at a time** instead: one test → one implementation → repeat, each test responding to what the last cycle taught you.
 

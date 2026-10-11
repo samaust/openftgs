@@ -27,7 +27,7 @@ Both labels are created on GitHub by `/setup-skills`. If publishing fails becaus
 
 1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the `docs/GLOSSARY.md` vocabulary throughout the PRD.
 
-2. List the seams: the §3 tests that must pass and the §2.1 interfaces they exercise. These are fixed by the spec, so don't ask about them. The one exception to "no interview": a test the conversation agreed on that needs a seam §2.1 doesn't provide. Propose that seam at the highest point you can, with a one-line note on what it catches and what it misses, and confirm it with the owner before publishing.
+2. List the seams: the §3 tests that must pass and the §2.1 interfaces they exercise. These are fixed by the spec, so don't ask about them. Where a test targets something the spec names but gives no signature for, the plan's proposed signature is a Q-n candidate under Open questions (CLAUDE.md, "Working from the spec"); list it with its tests. The one exception to "no interview": a test the conversation agreed on that needs a seam the spec doesn't imply at all. Propose that seam at the highest point you can, with a one-line note on what it catches and what it misses, and confirm it with the owner before publishing.
 
 3. Write the PRD using the template below, then publish it to the project issue tracker. Apply both labels from the Labels section (`ready-for-agent` and `skill:conversation-to-prd`) - no need for additional triage.
 

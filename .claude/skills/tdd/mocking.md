@@ -19,4 +19,4 @@ Don't mock:
 
 ## Designing for testability
 
-The §2.1 signatures already inject what tests need to control: the generator, the render backend, the configuration objects, the paths. Test through them. Don't add a parameter, hook or global for testability alone: a change to a §2.1 signature is a Q-n row for the owner, and anything private you add for a test is an implementation detail the test then depends on.
+The §2.1 signatures already inject what tests need to control: the generator, the render backend, the configuration objects, the paths. Test through them. Don't add a parameter, hook or global for testability alone: changing a §2.1 signature means stopping to ask the owner, adding a public signature the spec omits is a Q-n row (CLAUDE.md), and anything private you add for a test is an implementation detail the test then depends on.
