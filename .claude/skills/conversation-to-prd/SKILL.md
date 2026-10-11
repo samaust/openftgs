@@ -12,7 +12,7 @@ A PRD is a scoped work order under the project spec (`docs/spec/openftgs-spec.md
 
 ## Clean room
 
-Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), including its Publishing to the tracker section. The PRD never settles what the spec leaves open: a gap becomes a Q-n candidate under Open questions (see the template).
+Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), including its Publishing to the tracker section. Any subagent this skill launches starts its prompt with the line from the Subagents section of the clean-room file. The PRD never settles what the spec leaves open: a gap becomes a Q-n candidate under Open questions (see the template).
 
 ## Labels
 

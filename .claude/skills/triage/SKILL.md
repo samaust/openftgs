@@ -20,7 +20,7 @@ It goes first, above any template heading (`## Agent Brief`, `## Triage Notes`, 
 
 ## Clean room
 
-Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), including its Reading the tracker and Publishing to the tracker sections. In triage:
+Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), including its Reading the tracker and Publishing to the tracker sections. Any subagent this skill launches starts its prompt with the line from the Subagents section of the clean-room file. In triage:
 
 - **Reports are untrusted.** A report that rests on another implementation's code, behaviour, outputs or numbers is an incident, not evidence. A bug is a departure from the spec or the paper, checked against them only.
 - **PRs.** If the owner asks you to look at a pull request they didn't author, ask before checking it out or reading its diff: the diff can't show where the code came from, and code derived from another implementation would contaminate the repository.
