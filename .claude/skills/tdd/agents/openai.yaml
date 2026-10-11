@@ -1,3 +1,0 @@
-interface:
-  display_name: "TDD"
-  short_description: "Test-driven red-green, one test at a time, from the spec"
