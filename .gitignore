@@ -2,3 +2,4 @@ docs/paper/
 .claude/settings.local.json
 .claude/clean-room-guard.log
 CLAUDE.local.md
+.scratch/

@@ -2,23 +2,19 @@
 
 Nineteen milestones, M0 to M18, build `openftgs` bottom-up along the dependency bands of spec §2.1 (`docs/spec/openftgs-spec.md`, revision 549). Each one lands with the spec tests that pin it; a test listed under a milestone must pass before the next milestone starts. The order is the spec author's suggestion, not part of the spec.
 
-How to run one:
+How to run one. Each milestone runs as one PRD through the skills in `.claude/skills/`:
 
-1. Start a fresh session in the repository: `claude` (model and effort come from `.claude/settings.local.json`). Switch to plan mode with Shift+Tab and paste the milestone's prompt.
-2. Read the plan. Approve it, or correct it and ask for a revised plan.
-3. Leave plan mode and send the execution message below.
-4. When the milestone is done, run the review prompt in another fresh session.
+1. **Plan.** Start a fresh session in the repository: `claude` (model and effort come from `.claude/settings.local.json`). Switch to plan mode with Shift+Tab and paste the milestone's prompt. Read the plan; approve it, or correct it and ask for a revised plan.
+2. **Record.** Leave plan mode and run `/conversation-to-prd`. It publishes the approved plan as a PRD issue titled "Mn · <milestone title>".
+3. **Split, if needed.** When the milestone's complexity and amount of work call for tickets, run `/prd-to-tickets <PRD#>`: one ticket per module or test group. Otherwise skip this step; the PRD is then implemented as a single ticket.
+4. **Build.** Run `/implement-without-subagents <PRD#>`, or `/implement-with-subagents <PRD#>` when the tickets cover independent modules. Don't approve the merge in this prompt: the skill builds on an integration branch, runs `two-axis-review`, and then stops to ask before merging into `main`.
+5. **Review.** While the build session waits, run the review prompt below in another fresh session at `/effort xhigh`, naming the integration branch.
+6. **Fix and merge.** Back in the build session, paste the review's findings to fix, then approve the merge. The milestone is done when its PRD is merged and closed; only then does the next milestone start.
 
-Execution message, the same for every milestone:
-
-```text
-Approved. Implement the plan. One commit per module or test group, each message citing the spec items it implements. Run every test you listed and paste the pytest summary. Append every source you consulted to docs/clean-room/source-log.md and any gap you had to decide to docs/clean-room/questions.md. Finish with: what passed, what is skipped and why, and the open Q-n rows.
-```
-
-Review prompt, run in a fresh session at `/effort xhigh` after each milestone:
+Review prompt, run in a fresh session at `/effort xhigh` after each milestone's build:
 
 ```text
-Review milestone <Mn> of docs/clean-room/milestones.md against docs/spec/openftgs-spec.md. Read CLAUDE.md first. For every function and test the milestone lists, check the code against the spec items it cites: equations, constants, provenance tags, decisions and pass criteria. Report each finding with a severity (critical, major, minor, nit), the spec location, the code location and the exact discrepancy. Also check docs/clean-room/source-log.md: every third-party file or page the code could only have come from must have a row, and no row may name a forbidden source. Change nothing; report only.
+Review milestone <Mn> of docs/clean-room/milestones.md, built on branch <integration-branch> for PRD #<n>, against docs/spec/openftgs-spec.md. Read CLAUDE.md first. Review the diff `git diff main...<integration-branch>` without checking the branch out. For every function and test the milestone lists, check the code against the spec items it cites: equations, constants, provenance tags, decisions and pass criteria. Report each finding with a severity (critical, major, minor, nit), the spec location, the code location and the exact discrepancy. Also check docs/clean-room/source-log.md as it stands on that branch (`git show <integration-branch>:docs/clean-room/source-log.md`): every third-party file or page the code could only have come from must have a row, and no row may name a forbidden source. Change nothing; report only.
 ```
 
 Effort: the sessions marked xhigh below carry the numerically delicate work; the others run at the default `high`.

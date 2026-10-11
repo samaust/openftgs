@@ -460,7 +460,7 @@ _Avoid_: spec version, draft, edition, the spec's git history
 
 **Provenance tag**:
 The marker on every spec rule saying who fixed it and whether the implementer may change it: [P], [P→3DGS], [L: source] or [D-n]. §0
-_Avoid_: citation, source tag, origin, label
+_Avoid_: citation, source tag, origin, label, provenance label (a skill label is a GitHub label, not a spec marker)
 
 **[P] tag**:
 Stated in the paper, with section or equation; never changed. §0
@@ -476,11 +476,19 @@ _Avoid_: literature value, convention
 
 **Decision D-n**:
 A numbered design decision in the spec's Appendix B filling a gap the paper leaves, with rationale, alternatives and detecting test; configurable, never changed silently, and this project's decision record. §0, Appendix B
-_Avoid_: ADR, ambiguity-log row, assumption, choice
+_Avoid_: ambiguity-log row, assumption, choice
 
 **Question Q-n**:
 A numbered row in `docs/clean-room/questions.md` recording a provisional decision the implementer made where the spec is silent or ambiguous and the choice affects numbers, outputs or the public API; marked `# Q-n` in code and raised with the owner, who may turn it into a D-n. CLAUDE.md
 _Avoid_: issue (the GitHub channel that carries it), TODO, open point, assumption
+
+**Q-n candidate**:
+A gap found before a build, recorded on the tracker with the columns of `questions.md` but no number, in a PRD, an agent brief or a Q-n issue; an implement run turns it into a numbered Q-n row. docs/agents/clean-room.md
+_Avoid_: draft Q-n, Q-n row (one that has a number), open question (the PRD section that lists candidates)
+
+**Q-n issue**:
+A GitHub issue labelled `q-n` that carries Q-n material: a decision issue titled `Q-<n>: …` for a numbered row that needs the owner's decision, or a candidates issue titled `Q-n candidates: …` for gaps found outside any PRD that have no number yet. docs/agents/issue-tracker.md
+_Avoid_: question issue, spec question, the `question` label (GitHub's generic one)
 
 **Allowed source**:
 Anything the implementer may read: the paper and project page, papers it cites, general Gaussian-splatting literature, dataset documentation and data files, and third-party software to the depth its §0 class permits. §0
@@ -533,3 +541,33 @@ _Avoid_: lossless, safe path, free speed-up
 **Approximate optimization**:
 A performance change that alters results beyond rounding: off by default, logged as a D-n, and required to pass L2 and L3 before it can become a default; TF32 in training-time convolutions is the one approximate default. §2.4, D-49
 _Avoid_: lossy, fast path, mixed precision (one instance of it)
+
+### Workflow
+
+**PRD**:
+A GitHub issue that scopes one piece of work under the spec, usually one milestone, citing the spec items it implements and the §3 tests that must pass, with its decisions within the spec's latitude and its open questions; a work order, never a replacement for the spec. .claude/skills/conversation-to-prd
+_Avoid_: spec (reserved for the owner's document), plan (what plan mode produces), epic, feature request
+
+**Ticket**:
+A GitHub sub-issue of a PRD covering one of its modules, or one test group of a large module, whose acceptance criteria are the §3 tests it must make pass; its blocking edges follow the §2.1 import bands. .claude/skills/prd-to-tickets
+_Avoid_: task, story, vertical slice, slice (reserved for the temporal slice)
+
+**Integration branch**:
+The one git branch off `main` on which a PRD, or an issue implemented on its own, is built and its tickets are merged; it reaches `main` only by a `--no-ff` merge the owner approves. CLAUDE.md "Commits"
+_Avoid_: feature branch, dev branch, working branch (an implementer's ticket branch in its worktree is something else)
+
+**Frontier**:
+The tickets of a PRD ready to start: not yet started, with every blocker done, where a blocker counts as done once merged into the integration branch during a run, or once closed on GitHub outside one. docs/agents/issue-tracker.md
+_Avoid_: queue, backlog, ready list, question frontier (grilling's questions ready to ask, a different thing)
+
+**Agent brief**:
+The structured comment `triage` posts on an issue when it moves to `ready-for-agent`: the contract an implement run works from, under the spec, with acceptance criteria and its own open questions. .claude/skills/triage/AGENT-BRIEF.md
+_Avoid_: ticket (a sub-issue of a PRD), task description, spec
+
+**Skill label**:
+A GitHub label `skill:<name>` recording which skill created an issue (`skill:conversation-to-prd` on PRDs, `skill:prd-to-tickets` on tickets); it records provenance only and is never added, removed or renamed by hand. .claude/skills/setup-skills
+_Avoid_: provenance label (one word from the spec's provenance tag), triage label, tag
+
+**Out-of-scope record**:
+The closed GitHub issues labelled `out-of-scope`, one canonical issue per rejected feature request, each with a decision comment citing the spec item that bounds the scope; later requests for the same concept are closed as its duplicates. docs/agents/issue-tracker.md
+_Avoid_: out-of-scope folder, `.out-of-scope/`, rejection log, wontfix list

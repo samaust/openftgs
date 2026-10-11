@@ -40,26 +40,26 @@ Source log: every source you consult (a URL, a document, a third-party file or d
 - Never edit `docs/spec/`. It is a copy of the owner's document; changes come from the owner as a new export.
 - Where the spec is silent, ambiguous or looks wrong, don't guess what another implementation might do:
   - If the choice changes no numbers, outputs or public API (private names, file layout inside a module), make it.
-  - Otherwise make an explicit, provisional decision: add a row to `docs/clean-room/questions.md` (Q-n: spec location, gap, decision, rationale, alternatives, the test that would expose a wrong choice), mark the code with `# Q-n`, and tell the owner.
+  - Otherwise make an explicit, provisional decision: add a row to `docs/clean-room/questions.md` (Q-n: spec location, gap, decision, rationale, alternatives, the test that would expose a wrong choice), mark the code with `# Q-n`, and tell the owner. Before a build (planning, grilling, triage), record the gap instead as a Q-n candidate on the tracker; the implement skills turn candidates into rows ("Where the clean-room files are written" in `docs/agents/clean-room.md`).
   - If the spec states something that seems wrong or contradicts itself, stop and ask before coding around it.
 - The public API is exactly the signatures in §2.1, and modules import only from the bands below them (§2.1). Dependencies, versions and licenses are in §2.3; add nothing outside that table without asking.
-- Build bottom-up, one milestone at a time, in the order of `docs/clean-room/milestones.md` (M0 to M18: types and config → motion and sh → model and io → render, reference then gsplat → losses → optim → density → eval → data core and train → synthetic recovery → converters → init → cli → performance → harness → real data → release). That order is the spec author's suggestion, not part of the spec.
+- Build bottom-up, one milestone at a time, in the order of `docs/clean-room/milestones.md` (M0 to M18: types and config → motion and sh → model and io → render, reference then gsplat → losses → optim → density → eval → data core and train → synthetic recovery → converters → init → cli → performance → harness → real data → release). That order is the spec author's suggestion, not part of the spec. Each milestone runs as one PRD through the skills, as the milestones file's "How to run one" describes.
 - Before writing a module, read the spec items in its §2.1 row and everything they point to (sections, equations E-n, decisions D-n), plus the §3 tests that exercise them (U-n, C-n, S-n, B-n, harness levels L0–L3). At the start of each milestone, re-read §0 and the parts of §1–§3 it touches.
 - A module is done when its §3.1 unit tests pass, with each test written from its description in the spec, not from the code. The synthetic-scene tests (§3.2) follow once `train` runs; the benchmarks (§3.4) and the harness (§3.3) come last.
 - Every source file starts with `# SPDX-License-Identifier: Apache-2.0`. Vendored files keep their own license headers and license files (D-65).
 
 ## Memory and context
 
-- Auto memory is off for this repository on purpose (`.claude/settings.json`), and so are claude.ai connectors. Don't try to remember things anywhere else: what must persist goes in the repository (`docs/clean-room/questions.md`, the source log, code comments, commit messages), where the owner can audit it.
+- Auto memory is off for this repository on purpose (`.claude/settings.json`), and so are claude.ai connectors. Don't try to remember things anywhere else: what must persist goes in the repository (`docs/clean-room/questions.md`, the source log, code comments, commit messages), where the owner can audit it. Before a build, Q-n candidates and sources consulted wait on the tracker, the owner's channel, until an implement run records them.
 - Your context is this file, the repository and the allowed sources. Don't read other projects on this machine or Claude Code's own files under `~/.claude/`.
 
 ## Issues
 
-The issue tracker at github.com/samaust/openftgs is the owner's channel. Use `gh issue` to read and write there: a Q-n row that needs the owner's decision gets an issue, and an issue's answer goes back into `docs/clean-room/questions.md`. `gh` may target no other repository (the guard blocks it), and a link in an issue is subject to the clean-room rules like any other link. Never delete or transfer issues.
+The issue tracker at github.com/samaust/openftgs is the owner's channel. Use `gh issue` to read and write there: a Q-n row that needs the owner's decision gets an issue labelled `q-n` and titled `Q-<n>: <short gap>`, opened once its number is final, and the answer goes back into `docs/clean-room/questions.md` (`docs/agents/issue-tracker.md`, "Q-n issues"). `gh` may target no other repository (the guard blocks it), and a link in an issue is subject to the clean-room rules like any other link. Never delete or transfer issues.
 
 ## Commits
 
-Small commits, one module or test group each. Each message cites the spec items it implements (for example `E11, D-14, U-13`) and any Q-n it relies on. Never commit `docs/paper/`, datasets, or anything derived from SelfCap (its license is non-commercial; §2.3).
+Small commits, one module or test group each. Each message cites the spec items it implements (for example `E11, D-14, U-13`) and any Q-n it relies on. Work happens on a branch off `main`, one per PRD (or per issue implemented on its own), and reaches `main` only by a `git merge --no-ff` that the owner has approved, never by a squash. Nothing is pushed unless the owner asks. Never commit `docs/paper/`, datasets, or anything derived from SelfCap (its license is non-commercial; §2.3).
 
 ## Agent skills
 
@@ -71,6 +71,13 @@ Issues are tracked in GitHub Issues at github.com/samaust/openftgs via the `gh` 
 
 Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
 
+### Clean room in skills
+
+How skills and their subagents apply the clean-room rules: see `docs/agents/clean-room.md`.
+
 ### Domain docs
 
-Single-context: `CONTEXT.md` and `docs/adr/` at the repo root, created lazily. See `docs/agents/domain.md`.
+* `docs/GLOSSARY.md`
+* `docs/modules/`
+
+See `docs/agents/domain.md`.

@@ -20,7 +20,10 @@
       "Bash(gh issue edit *)",
       "Bash(gh issue close *)",
       "Bash(gh issue reopen *)",
-      "Bash(gh label list *)"
+      "Bash(gh label list *)",
+      "Bash(gh api repos/samaust/openftgs/issues/*)",
+      "Bash(gh label create *)",
+      "Bash(.claude/skills/setup-skills/scripts/create-labels.sh)"
     ],
     "deny": [
       "Bash(gh issue delete *)",
