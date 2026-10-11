@@ -10,7 +10,7 @@ Break a PRD into a set of **tickets**, one per module or test group, each declar
 
 ## Clean room
 
-Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), including its Publishing to the tracker section. A ticket never settles what the spec leaves open. A gap found while drafting tickets becomes a Q-n candidate in the PRD's format, posted as a comment on the PRD (not written into `questions.md`, which would leave `main` with uncommitted changes); the tickets that depend on it cite it by its title.
+Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md), including its Publishing to the tracker section. Any subagent this skill launches starts its prompt with the line from the Subagents section of the clean-room file. A ticket never settles what the spec leaves open. A gap found while drafting tickets becomes a Q-n candidate in the PRD's format, posted as a comment on the PRD (not written into `questions.md`, which would leave `main` with uncommitted changes); the tickets that depend on it cite it by its title.
 
 ## Labels
 

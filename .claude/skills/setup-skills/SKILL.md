@@ -32,7 +32,7 @@ Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). This ski
 | `ready-for-human` | triage role (state) | `triage` |
 | `wontfix` | triage role (state) | `triage` |
 | `bug`, `enhancement` | triage role (category) | `triage` |
-| `q-n` | Q-n issue (no category) | the implement skills, for Q-n decision issues; `grilling` and `docs/agents/clean-room.md`, for Q-n candidates issues |
+| `q-n` | Q-n issue (no category) | the implement skills, for Q-n decision issues; any skill that records Q-n candidates outside a PRD or agent brief (`grilling`, `codebase-design`, `two-axis-review` run on `main`), for Q-n candidates issues |
 | `out-of-scope` | out-of-scope record | `triage`, on the canonical issue of a rejected enhancement |
 | `skill:conversation-to-prd` | skill label | `conversation-to-prd` |
 | `skill:prd-to-tickets` | skill label | `prd-to-tickets` |

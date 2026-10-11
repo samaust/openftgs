@@ -1,5 +1,0 @@
-interface:
-  display_name: "Implement with subagents"
-  short_description: "Implement a PRD with parallel subagents in worktrees"
-policy:
-  allow_implicit_invocation: false

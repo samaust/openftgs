@@ -101,7 +101,7 @@ _Avoid_: the paper's t for this quantity, progress fraction, normalized iteratio
 ### Training
 
 **Training iteration**:
-The seven-step unit of training on one image: temporal slice, render, total loss, backpropagation with gradient statistics, one Adam step at that iteration's rates, and on event iterations the event. §1.3 One training iteration
+The seven-step unit of training on one image: take the next image, compute its normalized time and active SH degree, build the per-time arrays and render, evaluate the total loss, backpropagate with gradient statistics, take one Adam step at that iteration's rates, and on event iterations run the event. §1.3 One training iteration
 _Avoid_: step, training step, batch
 
 **Event**:
@@ -126,11 +126,11 @@ _Avoid_: duplicate (gsplat's name), copy (reserved for relocation)
 
 **Split**:
 The growth of a larger candidate into two children drawn from its Gaussian with scales divided by 1.6, which replace it; the split is spatial only. E17, D-43
-_Avoid_: 4D split, subdivide
+_Avoid_: 4D split, subdivide, split (for the train/test label, which is a data split)
 
 **Cap N_max**:
 The maximum primitive count, 3,000,000 by default and 500,000 in the † configuration; when candidates exceed the room left, the largest-g ones grow, ties to the lower row. D-44, D-39
-_Avoid_: budget (reserved for initialization), max Gaussians, limit
+_Avoid_: budget (reserved for the initial budget B and the budgets of benchmarks), max Gaussians, limit
 
 **Relocation**:
 The part of an event, in iterations 500 to 25,000, that moves every dead primitive onto a live target instead of deleting it. §1.3 Relocation
@@ -314,9 +314,9 @@ _Avoid_: pose (the extrinsics alone), view, intrinsics (K alone), camera-to-worl
 The convention in which the image spans [0, W] × [0, H] and pixel (u, v) is sampled at (u + 0.5, v + 0.5), so an OpenCV calibration gains +0.5 on cx and cy. §1.4
 _Avoid_: half-pixel offset, pixel-center shift, integer convention
 
-**Split**:
+**Data split**:
 The label "train" or "test" on every image record; training, initialization and the spatial scale read only the train split. §2.1, D-66
-_Avoid_: partition, fold, subset
+_Avoid_: split (unqualified, reserved for growth), partition, fold, subset
 
 **Test view**:
 The camera held out for evaluation: cam00 on Neural3DV, 0015, 0007 or 0009 on SelfCap, configurable on ENeRF-Outdoor; its images form the test split. D-29
@@ -491,11 +491,11 @@ A GitHub issue labelled `q-n` that carries Q-n material: a decision issue titled
 _Avoid_: question issue, spec question, the `question` label (GitHub's generic one)
 
 **Allowed source**:
-Anything the implementer may read: the paper and project page, papers it cites, general Gaussian-splatting literature, dataset documentation and data files, and third-party software to the depth its §0 class permits. §0
+Anything the implementer may read: the paper and project page, papers it cites, general Gaussian-splatting literature, dataset documentation and data files, the source code and documentation of third-party software under a permissive license that allows commercial use, and the documentation of the rest. §0, CLAUDE.md
 _Avoid_: reference, dependency docs, whitelist
 
 **Forbidden source**:
-Anything from another FreeTimeGS implementation (the authors' code included), EasyVolcap in any form, any GPL or AGPL code, and the source code of software whose class allows documentation only. §0
+Anything from another FreeTimeGS implementation (the authors' code included) or EasyVolcap, whatever its license, and the source code of software under a copyleft, non-commercial or missing license. §0, CLAUDE.md
 _Avoid_: blacklist, upstream, the official repo
 
 **Source log**:

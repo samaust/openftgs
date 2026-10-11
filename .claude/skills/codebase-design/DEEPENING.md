@@ -16,7 +16,7 @@ Dependencies that have a local stand-in the spec already provides or the tests c
 
 ### 3. Owned, across a process boundary (Ports & Adapters)
 
-Our own code on the far side of a process or file boundary: the differential harness drives an implementation through the command line and the §2.2 file formats, never by import (§3.3). Define a **port** at the seam. The deep module owns the logic; the transport is injected as an **adapter**. Tests use an in-process adapter; production uses the command-line adapter.
+Our own code on the far side of a process or file boundary: the differential harness drives an implementation through the command line and the §2.2 file formats, never by import (§3.3). Define a **port** at the seam. The deep module owns the logic; the transport is injected as a **seam adapter** (not to be confused with the harness adapter of the glossary, the executable on the far side). Tests use an in-process adapter; production uses the command-line adapter.
 
 Recommendation shape: *"Define a port at the seam, implement a command-line adapter for the harness runs and an in-process adapter for testing, so the logic sits in one deep module even though it runs across a process boundary."*
 

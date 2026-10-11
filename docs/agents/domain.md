@@ -9,6 +9,8 @@ How the skills should consume this repo's domain documentation when exploring th
 
 ## File structure
 
+An example of the layout; a module has docs only once someone writes them.
+
 ```
 /
 └── docs/
