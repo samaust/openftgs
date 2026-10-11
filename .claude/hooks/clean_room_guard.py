@@ -5,7 +5,7 @@
 Blocks tool calls that would reach another FreeTimeGS implementation or
 EasyVolcap: web searches that name them, fetches of URLs that name them
 (except the paper and the official project page), downloads and clones that
-name them, and reads of local paths that name them.
+name them, and reads and writes of local paths that name them.
 
 It is a tripwire, not a guarantee: a forbidden source that never names
 FreeTimeGS or EasyVolcap passes. CLAUDE.md's rules still apply to everything.
@@ -88,6 +88,8 @@ GH_AT_COMMAND = re.compile(
 )
 
 READ_TOOLS = {"Read", "Grep", "Glob", "LS", "NotebookRead"}
+# A file written under a forbidden name would then be blocked from every read.
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 PATH_FIELDS = ("file_path", "path", "notebook_path")
 
 MESSAGE = (
@@ -214,7 +216,7 @@ def check(tool, tool_input):
                 return "this command touches a path or URL that names FreeTimeGS or EasyVolcap."
         return None
 
-    if tool in READ_TOOLS:
+    if tool in READ_TOOLS or tool in WRITE_TOOLS:
         fields = list(PATH_FIELDS) + (["pattern"] if tool == "Glob" else [])
         for field in fields:
             if names_forbidden(tool_input.get(field, "")):
@@ -234,16 +236,19 @@ def log_block(event, why):
     project = os.environ.get("CLAUDE_PROJECT_DIR") or os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
+    tool_input = json.dumps(event.get("tool_input"), ensure_ascii=False)
+    if len(tool_input) > 3000:
+        tool_input = tool_input[:3000] + " [truncated]"  # truncate the field, so each line stays valid JSON
     record = {
         "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "session": event.get("session_id"),
         "tool": event.get("tool_name"),
-        "input": event.get("tool_input"),
+        "input": tool_input,
         "reason": why,
     }
     try:
         with open(os.path.join(project, ".claude", "clean-room-guard.log"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False)[:4000] + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         pass
 
