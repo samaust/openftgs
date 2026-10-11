@@ -31,7 +31,7 @@ Use these terms exactly: don't substitute "component," "service," "API," or "bou
 
 **Locality**: what maintainers get from depth. Change, bugs, knowledge, and verification concentrate in one place rather than spreading across callers. Fix once, fixed everywhere.
 
-**In this repository.** These design terms sit beside the project's own vocabulary, which wins where they overlap. A *module* without qualification means a Python module of spec §2.1 (`openftgs.motion`); say *deep module* when the scale-agnostic sense above is meant. *Public API* and *signature* keep the meaning CLAUDE.md and the spec give them: the public API is the set of §2.1 signatures plus the additions recorded as Q-n rows, and each module's `__all__` lists it. A module's *interface* in the sense above contains those signatures plus every invariant, ordering constraint and error mode a caller relies on.
+**In this repository.** These design terms sit beside the project's own vocabulary, which wins where they overlap. A *module* without qualification means a Python module of spec §2.1 (`openftgs.motion`); say *deep module* when the scale-agnostic sense above is meant. *Public API* and *signature* keep the meaning CLAUDE.md and the spec give them: the public API is the set of §2.1 signatures plus the additions recorded as Q-n rows, and each module's `__all__` lists it. A module's *interface* in the sense above contains those signatures plus every invariant, ordering constraint and error mode a caller relies on. *Adapter* without qualification keeps the glossary's meaning, the small executable each implementation ships for the harness (§3.3); say *seam adapter* for the sense above.
 
 ## Deep vs shallow
 
