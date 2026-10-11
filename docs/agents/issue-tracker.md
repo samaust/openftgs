@@ -25,7 +25,7 @@ Infer the repo from `git remote -v`; `gh` does this automatically when run insid
 
 Two kinds of issue carry Q-n material. Both are labelled `q-n` and take no category role:
 
-- **Q-n decision issue**: a numbered row of `docs/clean-room/questions.md`, awaiting the owner's confirmation or decision. Title `Q-<n>: <short gap>`; the body gives the row's spec location, gap, provisional decision, alternatives and detecting test. It is opened only once the number is final, after the merge into `main` that brought the row. The owner answers in a comment; the answer goes back into the row through a short `q-<n>-answer` branch, and the issue closes after that merge.
+- **Q-n decision issue**: a numbered row of `docs/clean-room/questions.md`, awaiting the owner's confirmation or decision. Title `Q-<n>: <short gap>`; the body gives the row's spec location, gap, provisional decision, alternatives and detecting test. It is opened only once the number is final, after the merge into `main` that brought the row. The owner answers in a comment; the answer goes back into the row through a short `q-<n>-answer` branch, and the issue closes after that merge. A row the owner already answered during its build still gets this issue, as the record, opened and closed at once with a comment quoting the answer ("Answers during a build" in `docs/agents/clean-room.md`).
 - **Q-n candidates issue**: gaps found outside any PRD, without numbers yet. Title `Q-n candidates: <topic>`; the body lists each candidate with the columns of `questions.md` and the sources consulted. `triage` routes it into a PRD or an agent brief, whose implement run records the candidates.
 
 Find them with `gh issue list --label q-n --state open`.
