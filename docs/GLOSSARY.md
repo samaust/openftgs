@@ -126,7 +126,7 @@ _Avoid_: duplicate (gsplat's name), copy (reserved for relocation)
 
 **Split**:
 The growth of a larger candidate into two children drawn from its Gaussian with scales divided by 1.6, which replace it; the split is spatial only. E17, D-43
-_Avoid_: 4D split, subdivide
+_Avoid_: 4D split, subdivide, split (for the train/test label, which is a data split)
 
 **Cap N_max**:
 The maximum primitive count, 3,000,000 by default and 500,000 in the † configuration; when candidates exceed the room left, the largest-g ones grow, ties to the lower row. D-44, D-39
@@ -314,9 +314,9 @@ _Avoid_: pose (the extrinsics alone), view, intrinsics (K alone), camera-to-worl
 The convention in which the image spans [0, W] × [0, H] and pixel (u, v) is sampled at (u + 0.5, v + 0.5), so an OpenCV calibration gains +0.5 on cx and cy. §1.4
 _Avoid_: half-pixel offset, pixel-center shift, integer convention
 
-**Split**:
+**Data split**:
 The label "train" or "test" on every image record; training, initialization and the spatial scale read only the train split. §2.1, D-66
-_Avoid_: partition, fold, subset
+_Avoid_: split (unqualified, reserved for growth), partition, fold, subset
 
 **Test view**:
 The camera held out for evaluation: cam00 on Neural3DV, 0015, 0007 or 0009 on SelfCap, configurable on ENeRF-Outdoor; its images form the test split. D-29
