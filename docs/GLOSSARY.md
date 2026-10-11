@@ -101,7 +101,7 @@ _Avoid_: the paper's t for this quantity, progress fraction, normalized iteratio
 ### Training
 
 **Training iteration**:
-The seven-step unit of training on one image: temporal slice, render, total loss, backpropagation with gradient statistics, one Adam step at that iteration's rates, and on event iterations the event. §1.3 One training iteration
+The seven-step unit of training on one image: take the next image, compute its normalized time and active SH degree, build the per-time arrays and render, evaluate the total loss, backpropagate with gradient statistics, take one Adam step at that iteration's rates, and on event iterations run the event. §1.3 One training iteration
 _Avoid_: step, training step, batch
 
 **Event**:
@@ -130,7 +130,7 @@ _Avoid_: 4D split, subdivide, split (for the train/test label, which is a data s
 
 **Cap N_max**:
 The maximum primitive count, 3,000,000 by default and 500,000 in the † configuration; when candidates exceed the room left, the largest-g ones grow, ties to the lower row. D-44, D-39
-_Avoid_: budget (reserved for initialization), max Gaussians, limit
+_Avoid_: budget (reserved for the initial budget B and the budgets of benchmarks), max Gaussians, limit
 
 **Relocation**:
 The part of an event, in iterations 500 to 25,000, that moves every dead primitive onto a live target instead of deleting it. §1.3 Relocation
