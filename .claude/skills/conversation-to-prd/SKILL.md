@@ -57,6 +57,10 @@ Each existing Q-n row of `docs/clean-room/questions.md` the work relies on, with
 
 Then each new gap as a **Q-n candidate**: the spec location, the gap, the provisional decision, the rationale, the alternatives and the test that would expose a wrong choice (the columns of `questions.md`). Don't write it into `questions.md` here: that would leave `main` with uncommitted changes. The implement skill records the candidates as numbered rows in the first commit on the integration branch.
 
+## Glossary and module docs
+
+The new or changed entries of `docs/GLOSSARY.md`, each written out in the format of `.claude/skills/domain-documenting/GLOSSARY-FORMAT.md`, and the changes to `docs/modules/<module>/`, each as the file and what it will say, that the conversation settled. Omit the section if there are none. Don't edit those files here: the implement skill applies the list.
+
 ## Out of scope
 
 What this PRD leaves to other PRDs or milestones, citing them.
