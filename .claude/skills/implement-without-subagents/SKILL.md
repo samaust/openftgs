@@ -20,7 +20,7 @@ These are skill labels, not triage labels. Never add, remove or rename them, inc
 
 ## Clean room
 
-Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). Log sources and Q-n rows as you go, not at the end, and list the new ones in your final report.
+Follow [docs/agents/clean-room.md](../../../docs/agents/clean-room.md). Log sources and Q-n rows as you go, not at the end, and list the new ones in your final report. A Q-n row is a provisional decision: tell the owner and keep working with it. Stop only for a question you can't settle from the PRD, ticket or spec, a spec contradiction or an incident, and go on with the tickets that don't depend on it.
 
 ## Steps
 
