@@ -205,7 +205,7 @@ def temporal_slice(
         return TemporalSlice(*out)
     # D-50: dynamo gives nn.Parameter inputs static shapes, so a model's stored tensors would
     # recompile the slice at every growth event; views of them are plain tensors with dynamic
-    # shapes, and gradients still reach the parameters (#45).
+    # shapes, and gradients still reach the parameters (#45, source log #37).
     views = tuple(arg.view_as(arg) for arg in args)
     if impl == "compiled":
         out = _compiled_slice()(*views, t_tensor)
