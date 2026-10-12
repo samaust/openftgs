@@ -69,7 +69,7 @@ A row is visible in a camera when both screen radii gsplat returns are positive 
 
 ### Background and empty renders
 
-The pinned gsplat cannot take a per-camera background in packed mode, so the backend composites it itself in both layouts, from the render's alpha, which is one minus E6's final transmittance: the same background term (Q-38). gsplat's kernels cannot run on zero rows, so when no rows reach the backend (an empty model, or nothing kept by compaction) it returns Q-32's empty render without calling gsplat.
+The pinned gsplat cannot take a per-camera background in packed mode, so the backend composites it itself in both layouts, from the render's alpha, which is one minus E6's final transmittance: the same background term (Q-38). gsplat's kernels cannot run on zero rows, so when no rows reach the backend (an empty model, or nothing kept by compaction) it returns Q-32's empty render without calling gsplat. That render stays on the autograd graph, as the reference's does: its outputs depend with weight zero on the 2D means, and those on every per-time array, so a backward pass gives every stored tensor and the 2D means an exactly zero gradient (U-8, D-57), whichever placement of the opacity cull left no rows.
 
 ### Host synchronization
 

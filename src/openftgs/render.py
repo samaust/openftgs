@@ -3,7 +3,8 @@
 PyTorch, the readable oracle for tests), and, from M15, the temporal index used for rendering
 (D-55).
 
-Spec: E2, E5, E6, D-6, D-31, D-55, D-57. Band: Core model (§2.1).
+Spec: E2, E5, E6, D-3, D-4, D-6, D-12, D-28, D-31, D-32, D-34, D-55, D-57. Band: Core model
+(§2.1).
 """
 
 import math
@@ -416,7 +417,7 @@ def _render_gsplat(
     like = g.means_t
     if like.shape[0] == 0:
         # Q-38: gsplat's kernels cannot run on zero rows; this is Q-32's empty render.
-        return _empty_gsplat_render(background, width, height, num_rows=num_rows, packed=packed)
+        return _empty_gsplat_render(g, background, width, height, num_rows=num_rows, packed=packed)
 
     import gsplat
 
@@ -546,14 +547,27 @@ def _intrinsics(cam: _CameraTensors) -> Tensor:
 
 
 def _empty_gsplat_render(
-    background: Tensor, width: int, height: int, *, num_rows: int, packed: bool
+    g: GaussiansAtTime,
+    background: Tensor,
+    width: int,
+    height: int,
+    *,
+    num_rows: int,
+    packed: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
-    """Q-32's empty render, in the gsplat backend's layouts (Q-38)."""
+    """Q-32's empty render, in the gsplat backend's layouts (Q-38), for per-time arrays `g` with no
+    rows. It stays on the autograd graph, as the reference's empty render does: the outputs depend
+    with weight zero on the 2D means, which depend with weight zero on every per-time array, so
+    every stored tensor and the 2D means get an exactly zero gradient (U-8, D-57)."""
     num_cams = background.shape[0]
-    image = background[:, None, None, :].expand(num_cams, height, width, 3).contiguous()
-    alpha = background.new_zeros((num_cams, height, width, 1))
+    arrays = (g.means_t, g.opacities_t, g.quats_n, g.scales, g.sh)
+    zero = sum((array.sum() for array in arrays), start=g.means_t.new_zeros(())) * 0.0
+    means2d = zero.expand(0, 2) if packed else zero.expand(num_cams, num_rows, 2)
+    through = means2d.sum() * 0.0  # the outputs read the 2D means, as compositing does
+    image = background[:, None, None, :].expand(num_cams, height, width, 3) + through
+    alpha = background.new_zeros((num_cams, height, width, 1)) + through
     visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=background.device)
     if not packed:
-        return image, alpha, background.new_zeros((num_cams, num_rows, 2)), visible, None
+        return image, alpha, means2d, visible, None
     ids = torch.zeros(0, dtype=torch.int64, device=background.device)
-    return image, alpha, background.new_zeros((0, 2)), visible, ids
+    return image, alpha, means2d, visible, ids

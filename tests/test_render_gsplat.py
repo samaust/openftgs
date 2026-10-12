@@ -46,6 +46,17 @@ pytestmark = pytest.mark.gpu
 
 F32 = torch.float32
 ALPHA_MAX_F32 = torch.tensor(0.999, dtype=F32)  # E6, D-31
+PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
 LAYOUTS = pytest.mark.parametrize("packed", [True, False], ids=["packed", "unpacked"])
 _CAMERAS = ring(2, width_px=64, height_px=48, focal=40.0)  # two ring cameras, 64×48
 
@@ -268,7 +279,8 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
     """Q-37: the backend runs the kernels gsplat's rasterization() runs, with D-6's and D-57's
     arguments: on the same per-time arrays and no background, images and alpha agree within 1e-6
     (only the camera center is computed differently, Q-38), and so do the 2D means and the
-    visible primitives."""
+    visible primitives; in unpacked mode, a per-camera background composited outside the kernel
+    agrees with gsplat's own within 1e-6 too (Q-38)."""
     import gsplat
 
     cameras = _CAMERAS
@@ -296,6 +308,32 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
     )
     torch.testing.assert_close(out.image, image, rtol=0, atol=1e-6)
     torch.testing.assert_close(out.alpha, alpha, rtol=0, atol=1e-6)
+    if not packed:
+        # Q-38: the background composited outside the kernel agrees with gsplat's own, which
+        # gsplat 1.5.3 accepts per camera in unpacked mode only.
+        backgrounds = torch.tensor([[0.25, 0.5, 0.75], [1.0, 0.0, 0.5]], device="cuda")
+        with_background = _gsplat(model, cameras, 0.37, background=backgrounds, packed=False)
+        in_kernel, _, _ = gsplat.rasterization(
+            g.means_t,
+            g.quats_n,
+            g.scales,
+            g.opacities_t,
+            g.sh,
+            torch.stack([cam.world_to_camera for cam in cameras]).cuda(),
+            torch.stack([cam.K for cam in cameras]).cuda(),
+            64,
+            48,
+            near_plane=0.01,
+            far_plane=1e10,
+            radius_clip=0.0,
+            eps2d=0.3,
+            sh_degree=3,
+            packed=False,
+            tile_size=16,
+            rasterize_mode="classic",
+            backgrounds=backgrounds,
+        )
+        torch.testing.assert_close(with_background.image, in_kernel, rtol=0, atol=1e-6)
     visible = (meta["radii"] > 0).all(dim=-1)
     assert out.visible is not None and out.means2d is not None
     if packed:
@@ -427,6 +465,34 @@ def test_empty_and_fully_culled_scenes_render_the_background(packed: bool, precu
 
 
 @LAYOUTS
+@PLACEMENTS
+def test_renders_with_no_visible_row_keep_exactly_zero_gradients(
+    packed: bool, precull: str
+) -> None:
+    """U-8, D-57, Q-32, Q-38: when no row is visible, whether none reaches gsplat (an empty model,
+    or compaction keeping none) or gsplat culls them all, the render stays on the autograd graph:
+    backpropagating image and alpha gives every stored tensor an exactly zero gradient and the 2D
+    means a zero gradient, in every layout and placement, as on the reference backend."""
+    for scene in ("empty model", "no row kept"):
+        for backend in ("gsplat", "reference"):
+            built = model_from_rows([]) if scene == "empty model" else u8_scene(1, F32, kept=0)
+            model = _cuda(built)
+            out = (_gsplat if backend == "gsplat" else _reference)(
+                model, ring(3), 0.37, return_aux=True, packed=packed, precull=precull
+            )
+            assert out.visible is not None and not bool(out.visible.any())
+            torch.autograd.backward(out.image.sum() + out.alpha.sum())
+            for name in PARAM_NAMES:
+                grad = getattr(model, name).grad
+                assert grad is not None and torch.equal(grad, torch.zeros_like(grad)), (
+                    backend,
+                    name,
+                )
+            assert out.means2d is not None and out.means2d.grad is not None, backend
+            assert torch.equal(out.means2d.grad, torch.zeros_like(out.means2d)), backend
+
+
+@LAYOUTS
 def test_cameras_render_independently(packed: bool) -> None:
     """Q-32, Q-38: a single Camera renders like a one-element list, and a batch of cameras like
     each camera alone, with a per-camera background [C, 3] in both layouts."""
@@ -453,18 +519,6 @@ def test_gsplat_backend_rejects_float64_models_on_the_device() -> None:
 
 
 # U-8 · culling σ_eff < 1/255 before the backend changes nothing (D-32, D-57; Q-31), on gsplat
-
-PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
-    "means",
-    "times",
-    "log_durations",
-    "velocities",
-    "log_scales",
-    "quats",
-    "opacity_logits",
-    "sh0",
-    "shN",
-)
 
 
 @LAYOUTS
