@@ -18,12 +18,12 @@ import numpy as np
 import pytest
 import torch
 from builders import UNIT_TIME, look_at, pinhole, random_model, random_params, ring
+from real_sh import real_sh
 from torch import Tensor
 
 from openftgs.io import read_exchange, write_exchange
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
-from openftgs.sh import sh_basis
 from openftgs.types import Camera, ExchangeModel, RenderOutput, TimeNormalizer
 
 F32 = torch.float32
@@ -388,8 +388,9 @@ def _oracle(
     model: FreeTimeGaussians, camera: Camera, t: float, background: Sequence[float]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Image [H, W, 3], alpha [H, W] and visibility [N] of one camera by E1–E6, in float64 NumPy
-    with an explicit loop over pixels and depth-sorted primitives. Only `sh_basis` (pinned by U-6
-    in test_sh.py) is shared with the code under test."""
+    with an explicit loop over pixels and depth-sorted primitives, sharing no code with the code
+    under test: the SH basis is `real_sh` (U-6 pins `sh_basis` to it). Q-33's readings: ties in
+    depth to the lower row, a box touching the image counts as off it, det Σ′ > 0 required."""
     p = {name: getattr(model, name).detach().to(F64).numpy() for name in _PARAM_NAMES}
     n = p["means"].shape[0]
     means_t = p["means"] + p["velocities"] * (t - p["times"])[:, None]  # E1
@@ -411,9 +412,8 @@ def _oracle(
     fx, fy, cx, cy = k_mat[0, 0], k_mat[1, 1], k_mat[0, 2], k_mat[1, 2]
     width, height = camera.width, camera.height
     center = -r_w.T @ t_w
-    dirs = torch.from_numpy(means_t - center)
     sh = np.concatenate([p["sh0"], p["shN"]], axis=1)
-    basis = sh_basis(dirs, model.sh_degree).numpy()
+    basis = real_sh(means_t - center, model.sh_degree)
     colors = np.maximum(0.0, (sh * basis[:, :, None]).sum(axis=1) + 0.5)  # E2
 
     mean2d = np.zeros((n, 2))
@@ -471,7 +471,7 @@ def _oracle(
 def _oracle_scene(seed: int) -> FreeTimeGaussians:
     """Up to 32 primitives spread around two ring cameras: some behind or close to a camera,
     some below the opacity cull or away from their time center, anisotropic and rotated."""
-    n = 8 + seed * 3
+    n = 5 + 3 * seed  # 5 to 32
     return random_model(
         n, seed=seed, spread=4.5, log_scale=(-2.5, -0.5), logit=(-6.0, 3.0), speed=0.5
     )
@@ -499,6 +499,9 @@ def test_e6_reference_matches_an_independent_evaluation(seed: int) -> None:
         )
         torch.testing.assert_close(
             out32.image[c].detach().to(F64), torch.from_numpy(image), rtol=0, atol=1e-5
+        )
+        torch.testing.assert_close(
+            out32.alpha[c, ..., 0].detach().to(F64), torch.from_numpy(alpha), rtol=0, atol=1e-5
         )
 
 
