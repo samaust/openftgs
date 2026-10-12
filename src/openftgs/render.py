@@ -407,4 +407,148 @@ def _render_gsplat(
     num_rows: int,
     packed: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
-    raise NotImplementedError("the gsplat backend's rendering arrives in the next commit")
+    """Image [C, H, W, 3], alpha [C, H, W, 1], 2D means ([C, N, 2] unpacked, [nnz, 2] packed),
+    visibility [C, N] and, packed, the model row behind each row of the 2D means [nnz], of the
+    per-time arrays `g`, which hold all N rows or the ascending subset `rows` (Q-37, Q-38)."""
+    num_cams, width, height = len(cameras), cameras[0].width, cameras[0].height
+    like = g.means_t
+    if like.shape[0] == 0:
+        # Q-38: gsplat's kernels cannot run on zero rows; this is Q-32's empty render.
+        return _empty_gsplat_render(background, width, height, num_rows=num_rows, packed=packed)
+
+    import gsplat
+
+    # Adapted from gsplat 1.5.3, gsplat/rendering.py, rasterization() (lines 407-525, 631-648 and
+    # 746-759), Apache-2.0: its stage functions in its order, for this package's one configuration
+    # (pinhole camera, classic mode, no distortion, one GPU, RGB). Calling the stages directly
+    # keeps Q-32's 2D means in every layout (Q-37); the background and the camera center are this
+    # package's own (Q-38).
+    cams = [_camera_tensors(camera, like) for camera in cameras]
+    viewmats = torch.stack([_view_matrix(cam) for cam in cams])
+    intrinsics = torch.stack([_intrinsics(cam) for cam in cams])
+    centers = torch.stack([cam.center for cam in cams])
+    projection = gsplat.fully_fused_projection(
+        g.means_t,
+        None,
+        g.quats_n,
+        g.scales,
+        viewmats,
+        intrinsics,
+        width,
+        height,
+        eps2d=_EPS2D,
+        near_plane=_NEAR,
+        far_plane=_FAR,
+        radius_clip=_RADIUS_CLIP,
+        packed=packed,
+        sparse_grad=False,
+        calc_compensations=_RASTERIZE_MODE == "antialiased",
+        camera_model="pinhole",
+        opacities=g.opacities_t,  # E6, D-32: the opacity cull and the opacity-aware extent
+    )
+    camera_ids: Tensor | None = None
+    local_ids: Tensor | None = None
+    gaussian_ids: Tensor | None = None
+    if packed:
+        _, camera_ids, local_ids, radii, means2d, depths, conics, _ = projection
+        # Every packed row is written and visible (both radii positive), so gsplat's own 2D means
+        # are the anchor (Q-37). Rows come camera-major, ascending within a camera (Q-38).
+        anchor = rasterized = means2d
+        drawn = (radii > 0).all(dim=-1)
+        dirs = g.means_t[local_ids] - centers[camera_ids]
+        coeffs = g.sh[local_ids]
+        opacities = g.opacities_t[local_ids]
+        gaussian_ids = local_ids if rows is None else rows[local_ids]
+        visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=like.device)
+        visible[camera_ids, gaussian_ids] = True  # no host synchronization (D-49)
+    else:
+        radii, means2d, depths, conics, _ = projection
+        drawn = (radii > 0).all(dim=-1)  # E6: both screen radii positive
+        # gsplat leaves the 2D means of culled rows uninitialized; Q-32 wants 0 there, in the
+        # tensor the rasterizer reads (Q-37).
+        means2d = torch.where(drawn[..., None], means2d, torch.zeros_like(means2d))
+        if rows is None:
+            anchor = rasterized = means2d
+            visible = drawn
+        else:
+            # Q-31, Q-37: the 2D means go back among all N rows, and the rasterizer reads the kept
+            # rows from there, so that [C, N, 2] tensor is the anchor.
+            anchor = means2d.new_zeros((num_cams, num_rows, 2)).index_copy(1, rows, means2d)
+            rasterized = anchor.index_select(1, rows)
+            visible = drawn.new_zeros((num_cams, num_rows)).index_copy(1, rows, drawn)
+        dirs = g.means_t[None] - centers[:, None]
+        coeffs = g.sh.expand(num_cams, *g.sh.shape)
+        opacities = g.opacities_t.expand(num_cams, -1)
+    # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; at_time has
+    # already cut the bands above the active degree (D-3).
+    degree = math.isqrt(g.sh.shape[1]) - 1
+    colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=drawn)
+    colors = torch.clamp_min(colors + _SH_OFFSET, 0.0)
+    tile_width = math.ceil(width / _TILE_SIZE)
+    tile_height = math.ceil(height / _TILE_SIZE)
+    _, isect_ids, flatten_ids = gsplat.isect_tiles(
+        rasterized,
+        radii,
+        depths,
+        _TILE_SIZE,
+        tile_width,
+        tile_height,
+        segmented=False,  # D-57
+        packed=packed,
+        n_images=num_cams,
+        image_ids=camera_ids,
+        gaussian_ids=local_ids,  # gsplat's own ids, local to the rows passed
+    )
+    offsets = gsplat.isect_offset_encode(isect_ids, num_cams, tile_width, tile_height)
+    offsets = offsets.reshape(num_cams, tile_height, tile_width)
+    image, alpha = gsplat.rasterize_to_pixels(
+        rasterized,
+        conics,
+        colors,
+        opacities,
+        width,
+        height,
+        _TILE_SIZE,
+        offsets,
+        flatten_ids,
+        backgrounds=None,
+        packed=packed,
+        absgrad=False,
+    )
+    # Q-38: E6's background, T_final·c_bg = (1 − alpha)·c_bg, composited here in both layouts,
+    # since gsplat 1.5.3 cannot take a per-camera background in packed mode.
+    image = image + (1.0 - alpha) * background[:, None, None, :]
+    return image, alpha, anchor, visible, gaussian_ids
+
+
+def _view_matrix(cam: _CameraTensors) -> Tensor:
+    """gsplat's view matrix [4, 4] (world to camera) from R_w and t_w only (§1.4, Q-32)."""
+    bottom = torch.zeros(1, 4, dtype=cam.rotation.dtype, device=cam.rotation.device)
+    bottom[0, 3] = 1.0
+    return torch.cat([torch.cat([cam.rotation, cam.translation[:, None]], dim=1), bottom])
+
+
+def _intrinsics(cam: _CameraTensors) -> Tensor:
+    """gsplat's K [3, 3] from f_x, f_y, c_x and c_y only (§1.4, Q-32)."""
+    zero, one = torch.zeros_like(cam.fx), torch.ones_like(cam.fx)
+    return torch.stack(
+        [
+            torch.stack([cam.fx, zero, cam.cx]),
+            torch.stack([zero, cam.fy, cam.cy]),
+            torch.stack([zero, zero, one]),
+        ]
+    )
+
+
+def _empty_gsplat_render(
+    background: Tensor, width: int, height: int, *, num_rows: int, packed: bool
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    """Q-32's empty render, in the gsplat backend's layouts (Q-38)."""
+    num_cams = background.shape[0]
+    image = background[:, None, None, :].expand(num_cams, height, width, 3).contiguous()
+    alpha = background.new_zeros((num_cams, height, width, 1))
+    visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=background.device)
+    if not packed:
+        return image, alpha, background.new_zeros((num_cams, num_rows, 2)), visible, None
+    ids = torch.zeros(0, dtype=torch.int64, device=background.device)
+    return image, alpha, background.new_zeros((0, 2)), visible, ids
