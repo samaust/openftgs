@@ -15,14 +15,30 @@ from collections.abc import Iterator
 import numpy as np
 import pytest
 import torch
+from builders import CAM_A, model_from_rows, pinhole, random_model
 from skimage.metrics import structural_similarity
 from torch import Tensor
 
 import openftgs.losses
-from openftgs.losses import LPIPSLoss, l1_loss, ssim
+from openftgs.config import LossConfig
+from openftgs.losses import LPIPSLoss, l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.model import FreeTimeGaussians
+from openftgs.render import render
 
 F32 = torch.float32
 F64 = torch.float64
+
+PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
 
 
 # U-9: L1 (E7, D-7)
@@ -417,3 +433,209 @@ def test_u9_lpips_of_an_image_with_itself_is_zero_on_the_gpu() -> None:
     image, _ = _image_pair((2, 32, 40, 3), seed=13, correlated=False, dtype=F32)
     image = image.cuda()
     assert abs(loss(image, image.clone()).item()) <= 1e-6
+
+
+# U-10: the 4D regularization (E8, D-11)
+
+
+def _reg_oracle(model: FreeTimeGaussians, t: float) -> tuple[float, np.ndarray]:
+    """E8 in float64 from the stored tensors: L_reg = mean(σ·σt(t)) with σ = 1/(1 + e^−ô) and
+    σt = exp(−½((t − μt)/e^ŝ)²), and its closed-form gradient (1/N)·σt·σ(1 − σ) w.r.t. ô."""
+    logits = model.opacity_logits.detach().double().numpy()
+    times = model.times.detach().double().numpy()
+    log_durations = model.log_durations.detach().double().numpy()
+    sigma = 1.0 / (1.0 + np.exp(-logits))
+    sigma_t = np.exp(-0.5 * ((t - times) / np.exp(log_durations)) ** 2)
+    n = len(logits)
+    return float(np.mean(sigma * sigma_t)), sigma_t * sigma * (1.0 - sigma) / n
+
+
+def _all_grads(loss: Tensor, model: FreeTimeGaussians) -> dict[str, Tensor]:
+    params = [getattr(model, name) for name in PARAM_NAMES]
+    grads = torch.autograd.grad(loss, params, allow_unused=True, materialize_grads=True)
+    return dict(zip(PARAM_NAMES, grads, strict=True))
+
+
+@pytest.mark.parametrize("t", [0.0, 0.37, 1.0])
+def test_u10_regularization_is_the_mean_of_opacity_times_temporal_opacity(t: float) -> None:
+    """U-10: L_reg(t) = mean(σ·σt(t)) over all N primitives, to 1e-7 (float64 model; a float32
+    model to 1e-6)."""
+    model = random_model(40, seed=20, logit=(-4.0, 4.0)).double()
+    expected, _ = _reg_oracle(model, t)
+    value = reg4d_loss(model, t)
+    assert value.shape == () and value.dtype == F64
+    assert abs(value.item() - expected) <= 1e-7
+    model32 = random_model(40, seed=20, logit=(-4.0, 4.0))
+    assert abs(reg4d_loss(model32, t).item() - expected) <= 1e-6
+
+
+@pytest.mark.parametrize("t", [0.0, 0.37, 1.0])
+def test_u10_regularization_gradient_reaches_only_the_opacity_logits(t: float) -> None:
+    """U-10: ∂L_reg/∂ô = (1/N)·σt·σ(1 − σ) to 1e-7 relative; every other gradient, μt and ŝ
+    included (the stop-gradient on σt), is exactly 0."""
+    model = random_model(40, seed=21, logit=(-4.0, 4.0)).double()
+    _, expected = _reg_oracle(model, t)
+    grads = _all_grads(reg4d_loss(model, t), model)
+    torch.testing.assert_close(
+        grads["opacity_logits"], torch.from_numpy(expected), rtol=1e-7, atol=0.0
+    )
+    for name in PARAM_NAMES:
+        if name != "opacity_logits":
+            assert bool((grads[name] == 0).all()), name
+
+
+def test_regularization_of_an_empty_model_is_zero() -> None:
+    """Q-41: with N = 0 the mean of E8 is taken as 0, not NaN."""
+    model = random_model(0, seed=0)
+    assert reg4d_loss(model, 0.5).item() == 0.0
+
+
+# U-10 and U-9: the total loss (E9, D-10, D-37, D-38; Q-40, Q-41)
+
+NO_PERC = LossConfig(lambda_perc=0.0)  # E9 at its defaults, without the downloaded network
+
+
+def _detached_pair(seed: int, dtype: torch.dtype = F64) -> tuple[Tensor, Tensor]:
+    """A render-sized image pair that doesn't depend on any model."""
+    return _image_pair((48, 64, 3), seed=seed, correlated=True, dtype=dtype)
+
+
+@pytest.mark.parametrize("it", [1, 30_000])
+def test_u10_regularization_weight_is_one_hundredth_at_every_iteration_by_default(it: int) -> None:
+    """U-10 (E9, D-10, D-38): with reg_until unset, λ_reg = 10⁻² applies at it = 1 and at
+    it = T_it: the total is the weighted sum of the terms to 1e-6, and with images independent of
+    the model ∂L/∂ô is 10⁻² times E8's gradient, to 1e-7 relative."""
+    model = random_model(30, seed=22, logit=(-4.0, 4.0)).double()
+    pred, gt = _detached_pair(23)
+    loss, terms = total_loss(pred, gt, model, 0.4, it, NO_PERC)
+    reg, expected_grad = _reg_oracle(model, 0.4)
+    assert set(terms) == {"l1", "one_minus_ssim", "reg", "total"}
+    weighted = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt)) + 1e-2 * reg
+    assert abs(loss.item() - weighted.item()) <= 1e-6
+    assert abs(terms["reg"].item() - reg) <= 1e-7
+    grads = _all_grads(loss, model)
+    torch.testing.assert_close(
+        grads["opacity_logits"], 1e-2 * torch.from_numpy(expected_grad), rtol=1e-7, atol=0.0
+    )
+
+
+def test_u10_regularization_stops_after_reg_until() -> None:
+    """U-10 (D-10, Q-41): reg_until is the last iteration with L_reg: at it = reg_until it
+    applies, after it the term is absent and ∂L/∂ô is exactly 0; reg_until = 0 never applies."""
+    model = random_model(30, seed=24).double()
+    pred, gt = _detached_pair(25)
+    cfg = LossConfig(lambda_perc=0.0, reg_until=100)
+    loss, terms = total_loss(pred, gt, model, 0.4, 100, cfg)
+    assert "reg" in terms
+    assert bool((_all_grads(loss, model)["opacity_logits"] != 0).all())
+    for it, until in [(101, 100), (30_000, 100), (1, 0)]:
+        cfg = LossConfig(lambda_perc=0.0, reg_until=until)
+        loss, terms = total_loss(pred, gt, model, 0.4, it, cfg)
+        assert "reg" not in terms
+        expected = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt))
+        assert loss.item() == expected.item()
+        assert not loss.requires_grad or bool(
+            (_all_grads(loss, model)["opacity_logits"] == 0).all()
+        )
+
+
+def _off_screen_scene() -> FreeTimeGaussians:
+    """Two primitives in front of camera A and one 100 units to its side, off its image."""
+    return model_from_rows(
+        [
+            {"mean": (0.0, 0.0, 4.0), "logit": 1.0},
+            {"mean": (1.0, 0.5, 5.0), "logit": -0.5, "log_duration": -1.0},
+            {"mean": (100.0, 0.0, 4.0), "logit": 0.3, "log_duration": -0.5, "time": 0.2},
+        ]
+    ).double()
+
+
+def test_u10_regularization_is_independent_of_the_camera() -> None:
+    """U-10 (D-11): L_reg is identical for renders from two cameras, and a primitive off one
+    camera's image still gets E8's gradient λ_reg·(1/N)·σt·σ(1 − σ) through the total loss."""
+    model = _off_screen_scene()
+    cam_b = pinhole(
+        64,
+        48,
+        fx=16.0,
+        fy=16.0,
+        cx=32.5,
+        cy=24.5,
+        world_to_camera=[[1.0, 0.0, 0.0, -100.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+    )
+    gt = _detached_pair(26)[1]
+    regs, losses = [], []
+    for camera, visible in ((CAM_A, [True, True, False]), (cam_b, [False, False, True])):
+        out = render(
+            model, camera, 0.4, time_units="normalized", backend="reference", return_aux=True
+        )
+        assert out.visible is not None and out.visible[0].tolist() == visible
+        loss, terms = total_loss(out.image[0], gt, model, 0.4, 1, NO_PERC)
+        regs.append(terms["reg"])
+        losses.append(loss)
+    assert torch.equal(regs[0], regs[1])
+    loss = losses[0]
+    _, expected = _reg_oracle(model, 0.4)
+    grad = _all_grads(loss, model)["opacity_logits"]
+    torch.testing.assert_close(
+        grad[2], torch.tensor(1e-2 * expected[2], dtype=F64), rtol=1e-7, atol=0.0
+    )
+
+
+def test_total_loss_returns_detached_scalars_without_host_sync() -> None:
+    """Q-40: the terms are detached 0-d tensors on the images' device, and "total" is the
+    returned loss's value."""
+    model = random_model(10, seed=27)
+    pred, gt = _detached_pair(28, dtype=F32)
+    loss, terms = total_loss(pred.requires_grad_(), gt, model, 0.5, 1, NO_PERC)
+    assert loss.shape == () and loss.requires_grad
+    for value in terms.values():
+        assert isinstance(value, Tensor) and value.shape == () and not value.requires_grad
+        assert value.device == pred.device
+    assert terms["total"].item() == loss.item()
+
+
+@pytest.mark.parametrize("it", [0, -1, True, 1.0], ids=["zero", "negative", "bool", "float"])
+def test_total_loss_rejects_an_iteration_below_one(it: object) -> None:
+    """Q-41: iterations are counted from 1 (D-41)."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(29, dtype=F32)
+    with pytest.raises(ValueError):
+        total_loss(pred, gt, model, 0.5, it, NO_PERC)  # type: ignore[arg-type]
+
+
+def test_total_loss_needs_the_perceptual_network_when_its_weight_is_positive() -> None:
+    """Q-40: λ_perc > 0 with no network passed is a ValueError."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(30, dtype=F32)
+    with pytest.raises(ValueError):
+        total_loss(pred, gt, model, 0.5, 1, LossConfig())
+
+
+def test_total_loss_skips_terms_whose_weight_is_zero() -> None:
+    """Q-41: a term with weight 0 is not computed and has no key."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(31, dtype=F32)
+    cfg = LossConfig(lambda_img=0.0, lambda_ssim=0.0, lambda_perc=0.0, lambda_reg=1e-2)
+    loss, terms = total_loss(pred, gt, model, 0.5, 1, cfg)
+    assert set(terms) == {"reg", "total"}
+    assert loss.item() == pytest.approx(1e-2 * reg4d_loss(model, 0.5).item(), rel=1e-6)
+
+
+@pytest.mark.weights
+def test_u9_total_loss_is_the_weighted_sum_of_its_terms(lpips_nets: dict[str, LPIPSLoss]) -> None:
+    """U-9 (E7, E9, D-37): L = 0.8·L1 + 0.2·(1 − SSIM) + 0.01·LPIPS-VGG + 0.01·L_reg, to 1e-6,
+    each term recomputed with the public functions."""
+    model = random_model(30, seed=32)
+    pred, gt = _detached_pair(33, dtype=F32)
+    perc = lpips_nets["vgg"]
+    loss, terms = total_loss(pred, gt, model, 0.6, 1, LossConfig(), perceptual=perc)
+    assert set(terms) == {"l1", "one_minus_ssim", "lpips", "reg", "total"}
+    expected = (
+        0.8 * l1_loss(pred, gt).item()
+        + 0.2 * (1.0 - ssim(pred, gt).item())
+        + 0.01 * perc(pred, gt).item()
+        + 0.01 * reg4d_loss(model, 0.6).item()
+    )
+    assert abs(loss.item() - expected) <= 1e-6
+    assert terms["lpips"].item() == perc(pred, gt).item()

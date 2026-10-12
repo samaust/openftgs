@@ -13,7 +13,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-__all__ = ["LPIPSLoss", "l1_loss", "ssim"]
+from openftgs.config import LossConfig
+from openftgs.model import FreeTimeGaussians
+from openftgs.motion import reg4d_terms
+
+__all__ = ["LPIPSLoss", "l1_loss", "reg4d_loss", "ssim", "total_loss"]
 
 
 def _fail(reason: str) -> NoReturn:
@@ -168,3 +172,55 @@ class LPIPSLoss(torch.nn.Module):
         # doesn't require a gradient, autograd records nothing on the target's branch (§2.4).
         out: Tensor = self.net(2 * x - 1, 2 * y - 1)
         return out.mean()
+
+
+def reg4d_loss(model: FreeTimeGaussians, t: float) -> Tensor:
+    """L_reg(t) = (1/N)·Σ σᵢ·sg[σt,ᵢ(t)] over all N primitives at normalized time t (E8, D-11).
+    The stop-gradient is motion's (Q-12); the parameters are read at call time."""
+    terms = reg4d_terms(model.opacity_logits, model.times, model.log_durations, t)
+    # Q-41: an empty model gives 0, not the NaN of an empty mean.
+    return terms.mean() if terms.numel() > 0 else terms.sum()
+
+
+# Q-40: the dict holds detached 0-d tensors, so the loss never syncs with the host (§2.4 rule 3),
+# and the perceptual network is passed in.
+def total_loss(
+    pred: Tensor,
+    gt: Tensor,
+    model: FreeTimeGaussians,
+    t: float,
+    it: int,
+    cfg: LossConfig,
+    *,
+    perceptual: LPIPSLoss | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·LPIPS + λ_reg·L_reg(t) at iteration `it` (E7, E9,
+    D-37), and its unweighted terms with the total under "total". A term whose weight is 0 is
+    neither computed nor reported; L_reg's weight is 0 after `cfg.reg_until` (D-10, Q-41)."""
+    # Q-41: iterations count from 1 (D-41).
+    if isinstance(it, bool) or not isinstance(it, int) or it < 1:
+        _fail(f"it must be an int >= 1, got {it!r}")
+    if cfg.lambda_perc > 0.0 and perceptual is None:
+        _fail("lambda_perc > 0 needs the perceptual network (perceptual=LPIPSLoss(...))")
+    _check_pair(pred, gt)
+    terms: dict[str, Tensor] = {}
+    weighted: list[Tensor] = []
+    if cfg.lambda_img > 0.0:
+        terms["l1"] = l1_loss(pred, gt)
+        weighted.append(cfg.lambda_img * terms["l1"])
+    if cfg.lambda_ssim > 0.0:
+        value = ssim(
+            pred, gt, window=cfg.ssim_window, sigma=cfg.ssim_sigma, padding=cfg.ssim_padding
+        )
+        terms["one_minus_ssim"] = 1.0 - value
+        weighted.append(cfg.lambda_ssim * terms["one_minus_ssim"])
+    if perceptual is not None and cfg.lambda_perc > 0.0:
+        terms["lpips"] = perceptual(pred, gt)
+        weighted.append(cfg.lambda_perc * terms["lpips"])
+    if cfg.lambda_reg > 0.0 and (cfg.reg_until is None or it <= cfg.reg_until):
+        terms["reg"] = reg4d_loss(model, t)
+        weighted.append(cfg.lambda_reg * terms["reg"])
+    loss = functools.reduce(torch.add, weighted) if weighted else pred.new_zeros(())
+    report = {name: value.detach() for name, value in terms.items()}
+    report["total"] = loss.detach()
+    return loss, report
