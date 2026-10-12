@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""render() with two backends, gsplat (CUDA, production; from M5) and reference (pure PyTorch, CPU,
-tests), and, from M15, the temporal index used for rendering (D-55).
+"""render() with two backends, gsplat 1.5.3 (CUDA, float32, production) and reference (pure
+PyTorch, the readable oracle for tests), and, from M15, the temporal index used for rendering
+(D-55).
 
-Spec: E2, E5, E6, D-55. Band: Core model (§2.1).
+Spec: E2, E5, E6, D-6, D-31, D-55, D-57. Band: Core model (§2.1).
 """
 
 import math
@@ -191,9 +192,6 @@ def _scatter_rows(values: Tensor, rows: Tensor | None, num_rows: int) -> Tensor:
     return full.index_copy(0, rows, values)
 
 
-# The reference backend.
-
-
 @dataclass(frozen=True)
 class _CameraTensors:
     """One camera's parameters as tensors in the model parameters' dtype and device."""
@@ -207,17 +205,6 @@ class _CameraTensors:
     center: Tensor  # [3] o = −R_wᵀ t_w (E2, §1.4)
     width: int
     height: int
-
-
-@dataclass(frozen=True)
-class _Projection:
-    """Per-row results of projecting the passed rows into one camera (E2, E6)."""
-
-    means2d: Tensor  # [M, 2] μ′ where visible, 0 elsewhere
-    conics: Tensor  # [M, 3] Σ′⁻¹ as (a, b, c): q = ½(a dx² + c dy²) + b dx dy
-    depths: Tensor  # [M] z_c, detached, for sorting
-    colors: Tensor  # [M, 3] E2
-    visible: Tensor  # [M] bool: both screen radii positive
 
 
 def _camera_tensors(camera: Camera, like: Tensor) -> _CameraTensors:
@@ -236,6 +223,20 @@ def _camera_tensors(camera: Camera, like: Tensor) -> _CameraTensors:
         width=camera.width,
         height=camera.height,
     )
+
+
+# The reference backend.
+
+
+@dataclass(frozen=True)
+class _Projection:
+    """Per-row results of projecting the passed rows into one camera (E2, E6)."""
+
+    means2d: Tensor  # [M, 2] μ′ where visible, 0 elsewhere
+    conics: Tensor  # [M, 3] Σ′⁻¹ as (a, b, c): q = ½(a dx² + c dy²) + b dx dy
+    depths: Tensor  # [M] z_c, detached, for sorting
+    colors: Tensor  # [M, 3] E2
+    visible: Tensor  # [M] bool: both screen radii positive
 
 
 def _matmul(a: Tensor, b: Tensor) -> Tensor:

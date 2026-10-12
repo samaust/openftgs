@@ -55,7 +55,7 @@ The backend calls the stage functions gsplat exports, in the order its top-level
 - With compaction in unpacked mode, only the 2D means are placed back among all N rows. The rasterizer reads the kept rows from that [C, N, 2] tensor, so it is the anchor, while rasterization still runs over the kept rows only.
 - In packed mode, gsplat's own [nnz, 2] tensor is the anchor, since every row of it is written.
 
-The settings of D-6 and D-57 are private constants beside E6's (classic mode, tile size, no `radius_clip`, no sparse gradients, an unsegmented sort), and ε, near and far are passed from E6's constants, so a change to any of them is a logged code change (D-72). The effective opacity goes into gsplat's projection, which applies the opacity cull and the opacity-aware extent there: D-32's default placement.
+The settings of D-6 and D-57 are private constants beside E6's (classic mode, the tile size, no `radius_clip`) or literal arguments (no sparse gradients, an unsegmented sort), and ε, near and far are passed from E6's constants, so a change to any of them is a logged code change (D-72). The camera tensors both backends read are built once per camera by the front half's helper. The effective opacity goes into gsplat's projection, which applies the opacity cull and the opacity-aware extent there: D-32's default placement.
 
 ### Cameras
 
