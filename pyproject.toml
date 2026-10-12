@@ -57,10 +57,10 @@ openftgs = ["py.typed"]
 testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
-    "cpu: runs on any machine, on the reference backend; added to every test not marked gpu",
+    "cpu: added to every test not marked gpu; uses the reference backend, but may still need a dataset or downloaded weights",
     "gpu: needs a CUDA device; skipped without one",
-    "dataset: needs a real dataset under $OPENFTGS_DATASETS; skipped otherwise",
-    "weights: downloads pretrained weights at run time (RoMa, DINOv2, LPIPS backbones); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1",
+    "dataset: needs a real dataset under $OPENFTGS_DATASETS; skipped otherwise (Q-7)",
+    "weights: downloads pretrained weights at run time (RoMa, DINOv2, LPIPS backbones); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1 (Q-7)",
 ]
 
 [tool.ruff]

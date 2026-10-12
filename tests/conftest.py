@@ -18,6 +18,7 @@ def _cuda_available() -> bool:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # Q-7: the dataset directory and the download permission come from the environment.
     datasets = os.environ.get("OPENFTGS_DATASETS")
     have_datasets = datasets is not None and Path(datasets).is_dir()
     allow_downloads = os.environ.get("OPENFTGS_ALLOW_DOWNLOADS") == "1"
