@@ -2,7 +2,7 @@ openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al.,
 
 # openftgs
 
-Python package `openftgs` with the command-line tool `ftgs`, under the Apache-2.0 license.
+Python package `openftgs`, under the Apache-2.0 license. Its command-line tool, `ftgs`, arrives with milestone M14.
 
 **Status: pre-alpha.** The repository holds the package skeleton (milestone M0); the modules are empty and nothing runs yet.
 
@@ -45,6 +45,8 @@ OPENFTGS_DATASETS=/path pytest -m dataset         # converter checks on real dat
 OPENFTGS_ALLOW_DOWNLOADS=1 pytest -m weights      # tests that download pretrained weights
 python scripts/license_scan.py                    # GPL, AGPL, non-commercial fail; others need a sign-off in scripts/license_signoff.json
 ```
+
+The license scan passes in CI's environment (CPU torch). With CUDA torch it also lists the NVIDIA runtime wheels, which stay unapproved until they are signed off for the release (milestone M18).
 
 ## License
 
