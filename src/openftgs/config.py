@@ -8,9 +8,9 @@ Spec: §1.5, §2.1, §2.2, §2.4. Band: Foundation (§2.1).
 
 import dataclasses
 import math
-import types
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import UnionType
 from typing import Any, ClassVar, Literal, Union, get_args, get_origin, get_type_hints
 
 __all__ = [
@@ -277,7 +277,7 @@ def _check_types(obj: object) -> None:
 def _coerce(obj: object, name: str, hint: Any, value: Any) -> Any:
     path = _path(obj, name)
     origin = get_origin(hint)
-    if origin in (Union, types.UnionType):
+    if origin in (Union, UnionType):
         args = get_args(hint)
         if value is None and type(None) in args:
             return None
