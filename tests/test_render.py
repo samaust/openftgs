@@ -15,7 +15,8 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from builders import UNIT_TIME, pinhole, random_model, random_params, ring
+from builders import UNIT_TIME, look_at, pinhole, random_model, random_params, ring
+from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
@@ -567,3 +568,96 @@ def test_u8_culled_primitives_get_exactly_zero_render_gradient(
     for name, grad in zip(_PARAM_NAMES, grads, strict=True):
         assert torch.equal(grad[culled], torch.zeros_like(grad[culled])), name
         assert bool(torch.isfinite(grad).all()), name
+
+
+# U-20 · camera conventions, the projection cases (§1.4, D-28)
+
+_U20_W2C = [[0.0, -1.0, 0.0, 1.0], [0.0, 0.0, -1.0, 2.0], [1.0, 0.0, 0.0, 3.0]]
+_U20_POINT = (1.0, 0.5, -1.0)  # x_c = R_w·p + t_w = (0.5, 3, 4)
+
+
+def _means2d(model: FreeTimeGaussians, camera: Camera) -> Tensor:
+    out = _render(model, camera, 0.5, return_aux=True)
+    assert out.means2d is not None and out.visible is not None and bool(out.visible.all())
+    return out.means2d[0].detach()
+
+
+def test_u20_known_point_projects_to_the_expected_pixel() -> None:
+    """U-20, §1.4: with world_to_camera = [[0, −1, 0, 1], [0, 0, −1, 2], [1, 0, 0, 3]] the point
+    (1, 0.5, −1) is at x_c = (0.5, 3, 4); with f = (32, 24) and c = (20.5, 10.5) it projects to
+    (32·0.125 + 20.5, 24·0.75 + 10.5) = (24.5, 28.5), the center of pixel (28, 24), where the
+    render peaks."""
+    camera = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
+    model = _model([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
+    out = _render(model, camera, 0.5, return_aux=True)
+    assert out.means2d is not None
+    assert torch.equal(out.means2d[0, 0].detach(), torch.tensor([24.5, 28.5]))
+    assert divmod(int(torch.argmax(out.alpha.detach()[0, :, :, 0])), 48) == (28, 24)
+
+
+def test_u20_opencv_calibration_converts_with_a_half_pixel_shift() -> None:
+    """U-20, §1.4: an OpenCV calibration with c = (20, 10) (pixel centers at integers) puts the
+    point at (24, 28), a pixel center in its convention; converted with c + 0.5 it projects to
+    (24.5, 28.5), the same pixel's center in the continuous convention."""
+    model = _model([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
+    opencv = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.0, cy=10.0, world_to_camera=_U20_W2C)
+    shifted = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
+    assert torch.equal(_means2d(model, opencv)[0], torch.tensor([24.0, 28.0]))
+    assert torch.equal(_means2d(model, shifted)[0], torch.tensor([24.5, 28.5]))
+
+
+def test_u20_resizing_by_one_half_halves_projections() -> None:
+    """U-20, §1.4: resizing 48×40 by r = 0.5 multiplies f and c by 0.5, so (24.5, 28.5) becomes
+    (12.25, 14.25)."""
+    model = _model([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
+    half = pinhole(24, 20, fx=16.0, fy=12.0, cx=10.25, cy=5.25, world_to_camera=_U20_W2C)
+    assert torch.equal(_means2d(model, half)[0], torch.tensor([12.25, 14.25]))
+
+
+def _backproject(camera: Camera, pixels: Tensor, depths: Tensor) -> Tensor:
+    """World points that the camera (its float32 values, in float64) sees at the given continuous
+    pixel coordinates and depths, by inverting §1.4's projection in float64."""
+    k = camera.K.to(F64)
+    w2c = camera.world_to_camera.to(F64)
+    x_c = torch.stack(
+        [
+            (pixels[:, 0] - k[0, 2]) / k[0, 0] * depths,
+            (pixels[:, 1] - k[1, 2]) / k[1, 1] * depths,
+            depths,
+        ],
+        dim=1,
+    )
+    # R_w⁻¹ (x_c − t_w): the float32 rotation is orthonormal only to float32 precision.
+    world: Tensor = torch.linalg.solve(w2c[:3, :3], (x_c - w2c[:3, 3]).T)
+    return world.T
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_u20_points_project_to_their_pixels_at_full_resolution(seed: int) -> None:
+    """U-20, §1.4: on random rigid cameras at 1352×1014, points back-projected from random
+    continuous pixel coordinates project back to them within 1e-5 px (float64); resizing by
+    r = 0.37 (500×375) scales the x projections by W′/W = 500/1352 and the y ones by
+    H′/H = 375/1014."""
+    gen = torch.Generator().manual_seed(seed)
+    eye = (torch.randn(3, generator=gen, dtype=F64) * 3.0).tolist()
+    target = (torch.randn(3, generator=gen, dtype=F64) * 0.5).tolist()
+    camera = look_at(eye, target, width=1352, height=1014, focal=1100.0)
+    pixels = torch.rand(3, 2, generator=gen, dtype=F64) * torch.tensor([1352.0, 1014.0])
+    depths = 2.0 + 3.0 * torch.rand(3, generator=gen, dtype=F64)
+    points = _backproject(camera, pixels, depths)
+    rows = [{"mean": tuple(p), "scale": 1e-2, "logit": 20.0} for p in points.tolist()]
+    model = _model(rows).double()
+    model.means.data = points.clone()  # the float64 positions, not their float32 roundings
+    torch.testing.assert_close(_means2d(model, camera), pixels, rtol=0, atol=1e-5)
+
+    # The resize rule of §1.4, with K kept in float64 so the scaled intrinsics are exact.
+    w_ratio, h_ratio = 500 / 1352, 375 / 1014
+    scale = torch.tensor([[w_ratio], [h_ratio], [1.0]], dtype=F64)
+    resized = Camera(
+        K=camera.K.to(F64) * scale,
+        world_to_camera=camera.world_to_camera,
+        width=500,
+        height=375,
+    )
+    expected = pixels * torch.tensor([w_ratio, h_ratio], dtype=F64)
+    torch.testing.assert_close(_means2d(model, resized), expected, rtol=0, atol=1e-5)
