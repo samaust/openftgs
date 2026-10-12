@@ -4,7 +4,7 @@ ftgs-init files (InitPoints) and PLY files for viewers, with the validators of t
 init formats. Plain data in and out: this module imports neither openftgs.model nor
 openftgs.train.
 
-Spec: §2.2, D-30. Band: Foundation (§2.1).
+Spec: §2.2, D-30, D-73. Band: Foundation (§2.1).
 """
 
 import hashlib
@@ -201,7 +201,8 @@ _MIN_ROTATION_NORM = 1e-8  # §1.1 validity rules
 _UNIT_TOLERANCE = 1e-6  # Q-24: |‖q‖ − 1| allowed on write, a few float32 roundings
 
 # Q-24: the render conventions written with every exchange file, from E6's normative constants
-# (gsplat 1.5.3 classic mode, D-6, D-31) and the black background of D-34.
+# (gsplat 1.5.3 classic mode, D-6, D-31) and the black background of D-34; D-73 adds the
+# Jacobian clamp margin, the screen-extent rule and the rasterize mode, under Q-35's keys.
 _RENDER_CONVENTIONS = {
     "alpha_max": 0.999,
     "eps2d": 0.3,
@@ -211,6 +212,11 @@ _RENDER_CONVENTIONS = {
     "transmittance_stop": 1e-4,
     "pixel_center_offset": 0.5,
     "background": [0.0, 0.0, 0.0],
+    # D-73, Q-35:
+    "jacobian_clamp_margin": 0.15,  # E6: beyond the image edges, as a fraction of its size; J only
+    "screen_extent_rule": "opacity_aware",  # E6: √(2 ln(255·σ_eff)) standard deviations
+    "screen_extent_max": 3.33,  # E6: the extent's cap
+    "rasterize_mode": "classic",  # D-6
 }
 
 
