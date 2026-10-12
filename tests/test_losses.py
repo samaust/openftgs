@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""openftgs.losses (E7, E8, E9; D-7 to D-11, D-37, D-38, D-52, D-68; Q-40 to Q-42): U-9, U-10,
+"""openftgs.losses (E7, E8, E9; D-7 to D-11, D-37, D-38, D-52, D-68; Q-40 to Q-43): U-9, U-10,
 U-11 and the added tests of PRD #53.
 
 Expected values are worked by hand from the spec, come from scikit-image's
@@ -7,6 +7,7 @@ Expected values are worked by hand from the spec, come from scikit-image's
 2004 and E7, or from E8's closed-form gradient. Images are in §1.4's layout, [..., H, W, 3].
 """
 
+import copy
 import importlib
 import sys
 import warnings
@@ -15,7 +16,7 @@ from collections.abc import Iterator
 import numpy as np
 import pytest
 import torch
-from builders import CAM_A, model_from_rows, pinhole, random_model
+from builders import CAM_A, UNIT_TIME, model_from_rows, pinhole, random_model
 from skimage.metrics import structural_similarity
 from torch import Tensor
 
@@ -24,6 +25,7 @@ from openftgs.config import LossConfig
 from openftgs.losses import LPIPSLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
+from openftgs.types import Camera
 
 F32 = torch.float32
 F64 = torch.float64
@@ -639,3 +641,68 @@ def test_u9_total_loss_is_the_weighted_sum_of_its_terms(lpips_nets: dict[str, LP
     )
     assert abs(loss.item() - expected) <= 1e-6
     assert terms["lpips"].item() == perc(pred, gt).item()
+
+
+# U-11: the full forward through the reference backend
+
+
+class _LossModule(torch.nn.Module):
+    """Holds a model, and a copy of it for L_reg, so that torch.func.functional_call can
+    substitute their tensors; forward renders `model` with the reference backend and returns
+    L1 + L_reg, with L_reg evaluated on `reg_model`."""
+
+    def __init__(self, model: FreeTimeGaussians, camera: Camera, t: float, gt: Tensor) -> None:
+        super().__init__()
+        self.model = model
+        self.reg_model = copy.deepcopy(model)
+        self.camera = camera
+        self.t = t
+        self.gt = gt
+
+    def forward(self) -> Tensor:
+        out = render(self.model, self.camera, self.t, time_units="normalized", backend="reference")
+        return l1_loss(out.image[0], self.gt) + reg4d_loss(self.reg_model, self.t)
+
+
+def test_u11_l1_plus_regularization_passes_gradcheck_through_the_reference_renderer() -> None:
+    """U-11: float64 gradcheck of L1 + L_reg through the reference backend, 3 primitives on an
+    8×8 image, all nine stored tensors, at eps 1e-6 and atol 1e-5. The scene stays away from the
+    clamps and thresholds of E6 (σ′ ≈ 3 px, σ ≤ 0.6, distinct depths, colors away from 0), and
+    the target sits 0.1 from the initial render in every pixel and channel, away from L1's kink.
+
+    Q-43: E8's sg[σt] gives L_reg no gradient through μt and ŝ while finite differences see its
+    value move, so L_reg is evaluated with the substituted opacity logits and μt and ŝ held at
+    their base values, which is what the stop-gradient means to first order; L1 sees all nine
+    substituted tensors. U-10 pins the exact zeros."""
+    camera = pinhole(8, 8, fx=8.0, fy=8.0, cx=4.0, cy=4.0)
+    gen = torch.Generator().manual_seed(11)
+    params = {
+        "means": torch.tensor([[0.2, -0.1, 3.6], [-0.3, 0.2, 4.0], [0.1, 0.3, 4.4]]),
+        "times": torch.tensor([0.5, 0.6, 0.4]),
+        "log_durations": torch.zeros(3),
+        "velocities": 0.3 * torch.randn(3, 3, generator=gen),
+        "log_scales": torch.log(1.2 + 0.6 * torch.rand(3, 3, generator=gen)),
+        "quats": torch.randn(3, 4, generator=gen),
+        "opacity_logits": torch.tensor([-0.8, 0.0, 0.4]),
+        "sh0": 0.3 + 0.2 * torch.rand(3, 1, 3, generator=gen),
+        "shN": 0.05 * torch.randn(3, 15, 3, generator=gen),
+    }
+    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME).double()
+    t = 0.3
+    with torch.no_grad():
+        image = render(model, camera, t, time_units="normalized", backend="reference").image[0]
+    signs = torch.randint(0, 2, image.shape, generator=gen).to(F64) * 2 - 1
+    module = _LossModule(model, camera, t, image + 0.1 * signs)
+    inputs = tuple(getattr(model, name).detach().clone().requires_grad_() for name in PARAM_NAMES)
+
+    def fn(*tensors: Tensor) -> Tensor:
+        substituted = {f"model.{name}": x for name, x in zip(PARAM_NAMES, tensors, strict=True)}
+        # Q-43: L_reg's μt and ŝ stay at their base values.
+        substituted["reg_model.opacity_logits"] = substituted["model.opacity_logits"]
+        loss: Tensor = torch.func.functional_call(module, substituted, ())
+        return loss
+
+    assert torch.autograd.gradcheck(fn, inputs, eps=1e-6, atol=1e-5)
+    # Every tensor gets a gradient: L1 reaches all nine through the render, L_reg the logits.
+    grads = torch.autograd.grad(fn(*inputs), inputs)
+    assert all(bool(g.abs().sum() > 0) for g in grads)
