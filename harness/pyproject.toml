@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Q-5: ftgs_harness is a separate distribution and never imports openftgs (§2.1).
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ftgs-harness"
+version = "0.1.0.dev0"
+description = "Black-box differential harness that compares two implementations through the openftgs file formats and CLI."
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Samuel Austin" }]
+requires-python = ">=3.10"
+# Owner decision 2026-10-11: report plots use matplotlib's Agg backend (M16).
+dependencies = ["matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ftgs_harness = ["py.typed"]

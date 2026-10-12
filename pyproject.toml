@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openftgs"
+version = "0.1.0.dev0"
+description = "An independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Samuel Austin" }]
+# Q-1: Python floor.
+requires-python = ">=3.10"
+# §2.3. Training needs a CUDA build of torch, which metadata can't express (Q-3).
+dependencies = [
+    "gsplat==1.5.3",
+    "torch>=2.1",
+    "safetensors>=0.4",
+    "lpips==0.1.4",
+    "PyYAML>=6.0",
+    "Pillow>=10",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+# §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1; fused-local-corr is a Linux-only speed-up.
+init = [
+    "torch>=2.5.1",
+    "torchvision",
+    "einops",
+    "loguru",
+    "fused-local-corr>=0.2.2; sys_platform == 'linux'",
+]
+# Q-2: fused-ssim is not on PyPI; the README says how to install it.
+fast = []
+dev = [
+    "pytest",
+    "hypothesis",
+    "ruff",
+    "mypy",
+    "pip-licenses",
+    "scikit-image",
+    "opencv-python-headless",
+    "torchmetrics",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+openftgs = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "cpu: runs on any machine, on the reference backend; added to every test not marked gpu",
+    "gpu: needs a CUDA device; skipped without one",
+    "dataset: needs a real dataset under $OPENFTGS_DATASETS; skipped otherwise",
+    "weights: downloads pretrained weights at run time (RoMa, DINOv2, LPIPS backbones); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [".claude", "docs", "src/openftgs/_vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["openftgs", "ftgs_harness"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/openftgs", "harness/src/ftgs_harness", "tests", "scripts"]
+exclude = ["^src/openftgs/_vendor/"]
+
+[[tool.mypy.overrides]]
+module = [
+    "gsplat.*",
+    "lpips.*",
+    "fused_ssim.*",
+    "fused_local_corr.*",
+    "scipy.*",
+    "yaml.*",
+    "skimage.*",
+    "cv2.*",
+    "torchmetrics.*",
+]
+ignore_missing_imports = true

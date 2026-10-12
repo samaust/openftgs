@@ -3,3 +3,29 @@ docs/paper/
 .claude/clean-room-guard.log
 CLAUDE.local.md
 .scratch/
+
+# Python build outputs
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Run directories, converted datasets and frame caches (never committed; §2.3)
+/runs/
+/data/
+/datasets/
