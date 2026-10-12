@@ -169,7 +169,8 @@ def _backgrounds(background: Tensor | None, num_cameras: int, like: Tensor) -> T
     """One background color per camera, [C, 3], in the parameters' dtype and device (D-34)."""
     # Q-32: None (black), [3] for every camera, or [C, 3].
     if background is None:
-        color = torch.tensor(_BACKGROUND, dtype=like.dtype, device=like.device)
+        # Filled on the device, not copied from the host, so a render doesn't synchronize (D-49).
+        color = torch.stack([like.new_full((), value) for value in _BACKGROUND])
     else:
         color = torch.as_tensor(background).to(dtype=like.dtype, device=like.device)
     if tuple(color.shape) == (3,):
@@ -443,7 +444,7 @@ def _render_gsplat(
         radius_clip=_RADIUS_CLIP,
         packed=packed,
         sparse_grad=False,
-        calc_compensations=_RASTERIZE_MODE == "antialiased",
+        calc_compensations=False,  # classic mode (D-6, _RASTERIZE_MODE): no compensation
         camera_model="pinhole",
         opacities=g.opacities_t,  # E6, D-32: the opacity cull and the opacity-aware extent
     )
@@ -455,35 +456,38 @@ def _render_gsplat(
         # Every packed row is written and visible (both radii positive), so gsplat's own 2D means
         # are the anchor (Q-37). Rows come camera-major, ascending within a camera (Q-38).
         anchor = rasterized = means2d
-        drawn = (radii > 0).all(dim=-1)
+        passed_visible = (radii > 0).all(dim=-1)
         dirs = g.means_t[local_ids] - centers[camera_ids]
         coeffs = g.sh[local_ids]
         opacities = g.opacities_t[local_ids]
         gaussian_ids = local_ids if rows is None else rows[local_ids]
         visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=like.device)
-        visible[camera_ids, gaussian_ids] = True  # no host synchronization (D-49)
+        # A value already on the device, so the scatter doesn't synchronize (D-49).
+        visible.index_put_((camera_ids, gaussian_ids), visible.new_ones(()))
     else:
         radii, means2d, depths, conics, _ = projection
-        drawn = (radii > 0).all(dim=-1)  # E6: both screen radii positive
+        passed_visible = (radii > 0).all(dim=-1)  # E6: both screen radii positive
         # gsplat leaves the 2D means of culled rows uninitialized; Q-32 wants 0 there, in the
         # tensor the rasterizer reads (Q-37).
-        means2d = torch.where(drawn[..., None], means2d, torch.zeros_like(means2d))
+        means2d = torch.where(passed_visible[..., None], means2d, torch.zeros_like(means2d))
         if rows is None:
             anchor = rasterized = means2d
-            visible = drawn
+            visible = passed_visible
         else:
             # Q-31, Q-37: the 2D means go back among all N rows, and the rasterizer reads the kept
             # rows from there, so that [C, N, 2] tensor is the anchor.
             anchor = means2d.new_zeros((num_cams, num_rows, 2)).index_copy(1, rows, means2d)
             rasterized = anchor.index_select(1, rows)
-            visible = drawn.new_zeros((num_cams, num_rows)).index_copy(1, rows, drawn)
+            visible = passed_visible.new_zeros((num_cams, num_rows)).index_copy(
+                1, rows, passed_visible
+            )
         dirs = g.means_t[None] - centers[:, None]
         coeffs = g.sh.expand(num_cams, *g.sh.shape)
         opacities = g.opacities_t.expand(num_cams, -1)
     # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; at_time has
     # already cut the bands above the active degree (D-3).
     degree = math.isqrt(g.sh.shape[1]) - 1
-    colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=drawn)
+    colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=passed_visible)
     colors = torch.clamp_min(colors + _SH_OFFSET, 0.0)
     tile_width = math.ceil(width / _TILE_SIZE)
     tile_height = math.ceil(height / _TILE_SIZE)
@@ -524,8 +528,8 @@ def _render_gsplat(
 
 def _view_matrix(cam: _CameraTensors) -> Tensor:
     """gsplat's view matrix [4, 4] (world to camera) from R_w and t_w only (§1.4, Q-32)."""
-    bottom = torch.zeros(1, 4, dtype=cam.rotation.dtype, device=cam.rotation.device)
-    bottom[0, 3] = 1.0
+    # Filled on the device, not written from the host, so a render doesn't synchronize (D-49).
+    bottom = torch.cat([cam.translation.new_zeros(3), cam.translation.new_ones(1)])[None]
     return torch.cat([torch.cat([cam.rotation, cam.translation[:, None]], dim=1), bottom])
 
 

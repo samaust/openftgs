@@ -17,8 +17,12 @@ from openftgs.model import FreeTimeGaussians
 from openftgs.types import Camera
 
 ALPHA_SKIP = 1.0 / 255.0  # E6
+ALPHA_MAX = 0.999  # E6, D-31
 T_STOP = 1e-4  # E6
 NEAR, FAR = 0.01, 1e10  # E6, D-6
+EPS2D = 0.3  # E6, D-6
+CLAMP_MARGIN = 0.15  # E6: J's clamp beyond the image edges, as a share of W/f_x and H/f_y
+EXTENT_MAX = 3.33  # E6
 
 # Q-39's margins.
 ALPHA_REL = 1e-3  # α within this relative distance of 1/255
@@ -109,17 +113,19 @@ def _camera_margins(q: dict[str, np.ndarray], camera: Camera) -> tuple[np.ndarra
     u, v = xc[:, 0] / zs, xc[:, 1] / zs
     mean2d = np.stack([fx * u + cx, fy * v + cy], axis=1)
     # E6: the Jacobian at x_c, with x_c/z_c and y_c/z_c clamped for J only.
-    tx = np.clip(u, -(cx / fx + 0.15 * width / fx), (width - cx) / fx + 0.15 * width / fx)
-    ty = np.clip(v, -(cy / fy + 0.15 * height / fy), (height - cy) / fy + 0.15 * height / fy)
+    margin_x, margin_y = CLAMP_MARGIN * width / fx, CLAMP_MARGIN * height / fy
+    tx = np.clip(u, -(cx / fx + margin_x), (width - cx) / fx + margin_x)
+    ty = np.clip(v, -(cy / fy + margin_y), (height - cy) / fy + margin_y)
     jac = np.zeros((n, 2, 3))
     jac[:, 0, 0], jac[:, 0, 2] = fx / zs, -fx * tx / zs
     jac[:, 1, 1], jac[:, 1, 2] = fy / zs, -fy * ty / zs
-    cov2d = jac @ (r_w @ cov @ r_w.T) @ jac.transpose(0, 2, 1) + 0.3 * np.eye(2)
+    cov2d = jac @ (r_w @ cov @ r_w.T) @ jac.transpose(0, 2, 1) + EPS2D * np.eye(2)
     det = cov2d[:, 0, 0] * cov2d[:, 1, 1] - cov2d[:, 0, 1] ** 2
     passes = in_depth & (opacity >= ALPHA_SKIP) & (det > 0)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        extent = np.minimum(3.33, np.sqrt(2.0 * np.log(np.where(passes, 255.0 * opacity, 1.0))))
+        ratio = np.where(passes, opacity / ALPHA_SKIP, 1.0)
+        extent = np.minimum(EXTENT_MAX, np.sqrt(2.0 * np.log(ratio)))
         exact_x = extent * np.sqrt(cov2d[:, 0, 0])
         exact_y = extent * np.sqrt(cov2d[:, 1, 1])
     rx, ry = np.ceil(exact_x), np.ceil(exact_y)
@@ -145,7 +151,7 @@ def _camera_margins(q: dict[str, np.ndarray], camera: Camera) -> tuple[np.ndarra
     dx = px[None, :, None] - mx[ids]  # [1, W, M]
     dy = py[:, None, None] - my[ids]  # [H, 1, M]
     quad = 0.5 * (conic[:, 0, 0] * dx * dx + conic[:, 1, 1] * dy * dy) + conic[:, 0, 1] * dx * dy
-    alpha = np.minimum(0.999, opacity[ids] * np.exp(-quad))  # [H, W, M]
+    alpha = np.minimum(ALPHA_MAX, opacity[ids] * np.exp(-quad))  # [H, W, M]
     pixel |= (np.abs(alpha - ALPHA_SKIP) <= ALPHA_REL * ALPHA_SKIP).any(axis=-1)
     drawn = alpha >= ALPHA_SKIP
     trans = np.cumprod(np.where(drawn, 1.0 - alpha, 1.0), axis=-1)

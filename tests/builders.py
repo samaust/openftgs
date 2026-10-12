@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared builders of random models and cameras for the test suite (forward note on PRD #20).
+"""Shared test scenes for the test suite (forward note on PRD #20): random models and cameras,
+the hand-built render scenes and U-8's scenes that both render backends' tests use, and U-4's
+change of time unit.
 
 Each test file still writes out its own `PARAM_NAMES` from §1.1: that tuple is the tests'
 independent expectation, not a duplicate to share.
@@ -166,6 +168,9 @@ def ring(
 # Hand-built render scenes, shared by the render tests of both backends (E2, E6).
 
 
+_ROW_KEYS = {"mean", "time", "log_duration", "velocity", "scale", "quat", "logit", "sh0", "shN"}
+
+
 def model_from_rows(
     rows: Sequence[dict[str, Any]],
     *,
@@ -174,7 +179,7 @@ def model_from_rows(
 ) -> FreeTimeGaussians:
     """A model with one primitive per row. Defaults: time center 0.5, ŝ = 20 (σt = 1 within
     |t − μt| ≤ 1), no velocity, isotropic scale 0.25, identity quaternion, logit 0 (σ = 0.5),
-    sh0 = 0 (color 0.5) and no higher bands."""
+    sh0 = 0 (color 0.5) and no higher bands. An unknown key raises ValueError."""
     k = (sh_degree + 1) ** 2 - 1
     shapes: dict[str, tuple[int, ...]] = {
         "means": (3,),
@@ -189,6 +194,9 @@ def model_from_rows(
     }
     cols: dict[str, list[Any]] = {name: [] for name in shapes}
     for row in rows:
+        unknown = set(row) - _ROW_KEYS
+        if unknown:
+            raise ValueError(f"unknown row keys {sorted(unknown)}")
         scale = row.get("scale", 0.25)
         scales = [scale] * 3 if isinstance(scale, int | float) else list(scale)
         cols["means"].append(list(row["mean"]))

@@ -47,6 +47,7 @@ pytestmark = pytest.mark.gpu
 F32 = torch.float32
 ALPHA_MAX_F32 = torch.tensor(0.999, dtype=F32)  # E6, D-31
 LAYOUTS = pytest.mark.parametrize("packed", [True, False], ids=["packed", "unpacked"])
+_CAMERAS = ring(2, width_px=64, height_px=48, focal=40.0)  # two ring cameras, 64×48
 
 
 def _cuda(model: FreeTimeGaussians) -> FreeTimeGaussians:
@@ -59,6 +60,22 @@ def _gsplat(
     """The gsplat backend at normalized time t."""
     kw.setdefault("time_units", "normalized")
     return render(model, cameras, t, backend="gsplat", **kw)
+
+
+def _reference(
+    model: FreeTimeGaussians, cameras: Camera | list[Camera], t: float, **kw: Any
+) -> RenderOutput:
+    """The reference backend at normalized time t, on the same model and device."""
+    return render(model, cameras, t, time_units="normalized", backend="reference", **kw)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _warm_up() -> None:
+    """Compiles the temporal slice once before the tests, for one row and for several (dynamo
+    specializes a single row; Q-13)."""
+    for rows in ([{"mean": (0.0, 0.0, 4.0)}], [{"mean": (0.0, 0.0, 4.0)}] * 3):
+        for packed in (True, False):
+            _gsplat(_cuda(model_from_rows(rows)), CAM_A, 0.5, packed=packed)
 
 
 def _unpacked(out: RenderOutput) -> Tensor:
@@ -254,7 +271,7 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
     visible primitives."""
     import gsplat
 
-    cameras = ring(2, width_px=64, height_px=48, focal=40.0)
+    cameras = _CAMERAS
     model = _cuda(random_model(40, seed=3, spread=1.5, log_scale=(-2.5, -1.0)))
     out = _gsplat(model, cameras, 0.37, return_aux=True, packed=packed)
     g = model.at_time(0.37)
@@ -305,9 +322,6 @@ def _culling_scene(seed: int) -> FreeTimeGaussians:
     return _cuda(model)
 
 
-_RING = ring(2, width_px=64, height_px=48, focal=40.0)
-
-
 @PLACEMENTS
 def test_packed_and_unpacked_layouts_render_alike(precull: str) -> None:
     """D-57, Q-37, Q-38: packed mode changes memory and speed, not results. Images and alpha agree
@@ -315,7 +329,7 @@ def test_packed_and_unpacked_layouts_render_alike(precull: str) -> None:
     entries read camera by camera in ascending row order, labeled by gaussian_ids."""
     model = _culling_scene(0)
     out = {
-        packed: _gsplat(model, _RING, 0.37, return_aux=True, precull=precull, packed=packed)
+        packed: _gsplat(model, _CAMERAS, 0.37, return_aux=True, precull=precull, packed=packed)
         for packed in (True, False)
     }
     packed, unpacked = out[True], out[False]
@@ -338,7 +352,7 @@ def test_unpacked_means2d_is_zero_off_the_visible_rows(precull: str) -> None:
     """Q-32, Q-37: in unpacked mode, means2d is μ′ for visible rows and exactly 0 elsewhere (gsplat
     leaves those rows uninitialized), with and without compaction."""
     model = _culling_scene(1)
-    out = _gsplat(model, _RING, 0.37, return_aux=True, precull=precull, packed=False)
+    out = _gsplat(model, _CAMERAS, 0.37, return_aux=True, precull=precull, packed=False)
     assert out.means2d is not None and out.visible is not None
     assert out.means2d.shape == (2, 48, 2) and out.visible.shape == (2, 48)
     hidden = out.means2d[~out.visible]
@@ -429,6 +443,15 @@ def test_cameras_render_independently(packed: bool) -> None:
     assert float(batch.alpha.detach().max()) > 0.5
 
 
+def test_gsplat_backend_rejects_float64_models_on_the_device() -> None:
+    """Q-38 (GPU): gsplat's kernels compute in float32, so a float64 model on a CUDA device raises
+    ValueError naming the reference backend, in both layouts."""
+    model = _cuda(model_from_rows([{"mean": (0.0, 0.0, 4.0)}])).double()
+    for packed in (True, False):
+        with pytest.raises(ValueError, match="reference"):
+            _gsplat(model, CAM_A, 0.5, packed=packed)
+
+
 # U-8 · culling σ_eff < 1/255 before the backend changes nothing (D-32, D-57; Q-31), on gsplat
 
 PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
@@ -500,7 +523,6 @@ def test_u8_culled_primitives_get_exactly_zero_render_gradient(packed: bool, pre
 # U-7's random scenes and U-12, gsplat against the reference (Q-39's margins)
 
 _T = 0.37
-_SCENE_CAMERAS = ring(2, width_px=64, height_px=48, focal=40.0)
 
 
 def _random_scene(seed: int, *, min_rows: int = 1) -> FreeTimeGaussians:
@@ -520,7 +542,7 @@ def _random_scene(seed: int, *, min_rows: int = 1) -> FreeTimeGaussians:
     model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME)
     for _ in range(10):
         near_cull = torch.from_numpy(opacity_near_cull(model, _T))
-        near_plane = torch.from_numpy(depth_near_plane(model, _SCENE_CAMERAS, _T))
+        near_plane = torch.from_numpy(depth_near_plane(model, _CAMERAS, _T))
         if not (bool(near_cull.any()) or bool(near_plane.any())):
             return _cuda(model)
         with torch.no_grad():
@@ -535,21 +557,22 @@ def _compare(
     """U-7 on one scene: image and alpha within 1e-4 outside Q-39's excluded pixels, `visible`
     equal outside its excluded rows, 2D means of the rows visible in both within 1e-4 px. Returns
     the largest difference outside the mask and the excluded share."""
-    margins = boundary_margins(model, _SCENE_CAMERAS, _T)
+    margins = boundary_margins(model, _CAMERAS, _T)
     share = excluded_share(margins)
     assert share <= 0.01, (seed, share)
     keep = torch.from_numpy(~margins.pixels).to("cuda")
     worst = 0.0
     for field in ("image", "alpha"):
-        diff = (getattr(gsplat_out, field) - getattr(reference, field)).detach().abs()
-        worst = max(worst, float(diff.amax(dim=-1)[keep].max()))
-    assert worst <= 1e-4, (seed, worst)
+        a, b = getattr(gsplat_out, field).detach()[keep], getattr(reference, field).detach()[keep]
+        torch.testing.assert_close(a, b, rtol=0, atol=1e-4, msg=lambda m: f"seed {seed}: {m}")
+        worst = max(worst, float((a - b).abs().max()))
     assert gsplat_out.visible is not None and reference.visible is not None
     rows = torch.from_numpy(~margins.rows).to("cuda")
     assert torch.equal(gsplat_out.visible[rows], reference.visible[rows]), seed
     both = gsplat_out.visible & reference.visible
-    means2d = (_unpacked(gsplat_out) - _unpacked(reference)).abs()
-    assert float(means2d[both].max()) <= 1e-4 if bool(both.any()) else True, seed
+    torch.testing.assert_close(
+        _unpacked(gsplat_out)[both], _unpacked(reference)[both], rtol=0, atol=1e-4
+    )
     return worst, share
 
 
@@ -564,15 +587,8 @@ def test_u7_random_scenes_match_the_reference(packed: bool) -> None:
     visible_rows = 0
     for seed in range(50):
         model = _random_scene(seed)
-        out = _gsplat(model, _SCENE_CAMERAS, _T, return_aux=True, packed=packed)
-        reference = render(
-            model,
-            _SCENE_CAMERAS,
-            _T,
-            time_units="normalized",
-            backend="reference",
-            return_aux=True,
-        )
+        out = _gsplat(model, _CAMERAS, _T, return_aux=True, packed=packed)
+        reference = _reference(model, _CAMERAS, _T, return_aux=True)
         scene_worst, scene_share = _compare(seed, out, reference, model)
         worst, share = max(worst, scene_worst), max(share, scene_share)
         assert reference.visible is not None
@@ -597,18 +613,23 @@ def test_u12_gradients_match_the_reference(packed: bool) -> None:
     """U-12: for 20 random scenes (U-7's generator, at least 8 rows), the gradients of a random
     weighting of image and alpha with respect to each of the nine stored tensors agree between
     gsplat and the reference: cosine ≥ 0.999 and relative L2 error ≤ 1e-3. The weights are zero
-    at the pixels Q-39 excludes. Prints the worst cosine and relative error."""
-    worst_cos, worst_rel = 1.0, 0.0
+    at the pixels Q-39 excludes, at most 1% of a camera's pixels. Prints the worst cosine and
+    relative error and the largest excluded share."""
+    worst_cos, worst_rel, worst_share = 1.0, 0.0, 0.0
     for seed in range(20):
         model = _random_scene(100 + seed, min_rows=8)
-        keep = torch.from_numpy(~boundary_margins(model, _SCENE_CAMERAS, _T).pixels).to("cuda")
+        margins = boundary_margins(model, _CAMERAS, _T)
+        share = excluded_share(margins)
+        assert share <= 0.01, (seed, share)
+        worst_share = max(worst_share, share)
+        keep = torch.from_numpy(~margins.pixels).to("cuda")
         params = [getattr(model, name) for name in PARAM_NAMES]
         grads = {}
         backends: tuple[Literal["gsplat", "reference"], ...] = ("gsplat", "reference")
         for backend in backends:
             out = render(
                 model,
-                _SCENE_CAMERAS,
+                _CAMERAS,
                 _T,
                 time_units="normalized",
                 backend=backend,
@@ -625,7 +646,7 @@ def test_u12_gradients_match_the_reference(packed: bool) -> None:
             worst_cos, worst_rel = min(worst_cos, cos), max(worst_rel, rel)
     print(
         f"\nU-12 ({'packed' if packed else 'unpacked'}): worst cosine {worst_cos:.7f}, "
-        f"worst relative L2 error {worst_rel:.3g}"
+        f"worst relative L2 error {worst_rel:.3g}, largest excluded share {worst_share:.3g}"
     )
 
 
@@ -682,8 +703,9 @@ def test_u4_single_timestamp_renders_are_invariant_too(a: float, b: float, packe
     torch.testing.assert_close(y.alpha, x.alpha, rtol=0, atol=1e-4)
 
 
-# U-20 · camera conventions, the projection cases (§1.4, D-28), on gsplat: the dyadic float32 cases
-# (float32 cannot reach 1e-5 px at 1000 px, so random poses stay with the float64 reference)
+# U-20 · camera conventions, the projection cases (§1.4, D-28), on gsplat: the dyadic float32 cases,
+# which are exact, so they are compared exactly, within U-20's 1e-5 px (float32 cannot reach 1e-5 px
+# at 1000 px in general, so random poses stay with the float64 reference)
 
 _U20_W2C = [[0.0, -1.0, 0.0, 1.0], [0.0, 0.0, -1.0, 2.0], [1.0, 0.0, 0.0, 3.0]]
 _U20_POINT = (1.0, 0.5, -1.0)  # x_c = R_w·p + t_w = (0.5, 3, 4)
@@ -703,9 +725,7 @@ def test_u20_known_point_projects_to_the_expected_pixel(packed: bool) -> None:
     to (24.5, 28.5), the center of pixel (28, 24), where the render peaks."""
     camera = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
     out = _projected(camera, packed)
-    torch.testing.assert_close(
-        _unpacked(out)[0, 0].cpu(), torch.tensor([24.5, 28.5]), rtol=0, atol=1e-5
-    )
+    assert torch.equal(_unpacked(out)[0, 0].cpu(), torch.tensor([24.5, 28.5]))
     assert divmod(int(torch.argmax(out.alpha.detach()[0, :, :, 0])), 48) == (28, 24)
 
 
@@ -717,11 +737,8 @@ def test_u20_opencv_calibration_converts_with_a_half_pixel_shift(packed: bool) -
     opencv = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.0, cy=10.0, world_to_camera=_U20_W2C)
     shifted = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
     for camera, expected in [(opencv, [24.0, 28.0]), (shifted, [24.5, 28.5])]:
-        torch.testing.assert_close(
-            _unpacked(_projected(camera, packed))[0, 0].cpu(),
-            torch.tensor(expected),
-            rtol=0,
-            atol=1e-5,
+        assert torch.equal(
+            _unpacked(_projected(camera, packed))[0, 0].cpu(), torch.tensor(expected)
         )
 
 
@@ -730,11 +747,8 @@ def test_u20_resizing_by_one_half_halves_projections(packed: bool) -> None:
     """U-20 (GPU), §1.4: resizing 48×40 by r = 0.5 multiplies f and c by 0.5, so (24.5, 28.5)
     becomes (12.25, 14.25)."""
     resized = pinhole(24, 20, fx=16.0, fy=12.0, cx=10.25, cy=5.25, world_to_camera=_U20_W2C)
-    torch.testing.assert_close(
-        _unpacked(_projected(resized, packed))[0, 0].cpu(),
-        torch.tensor([12.25, 14.25]),
-        rtol=0,
-        atol=1e-5,
+    assert torch.equal(
+        _unpacked(_projected(resized, packed))[0, 0].cpu(), torch.tensor([12.25, 14.25])
     )
 
 
@@ -753,9 +767,7 @@ def test_box_touching_the_image_edge_counts_as_off_it(packed: bool, precull: str
     ]
     model = _cuda(model_from_rows(rows))
     out = _gsplat(model, CAM_A, 0.5, return_aux=True, packed=packed, precull=precull)
-    reference = render(
-        model, CAM_A, 0.5, time_units="normalized", backend="reference", return_aux=True
-    )
+    reference = _reference(model, CAM_A, 0.5, return_aux=True)
     assert out.visible is not None and out.visible.tolist() == [[False, True, False, True]]
     assert reference.visible is not None and torch.equal(out.visible, reference.visible)
     assert _unpacked(out)[0, [1, 3], 0].tolist() == [65.9375, -1.9375]
@@ -776,7 +788,7 @@ def test_depth_ties_composite_the_lower_row_first(packed: bool, precull: str) ->
     for rows in scenes:
         model = _cuda(model_from_rows(rows))
         image = _gsplat(model, CAM_A, 0.5, packed=packed, precull=precull).image.detach()
-        reference = render(model, CAM_A, 0.5, time_units="normalized", backend="reference")
+        reference = _reference(model, CAM_A, 0.5)
         torch.testing.assert_close(
             image[0, 24, 32].cpu(), torch.tensor([0.5, 0.25, 0.0]), rtol=0, atol=1e-6
         )
@@ -786,12 +798,12 @@ def test_depth_ties_composite_the_lower_row_first(packed: bool, precull: str) ->
 # The exact 1/255 boundary (E6, D-32; #37, M4 milestone review finding 5; Q-39)
 
 
-def _threshold_rows() -> list[dict[str, Any]]:
+def _threshold_rows() -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
     """Rows whose σ_eff straddles float32(1/255) in steps of about one float32 ulp: 81 logits
     around logit(1/255) with σt = 1, then the first logit above the threshold with time centers
     0.5 − δ (s = 1), whose σt < 1 lowers σ_eff in sub-ulp steps so one row can land exactly on
-    the threshold. Each row sits at its own pixel center of camera A, 3 px from the next, with
-    color 1."""
+    the threshold. Each row sits at its own pixel center (v, u) of camera A, 3 px from the next,
+    with color 1; the pixels are returned beside the rows."""
     threshold = torch.tensor(1.0 / 255.0, dtype=F32)
     logit = torch.tensor(math.log(1.0 / 254.0), dtype=F32)
     up, down = [logit], [logit]
@@ -805,19 +817,19 @@ def _threshold_rows() -> list[dict[str, Any]]:
     params = [(x, 0.5, 20.0) for x in logits] + [
         (first_above, 0.5 - 5e-5 * j, 0.0) for j in range(1, 201)
     ]
-    slots = [(u, v) for v in range(2, 48, 3) for u in range(2, 63, 3)]
+    pixels = [(v, u) for v in range(2, 48, 3) for u in range(2, 63, 3)][: len(params)]
     color = sh0_for((1.0, 1.0, 1.0))
-    return [
+    rows = [
         {
             "mean": ((u - 32) / 4, (v - 24) / 4, 4.0),
             "logit": x,
             "time": time,
             "log_duration": log_duration,
             "sh0": color,
-            "pixel": (v, u),
         }
-        for (x, time, log_duration), (u, v) in zip(params, slots, strict=False)
+        for (x, time, log_duration), (v, u) in zip(params, pixels, strict=True)
     ]
+    return rows, pixels
 
 
 @LAYOUTS
@@ -828,21 +840,18 @@ def test_backends_agree_at_the_opacity_cull_threshold(packed: bool) -> None:
     zero in one backend only: then `visible` differs and the row's own pixel differs by at most
     σ_eff·|c − c_bg|; nothing else differs. Prints how many rows sat exactly on the threshold and
     how many differ in visibility."""
-    rows = _threshold_rows()
+    rows, pixels = _threshold_rows()
     model = _cuda(model_from_rows(rows))
     g = model.at_time(0.5)
     sigma, passes = g.opacities_t.cpu(), g.passes_cull.cpu()
     threshold = torch.tensor(1.0 / 255.0, dtype=F32)
     out = _gsplat(model, CAM_A, 0.5, return_aux=True, packed=packed)
-    reference = render(
-        model, CAM_A, 0.5, time_units="normalized", backend="reference", return_aux=True
-    )
+    reference = _reference(model, CAM_A, 0.5, return_aux=True)
     assert out.visible is not None and reference.visible is not None
     image, ref_image = out.image.detach()[0].cpu(), reference.image.detach()[0].cpu()
     owned = torch.zeros(image.shape[:2], dtype=torch.bool)
     counts = {"below": 0, "at": 0, "above": 0, "differ": 0}
-    for i, row in enumerate(rows):
-        v, u = row["pixel"]
+    for i, (v, u) in enumerate(pixels):
         owned[v, u] = True
         vis, ref_vis = bool(out.visible[0, i]), bool(reference.visible[0, i])
         if sigma[i] <= threshold:
@@ -853,10 +862,50 @@ def test_backends_agree_at_the_opacity_cull_threshold(packed: bool) -> None:
             assert torch.equal(ref_image[v, u], torch.zeros(3)), i
             continue
         counts["above"] += 1
-        bound = 1e-6 if vis == ref_vis else float(sigma[i]) * 1.0 + 1e-6
+        bound = 1e-6 if vis == ref_vis else float(sigma[i]) * 1.0 + 1e-6  # |c − c_bg| = 1
         counts["differ"] += vis != ref_vis
-        assert float((image[v, u] - ref_image[v, u]).abs().max()) <= bound, i
+        torch.testing.assert_close(image[v, u], ref_image[v, u], rtol=0, atol=bound)
     assert torch.equal(image[~owned], torch.zeros_like(image[~owned]))
     assert torch.equal(ref_image[~owned], torch.zeros_like(ref_image[~owned]))
     assert counts["below"] >= 10 and counts["above"] >= 10
     print(f"\n1/255 boundary ({'packed' if packed else 'unpacked'}): {counts}")
+
+
+# Host synchronization (§2.4 rule 3, D-49)
+
+
+def _on_device(camera: Camera) -> Camera:
+    return Camera(
+        K=camera.K.cuda(),
+        world_to_camera=camera.world_to_camera.cuda(),
+        width=camera.width,
+        height=camera.height,
+        name=camera.name,
+    )
+
+
+@LAYOUTS
+def test_render_synchronizes_only_inside_gsplat(packed: bool) -> None:
+    """§2.4 rule 3, D-49, Q-38: with cameras and background already on the device, a render
+    (opacity cull inside the projection) synchronizes with the host only inside gsplat's own
+    calls: every synchronization torch's debug mode reports comes from gsplat's files, with the
+    default black background and with a given one. The debug mode is a prototype that misses some
+    synchronizations, so this pins only the ones it sees."""
+    cameras = [_on_device(camera) for camera in _CAMERAS]
+    model = _random_scene(7, min_rows=20)
+    for background in (None, torch.tensor([0.25, 0.5, 0.75], device="cuda")):
+        _gsplat(model, cameras, _T, background=background, packed=packed)
+        torch.cuda.synchronize()
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                _gsplat(model, cameras, _T, background=background, packed=packed)
+            finally:
+                torch.cuda.set_sync_debug_mode(0)
+        sites = {
+            f"{record.filename}:{record.lineno}"
+            for record in records
+            if "synchronizing CUDA operation" in str(record.message)
+        }
+        assert all("/gsplat/" in site for site in sites), sites
