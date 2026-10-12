@@ -34,23 +34,49 @@ def _source_files() -> list[Path]:
     return sorted(p for p in files if "_vendor" not in p.parts)
 
 
+def _package_of(path: Path) -> list[str]:
+    """The dotted package a source file under src/ belongs to, as a list of parts."""
+    parts = list(path.relative_to(ROOT / "src").with_suffix("").parts)
+    return parts[:-1]  # a module's package, or for __init__ the package itself
+
+
 def _imported_modules(path: Path) -> set[str]:
-    """Absolute module names a file imports, relative imports resolved within openftgs."""
+    """Absolute module names a file under src/ imports, relative imports resolved by level."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
+    package = _package_of(path) if path.is_relative_to(ROOT / "src") else []
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
-                names.add("openftgs" + ("." + node.module if node.module else ""))
-                if node.module is None:
-                    names.update("openftgs." + alias.name for alias in node.names)
-            elif node.module is not None:
-                names.add(node.module)
-                if node.module == "openftgs":
-                    names.update("openftgs." + alias.name for alias in node.names)
+                base = package[: len(package) - (node.level - 1)]
+            else:
+                base = []
+            module = ".".join(base + ([node.module] if node.module else []))
+            names.add(module)
+            names.update(f"{module}.{alias.name}" for alias in node.names)
     return names
+
+
+def _defined_public_names(module_file: Path) -> set[str]:
+    """Public names a module defines at its top level.
+
+    Imports are excluded, except relative ones, which a subpackage's __init__ uses to
+    re-export its own public names.
+    """
+    tree = ast.parse(module_file.read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.ImportFrom) and node.level:
+            names.update(alias.asname or alias.name for alias in node.names)
+    return {n for n in names if not n.startswith("_")}
 
 
 def _openftgs_targets(path: Path) -> set[str]:
@@ -64,13 +90,13 @@ def _openftgs_targets(path: Path) -> set[str]:
 
 
 @pytest.mark.parametrize("name", ORDER)
-def test_module_imports_with_public_names_only_in_all(name: str) -> None:
+def test_all_lists_exactly_the_public_names(name: str) -> None:
     module = importlib.import_module(f"openftgs.{name}")
+    assert module.__file__ is not None
     exported = module.__all__
     assert isinstance(exported, list)
-    for public in exported:
-        assert not public.startswith("_")
-        assert hasattr(module, public)
+    assert len(exported) == len(set(exported))
+    assert set(exported) == _defined_public_names(Path(module.__file__))
 
 
 def test_package_imports() -> None:
