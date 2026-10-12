@@ -55,6 +55,18 @@ def _model(n: int, seed: int, device: str) -> list[Tensor]:
     ]
 
 
+def _resize(params: list[Tensor], n: int, seed: int, device: str) -> list[Tensor]:
+    """Resize as at growth events: kept rows keep their order, new rows go last; shrinking keeps
+    a random subset in order (the pruning ablation)."""
+    n_old = len(params[0])
+    if n >= n_old:
+        new = _model(n - n_old, seed, device)
+        return [torch.cat([p, q]) for p, q in zip(params, new, strict=True)]
+    g = torch.Generator(device=device).manual_seed(seed)
+    keep = torch.randperm(n_old, generator=g, device=device)[:n].sort().values
+    return [p[keep] for p in params]
+
+
 def _run(params: list[Tensor], t: float, impl: Impl) -> tuple[TemporalSlice, list[Tensor]]:
     """Slice, then backpropagate a fixed random weighting of every float output."""
     leaves = [p.detach().clone().requires_grad_() for p in params]
@@ -90,8 +102,9 @@ def test_u28_eager_and_compiled_agree_across_resizes(device: str) -> None:
     between calls; at most 2 recompilations over the 10 resizes."""
     torch._dynamo.reset()
     counters.clear()
+    params = _model(SIZES[0], 100, device)
     for k, n in enumerate(SIZES):
-        params = _model(n, 100 + k, device)
+        params = _resize(params, n, 100 + k, device)
         t = 0.05 + 0.9 * k / len(SIZES)
         eager, g_eager = _run(params, t, "eager")
         compiled, g_compiled = _run(params, t, "compiled")
@@ -100,7 +113,7 @@ def test_u28_eager_and_compiled_agree_across_resizes(device: str) -> None:
         for name, a, b in zip(NAMES, g_compiled, g_eager, strict=True):
             _assert_relative_l2(a, b, 1e-5, f"N={n} grad {name}")
         # Q-15: the mask may differ only within 1e-6 relative of the cull threshold.
-        differ = compiled.visible != eager.visible
+        differ = compiled.passes_cull != eager.passes_cull
         near = (eager.opacities_t - CULL).abs() <= 1e-6 * CULL
         assert not bool((differ & ~near).any()), f"N={n}: mask differs away from 1/255"
     frames = _compiled_frames()
@@ -109,7 +122,7 @@ def test_u28_eager_and_compiled_agree_across_resizes(device: str) -> None:
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_u28_new_time_does_not_recompile(device: str) -> None:
+def test_slice_new_time_does_not_recompile(device: str) -> None:
     """D-50: t changes at every iteration, so a new time must not recompile the slice."""
     torch._dynamo.reset()
     counters.clear()
@@ -120,7 +133,7 @@ def test_u28_new_time_does_not_recompile(device: str) -> None:
 
 
 @pytest.mark.gpu
-def test_u28_auto_compiles_on_cuda() -> None:
+def test_slice_auto_compiles_on_cuda() -> None:
     """Q-13: "auto" on CUDA tensors runs the compiled slice, which matches eager (Q-15)."""
     torch._dynamo.reset()
     counters.clear()

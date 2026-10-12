@@ -9,6 +9,7 @@ the training dtype (D-52).
 """
 
 import math
+import warnings
 
 import pytest
 import torch
@@ -84,13 +85,18 @@ def test_u1_position_at_own_time_center_is_exact() -> None:
         assert torch.equal(_slice(m, 0.37).means_t, m["means"])
 
 
-def test_u1_displacement_is_velocity_times_elapsed_time() -> None:
+@pytest.mark.parametrize("entry", ["function", "slice"])
+def test_u1_displacement_is_velocity_times_elapsed_time(entry: str) -> None:
     """U-1: μx(t₁) − μx(t₀) = v(t₁ − t₀), rtol 1e-6; also outside [0, 1] (no clamping)."""
     m = _model(500, 1)
+
+    def at(t: float) -> Tensor:
+        if entry == "slice":
+            return _slice(m, t).means_t
+        return moved_means(m["means"], m["velocities"], m["times"], t)
+
     for t0, t1 in [(0.1, 0.9), (-2.0, 3.5), (0.3, 0.31)]:
-        d = moved_means(m["means"], m["velocities"], m["times"], t1) - moved_means(
-            m["means"], m["velocities"], m["times"], t0
-        )
+        d = at(t1) - at(t0)
         torch.testing.assert_close(d, m["velocities"] * (t1 - t0), rtol=1e-6, atol=0.0)
 
 
@@ -107,7 +113,7 @@ def test_u1_jacobians_match_closed_form() -> None:
     j_v = torch.einsum("ij,ab->iajb", eye_n * (t - mu_t)[:, None], eye_3)
     j_mu = torch.einsum("ij,ia->iaj", eye_n, -v)
     torch.testing.assert_close(jac[0], j_means, rtol=1e-6, atol=0.0)
-    torch.testing.assert_close(jac[1], j_v, rtol=1e-6, atol=1e-15)
+    torch.testing.assert_close(jac[1], j_v, rtol=1e-6, atol=0.0)
     torch.testing.assert_close(jac[2], j_mu, rtol=1e-6, atol=0.0)
 
 
@@ -141,21 +147,31 @@ def test_u1_property_random_shapes_and_values(
     )
     assert torch.equal(at_center.reshape(n, 3), means)
     d = moved_means(means, v, mu_t, t1) - moved_means(means, v, mu_t, t0)
+    # μx(t₁) − μx(t₀) subtracts two positions of size ~scale; when v·(t₁ − t₀) is far smaller
+    # than that, float64 rounding of the positions (~1e-16·scale) exceeds rtol·|v(t₁ − t₀)|, so
+    # an absolute floor well above that rounding and well below any tested displacement is added.
     torch.testing.assert_close(d, v * (t1 - t0), rtol=1e-6, atol=1e-12 * scale)
 
 
 # U-2 · E4 temporal opacity
 
 
-def test_u2_values_at_center_one_and_two_durations_float32_exact_inputs() -> None:
+@pytest.mark.parametrize("entry", ["function", "slice"])
+def test_u2_values_at_center_one_and_two_durations_float32_exact_inputs(entry: str) -> None:
     """U-2: σt = 1, e^−0.5, e^−2 at μt, μt ± s, μt ± 2s to 1e-7, in float32 with ŝ = 0 and
-    μt = 0.5, where every input and difference is exact."""
+    μt = 0.5, where every input and difference is exact. Through the slice, ô = 30 makes
+    σ = 1 exactly in float32, so σ_eff = σt."""
     mu = torch.full((5,), 0.5)
     s_hat = torch.zeros(5)
+    m = _model(5, 16, torch.float32)
+    m.update(times=mu, log_durations=s_hat, opacity_logits=torch.full((5,), 30.0))
     ts = [0.5, 1.5, -0.5, 2.5, -1.5]
     want = [1.0, math.exp(-0.5), math.exp(-0.5), math.exp(-2.0), math.exp(-2.0)]
     for t, w in zip(ts, want, strict=True):
-        got = temporal_opacity(mu, s_hat, t)
+        if entry == "slice":
+            got = _slice(m, t).opacities_t
+        else:
+            got = temporal_opacity(mu, s_hat, t)
         assert got.dtype == torch.float32
         torch.testing.assert_close(got, torch.full((5,), w), rtol=0.0, atol=1e-7)
 
@@ -173,9 +189,13 @@ def test_u2_values_at_center_one_and_two_durations_float64_random() -> None:
         (2, math.exp(-2.0)),
         (-2, math.exp(-2.0)),
     ]:
-        for i in range(200):
-            got = temporal_opacity(mu[i : i + 1], s_hat[i : i + 1], float(mu[i] + k * s[i]))
-            assert abs(float(got) - w) <= 1e-7
+        got = torch.cat(
+            [
+                temporal_opacity(mu[i : i + 1], s_hat[i : i + 1], float(mu[i] + k * s[i]))
+                for i in range(200)
+            ]
+        )
+        torch.testing.assert_close(got, torch.full_like(got, w), rtol=0.0, atol=1e-7)
 
 
 def test_u2_symmetric_about_time_center() -> None:
@@ -199,8 +219,8 @@ def test_u2_decays_monotonically_away_from_center() -> None:
         assert bool((vals <= 1.0).all()) and float(vals[0]) == 1.0
 
 
-def test_u2_gradients_match_e4_derivatives() -> None:
-    """U-2 (E4): ∂σt/∂μt = σt·(t − μt)/s² and ∂σt/∂ŝ = σt·((t − μt)/s)²."""
+def test_e4_gradients_match_stated_derivatives() -> None:
+    """E4: ∂σt/∂μt = σt·(t − μt)/s² and ∂σt/∂ŝ = σt·((t − μt)/s)²."""
     m = _model(50, 5)
     mu = m["times"].requires_grad_()
     s_hat = m["log_durations"].requires_grad_()
@@ -336,9 +356,9 @@ def test_slice_fields_shapes_and_activations() -> None:
     sl = _slice(m, 0.2)
     assert sl.means_t.shape == (n, 3) and sl.quats_n.shape == (n, 4)
     assert sl.scales.shape == (n, 3)
-    for f in (sl.opacities_t, sl.opacities, sl.reg_terms, sl.visible):
+    for f in (sl.opacities_t, sl.opacities, sl.reg_terms, sl.passes_cull):
         assert f.shape == (n,)
-    assert sl.visible.dtype == torch.bool
+    assert sl.passes_cull.dtype == torch.bool
     for f in (sl.means_t, sl.opacities_t, sl.quats_n, sl.scales, sl.opacities, sl.reg_terms):
         assert f.dtype == torch.float32
     q = m["quats"]
@@ -368,13 +388,13 @@ def _boundary_row(target: Tensor) -> tuple[float, float]:
     eff = torch.sigmoid(logits)[:, None] * sig_t[None, :]
     hits = (eff == target).nonzero()
     if len(hits) == 0:
-        pytest.skip("no float32 (ô, t) pair on the grid lands exactly on the boundary")
+        pytest.fail("no float32 (ô, t) pair on the grid lands exactly on the boundary")
     i, j = (int(v) for v in hits[0])
     return float(logits[i]), float(times[j])
 
 
 def test_slice_culling_mask_boundary_is_inclusive() -> None:
-    """D-32, E6: visible is true exactly where σ_eff ≥ 1/255, the boundary itself included."""
+    """D-32, E6: passes_cull is true exactly where σ_eff ≥ 1/255, the boundary itself included."""
     boundary = torch.tensor(1.0 / 255.0)
     logit, mu_t = _boundary_row(boundary)
     n = 1000
@@ -384,8 +404,8 @@ def test_slice_culling_mask_boundary_is_inclusive() -> None:
     m["log_durations"][0] = 0.0
     sl = _slice(m, 0.0)
     assert float(sl.opacities_t[0]) == float(boundary)
-    assert bool(sl.visible[0])
-    assert torch.equal(sl.visible, sl.opacities_t >= boundary)
+    assert bool(sl.passes_cull[0])
+    assert torch.equal(sl.passes_cull, sl.opacities_t >= boundary)
 
 
 def test_slice_cuda_implementation_is_a_stub() -> None:
@@ -404,5 +424,40 @@ def test_slice_auto_is_eager_on_cpu() -> None:
     """Q-13: "auto" on CPU tensors gives the eager result bitwise."""
     m = _model(64, 15, torch.float32)
     a, b = _slice(m, 0.5, impl="auto"), _slice(m, 0.5, impl="eager")
-    for f in ("means_t", "opacities_t", "quats_n", "scales", "opacities", "reg_terms", "visible"):
+    for f in (
+        "means_t",
+        "opacities_t",
+        "quats_n",
+        "scales",
+        "opacities",
+        "reg_terms",
+        "passes_cull",
+    ):
         assert torch.equal(getattr(a, f), getattr(b, f)), f
+
+
+@pytest.mark.gpu
+def test__slice_auto_falls_back_once_and_compiled_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Q-13 (private): when compilation fails, "auto" warns once and runs eager from then on;
+    an explicit "compiled" raises."""
+    from torch._dynamo.exc import TorchDynamoException
+
+    def failing() -> object:
+        def fn(*args: object) -> object:
+            raise TorchDynamoException("no backend")
+
+        return fn
+
+    monkeypatch.setattr(openftgs.motion, "_compiled_slice", failing)
+    monkeypatch.setattr(openftgs.motion, "_auto_fell_back", False)
+    m = {k: v.cuda() for k, v in _model(64, 17, torch.float32).items()}
+    eager = _slice(m, 0.5, impl="eager")
+    with pytest.warns(UserWarning, match="eager"):
+        first = _slice(m, 0.5, impl="auto")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        second = _slice(m, 0.5, impl="auto")
+    for got in (first, second):
+        assert torch.equal(got.opacities_t, eager.opacities_t)
+    with pytest.raises(TorchDynamoException):
+        _slice(m, 0.5, impl="compiled")

@@ -12,4 +12,4 @@ E2 requires gsplat's constants and band ordering, because the gsplat render back
 
 ## The SH DC band and RGB
 
-`rgb_to_sh0` and `sh0_to_rgb` convert between a color and the SH DC band with C₀ and the +0.5 offset of D-4; initialization sets the SH DC band this way (§1.1). The clamp at zero and the inactive bands of E2 belong to the render backend, not to the basis.
+`rgb_to_sh0` and `sh0_to_rgb` convert between a color and the SH DC band with C₀ and the offset of D-4; initialization sets the SH DC band this way (§1.1). The clamp at zero and the inactive bands of E2 belong to the render backend, not to the basis.
