@@ -202,13 +202,18 @@ def temporal_slice(
     # Q-13: "auto" stays eager on CPU and after a failed compilation.
     if impl == "eager" or (impl == "auto" and (times.device.type != "cuda" or _auto_fell_back)):
         out = _slice_eager(*args, t_tensor)
-    elif impl == "compiled":
-        out = _compiled_slice()(*args, t_tensor)
+        return TemporalSlice(*out)
+    # D-50: dynamo gives nn.Parameter inputs static shapes, so a model's stored tensors would
+    # recompile the slice at every growth event; views of them are plain tensors with dynamic
+    # shapes, and gradients still reach the parameters (#45, source log #37).
+    views = tuple(arg.view_as(arg) for arg in args)
+    if impl == "compiled":
+        out = _compiled_slice()(*views, t_tensor)
     else:
         from torch._dynamo.exc import TorchDynamoException  # loaded by torch.compile anyway
 
         try:
-            out = _compiled_slice()(*args, t_tensor)
+            out = _compiled_slice()(*views, t_tensor)
         except TorchDynamoException as exc:  # Q-13: only "auto" falls back
             _auto_fell_back = True
             warnings.warn(

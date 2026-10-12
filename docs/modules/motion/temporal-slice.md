@@ -38,6 +38,8 @@ E1 adds the displacement to the stored position last, so a primitive sits exactl
 
 t enters the compiled graph as a zero-dimensional tensor on the parameters' device, made from a Python float with a fill rather than a copy, so a new timestamp at every iteration neither recompiles the graph nor synchronizes with the host. U-28 holds the eager and compiled paths to the same values and gradients and bounds the recompilations over resizes; the comparison it uses is Q-15.
 
+The compiled implementation receives views of its tensor inputs, not the tensors themselves. A model's stored tensors are `nn.Parameter`s, whose shapes dynamo treats as static, so passing them directly would compile a new graph at every growth event, against D-50, until dynamo's recompile limit (what happens then is Q-13's). Views are plain tensors with dynamic shapes, and gradients still reach the parameters, so `FreeTimeGaussians.at_time` meets U-28's recompilation bound like plain tensors do (#45, source log #37). While it traces them, dynamo reads `.grad` on these non-leaf views, which PyTorch warns about; the warning stays inside dynamo's tracing under the default warning filters, and only a run that turns every warning into an error would see the compilation fail, where Q-13 applies (source log #38). The eager implementation gets the tensors as they are.
+
 ## Unit conversions
 
 `durations_to_normalized`, `durations_to_raw`, `velocities_to_normalized` and `velocities_to_raw` are E14's unit conversions of primitive quantities, which Q-8 assigns to `motion` (Q-27). With a single timestamp they use a unit of 1 (D-70). Time centers convert through `TimeNormalizer`.

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """U-28: the eager and compiled temporal slices agree in values and gradients across resizes,
-with few recompilations (§2.4 "Kernels", D-50; Q-12, Q-13, Q-15).
+with few recompilations (§2.4 "Kernels", D-50; Q-12, Q-13, Q-15), on plain tensors and through
+FreeTimeGaussians.at_time on a model resized with resize_ (Q-23, #45).
 
 The CUDA implementation isn't built (D-50 waits for B-1, M15), so only eager and compiled are
-compared. "Relative" is the relative L2 error per tensor (Q-15). Recompilations are counted with
-dynamo's frame counters, after a reset.
+compared. "Relative" is the relative L2 error per tensor (Q-15). Recompilations are counted by
+dynamo's count of unique graphs, after a reset (Q-13).
 """
 
+import warnings
 from typing import Literal
 
 import pytest
@@ -15,7 +17,9 @@ import torch._dynamo
 from torch import Tensor
 from torch._dynamo.utils import counters
 
+from openftgs.model import FreeTimeGaussians
 from openftgs.motion import TemporalSlice, temporal_slice
+from openftgs.types import TimeNormalizer
 
 # 11 sizes, so 10 resizes: mostly growing as at growth events, with N = 1 and N = 10⁶.
 SIZES = [1000, 1500, 1, 2300, 4096, 10_000, 50_000, 120_000, 300_000, 700_000, 1_000_000]
@@ -95,7 +99,37 @@ def _assert_relative_l2(got: Tensor, want: Tensor, rtol: float, what: str) -> No
 
 
 def _compiled_frames() -> int:
-    return int(counters["frames"]["ok"])
+    """The graphs dynamo compiled since the last reset; Q-13 counts recompilations this way."""
+    return int(counters["stats"]["unique_graphs"])
+
+
+def _assert_mask(compiled_mask: Tensor, eager: TemporalSlice, what: str) -> None:
+    """Q-15: the culling mask may differ only within 1e-6 relative of the cull threshold."""
+    differ = compiled_mask != eager.passes_cull
+    near = (eager.opacities_t - CULL).abs() <= 1e-6 * CULL
+    assert not bool((differ & ~near).any()), f"{what}: mask differs away from 1/255"
+
+
+def _stored_tensors(n: int, seed: int) -> dict[str, Tensor]:
+    """The nine stored tensors of n random rows on CUDA, SH degree 0 (shN has no bands)."""
+    params = dict(zip(NAMES, _model(n, seed, "cuda"), strict=True))
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    params["sh0"] = torch.randn(n, 1, 3, generator=g, device="cuda")
+    params["shN"] = torch.zeros(n, 0, 3, device="cuda")
+    return params
+
+
+def _resize_model(model: FreeTimeGaussians, n: int, seed: int) -> None:
+    """Resize as at growth events through the model's resize_ (Q-23): new rows go last, and the
+    one shrink keeps a random subset by mask, in order."""
+    n_old = model.num_gaussians
+    if n >= n_old:
+        model.resize_(append=_stored_tensors(n - n_old, seed))
+        return
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    keep = torch.zeros(n_old, dtype=torch.bool, device="cuda")
+    keep[torch.randperm(n_old, generator=g, device="cuda")[:n]] = True
+    model.resize_(keep=keep)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -114,10 +148,7 @@ def test_u28_eager_and_compiled_agree_across_resizes(device: str) -> None:
             _assert_relative_l2(getattr(compiled, f), getattr(eager, f), 1e-6, f"N={n} {f}")
         for name, a, b in zip(NAMES, g_compiled, g_eager, strict=True):
             _assert_relative_l2(a, b, 1e-5, f"N={n} grad {name}")
-        # Q-15: the mask may differ only within 1e-6 relative of the cull threshold.
-        differ = compiled.passes_cull != eager.passes_cull
-        near = (eager.opacities_t - CULL).abs() <= 1e-6 * CULL
-        assert not bool((differ & ~near).any()), f"N={n}: mask differs away from 1/255"
+        _assert_mask(compiled.passes_cull, eager, f"N={n}")
     frames = _compiled_frames()
     assert frames >= 1, "the compiled slice never compiled"
     assert frames - 1 <= 2, f"{frames - 1} recompilations over {len(SIZES) - 1} resizes"
@@ -156,3 +187,79 @@ def test__impl_values_match_perf_config() -> None:
 
     hints = typing.get_type_hints(PerfConfig)
     assert typing.get_args(hints["slice_impl"]) == openftgs.motion._IMPLS
+
+
+@pytest.mark.gpu
+def test_u28_through_the_model_across_resizes() -> None:
+    """U-28 (#45): through FreeTimeGaussians.at_time on CUDA, under the default "auto" (the
+    compiled slice, Q-13), on one model resized between calls with resize_ as at growth events,
+    the values agree with the eager slice within 1e-6 and the gradients on the stored tensors
+    within 1e-5 relative, the culling mask as Q-15 allows, with at most 2 recompilations over
+    the 10 resizes (D-50). Q-13's fallback warning is an error here, so a fallback to eager
+    fails the test."""
+    torch._dynamo.reset()
+    counters.clear()
+    model = FreeTimeGaussians(
+        _stored_tensors(SIZES[0], 200), sh_degree=0, time=TimeNormalizer(0.0, 1.0)
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="torch.compile failed for the temporal slice")
+        for k, n in enumerate(SIZES):
+            _resize_model(model, n, 200 + k)
+            t = 0.05 + 0.9 * k / len(SIZES)
+            params = [getattr(model, name) for name in NAMES]
+            compiled = model.at_time(t)
+            means, times, log_durations, velocities, log_scales, quats, opacity_logits = params
+            eager = temporal_slice(
+                means,
+                times,
+                log_durations,
+                velocities,
+                log_scales,
+                quats,
+                opacity_logits,
+                t,
+                impl="eager",
+            )
+            g = torch.Generator(device="cuda").manual_seed(n)
+            weights = {
+                f: torch.randn(getattr(eager, f).shape, generator=g, device="cuda") for f in FIELDS
+            }
+            grads = {}
+            for which, out in (("compiled", compiled), ("eager", eager)):
+                loss = sum((getattr(out, f) * weights[f]).sum() for f in FIELDS)
+                assert isinstance(loss, Tensor)
+                grads[which] = torch.autograd.grad(loss, params)
+            for f in FIELDS:
+                _assert_relative_l2(getattr(compiled, f), getattr(eager, f), 1e-6, f"N={n} {f}")
+            for name, a, b in zip(NAMES, grads["compiled"], grads["eager"], strict=True):
+                _assert_relative_l2(a, b, 1e-5, f"N={n} grad {name}")
+            _assert_mask(compiled.passes_cull, eager, f"N={n}")
+    frames = _compiled_frames()
+    assert frames >= 1, "the compiled slice never compiled"
+    assert frames - 1 <= 2, f"{frames - 1} recompilations over {len(SIZES) - 1} resizes"
+
+
+@pytest.mark.gpu
+def test_compiled_slice_takes_parameters_like_plain_tensors() -> None:
+    """D-50, #45: temporal_slice called directly with nn.Parameter inputs, as a model stores them,
+    compiles like plain tensors: at most 2 recompilations over growing sizes."""
+    torch._dynamo.reset()
+    counters.clear()
+    for k, n in enumerate((1000, 1500, 2300, 4096, 10_000)):
+        params = [torch.nn.Parameter(p) for p in _model(n, 300 + k, "cuda")]
+        means, times, log_durations, velocities, log_scales, quats, opacity_logits = params
+        out = temporal_slice(
+            means,
+            times,
+            log_durations,
+            velocities,
+            log_scales,
+            quats,
+            opacity_logits,
+            0.4,
+            impl="compiled",
+        )
+        assert out.means_t.requires_grad
+    frames = _compiled_frames()
+    assert 1 <= frames <= 3, f"{frames} graphs over 5 sizes"

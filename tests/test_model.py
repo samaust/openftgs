@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """FreeTimeGaussians and E5 in openftgs.model: U-5, the steps-7–9 part of U-19, the model side
-of U-22, the shape parts of U-26, and the §1.1 validity rules (D-2, D-3, D-5, D-24, D-25; Q-16,
-Q-17, Q-19 to Q-21, Q-23 to Q-25, Q-27).
+of U-22, the shape parts of U-26, the §1.1 validity rules, and the gradients of the compiled
+at_time (U-28, #45) (D-2, D-3, D-5, D-24, D-25; Q-13, Q-15, Q-16, Q-17, Q-19 to Q-21, Q-23 to
+Q-25, Q-27).
 
 Expected values are worked by hand from the spec: E5's matrix and its rotation about an axis,
 the §1.1 initial values and shapes, the §2.2 ftgs-if conversions, and k-NN distances of point
@@ -269,6 +270,53 @@ def test_at_time_carries_gradients_to_the_stored_tensors() -> None:
     grads = torch.autograd.grad(loss, [getattr(model, n) for n in names])
     for name, grad in zip(names, grads, strict=True):
         assert bool(grad.abs().sum() > 0), name
+
+
+@pytest.mark.gpu
+def test_compiled_at_time_carries_gradients_to_every_stored_tensor() -> None:
+    """#45, U-28: on CUDA, at_time runs the compiled slice under the default "auto" (Q-13), and a
+    weighting of all its outputs gives every one of the nine stored tensors a nonzero, finite
+    gradient: the seven the slice reads through the slice, sh0 and shN through the SH concat.
+    They agree with the gradients through the eager slice within U-28's 1e-5 relative (Q-15)."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    from openftgs.motion import temporal_slice
+
+    torch._dynamo.reset()
+    counters.clear()
+    model = _model(n=64, seed=3).to("cuda")
+    params = [getattr(model, name) for name in PARAM_NAMES]
+    out = model.at_time(0.3)
+    assert int(counters["stats"]["unique_graphs"]) >= 1, "at_time did not compile the slice"
+    g = torch.Generator(device="cuda").manual_seed(0)
+    fields = ("means_t", "opacities_t", "quats_n", "scales", "opacities", "reg_terms")
+    weights = {f: torch.randn(getattr(out, f).shape, generator=g, device="cuda") for f in fields}
+    sh_weights = torch.randn(out.sh.shape, generator=g, device="cuda")
+    loss = sum((getattr(out, f) * weights[f]).sum() for f in fields) + (out.sh * sh_weights).sum()
+    assert isinstance(loss, Tensor)
+    grads = torch.autograd.grad(loss, params)
+    means, times, log_durations, velocities, log_scales, quats, opacity_logits = params[:7]
+    eager = temporal_slice(
+        means,
+        times,
+        log_durations,
+        velocities,
+        log_scales,
+        quats,
+        opacity_logits,
+        0.3,
+        impl="eager",
+    )
+    eager_loss = sum((getattr(eager, f) * weights[f]).sum() for f in fields)
+    assert isinstance(eager_loss, Tensor)
+    eager_grads = torch.autograd.grad(eager_loss, params[:7])
+    for name, grad in zip(PARAM_NAMES, grads, strict=True):
+        assert bool(torch.isfinite(grad).all()) and float(grad.abs().sum()) > 0.0, name
+    for name, a, b in zip(PARAM_NAMES[:7], grads[:7], eager_grads, strict=True):
+        err = float(torch.linalg.vector_norm((a - b).double().flatten()))
+        ref = float(torch.linalg.vector_norm(b.double().flatten()))
+        assert err <= 1e-5 * ref, f"{name}: relative L2 {err / ref:.3e}"
 
 
 # resize_ (§1.3 Growth step 4; Q-23)
