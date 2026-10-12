@@ -1,12 +1,12 @@
 # Render backends in `openftgs.render`
 
-How `render()` meets its §2.1 row for E2, E5 and E6, and how its two render backends are built: the pure-PyTorch reference and the gsplat version §2.3 pins. The temporal index (D-55) arrives in M15 and is meant to reuse the front half described here. The keywords `precull` (Q-31) and `packed` (Q-36) and the semantics §2.1 leaves open (Q-32, Q-33, Q-37, Q-38) are provisional decisions or owner answers recorded in `docs/clean-room/questions.md`.
+How `render()` meets its §2.1 row for E2, E5 and E6, and how its two render backends are built: the pure-PyTorch reference and the gsplat version §2.3 pins. The temporal index (D-55) arrives in M15 and is meant to reuse the front half described here. The keywords `precull` (Q-31) and `packed` (Q-36) and the semantics §2.1 leaves open (Q-32, Q-33) are provisional decisions or owner answers recorded in `docs/clean-room/questions.md`; the gsplat backend's are now in the spec as D-75 and D-76 (revision 549b).
 
 ## The front half, shared by every backend
 
 `render()` does everything that doesn't depend on the backend, once per call:
 
-1. It checks its arguments: the backend, time units and `precull` choices, `packed` as a bool (Q-36), a finite real timestamp, cameras of one positive size with the right tensor shapes, and the background's shape (Q-32); for the gsplat backend, a float32 model on a CUDA device (Q-38). The camera tensors' values are not checked: that is the scene-manifest reader's job, and a value check on GPU tensors would synchronize (D-49).
+1. It checks its arguments: the backend, time units and `precull` choices, `packed` as a bool (Q-36), a finite real timestamp, cameras of one positive size with the right tensor shapes, and the background's shape (Q-32); for the gsplat backend, a float32 model on a CUDA device (D-76). The camera tensors' values are not checked: that is the scene-manifest reader's job, and a value check on GPU tensors would synchronize (D-49).
 2. It turns the timestamp into normalized time. Raw timestamps go through `TimeNormalizer.to_t`, which warns outside the training span (Q-9); normalized ones are used as given, and `render()` warns itself outside the training range (Q-32).
 3. It takes the per-time arrays from `FreeTimeGaussians.at_time`, which runs the temporal slice and cuts the SH coefficients to the requested degree, so inactive bands never reach the backend (E13, Q-20).
 4. With `precull="compact"`, it applies compaction: only the rows that pass the opacity cull go to the backend, in ascending row order (D-32, D-57, Q-31). The default leaves the opacity cull to the backend's projection.
@@ -45,11 +45,11 @@ U-8 asks that compaction change nothing on this backend, within U-8's own tolera
 
 ## The gsplat backend
 
-The production backend runs the CUDA kernels of the gsplat version §2.3 pins (D-6, D-31). It needs per-time arrays in float32 on a CUDA device and raises `ValueError` otherwise, naming the reference backend; the float64 path of Q-32 stays the reference's (Q-38).
+The production backend runs the CUDA kernels of the gsplat version §2.3 pins (D-6, D-31). It needs per-time arrays in float32 on a CUDA device and raises `ValueError` otherwise, naming the reference backend; the float64 path of Q-32 stays the reference's (D-76).
 
 ### Stage functions, not `rasterization()`
 
-The backend calls the stage functions gsplat exports, in the order its top-level `rasterization()` runs them: projection, SH colors, tile intersection and rasterization. Its glue is adapted from `rasterization()` under an attribution comment (source log #27). The kernels and their arguments are the same, and a GPU test checks the backend against `rasterization()` itself. Calling the stages directly is what lets the backend keep Q-32 (Q-37):
+The backend calls the stage functions gsplat exports, in the order its top-level `rasterization()` runs them: projection, SH colors, tile intersection and rasterization. Its glue is adapted from `rasterization()` under an attribution comment (source log #27). The kernels and their arguments are the same, and a GPU test checks the backend against `rasterization()` itself. Calling the stages directly is what lets the backend keep Q-32 (D-75):
 
 - In unpacked mode, gsplat's projection leaves the 2D means of culled rows uninitialized. The backend zeroes them before the rasterizer reads them, so the tensor it returns is both μ′-or-zero and the gradient anchor.
 - With compaction in unpacked mode, only the 2D means are placed back among all N rows. The rasterizer reads the kept rows from that [C, N, 2] tensor, so it is the anchor, while rasterization still runs over the kept rows only.
@@ -61,15 +61,15 @@ The effective opacity goes into gsplat's projection, which applies the opacity c
 
 ### Cameras
 
-View matrices are built from R_w and t_w with a last row of (0, 0, 0, 1), and K from f_x, f_y, c_x and c_y only, so the backend reads the same camera fields as the reference (Q-32). The camera center for E2's view direction is E2's own (§1.4), as for the reference, rather than gsplat's inverse of the view matrix: the same in exact arithmetic, and without the host synchronization of `torch.inverse` (§2.4 rule 3; Q-38).
+View matrices are built from R_w and t_w with a last row of (0, 0, 0, 1), and K from f_x, f_y, c_x and c_y only, so the backend reads the same camera fields as the reference (Q-32). The camera center for E2's view direction is E2's own (§1.4), as for the reference, rather than gsplat's inverse of the view matrix: the same in exact arithmetic, and without the host synchronization of `torch.inverse` (§2.4 rule 3; D-76).
 
 ### Visibility and ids
 
-A row is visible in a camera when both screen radii gsplat returns are positive (E6). `visible` is [C, N] in both layouts (Q-37): in unpacked mode it is read from the radii, in packed mode it is scattered from the camera and primitive ids, with no host synchronization. Packed rows come camera-major and in ascending row order within a camera, as gsplat writes them, and `gaussian_ids` holds model rows, mapped back through compaction (Q-38). Inside the call, gsplat's tile intersection gets gsplat's own ids, local to the rows passed.
+A row is visible in a camera when both screen radii gsplat returns are positive (E6). `visible` is [C, N] in both layouts (D-75): in unpacked mode it is read from the radii, in packed mode it is scattered from the camera and primitive ids, with no host synchronization. Packed rows come camera-major and in ascending row order within a camera, as gsplat writes them, and `gaussian_ids` holds model rows, mapped back through compaction (D-76). Inside the call, gsplat's tile intersection gets gsplat's own ids, local to the rows passed.
 
 ### Background and empty renders
 
-The pinned gsplat cannot take a per-camera background in packed mode, so the backend composites it itself in both layouts, from the render's alpha, which is one minus E6's final transmittance: the same background term (Q-38). gsplat's kernels cannot run on zero rows, so when no rows reach the backend (an empty model, or nothing kept by compaction) it returns Q-32's empty render without calling gsplat. That render stays on the autograd graph, as the reference's does: its outputs depend with weight zero on the 2D means, and those on every per-time array, so a backward pass gives every stored tensor and the 2D means an exactly zero gradient (U-8, D-57), whichever placement of the opacity cull left no rows.
+The pinned gsplat cannot take a per-camera background in packed mode, so the backend composites it itself in both layouts, from the render's alpha, which is one minus E6's final transmittance: the same background term (D-76). gsplat's kernels cannot run on zero rows, so when no rows reach the backend (an empty model, or nothing kept by compaction) it returns Q-32's empty render without calling gsplat. That render stays on the autograd graph, as the reference's does: its outputs depend with weight zero on the 2D means, and those on every per-time array, so a backward pass gives every stored tensor and the 2D means an exactly zero gradient (U-8, D-57), whichever placement of the opacity cull left no rows.
 
 ### Host synchronization
 

@@ -479,7 +479,7 @@ The agent or person writing openftgs from the spec under the clean-room rules, i
 _Avoid_: developer, Claude, assistant, contributor
 
 **Spec revision**:
-The numbered version of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", exported to `docs/spec/openftgs-spec.md` with its SHA-256 (revision 549a at present: revision 549, amended once in the repository in the owner's name); changes arrive as a new export that replaces the file in one commit. docs/spec/README.md
+The numbered version of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", exported to `docs/spec/openftgs-spec.md` with its SHA-256 (revision 549b at present: revision 549, amended twice in the repository in the owner's name, as 549a and 549b); changes arrive as a new export that replaces the file in one commit. docs/spec/README.md
 _Avoid_: spec version, draft, edition, the spec's git history
 
 **Provenance tag**:
