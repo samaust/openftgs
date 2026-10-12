@@ -5,6 +5,7 @@ Spec: E7, E8, E9. Band: Mechanics (§2.1).
 """
 
 import functools
+import warnings
 from collections.abc import Callable
 from typing import Literal, NoReturn
 
@@ -12,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-__all__ = ["l1_loss", "ssim"]
+__all__ = ["LPIPSLoss", "l1_loss", "ssim"]
 
 
 def _fail(reason: str) -> NoReturn:
@@ -131,3 +132,39 @@ def ssim(
         data_range=data_range,
         padding=padding,
     )
+
+
+class LPIPSLoss(torch.nn.Module):
+    """L_perc: LPIPS with the given backbone on images in [0, 1], mapped to [−1, 1] (E7, D-9,
+    D-68), as the mean over the batch. The network is lpips 0.1.4's, frozen and kept in
+    evaluation mode (Q-41)."""
+
+    def __init__(self, net: Literal["vgg", "alex"] = "vgg") -> None:
+        super().__init__()
+        if net not in ("vgg", "alex"):
+            _fail(f'net must be "vgg" or "alex", got {net!r}')
+        import lpips  # torchvision comes with it; imported only when a network is built
+
+        with warnings.catch_warnings():
+            # lpips 0.1.4 (pinned, §2.3) passes torchvision's deprecated `pretrained=True`, which
+            # torchvision maps to the ImageNet weights with two UserWarnings.
+            warnings.filterwarnings("ignore", "The parameter 'pretrained'", UserWarning)
+            warnings.filterwarnings("ignore", "Arguments other than a weight enum", UserWarning)
+            self.net: torch.nn.Module = lpips.LPIPS(net=net, verbose=False)
+        # lpips freezes only its trunk; the linear layers would stay trainable.
+        self.net.requires_grad_(False)
+        self.net.eval()
+
+    def train(self, mode: bool = True) -> "LPIPSLoss":
+        # The linear layers hold dropout, which training mode would switch on (Q-41).
+        super().train(mode)
+        self.net.eval()
+        return self
+
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        _check_pair(pred, gt)
+        x, y = _batch_first(pred), _batch_first(gt)
+        # D-68: the network's documented input range. With frozen weights and a target that
+        # doesn't require a gradient, autograd records nothing on the target's branch (§2.4).
+        out: Tensor = self.net(2 * x - 1, 2 * y - 1)
+        return out.mean()
