@@ -430,19 +430,22 @@ def test_slice_rejects_unknown_implementation() -> None:
         _slice(_model(4, 14, torch.float32), 0.5, impl="triton")
 
 
+_SLICE_FIELDS = (
+    "means_t",
+    "opacities_t",
+    "quats_n",
+    "scales",
+    "opacities",
+    "reg_terms",
+    "passes_cull",
+)
+
+
 def test_slice_auto_is_eager_on_cpu() -> None:
     """Q-13: "auto" on CPU tensors gives the eager result bitwise."""
     m = _model(64, 15, torch.float32)
     a, b = _slice(m, 0.5, impl="auto"), _slice(m, 0.5, impl="eager")
-    for f in (
-        "means_t",
-        "opacities_t",
-        "quats_n",
-        "scales",
-        "opacities",
-        "reg_terms",
-        "passes_cull",
-    ):
+    for f in _SLICE_FIELDS:
         assert torch.equal(getattr(a, f), getattr(b, f)), f
 
 
@@ -471,6 +474,132 @@ def test__slice_auto_falls_back_once_and_compiled_raises(monkeypatch: pytest.Mon
         assert torch.equal(got.opacities_t, eager.opacities_t)
     with pytest.raises(TorchDynamoException):
         _slice(m, 0.5, impl="compiled")
+
+
+def _cast(m: dict[str, Tensor], device: str, dtype: torch.dtype) -> dict[str, Tensor]:
+    return {k: v.to(device=device, dtype=dtype) for k, v in m.items()}
+
+
+_DEVICES = [pytest.param("cpu", id="cpu"), pytest.param("cuda", id="cuda", marks=pytest.mark.gpu)]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_slice_compiles_as_one_graph_without_breaks(device: str) -> None:
+    """D-50, Q-13 (#51): the compiled slice is one fused function: it compiles to a single graph
+    with no graph break, on CPU and CUDA."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    counters.clear()
+    _slice(_cast(_model(64, 23), device, torch.float32), 0.5, impl="compiled")
+    assert int(counters["stats"]["unique_graphs"]) == 1
+    assert not counters["graph_break"], dict(counters["graph_break"])
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_slice_compiled_raises_at_the_recompile_limit(device: str) -> None:
+    """Q-13 (as amended, #51): dynamo reaching its recompile limit for the slice is a failed
+    compilation, so an explicit "compiled" raises. With the limit at 1, float32 inputs compile
+    one graph and float64 inputs would need a second."""
+    import torch._dynamo
+    from torch._dynamo.exc import FailOnRecompileLimitHit
+
+    m = _model(64, 21)
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit=1):
+            _slice(_cast(m, device, torch.float32), 0.5, impl="compiled")
+            with pytest.raises(FailOnRecompileLimitHit):
+                _slice(_cast(m, device, F64), 0.5, impl="compiled")
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.gpu
+def test__slice_auto_falls_back_at_the_recompile_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Q-13 (as amended, #51; private: it resets the sticky fallback): when dynamo reaches its
+    recompile limit, "auto" warns exactly once, naming eager, and runs eager from then on: later
+    float32 and float64 calls, the second of which would hit the limit again, raise nothing under
+    warnings.simplefilter("error"); the results equal eager."""
+    import torch._dynamo
+
+    monkeypatch.setattr(openftgs.motion, "_auto_fell_back", False)
+    m = _model(64, 22)
+    m32, m64 = _cast(m, "cuda", torch.float32), _cast(m, "cuda", F64)
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit=1):
+            _slice(m32, 0.5, impl="auto")
+            with pytest.warns(UserWarning, match="eager") as record:
+                fallen = _slice(m64, 0.5, impl="auto")
+            assert len(record) == 1
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                later = [(_slice(m32, 0.5, impl="auto"), m32), (_slice(m64, 0.5, impl="auto"), m64)]
+    finally:
+        torch._dynamo.reset()
+    _assert_equals_eager([(fallen, m64), *later])
+
+
+def _assert_equals_eager(results: list[tuple[TemporalSlice, dict[str, Tensor]]]) -> None:
+    """Each slice equals the eager slice of its inputs exactly (§2.4 rule 2)."""
+    for got, inputs in results:
+        want = _slice(inputs, 0.5, impl="eager")
+        for f in _SLICE_FIELDS:
+            torch.testing.assert_close(getattr(got, f), getattr(want, f), rtol=0, atol=0)
+
+
+def _breaking_body() -> object:
+    """The slice's body with a graph break before it, for compiling."""
+    body = openftgs.motion._slice_eager
+
+    def broken(*args: Tensor) -> object:
+        torch._dynamo.graph_break()
+        return body(*args)
+
+    return broken
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test__slice_compiled_raises_on_a_graph_break(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-13 (as amended, #51; private: it puts a graph break in the compiled body): the slice is
+    compiled as one graph, so a graph break is a failed compilation and "compiled" raises a
+    TorchDynamoException."""
+    import torch._dynamo
+    from torch._dynamo.exc import TorchDynamoException
+
+    monkeypatch.setattr(openftgs.motion, "_slice_eager", _breaking_body())
+    monkeypatch.setattr(openftgs.motion, "_compiled", None)
+    torch._dynamo.reset()
+    try:
+        with pytest.raises(TorchDynamoException):
+            _slice(_cast(_model(64, 24), device, torch.float32), 0.5, impl="compiled")
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.gpu
+def test__slice_auto_falls_back_on_a_graph_break(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Q-13 (as amended, #51; private): a graph break in the compiled body makes "auto" warn
+    exactly once and run eager, and the result equals eager."""
+    import torch._dynamo
+
+    monkeypatch.setattr(openftgs.motion, "_slice_eager", _breaking_body())
+    monkeypatch.setattr(openftgs.motion, "_compiled", None)
+    monkeypatch.setattr(openftgs.motion, "_auto_fell_back", False)
+    m32 = _cast(_model(64, 25), "cuda", torch.float32)
+    torch._dynamo.reset()
+    try:
+        with pytest.warns(UserWarning, match="eager") as record:
+            got = _slice(m32, 0.5, impl="auto")
+        assert len(record) == 1
+    finally:
+        torch._dynamo.reset()
+    monkeypatch.undo()
+    _assert_equals_eager([(got, m32)])
 
 
 def test_e14_unit_conversions_of_durations_and_velocities() -> None:
