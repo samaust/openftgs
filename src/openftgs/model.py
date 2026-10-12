@@ -413,24 +413,13 @@ class FreeTimeGaussians(torch.nn.Module):
     def resize_(
         self, *, keep: Tensor | None = None, append: Mapping[str, Tensor] | None = None
     ) -> None:
-        """Keep the rows `keep` selects, in their old order, then append the rows of `append`
-        last (§1.3 Growth step 4). `keep` is a bool mask [N] or strictly increasing int64
-        indices (Q-23). The result is revalidated; on error the model is unchanged."""
-        # Q-23: keep is a mask or strictly increasing indices; append matches shape and dtype.
+        """Keep the rows the bool mask `keep` [N] selects, in their old order, then append the
+        rows of `append` last (§1.3 Growth step 4; Q-23). The result is revalidated; on error
+        the model is unchanged."""
+        # Q-23: keep is a bool mask [N], so it can't reorder rows; append matches shape and dtype.
         n = self.num_gaussians
-        if keep is not None:
-            if keep.dtype == torch.bool:
-                if tuple(keep.shape) != (n,):
-                    _fail(f"a keep mask must have shape [{n}], got {list(keep.shape)}")
-            elif keep.dtype == torch.int64:
-                if keep.dim() != 1:
-                    _fail("keep indices must be one-dimensional")
-                if keep.numel() and (int(keep.min()) < 0 or int(keep.max()) >= n):
-                    _fail(f"keep indices must lie in [0, {n})")
-                if keep.numel() > 1 and not bool((keep[1:] > keep[:-1]).all()):
-                    _fail("keep indices must be strictly increasing")
-            else:
-                _fail(f"keep must be a bool mask or int64 indices, got {keep.dtype}")
+        if keep is not None and (keep.dtype != torch.bool or tuple(keep.shape) != (n,)):
+            _fail(f"keep must be a bool mask of shape [{n}], got {keep.dtype} {list(keep.shape)}")
         if append is not None and set(append) != set(self.PARAM_NAMES):
             _fail(f"append must hold exactly {self.PARAM_NAMES}, got {sorted(append)}")
         params: dict[str, Tensor] = {}

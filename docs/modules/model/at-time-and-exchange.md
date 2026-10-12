@@ -6,7 +6,7 @@ How `FreeTimeGaussians` meets its §2.1 row for the per-time arrays (§1.1) and 
 
 The nine stored tensors of §1.1 are registered as parameters under their own names, copied from the caller's tensors so that init points and exchange models stay plain data, so `state_dict()` and `params.safetensors` use the normative names. The validity rules of §1.1 run in the constructor, and every other way of building a model goes through it: `from_init_points`, `from_exchange`, `load` and `resize_`. The SH degree is checked there too (D-3, U-26); at L = 0 the higher bands are an empty tensor of the right shape.
 
-`resize_` takes a bool mask or strictly increasing indices for the kept rows, so it can't reorder them, and appends new rows last (Q-23). It builds new parameters, so an optimizer must rebind them (M7).
+`resize_` takes a bool mask for the kept rows, so it can't reorder or repeat them, and appends new rows last (Q-23). It revalidates the whole model, so a non-finite value anywhere surfaces at the next resize. It builds new parameters, so an optimizer must rebind them (M7).
 
 ## What `at_time` returns
 

@@ -278,14 +278,13 @@ def _rows(model: FreeTimeGaussians) -> dict[str, Tensor]:
     return {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
 
 
-@pytest.mark.parametrize("as_mask", [True, False])
-def test_resize_keeps_rows_in_order_and_appends_last(as_mask: bool) -> None:
-    """§1.3 Growth step 4 and §2.1: kept rows stay in their old order and new rows go last; a
-    bool mask and strictly increasing indices give the same result (Q-23)."""
+def test_resize_keeps_rows_in_order_and_appends_last() -> None:
+    """§1.3 Growth step 4 and §2.1: the rows a bool mask keeps stay in their old order and new
+    rows go last (Q-23)."""
     model = _model(n=5)
     before = _rows(model)
     new = _params(n=2, seed=9)
-    keep = torch.tensor([True, False, True, True, False]) if as_mask else torch.tensor([0, 2, 3])
+    keep = torch.tensor([True, False, True, True, False])
     model.resize_(keep=keep, append=new)
     assert model.num_gaussians == 5
     order = torch.tensor([0, 2, 3])
@@ -302,7 +301,7 @@ def test_resize_without_keep_appends_and_without_append_shrinks() -> None:
     model.resize_(append=_params(n=1, seed=4))
     assert model.num_gaussians == 4
     assert torch.equal(model.means.detach()[:3], before["means"])
-    model.resize_(keep=torch.tensor([1, 3]))
+    model.resize_(keep=torch.tensor([False, True, False, True]))
     assert model.num_gaussians == 2
     assert torch.equal(model.means.detach()[0], before["means"][1])
 
@@ -310,10 +309,9 @@ def test_resize_without_keep_appends_and_without_append_shrinks() -> None:
 @pytest.mark.parametrize(
     "case",
     [
-        "unsorted indices",
-        "duplicate indices",
-        "index out of range",
+        "int64 indices",
         "mask of another length",
+        "2-D mask",
         "float keep",
         "append without shN",
         "append of another SH degree",
@@ -321,19 +319,17 @@ def test_resize_without_keep_appends_and_without_append_shrinks() -> None:
     ],
 )
 def test_resize_rejects_invalid_input(case: str) -> None:
-    """Q-23: keep is a bool mask [N] or strictly increasing int64 indices; append holds all nine
-    names with matching trailing shapes; the result must pass the §1.1 validity rules."""
+    """Q-23: keep is a bool mask [N], never indices; append holds all nine names with matching
+    trailing shapes; the result must pass the §1.1 validity rules."""
     model = _model(n=5)
     keep: Tensor | None = None
     append: dict[str, Tensor] | None = None
-    if case == "unsorted indices":
-        keep = torch.tensor([2, 0])
-    elif case == "duplicate indices":
-        keep = torch.tensor([1, 1])
-    elif case == "index out of range":
-        keep = torch.tensor([0, 5])
+    if case == "int64 indices":
+        keep = torch.tensor([0, 2, 3])
     elif case == "mask of another length":
         keep = torch.tensor([True, False])
+    elif case == "2-D mask":
+        keep = torch.ones(5, 1, dtype=torch.bool)
     elif case == "float keep":
         keep = torch.tensor([0.0, 1.0])
     elif case == "append without shN":
