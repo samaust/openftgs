@@ -16,6 +16,7 @@ import pytest
 import torch
 from builders import (
     CAM_A,
+    U8_CASES,
     logit_of,
     model_from_rows,
     pinhole,
@@ -23,6 +24,7 @@ from builders import (
     ring,
     sh0_for,
     sigmoid64,
+    u8_scene,
 )
 from torch import Tensor
 
@@ -415,3 +417,71 @@ def test_cameras_render_independently(packed: bool) -> None:
         assert torch.equal(batch.image[c], alone.image[0])
         assert torch.equal(batch.alpha[c], alone.alpha[0])
     assert float(batch.alpha.detach().max()) > 0.5
+
+
+# U-8 · culling σ_eff < 1/255 before the backend changes nothing (D-32, D-57; Q-31), on gsplat
+
+PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
+
+
+@LAYOUTS
+@pytest.mark.parametrize("case", list(U8_CASES))
+def test_u8_compaction_leaves_renders_unchanged(case: str, packed: bool) -> None:
+    """U-8 (GPU): rendering with compaction (precull = "compact") and with the opacity cull inside
+    gsplat's projection ("internal") gives images and alpha within 1e-6 and equal 2D means,
+    visibility and gaussian_ids, with 0 or 1 rows kept, a third of the rows culled, and a depth
+    tie between visible rows."""
+    n, kept, tie = U8_CASES[case]
+    cameras = ring(3)
+    model = _cuda(u8_scene(n, F32, kept=kept, tie=tie))
+    passing = int(model.at_time(0.37).passes_cull.sum())
+    assert passing == kept if kept is not None else 0 < passing < n
+    out = {
+        precull: _gsplat(model, cameras, 0.37, return_aux=True, precull=precull, packed=packed)
+        for precull in ("internal", "compact")
+    }
+    internal, compact = out["internal"], out["compact"]
+    torch.testing.assert_close(compact.image, internal.image, rtol=0, atol=1e-6)
+    torch.testing.assert_close(compact.alpha, internal.alpha, rtol=0, atol=1e-6)
+    for field in ("means2d", "visible"):
+        assert torch.equal(getattr(compact, field), getattr(internal, field)), field
+    if packed:
+        assert compact.gaussian_ids is not None and internal.gaussian_ids is not None
+        assert torch.equal(compact.gaussian_ids, internal.gaussian_ids)
+    if tie:
+        assert internal.visible is not None and bool(internal.visible[:, [4, 5]].all())
+
+
+@LAYOUTS
+@PLACEMENTS
+def test_u8_culled_primitives_get_exactly_zero_render_gradient(packed: bool, precull: str) -> None:
+    """U-8 (GPU): after backpropagating a random weighting of image and alpha, every primitive
+    visible in no camera (below the opacity cull, behind a camera or off the image) has an exactly
+    zero gradient in all nine stored tensors, in both placements and both layouts; every gradient
+    is finite."""
+    cameras = ring(3)
+    model = _cuda(u8_scene(64, F32, tie=True))
+    out = _gsplat(model, cameras, 0.37, return_aux=True, precull=precull, packed=packed)
+    weights = torch.Generator(device="cuda").manual_seed(1)
+    loss = (out.image * torch.rand(out.image.shape, generator=weights, device="cuda")).sum() + (
+        out.alpha * torch.rand(out.alpha.shape, generator=weights, device="cuda")
+    ).sum()
+    params = [getattr(model, name) for name in PARAM_NAMES]
+    grads = torch.autograd.grad(loss, params)
+    assert out.visible is not None
+    culled = ~out.visible.any(dim=0)
+    assert int(culled.sum()) >= 20 and int((~culled).sum()) >= 10
+    for name, grad in zip(PARAM_NAMES, grads, strict=True):
+        assert torch.equal(grad[culled], torch.zeros_like(grad[culled])), name
+        assert bool(torch.isfinite(grad).all()), name
+        assert float(grad[~culled].abs().sum()) > 0.0, name

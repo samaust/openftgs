@@ -224,3 +224,42 @@ def logit_of(p: float) -> float:
 def sigmoid64(logit: float) -> float:
     """σ of a logit as stored (float32), evaluated in float64."""
     return float(torch.sigmoid(torch.tensor(logit, dtype=torch.float32).to(torch.float64)))
+
+
+# U-8's scenes (D-32, D-57), shared by both backends' U-8 tests.
+
+
+def u8_scene(
+    n: int, dtype: torch.dtype, *, kept: int | None = None, tie: bool = False
+) -> FreeTimeGaussians:
+    """n random rows around `ring(3)`, some behind a camera or off the image, with every third row
+    below the opacity cull (logit −9). With `kept`, exactly that many rows pass the cull. With
+    `tie`, rows 4 and 5 sit at the same place, opaque enough to be seen by every camera, with
+    different colors, so they tie in depth."""
+    params = random_params(
+        n,
+        generator=torch.Generator().manual_seed(n),
+        spread=4.5,
+        log_scale=(-2.5, -0.5),
+        logit=(-3.0, 3.0),
+    )
+    params["opacity_logits"][::3] = -9.0
+    if kept is not None:
+        params["opacity_logits"] = torch.tensor([3.0] * kept + [-9.0] * (n - kept))
+    if tie:
+        for row in (4, 5):
+            params["means"][row] = torch.tensor([0.1, 0.2, 0.3])
+            params["velocities"][row] = 0.0
+            params["times"][row] = 0.37
+            params["opacity_logits"][row] = 2.0
+    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME)
+    return model.double() if dtype == torch.float64 else model
+
+
+U8_CASES: dict[str, tuple[int, int | None, bool]] = {  # n, rows passing the cull, depth tie
+    "no row kept": (1, 0, False),
+    "one row kept": (2, 1, False),
+    "a third culled": (7, None, False),
+    "depth tie": (33, None, True),
+    "depth tie, more rows": (64, None, True),
+}

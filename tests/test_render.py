@@ -21,6 +21,7 @@ import torch
 from builders import (
     C0,
     CAM_A,
+    U8_CASES,
     UNIT_TIME,
     logit_of,
     look_at,
@@ -31,6 +32,7 @@ from builders import (
     ring,
     sh0_for,
     sigmoid64,
+    u8_scene,
 )
 from real_sh import real_sh
 from torch import Tensor
@@ -478,52 +480,16 @@ def test_e6_reference_matches_an_independent_evaluation(seed: int) -> None:
 # U-8 · culling σ_eff < 1/255 before the backend changes nothing (D-32, D-57; Q-31)
 
 
-def _u8_scene(
-    n: int, dtype: torch.dtype, *, kept: int | None = None, tie: bool = False
-) -> FreeTimeGaussians:
-    """n random rows around `ring(3)`, some behind a camera or off the image, with every third row
-    below the opacity cull (logit −9). With `kept`, exactly that many rows pass the cull. With
-    `tie`, rows 4 and 5 sit at the same place, opaque enough to be seen by every camera, with
-    different colors, so they tie in depth."""
-    params = random_params(
-        n,
-        generator=torch.Generator().manual_seed(n),
-        spread=4.5,
-        log_scale=(-2.5, -0.5),
-        logit=(-3.0, 3.0),
-    )
-    params["opacity_logits"][::3] = -9.0
-    if kept is not None:
-        params["opacity_logits"] = torch.tensor([3.0] * kept + [-9.0] * (n - kept))
-    if tie:
-        for row in (4, 5):
-            params["means"][row] = torch.tensor([0.1, 0.2, 0.3])
-            params["velocities"][row] = 0.0
-            params["times"][row] = 0.37
-            params["opacity_logits"][row] = 2.0
-    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME)
-    return model.double() if dtype == F64 else model
-
-
-_U8_CASES: dict[str, tuple[int, int | None, bool]] = {  # n, rows passing the cull, depth tie
-    "no row kept": (1, 0, False),
-    "one row kept": (2, 1, False),
-    "a third culled": (7, None, False),
-    "depth tie": (33, None, True),
-    "depth tie, more rows": (64, None, True),
-}
-
-
 @pytest.mark.parametrize("dtype", [F32, F64])
-@pytest.mark.parametrize("case", list(_U8_CASES))
+@pytest.mark.parametrize("case", list(U8_CASES))
 def test_u8_compaction_leaves_renders_bitwise_unchanged(case: str, dtype: torch.dtype) -> None:
     """U-8: rendering with compaction (precull = "compact") and with the opacity cull inside the
     backend's projection ("internal") gives bitwise-identical images, alpha, 2D means and
     visibility on the reference backend, with 0 or 1 rows kept, a third of the rows culled, and a
     depth tie between visible rows."""
-    n, kept, tie = _U8_CASES[case]
+    n, kept, tie = U8_CASES[case]
     cameras = ring(3)
-    model = _u8_scene(n, dtype, kept=kept, tie=tie)
+    model = u8_scene(n, dtype, kept=kept, tie=tie)
     passing = int(model.at_time(0.37).passes_cull.sum())
     assert passing == kept if kept is not None else 0 < passing < n
     out = {
@@ -547,7 +513,7 @@ def test_u8_culled_primitives_get_exactly_zero_render_gradient(
     in no camera (below the opacity cull, behind a camera or off the image) has an exactly zero
     gradient in all nine stored tensors, in both placements of the opacity cull."""
     cameras = ring(3)
-    model = _u8_scene(64, dtype, tie=True)
+    model = u8_scene(64, dtype, tie=True)
     out = _render(model, cameras, 0.37, return_aux=True, precull=precull)
     weights = torch.Generator().manual_seed(1)
     loss = (out.image * torch.rand(out.image.shape, generator=weights, dtype=dtype)).sum() + (
