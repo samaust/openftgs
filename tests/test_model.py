@@ -271,6 +271,52 @@ def test_at_time_carries_gradients_to_the_stored_tensors() -> None:
         assert bool(grad.abs().sum() > 0), name
 
 
+@pytest.mark.gpu
+def test_compiled_at_time_carries_gradients_to_every_stored_tensor() -> None:
+    """#45, U-28: on CUDA, at_time runs the compiled slice under the default "auto" (Q-13), and a
+    weighting of all its outputs gives every one of the nine stored tensors a nonzero, finite
+    gradient: the seven the slice reads through the slice, sh0 and shN through the SH concat.
+    They agree with the gradients through the eager slice within U-28's 1e-5 relative (Q-15)."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    from openftgs.motion import temporal_slice
+
+    torch._dynamo.reset()
+    counters.clear()
+    model = _model(n=64, seed=3).to("cuda")
+    params = [getattr(model, name) for name in PARAM_NAMES]
+    out = model.at_time(0.3)
+    assert int(counters["frames"]["ok"]) >= 1, "at_time did not compile the slice"
+    g = torch.Generator(device="cuda").manual_seed(0)
+    fields = ("means_t", "opacities_t", "quats_n", "scales", "opacities", "reg_terms")
+    weights = {f: torch.randn(getattr(out, f).shape, generator=g, device="cuda") for f in fields}
+    sh_weights = torch.randn(out.sh.shape, generator=g, device="cuda")
+    loss = sum((getattr(out, f) * weights[f]).sum() for f in fields) + (out.sh * sh_weights).sum()
+    assert isinstance(loss, Tensor)
+    grads = torch.autograd.grad(loss, params)
+    means, times, log_durations, velocities, log_scales, quats, opacity_logits = params[:7]
+    eager = temporal_slice(
+        means,
+        times,
+        log_durations,
+        velocities,
+        log_scales,
+        quats,
+        opacity_logits,
+        0.3,
+        impl="eager",
+    )
+    eager_loss = sum((getattr(eager, f) * weights[f]).sum() for f in fields)
+    assert isinstance(eager_loss, Tensor)
+    eager_grads = torch.autograd.grad(eager_loss, params[:7])
+    for name, grad in zip(PARAM_NAMES, grads, strict=True):
+        assert bool(torch.isfinite(grad).all()) and float(grad.abs().sum()) > 0.0, name
+    for name, a, b in zip(PARAM_NAMES[:7], grads[:7], eager_grads, strict=True):
+        err = torch.linalg.vector_norm((a - b).double().flatten())
+        assert float(err) <= 1e-5 * float(torch.linalg.vector_norm(b.double().flatten())), name
+
+
 # resize_ (§1.3 Growth step 4; Q-23)
 
 
