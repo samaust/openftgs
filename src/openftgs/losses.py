@@ -200,7 +200,8 @@ def total_loss(
     perceptual: LPIPSLoss | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·LPIPS + λ_reg·L_reg(t) at iteration `it` (E7, E9,
-    D-37), and its unweighted terms with the total under "total". A term whose weight is 0 is
+    D-37), and its unweighted terms with the total under "total". t is the training image's
+    normalized time (§1.4), as for `reg4d_loss`. A term whose weight is 0 is
     neither computed nor reported; L_reg's weight is 0 after `cfg.reg_until` (D-10, Q-41)."""
     # Q-41: iterations count from 1 (D-41).
     if isinstance(it, bool) or not isinstance(it, int) or it < 1:

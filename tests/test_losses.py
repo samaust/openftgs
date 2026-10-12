@@ -538,13 +538,12 @@ def test_u10_regularization_stops_after_reg_until() -> None:
     assert bool((_all_grads(loss, model)["opacity_logits"] != 0).all())
     for it, until in [(101, 100), (T_IT, 100), (1, 0)]:
         cfg = LossConfig(lambda_perc=0.0, reg_until=until)
-        loss, terms = total_loss(pred, gt, model, 0.4, it, cfg)
+        # pred requires a gradient so that the loss has a graph whose ô gradient can be read.
+        loss, terms = total_loss(pred.clone().requires_grad_(), gt, model, 0.4, it, cfg)
         assert "reg" not in terms
         expected = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt))
         assert loss.item() == expected.item()
-        assert not loss.requires_grad or bool(
-            (_all_grads(loss, model)["opacity_logits"] == 0).all()
-        )
+        assert bool((_all_grads(loss, model)["opacity_logits"] == 0).all())
 
 
 def _off_screen_scene() -> FreeTimeGaussians:
