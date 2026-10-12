@@ -38,6 +38,6 @@ E1 adds the displacement to the stored position last, so a primitive sits exactl
 
 t enters the compiled graph as a zero-dimensional tensor on the parameters' device, made from a Python float with a fill rather than a copy, so a new timestamp at every iteration neither recompiles the graph nor synchronizes with the host. U-28 holds the eager and compiled paths to the same values and gradients and bounds the recompilations over resizes; the comparison it uses is Q-15.
 
-## Not here yet
+## Unit conversions
 
-The unit conversions of primitive quantities between raw and normalized time, which Q-8 assigns to `motion`, arrive with their consumers in M3.
+`durations_to_normalized`, `durations_to_raw`, `velocities_to_normalized` and `velocities_to_raw` are E14's unit conversions of primitive quantities, which Q-8 assigns to `motion` (Q-27). With a single timestamp they use a unit of 1 (Q-19). Time centers convert through `TimeNormalizer`.

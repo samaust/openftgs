@@ -62,14 +62,18 @@ def _slice(m: dict[str, Tensor], t: float | Tensor, impl: str = "eager") -> Temp
 
 
 def test_all_lists_the_public_api() -> None:
-    """Q-12: `__all__` is exactly the public API."""
+    """Q-12, Q-27: `__all__` is exactly the public API."""
     assert sorted(openftgs.motion.__all__) == [
         "TemporalSlice",
+        "durations_to_normalized",
+        "durations_to_raw",
         "effective_opacity",
         "moved_means",
         "reg4d_terms",
         "temporal_opacity",
         "temporal_slice",
+        "velocities_to_normalized",
+        "velocities_to_raw",
     ]
 
 
@@ -467,3 +471,46 @@ def test__slice_auto_falls_back_once_and_compiled_raises(monkeypatch: pytest.Mon
         assert torch.equal(got.opacities_t, eager.opacities_t)
     with pytest.raises(TorchDynamoException):
         _slice(m, 0.5, impl="compiled")
+
+
+def test_e14_unit_conversions_of_durations_and_velocities() -> None:
+    """E14 (Q-27): s = d/T_τ, v = v_τ·T_τ, and their inverses; worked by hand with T_τ = 4."""
+    from openftgs.motion import (
+        durations_to_normalized,
+        durations_to_raw,
+        velocities_to_normalized,
+        velocities_to_raw,
+    )
+    from openftgs.types import TimeNormalizer
+
+    time = TimeNormalizer(2.0, 6.0)
+    d = torch.tensor([2.0, 0.5], dtype=F64)
+    v_tau = torch.tensor([[3.0, -1.0, 0.25]], dtype=torch.float32)
+    torch.testing.assert_close(durations_to_normalized(d, time), d.new_tensor([0.5, 0.125]))
+    torch.testing.assert_close(durations_to_raw(d.new_tensor([0.5, 0.125]), time), d)
+    v = velocities_to_normalized(v_tau, time)
+    assert v.dtype == torch.float32
+    torch.testing.assert_close(v, v_tau.new_tensor([[12.0, -4.0, 1.0]]))
+    torch.testing.assert_close(velocities_to_raw(v, time), v_tau)
+
+
+def test_e14_unit_conversions_use_a_unit_of_one_for_a_single_timestamp() -> None:
+    """Q-19: with T_τ = 0, durations and velocities convert with a time unit of 1."""
+    from openftgs.motion import (
+        durations_to_normalized,
+        durations_to_raw,
+        velocities_to_normalized,
+        velocities_to_raw,
+    )
+    from openftgs.types import TimeNormalizer
+
+    time = TimeNormalizer(3.0, 3.0)
+    d = torch.tensor([0.7], dtype=F64)
+    v = torch.tensor([[1.0, 2.0, 3.0]])
+    for fn, x in (
+        (durations_to_normalized, d),
+        (durations_to_raw, d),
+        (velocities_to_normalized, v),
+        (velocities_to_raw, v),
+    ):
+        assert torch.equal(fn(x, time), x)
