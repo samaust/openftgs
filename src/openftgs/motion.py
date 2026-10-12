@@ -13,13 +13,19 @@ from typing import Literal, get_args
 import torch
 from torch import Tensor
 
+from openftgs.types import TimeNormalizer
+
 __all__ = [
     "TemporalSlice",
+    "durations_to_normalized",
+    "durations_to_raw",
     "effective_opacity",
     "moved_means",
     "reg4d_terms",
     "temporal_opacity",
     "temporal_slice",
+    "velocities_to_normalized",
+    "velocities_to_raw",
 ]
 
 # D-32: gsplat 1.5.3 drops σ_eff < 1/255; on float32 tensors the bound rounds to float32(1/255).
@@ -94,6 +100,33 @@ def reg4d_terms(
 ) -> Tensor:
     """The per-row terms σ·sg[σt(t)] of E8, [N]; their mean is L_reg(t)."""
     return _opacity_terms(opacity_logits, temporal_opacity(times, log_durations, t))[2]
+
+
+def _span_or_one(time: TimeNormalizer) -> float:
+    # Q-19: with a single timestamp (T_τ = 0), durations and velocities convert with a unit of 1.
+    span = time.tau1 - time.tau0
+    return span if span > 0.0 else 1.0
+
+
+# Q-27: E14's unit conversions of primitive quantities (Q-8); time centers use TimeNormalizer.
+def durations_to_normalized(durations: Tensor, time: TimeNormalizer) -> Tensor:
+    """s = d/T_τ: durations in raw τ units to normalized time (E14)."""
+    return durations / _span_or_one(time)
+
+
+def durations_to_raw(durations: Tensor, time: TimeNormalizer) -> Tensor:
+    """d = s·T_τ: durations in normalized time to raw τ units (E14)."""
+    return durations * _span_or_one(time)
+
+
+def velocities_to_normalized(velocities: Tensor, time: TimeNormalizer) -> Tensor:
+    """v = v_τ·T_τ: world units per unit of τ to world units per unit of t (E14)."""
+    return velocities * _span_or_one(time)
+
+
+def velocities_to_raw(velocities: Tensor, time: TimeNormalizer) -> Tensor:
+    """v_τ = v/T_τ: world units per unit of t to world units per unit of τ (E14)."""
+    return velocities / _span_or_one(time)
 
 
 def _slice_eager(

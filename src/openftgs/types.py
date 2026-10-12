@@ -149,6 +149,8 @@ class TrainerState:  # plain tensors and dicts; a §2.2 checkpoint holds exactly
     stats: dict[str, Tensor]  # g_sum, count
     rng: dict[str, Any]  # generator states
     sampler: dict[str, Any]  # epoch, cursor, permutation
+    scene_sha256: str | None = None  # Q-17: SHA-256 of the scene manifest, for resume
+    time_unit: str = "s"  # Q-17: the scene manifest's time_unit
 
 
 def frame_interval(camera_timestamps: Mapping[str, Sequence[float]], time: TimeNormalizer) -> float:
