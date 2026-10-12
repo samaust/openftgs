@@ -17,7 +17,7 @@ from hypothesis import strategies as st
 from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians, covariance, rotation_matrix
-from openftgs.types import TimeNormalizer
+from openftgs.types import InitPoints, TimeNormalizer
 
 F32 = torch.float32
 F64 = torch.float64
@@ -340,3 +340,234 @@ def test_resize_rejects_invalid_input(case: str) -> None:
         model.resize_(keep=keep, append=append)
     for name in PARAM_NAMES:
         assert torch.equal(getattr(model, name).detach(), before[name])
+
+
+# U-19, steps 7–9 · from_init_points (§1.3; D-5, D-21, D-23, D-24, D-25, D-47; Q-16, Q-19, Q-21)
+
+C0 = 0.28209479177387814
+
+
+def _points(
+    positions: list[list[float]],
+    timestamps: list[float],
+    *,
+    colors: list[list[float]] | None = None,
+    velocities: list[list[float]] | None = None,
+    durations: list[float] | None = None,
+    frame_ids: list[int] | None = None,
+) -> InitPoints:
+
+    n = len(positions)
+    return InitPoints(
+        positions=torch.tensor(positions, dtype=F32),
+        colors=torch.tensor(colors, dtype=F32) if colors else torch.full((n, 3), 0.5),
+        timestamps=torch.tensor(timestamps, dtype=F64),
+        velocities=torch.tensor(velocities, dtype=F32) if velocities else None,
+        durations=torch.tensor(durations, dtype=F64) if durations else None,
+        frame_ids=torch.tensor(frame_ids, dtype=torch.int64) if frame_ids else None,
+    )
+
+
+def _init(
+    points: InitPoints,
+    time: TimeNormalizer,
+    frame_dt: float,
+    *,
+    b: int = 1000,
+    seed: int = 0,
+    sh_degree: int = 3,
+    n_max: int | None = None,
+    generator: torch.Generator | None = None,
+) -> FreeTimeGaussians:
+    from openftgs.config import InitConfig
+
+    return FreeTimeGaussians.from_init_points(
+        points,
+        time,
+        InitConfig(points_per_frame=b),
+        frame_dt=frame_dt,
+        generator=generator if generator is not None else _gen(seed),
+        sh_degree=sh_degree,
+        n_max=n_max,
+    )
+
+
+SPAN = TimeNormalizer(0.0, 10.0)  # T_τ = 10
+
+
+@pytest.mark.parametrize("sh_degree", [0, 1, 2, 3])
+def test_u19_initial_values_of_step_9(sh_degree: int) -> None:
+    """§1.3 step 9 and §1.1 (D-5): opacity logit(0.1), quaternion (1, 0, 0, 0), sh0 = (rgb −
+    0.5)/C₀, shN = 0 with L's shape; means and time centers from the points (E14)."""
+    pts = _points(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        [2.5, 7.0],
+        colors=[[0.5, 1.0, 0.0], [0.25, 0.5, 0.75]],
+    )
+    model = _init(pts, SPAN, 0.1, sh_degree=sh_degree)
+    assert model.sh_degree == sh_degree
+    assert torch.equal(model.means.detach(), pts.positions)
+    torch.testing.assert_close(model.times.detach(), torch.tensor([0.25, 0.7]), rtol=0, atol=1e-7)
+    logit = math.log(0.1 / 0.9)
+    torch.testing.assert_close(
+        model.opacity_logits.detach(), torch.full((2,), logit), rtol=1e-6, atol=0
+    )
+    assert torch.equal(model.quats.detach(), torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2))
+    expected_sh0 = torch.tensor([[[0.0, 0.5 / C0, -0.5 / C0]], [[-0.25 / C0, 0.0, 0.25 / C0]]])
+    torch.testing.assert_close(model.sh0.detach(), expected_sh0, rtol=1e-6, atol=1e-6)
+    assert model.shN.shape == (2, (sh_degree + 1) ** 2 - 1, 3)
+    assert not bool(model.shN.detach().any())
+    assert all(p.dtype == F32 for p in model.parameters())
+
+
+def test_u19_missing_velocities_and_durations_take_their_defaults() -> None:
+    """§1.3 paragraph after step 9: missing velocities become 0 (D-23, P §4.2's "w/o 4D
+    initialization") and missing durations s₀ = Δt_f (D-21)."""
+    model = _init(_points([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [0.0, 10.0]), SPAN, 0.1)
+    assert not bool(model.velocities.detach().any())
+    torch.testing.assert_close(
+        model.log_durations.detach(), torch.full((2,), math.log(0.1)), rtol=1e-6, atol=0
+    )
+
+
+def test_u19_supplied_durations_and_velocities_convert_to_normalized_time() -> None:
+    """E14: s = d/T_τ and v = v_τ·T_τ (worked by hand with T_τ = 10; Q-27)."""
+    pts = _points(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        [0.0, 10.0],
+        velocities=[[1.0, -0.5, 0.0], [0.0, 0.0, 0.25]],
+        durations=[0.5, 2.0],
+    )
+    model = _init(pts, SPAN, 0.1)
+    torch.testing.assert_close(
+        model.velocities.detach(), torch.tensor([[10.0, -5.0, 0.0], [0.0, 0.0, 2.5]])
+    )
+    torch.testing.assert_close(
+        model.log_durations.detach(),
+        torch.tensor([math.log(0.05), math.log(0.2)]),
+        rtol=1e-6,
+        atol=0,
+    )
+
+
+def test_u19_single_timestamp_uses_a_unit_of_one_and_one_frame() -> None:
+    """§1.3 step 7 (F = 1 for a single timestamp) and Q-19 (unit of 1 when T_τ = 0)."""
+    single = TimeNormalizer(5.0, 5.0)
+    pts = _points(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        [5.0, 5.0, 5.0],
+        velocities=[[1.0, 2.0, 3.0]] * 3,
+        durations=[0.3, 0.3, 0.3],
+    )
+    model = _init(pts, single, 1.0, b=3, n_max=3)  # F·B = 1·3
+    assert not bool(model.times.detach().any())
+    torch.testing.assert_close(model.velocities.detach(), torch.tensor([[1.0, 2.0, 3.0]] * 3))
+    torch.testing.assert_close(model.log_durations.detach(), torch.full((3,), math.log(0.3)))
+    with pytest.raises(ValueError, match="N_max|n_max"):
+        _init(pts, single, 1.0, b=3, n_max=2)
+
+
+def _mean_knn(points: list[list[float]], i: int, k: int = 3) -> float:
+    """Mean distance from point i to its k nearest others, worked out with math.dist."""
+    d = sorted(math.dist(points[i], p) for j, p in enumerate(points) if j != i)
+    return sum(d[:k]) / len(d[:k])
+
+
+def test_u19_scales_use_three_nearest_neighbours_within_each_frame() -> None:
+    """§1.3 step 8 and D-25: â = log(mean distance to the 3 nearest neighbours among the points
+    of the same init frame), isotropic. Frame 1 repeats frame 0 shifted by 10⁻³, so pooled
+    neighbours would collapse every scale to about 10⁻³."""
+    frame0 = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0], [2.0, 2.0, 2.0]]
+    frame1 = [[x, y, z + 1e-3] for x, y, z in frame0]
+    pts = _points(frame0 + frame1, [0.0] * 5 + [1.0] * 5, frame_ids=[0] * 5 + [1] * 5)
+    model = _init(pts, SPAN, 0.1)
+    expected = [_mean_knn(frame0, i) for i in range(5)] * 2
+    scales = torch.exp(model.log_scales.detach().double())
+    torch.testing.assert_close(
+        scales, torch.tensor(expected, dtype=F64)[:, None].expand(10, 3), rtol=1e-6, atol=0
+    )
+    assert torch.equal(model.log_scales[:, 0], model.log_scales[:, 1])
+    assert torch.equal(model.log_scales[:, 0], model.log_scales[:, 2])
+
+
+def test_u19_small_frames_duplicates_and_lone_points_hit_the_floor_rules() -> None:
+    """§1.3 step 8 with D-25's floor of 10⁻⁷ and Q-21: a frame of three points uses its two
+    others; duplicated points have mean distance 0 and get the floor; a lone point gets the
+    floor."""
+    line = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]]
+    dup = [[5.0, 5.0, 5.0], [5.0, 5.0, 5.0]]
+    lone = [[9.0, 9.0, 9.0]]
+    pts = _points(line + dup + lone, [0.0] * 6, frame_ids=[0, 0, 0, 1, 1, 2])
+    model = _init(pts, SPAN, 0.1)
+    floor = math.log(1e-7)
+    expected = [math.log(2.0), math.log(1.5), math.log(2.5), floor, floor, floor]
+    torch.testing.assert_close(
+        model.log_scales.detach()[:, 0], torch.tensor(expected), rtol=1e-6, atol=0
+    )
+
+
+def test_u19_missing_frame_ids_become_the_nearest_slot() -> None:
+    """§1.3 paragraph after step 9 and D-47: a point without a frame id joins the slot t_k =
+    k·Δt_f nearest its time, ties to the lower slot (Q-21); unsynchronized times included.
+
+    With Δt_f = 0.1 and T_τ = 10: t = 0.13 → slot 1, t = 0.07 → slot 1, t = 0.25 → slot 2 (a
+    tie), t = 0.18 → slot 2. The groups are checked through their scales: slot 1 holds points
+    0 and 1 (distance 1), slot 2 points 2 and 3 (distance 4)."""
+    pts = _points(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        [1.3, 0.7, 2.5, 1.8],
+    )
+    model = _init(pts, SPAN, 0.1)
+    torch.testing.assert_close(
+        torch.exp(model.log_scales.detach()[:, 0]), torch.tensor([1.0, 1.0, 4.0, 4.0])
+    )
+
+
+def test_u19_budget_keeps_a_seeded_ordered_subset_of_f_times_b_points() -> None:
+    """§1.3 step 7 and D-24: at most F·B points in total, F = round(1/Δt_f) + 1, as a seeded
+    uniform subset kept in file order; the same seed gives the same subset (Q-21)."""
+    xs = [[float(i), 0.0, 0.0] for i in range(40)]
+    pts = _points(xs, [0.0] * 40, frame_ids=[0] * 40)
+    a = _init(pts, SPAN, 0.5, b=4, seed=1)  # F = 3, F·B = 12
+    b = _init(pts, SPAN, 0.5, b=4, seed=1)
+    c = _init(pts, SPAN, 0.5, b=4, seed=2)
+    kept = a.means.detach()[:, 0]
+    assert kept.numel() == 12
+    assert bool((kept[1:] > kept[:-1]).all())
+    assert torch.equal(kept, b.means.detach()[:, 0])
+    assert not torch.equal(kept, c.means.detach()[:, 0])
+
+
+def test_u19_scales_come_from_the_kept_points() -> None:
+    """D-25: scales are computed among the points kept after the subsample."""
+    xs = [[float(i), 0.0, 0.0] for i in range(40)]
+    model = _init(_points(xs, [0.0] * 40, frame_ids=[0] * 40), SPAN, 0.5, b=4, seed=3)
+    kept = [[float(x), 0.0, 0.0] for x in model.means.detach()[:, 0]]
+    expected = torch.tensor([math.log(_mean_knn(kept, i)) for i in range(len(kept))])
+    torch.testing.assert_close(model.log_scales.detach()[:, 0], expected, rtol=1e-6, atol=0)
+
+
+def test_u19_budget_leaves_the_generator_untouched_when_everything_fits() -> None:
+    """Q-21: with N ≤ F·B every point is kept, in order, and the generator is not used."""
+    g = _gen(4)
+    state = g.get_state()
+    pts = _points([[float(i), 0.0, 0.0] for i in range(12)], [0.0] * 12)
+    model = _init(pts, SPAN, 0.5, b=4, generator=g)
+    assert torch.equal(model.means.detach(), pts.positions)
+    assert torch.equal(g.get_state(), state)
+
+
+def test_u19_frame_count_rounds_half_up_and_checks_n_max() -> None:
+    """§1.3 step 7, D-24 and Q-16, Q-21: Δt_f = 0.4 gives 1/Δt_f = 2.5, so F = 3 + 1 = 4 (round
+    half up); initialization stops when F·B exceeds n_max."""
+    pts = _points([[0.0, 0.0, 0.0]], [0.0])
+    _init(pts, SPAN, 0.4, b=5, n_max=20)
+    with pytest.raises(ValueError):
+        _init(pts, SPAN, 0.4, b=5, n_max=19)
+
+
+def test_u19_invalid_init_points_are_rejected() -> None:
+    """Q-22: init points are validated as a ftgs-init file would be."""
+    pts = _points([[0.0, 0.0, 0.0]], [0.0], colors=[[1.5, 0.0, 0.0]])
+    with pytest.raises(ValueError):
+        _init(pts, SPAN, 0.1)

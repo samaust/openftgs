@@ -4,14 +4,18 @@
 Spec: §1.1, E5. Band: Core model (§2.1).
 """
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
-from openftgs.motion import temporal_slice
-from openftgs.types import TimeNormalizer
+from openftgs.config import InitConfig
+from openftgs.io import validate_init_points
+from openftgs.motion import durations_to_normalized, temporal_slice, velocities_to_normalized
+from openftgs.sh import rgb_to_sh0
+from openftgs.types import InitPoints, TimeNormalizer
 
 __all__ = ["FreeTimeGaussians", "GaussiansAtTime", "covariance", "rotation_matrix"]  # Q-20
 
@@ -78,6 +82,27 @@ def _check_sh_degree(sh_degree: object) -> int:
     return sh_degree
 
 
+def _knn_mean_distance(positions: Tensor, k: int, floor: float) -> Tensor:
+    """Mean distance from each point to its min(k, n − 1) nearest others, floored (D-25, Q-21).
+
+    Brute force in float64 by chunks of rows, with differences rather than the matrix-product
+    form, so points far from the origin keep their precision. A lone point gets the floor."""
+    n = int(positions.shape[0])
+    if n < 2:
+        return torch.full((n,), floor, dtype=torch.float64, device=positions.device)
+    k = min(k, n - 1)
+    x = positions.to(torch.float64)
+    out = torch.empty(n, dtype=torch.float64, device=x.device)
+    rows = max(1, (1 << 24) // n)
+    for start in range(0, n, rows):
+        stop = min(n, start + rows)
+        d = torch.cdist(x[start:stop], x, compute_mode="donot_use_mm_for_euclid_dist")
+        local = torch.arange(stop - start, device=x.device)
+        d[local, local + start] = math.inf  # a point is not its own neighbour
+        out[start:stop] = torch.topk(d, k, dim=1, largest=False).values.mean(dim=1)
+    return out.clamp_min(floor)
+
+
 class FreeTimeGaussians(torch.nn.Module):
     """The nine stored tensors of §1.1, registered as parameters under their own names."""
 
@@ -117,6 +142,93 @@ class FreeTimeGaussians(torch.nn.Module):
         self.time_unit = time_unit  # Q-17
         self._slice_impl = "auto"  # Q-13; how PerfConfig.slice_impl reaches it is M10's
         self._set_params(params)
+
+    @classmethod
+    def from_init_points(
+        cls,
+        points: InitPoints,
+        time: TimeNormalizer,
+        cfg: InitConfig,
+        *,
+        frame_dt: float,
+        generator: torch.Generator,
+        sh_degree: int = 3,  # Q-16
+        n_max: int | None = None,  # Q-16
+    ) -> "FreeTimeGaussians":
+        """Initialization steps 7–9 of §1.3 for points from roma_init or supplied through the
+        public interface: at most F·B points in total (D-24), defaults for missing velocities,
+        durations and frame ids (D-23, D-21, D-47), per-frame 3-NN scales (D-25) and the fixed
+        initial values of step 9 (D-5). `frame_dt` is Δt_f (E14)."""
+        validate_init_points(points)  # Q-22
+        sh_degree = _check_sh_degree(sh_degree)
+        if not (math.isfinite(frame_dt) and frame_dt > 0.0):
+            _fail(f"frame_dt must be finite and positive, got {frame_dt!r}")
+        # §1.3 step 7: F frames of the sequence, 1 for a single timestamp; Q-21: round half up.
+        frames = 1 if time.tau1 == time.tau0 else math.floor(1.0 / frame_dt + 0.5) + 1
+        budget = frames * cfg.points_per_frame
+        if n_max is not None and budget > n_max:
+            _fail(
+                f"the initial budget F·B = {frames}·{cfg.points_per_frame} = {budget} exceeds "
+                f"N_max = {n_max} (D-24)"
+            )
+        n = int(points.positions.shape[0])
+        device = points.positions.device
+        keep: Tensor | None = None
+        if n > budget:
+            # Q-21: a seeded uniform subset, back in file order; the generator is used only here.
+            draw = torch.randperm(n, generator=generator, device=generator.device)[:budget]
+            keep = torch.sort(draw).values.to(device)
+
+        def kept(value: Tensor | None) -> Tensor | None:
+            return value if value is None or keep is None else value[keep]
+
+        positions = kept(points.positions)
+        colors = kept(points.colors)
+        timestamps = kept(points.timestamps)
+        velocities_tau = kept(points.velocities)
+        durations_tau = kept(points.durations)
+        frame_ids = kept(points.frame_ids)
+        assert positions is not None and colors is not None and timestamps is not None
+        m = int(positions.shape[0])
+
+        t = time.to_t(timestamps.to(torch.float64))
+        if velocities_tau is None:
+            velocities = torch.zeros(m, 3, dtype=torch.float32, device=device)  # D-23
+        else:
+            velocities = velocities_to_normalized(velocities_tau, time)  # E14, Q-27
+        if durations_tau is None:
+            durations = torch.full((m,), frame_dt, dtype=torch.float64, device=device)  # D-21
+        else:
+            durations = durations_to_normalized(durations_tau, time)  # E14, Q-27
+        if frame_ids is None:
+            # D-47: the nearest slot t_k = k·Δt_f; Q-21: ties to the lower slot, within [0, F).
+            frame_ids = torch.ceil(t / frame_dt - 0.5).clamp(0, frames - 1).to(torch.int64)
+
+        # §1.3 step 8, D-25: isotropic scales from the 3-NN within each init frame.
+        mean_distance = torch.empty(m, dtype=torch.float64, device=device)
+        for frame in torch.unique(frame_ids):
+            rows = torch.nonzero(frame_ids == frame).squeeze(1)
+            mean_distance[rows] = _knn_mean_distance(
+                positions[rows], cfg.scale_knn, cfg.scale_floor
+            )
+        log_scales = torch.log(mean_distance)[:, None].expand(m, 3)
+
+        # §1.3 step 9, D-5.
+        logit = math.log(cfg.init_opacity / (1.0 - cfg.init_opacity))
+        quats = torch.zeros(m, 4, dtype=torch.float32, device=device)
+        quats[:, 0] = 1.0
+        params = {
+            "means": positions,
+            "times": t.to(torch.float32),
+            "log_durations": torch.log(durations).to(torch.float32),
+            "velocities": velocities.to(torch.float32),
+            "log_scales": log_scales.to(torch.float32).contiguous(),
+            "quats": quats,
+            "opacity_logits": torch.full((m,), logit, dtype=torch.float32, device=device),
+            "sh0": rgb_to_sh0(colors)[:, None, :],
+            "shN": torch.zeros(m, (sh_degree + 1) ** 2 - 1, 3, dtype=torch.float32, device=device),
+        }
+        return cls(params, sh_degree=sh_degree, time=time)
 
     def _set_params(self, params: Mapping[str, Tensor]) -> None:
         """Check the §1.1 validity rules, then register the nine tensors as parameters."""
