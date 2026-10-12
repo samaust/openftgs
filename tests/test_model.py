@@ -9,6 +9,7 @@ layouts built so the answer is known.
 """
 
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -571,3 +572,225 @@ def test_u19_invalid_init_points_are_rejected() -> None:
     pts = _points([[0.0, 0.0, 0.0]], [0.0], colors=[[1.5, 0.0, 0.0]])
     with pytest.raises(ValueError):
         _init(pts, SPAN, 0.1)
+
+
+# U-22 · the exchange model (§2.2 ftgs-if; Q-17, Q-19, Q-20, Q-24, Q-25)
+
+
+def _known_model() -> FreeTimeGaussians:
+    """Four primitives whose physical values are worked by hand, with T_τ = 10 and τ₀ = 2."""
+    params = {
+        "means": torch.tensor([[1.0, 2.0, 3.0]] * 4),
+        "times": torch.tensor([0.5, 0.0, 1.0, 0.25]),
+        "log_durations": torch.tensor([math.log(0.1)] * 4),
+        "velocities": torch.tensor([[10.0, 0.0, -5.0]] * 4),
+        "log_scales": torch.tensor([[math.log(2.0), 0.0, math.log(0.5)]] * 4),
+        "quats": torch.tensor(
+            [
+                [-2.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -3.0, 4.0],
+                [1.0, 1.0, 1.0, 1.0],
+            ]
+        ),
+        "opacity_logits": torch.tensor([0.0, 20.0, -20.0, math.log(3.0)]),
+        "sh0": torch.tensor([[[0.1, 0.2, 0.3]]] * 4),
+        "shN": torch.arange(4 * 3 * 3, dtype=F32).reshape(4, 3, 3),
+    }
+    return FreeTimeGaussians(params, sh_degree=1, time=TIME, time_unit="frame")
+
+
+def test_u22_to_exchange_writes_physical_values_in_raw_time_units() -> None:
+    """§2.2 ftgs-if: τ₀ + μt·T_τ, s·T_τ, v/T_τ, exp(â), the unit quaternion with w ≥ 0 (Q-24's
+    tie-break at w = 0), sigmoid(ô) in float64 clamped to [10⁻⁷, 1 − 10⁻⁷], and concat(sh0, shN);
+    a logit of 20 exports 1 − 10⁻⁷ (U-22)."""
+    from openftgs.io import validate_exchange
+
+    model = _known_model()
+    ex = model.to_exchange()
+    a = ex.arrays
+    assert (ex.sh_degree, ex.tau0, ex.tau1, ex.time_unit) == (1, 2.0, 12.0, "frame")
+    assert ex.producer.startswith("openftgs")
+    assert a["time_center"].dtype == F64 and a["duration"].dtype == F64
+    assert all(
+        a[k].dtype == F32 for k in ("position", "velocity", "scale", "rotation", "opacity", "sh")
+    )
+    torch.testing.assert_close(a["time_center"], torch.tensor([7.0, 2.0, 12.0, 4.5], dtype=F64))
+    torch.testing.assert_close(a["duration"], torch.full((4,), 1.0, dtype=F64))
+    torch.testing.assert_close(a["velocity"], torch.tensor([[1.0, 0.0, -0.5]] * 4))
+    torch.testing.assert_close(a["scale"], torch.tensor([[2.0, 1.0, 0.5]] * 4))
+    expected_rotation = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.6, -0.8], [0.5, 0.5, 0.5, 0.5]]
+    )
+    torch.testing.assert_close(a["rotation"], expected_rotation, rtol=0, atol=1e-7)
+    expected_opacity = torch.tensor([0.5, 1.0 - 1e-7, 1e-7, 0.75], dtype=F64).to(F32)
+    assert torch.equal(a["opacity"], expected_opacity)
+    assert torch.equal(a["position"], model.means.detach())
+    assert torch.equal(a["sh"], torch.cat([model.sh0, model.shN], dim=1).detach())
+    validate_exchange(ex)
+
+
+def test_physical_returns_the_exchange_arrays_detached() -> None:
+    """Q-20: physical() gives exactly the arrays to_exchange writes, without autograd history."""
+    model = _known_model()
+    phys = model.physical()
+    arrays = model.to_exchange().arrays
+    assert set(phys) == set(arrays)
+    for key, value in phys.items():
+        assert not value.requires_grad
+        assert torch.equal(value, arrays[key]), key
+
+
+@pytest.mark.parametrize("sh_degree", [0, 1, 2, 3])
+def test_u22_export_import_export_round_trip(sh_degree: int, tmp_path: Path) -> None:
+    """U-22: export → import → export within 1e-6 relative, through a ftgs-if file; U-26's
+    FTGS-IF round trip per L; the time unit is kept (Q-17)."""
+    from openftgs.io import read_exchange, write_exchange
+
+    model = _model(n=50, sh_degree=sh_degree, seed=sh_degree, time_unit="ms")
+    first = model.to_exchange()
+    write_exchange(first, tmp_path / "m.safetensors")
+    again = FreeTimeGaussians.from_exchange(read_exchange(tmp_path / "m.safetensors"), device="cpu")
+    second = again.to_exchange()
+    assert again.sh_degree == sh_degree and again.time_unit == "ms"
+    assert again.time == model.time
+    for key, value in first.arrays.items():
+        torch.testing.assert_close(second.arrays[key], value, rtol=1e-6, atol=0, msg=key)
+
+
+def test_from_exchange_inverts_the_conversions() -> None:
+    """§2.2 ftgs-if, inverted by hand: μt = (τc − τ₀)/T_τ, ŝ = log(d/T_τ), v = v_τ·T_τ,
+    â = log a, q = rotation, ô = logit(opacity), sh split into sh0 and shN."""
+    from openftgs.types import ExchangeModel
+
+    arrays = {
+        "position": torch.tensor([[1.0, 2.0, 3.0]]),
+        "time_center": torch.tensor([7.0], dtype=F64),
+        "duration": torch.tensor([1.0], dtype=F64),
+        "velocity": torch.tensor([[1.0, 0.0, -0.5]]),
+        "scale": torch.tensor([[2.0, 1.0, 0.5]]),
+        "rotation": torch.tensor([[0.0, 0.0, 0.6, -0.8]]),
+        "opacity": torch.tensor([0.75]),
+        "sh": torch.arange(12, dtype=F32).reshape(1, 4, 3),
+    }
+    model = FreeTimeGaussians.from_exchange(
+        ExchangeModel(arrays, 1, 2.0, 12.0, "s", "test"), device="cpu"
+    )
+    torch.testing.assert_close(model.times.detach(), torch.tensor([0.5]))
+    torch.testing.assert_close(model.log_durations.detach(), torch.tensor([math.log(0.1)]))
+    torch.testing.assert_close(model.velocities.detach(), torch.tensor([[10.0, 0.0, -5.0]]))
+    torch.testing.assert_close(
+        model.log_scales.detach(), torch.tensor([[math.log(2.0), 0.0, math.log(0.5)]])
+    )
+    torch.testing.assert_close(model.quats.detach(), arrays["rotation"])
+    torch.testing.assert_close(model.opacity_logits.detach(), torch.tensor([math.log(3.0)]))
+    assert torch.equal(model.sh0.detach(), arrays["sh"][:, :1])
+    assert torch.equal(model.shN.detach(), arrays["sh"][:, 1:])
+
+
+def test_from_exchange_clamps_opacity_before_the_logit() -> None:
+    """§2.2: importers clamp opacity to [10⁻⁷, 1 − 10⁻⁷] before taking the logit; the largest
+    float32 below 1 imports as logit(1 − 10⁻⁷), not logit(1 − 2⁻²⁴)."""
+    from openftgs.types import ExchangeModel
+
+    model = _known_model()
+    ex = model.to_exchange()
+    arrays = dict(ex.arrays)
+    arrays["opacity"] = torch.tensor([0.5, 1.0 - 2.0**-24, 1e-9, 0.75])
+    back = FreeTimeGaussians.from_exchange(
+        ExchangeModel(arrays, 1, ex.tau0, ex.tau1, "s", "test"), device="cpu"
+    )
+    bound = math.log((1.0 - 1e-7) / 1e-7)
+    torch.testing.assert_close(
+        back.opacity_logits.detach()[1:3], torch.tensor([bound, -bound]), rtol=1e-6, atol=0
+    )
+
+
+def test_from_exchange_validates_its_input() -> None:
+    """Q-22: an invalid exchange model is rejected before it is converted."""
+    from openftgs.types import ExchangeModel
+
+    ex = _known_model().to_exchange()
+    arrays = dict(ex.arrays)
+    arrays["duration"] = torch.zeros(4, dtype=F64)
+    with pytest.raises(ValueError):
+        FreeTimeGaussians.from_exchange(ExchangeModel(arrays, 1, 2.0, 12.0, "s", "x"), device="cpu")
+
+
+def test_single_frame_model_exports_and_round_trips() -> None:
+    """Q-19: with T_τ = 0, duration = s and velocity = v; the model validates and round-trips."""
+    params = _params(n=3, sh_degree=0, seed=7)
+    model = FreeTimeGaussians(params, sh_degree=0, time=TimeNormalizer(4.0, 4.0))
+    ex = model.to_exchange()
+    torch.testing.assert_close(ex.arrays["duration"], torch.exp(params["log_durations"]).double())
+    torch.testing.assert_close(ex.arrays["velocity"], params["velocities"])
+    torch.testing.assert_close(ex.arrays["time_center"], torch.full((3,), 4.0, dtype=F64))
+    back = FreeTimeGaussians.from_exchange(ex, device="cpu")
+    for key, value in ex.arrays.items():
+        torch.testing.assert_close(back.to_exchange().arrays[key], value, rtol=1e-6, atol=0)
+
+
+def test_load_reads_ftgs_if_files_and_checkpoints(tmp_path: Path) -> None:
+    """§2.1 load: a checkpoint directory or a FTGS-IF file (MODEL in the CLI); the checkpoint
+    gives the nine tensors, the SH degree, the time normalizer and the time unit (Q-17)."""
+    from openftgs.config import TrainConfig, config_to_dict
+    from openftgs.io import save_checkpoint, write_exchange
+    from openftgs.types import TrainerState
+
+    model = _model(n=8, sh_degree=2, seed=3, time_unit="frame")
+    write_exchange(model.to_exchange(), tmp_path / "m.safetensors")
+    from_file = FreeTimeGaussians.load(tmp_path / "m.safetensors", device="cpu")
+    torch.testing.assert_close(from_file.means, model.means, rtol=0, atol=0)
+    assert from_file.time_unit == "frame"
+
+    params = {k: v.detach() for k, v in model.named_parameters()}
+    state = TrainerState(
+        iteration=10,
+        config=config_to_dict(TrainConfig(sh_degree=2)),
+        time=TIME,
+        spatial_scale=1.0,
+        frame_dt=0.1,
+        params=params,
+        optim={},
+        stats={},
+        rng={},
+        sampler={},
+        time_unit="frame",
+    )
+    save_checkpoint(state, tmp_path / "ckpt")
+    from_ckpt = FreeTimeGaussians.load(tmp_path / "ckpt", device="cpu")
+    assert (from_ckpt.sh_degree, from_ckpt.time, from_ckpt.time_unit) == (2, TIME, "frame")
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(from_ckpt, name).detach(), params[name]), name
+
+
+def test_load_rejects_a_checkpoint_above_its_n_max(tmp_path: Path) -> None:
+    """§1.1 validity rules: N never exceeds N_max; checked on load against the stored
+    configuration (Q-25)."""
+    from openftgs.config import GrowthConfig, TrainConfig, config_to_dict
+    from openftgs.io import save_checkpoint
+    from openftgs.types import TrainerState
+
+    model = _model(n=8)
+    state = TrainerState(
+        iteration=10,
+        config=config_to_dict(TrainConfig(growth=GrowthConfig(n_max=7))),
+        time=TIME,
+        spatial_scale=1.0,
+        frame_dt=0.1,
+        params={k: v.detach() for k, v in model.named_parameters()},
+        optim={},
+        stats={},
+        rng={},
+        sampler={},
+    )
+    save_checkpoint(state, tmp_path / "ckpt")
+    with pytest.raises(ValueError, match="N_max|n_max"):
+        FreeTimeGaussians.load(tmp_path / "ckpt", device="cpu")
+
+
+def test_io_keeps_the_same_tensor_names_as_the_model() -> None:
+    """§2.1: io may not import the model, so its copy of the nine names is pinned here."""
+    import openftgs.io
+
+    assert openftgs.io._PARAM_NAMES == FreeTimeGaussians.PARAM_NAMES

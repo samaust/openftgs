@@ -4,23 +4,32 @@
 Spec: §1.1, E5. Band: Core model (§2.1).
 """
 
+import importlib.metadata
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import Tensor
 
-from openftgs.config import InitConfig
-from openftgs.io import validate_init_points
-from openftgs.motion import durations_to_normalized, temporal_slice, velocities_to_normalized
+from openftgs.config import InitConfig, config_from_dict
+from openftgs.io import load_checkpoint, read_exchange, validate_exchange, validate_init_points
+from openftgs.motion import (
+    durations_to_normalized,
+    durations_to_raw,
+    temporal_slice,
+    velocities_to_normalized,
+    velocities_to_raw,
+)
 from openftgs.sh import rgb_to_sh0
-from openftgs.types import InitPoints, TimeNormalizer
+from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer
 
 __all__ = ["FreeTimeGaussians", "GaussiansAtTime", "covariance", "rotation_matrix"]  # Q-20
 
 _SH_DEGREES = (0, 1, 2, 3)  # D-3
 _MIN_QUAT_NORM = 1e-8  # §1.1 validity rules
+_OPACITY_EPS = 1e-7  # §2.2 ftgs-if: opacity clamped to [1e-7, 1 − 1e-7] on export and import
 
 
 # E5 (Q-20): public so the render backends and the split of E17 share one definition.
@@ -101,6 +110,21 @@ def _knn_mean_distance(positions: Tensor, k: int, floor: float) -> Tensor:
         d[local, local + start] = math.inf  # a point is not its own neighbour
         out[start:stop] = torch.topk(d, k, dim=1, largest=False).values.mean(dim=1)
     return out.clamp_min(floor)
+
+
+def _canonical_sign(quats: Tensor) -> Tensor:
+    """Q-24: the sign that makes the first nonzero component positive: w ≥ 0, and where w = 0
+    the next nonzero component decides."""
+    first = torch.argmax((quats != 0).to(torch.int8), dim=-1, keepdim=True)
+    lead = torch.gather(quats, -1, first)
+    return torch.where(lead < 0, -quats, quats)
+
+
+def _producer() -> str:
+    try:
+        return f"openftgs {importlib.metadata.version('openftgs')}"
+    except importlib.metadata.PackageNotFoundError:
+        return "openftgs"
 
 
 class FreeTimeGaussians(torch.nn.Module):
@@ -229,6 +253,87 @@ class FreeTimeGaussians(torch.nn.Module):
             "shN": torch.zeros(m, (sh_degree + 1) ** 2 - 1, 3, dtype=torch.float32, device=device),
         }
         return cls(params, sh_degree=sh_degree, time=time)
+
+    @classmethod
+    def from_exchange(cls, exchange: ExchangeModel, *, device: str = "cuda") -> "FreeTimeGaussians":
+        """A model from exchange-model contents (§2.2 ftgs-if): validated (Q-22), converted to
+        the stored forms in float64, the opacity clamped before the logit."""
+        validate_exchange(exchange)
+        a = exchange.arrays
+        time = TimeNormalizer(exchange.tau0, exchange.tau1)
+        f64 = torch.float64
+        span = time.tau1 - time.tau0
+        # E14, μt = (τc − τ₀)/T_τ, computed directly: TimeNormalizer.to_t would warn for time
+        # centers outside the training span, which are legitimate (Q-9); t ≡ 0 when T_τ = 0.
+        center = a["time_center"].to(f64)
+        times = (center - time.tau0) / span if span > 0.0 else torch.zeros_like(center)
+        opacity = a["opacity"].to(f64).clamp(_OPACITY_EPS, 1.0 - _OPACITY_EPS)
+        sh = a["sh"]
+        params = {
+            "means": a["position"],
+            "times": times,
+            "log_durations": torch.log(durations_to_normalized(a["duration"].to(f64), time)),
+            "velocities": velocities_to_normalized(a["velocity"].to(f64), time),
+            "log_scales": torch.log(a["scale"].to(f64)),
+            "quats": a["rotation"],
+            "opacity_logits": torch.logit(opacity),
+            "sh0": sh[:, :1],
+            "shN": sh[:, 1:],
+        }
+        params = {
+            k: v.to(device=device, dtype=torch.float32).contiguous() for k, v in params.items()
+        }
+        return cls(params, sh_degree=exchange.sh_degree, time=time, time_unit=exchange.time_unit)
+
+    @classmethod
+    def load(cls, path: Path, *, device: str = "cuda") -> "FreeTimeGaussians":
+        """A model from a checkpoint directory or a ftgs-if file (§2.1). From a checkpoint, a
+        model above the stored configuration's N_max is rejected (§1.1; Q-25)."""
+        path = Path(path)
+        if not path.is_dir():
+            return cls.from_exchange(read_exchange(path), device=device)
+        state = load_checkpoint(path)
+        cfg = config_from_dict(state.config)
+        model = cls(
+            {k: v.to(device) for k, v in state.params.items()},
+            sh_degree=cfg.sh_degree,
+            time=state.time,
+            time_unit=state.time_unit,
+        )
+        if model.num_gaussians > cfg.growth.n_max:
+            _fail(f"N = {model.num_gaussians} exceeds N_max = {cfg.growth.n_max}")
+        return model
+
+    def physical(self) -> dict[str, Tensor]:
+        """Activated values in raw time units under the ftgs-if keys (§2.2; Q-20): exactly the
+        arrays to_exchange writes, detached."""
+        time = self.time
+        f64 = torch.float64
+        with torch.no_grad():
+            quats = self.quats.detach()
+            unit = quats / torch.linalg.vector_norm(quats, dim=-1, keepdim=True)
+            opacity = torch.sigmoid(self.opacity_logits.detach().to(f64))
+            return {
+                "position": self.means.detach().clone(),
+                "time_center": time.to_tau(self.times.detach().to(f64)),
+                "duration": durations_to_raw(torch.exp(self.log_durations.detach().to(f64)), time),
+                "velocity": velocities_to_raw(self.velocities.detach().to(f64), time).float(),
+                "scale": torch.exp(self.log_scales.detach()),
+                "rotation": _canonical_sign(unit),
+                "opacity": opacity.clamp(_OPACITY_EPS, 1.0 - _OPACITY_EPS).float(),
+                "sh": torch.cat([self.sh0.detach(), self.shN.detach()], dim=1),
+            }
+
+    def to_exchange(self) -> ExchangeModel:
+        """The exchange model of §2.2 ftgs-if: physical values in raw time units."""
+        return ExchangeModel(
+            arrays=self.physical(),
+            sh_degree=self.sh_degree,
+            tau0=self.time.tau0,
+            tau1=self.time.tau1,
+            time_unit=self.time_unit,
+            producer=_producer(),
+        )
 
     def _set_params(self, params: Mapping[str, Tensor]) -> None:
         """Check the §1.1 validity rules, then register the nine tensors as parameters."""
