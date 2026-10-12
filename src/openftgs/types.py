@@ -121,7 +121,7 @@ class RenderOutput:
     alpha: Tensor  # [C, H, W, 1]
     # [C, N, 2] unpacked or [nnz, 2] packed; kept for gradient statistics
     means2d: Tensor | None = None
-    visible: Tensor | None = None  # [C, N] bool, unpacked mode
+    visible: Tensor | None = None  # [C, N] bool, in both layouts (packed and unpacked) (D-75)
     # [nnz] int, packed mode: the primitive behind each row of means2d
     gaussian_ids: Tensor | None = None
 

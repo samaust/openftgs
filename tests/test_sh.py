@@ -3,7 +3,8 @@
 
 The independent evaluation, `real_sh` in tests/real_sh.py, is written from the general definition
 of the real spherical harmonics, not from the table `openftgs.sh` uses. The direction, clamp and
-inactive-band parts of U-6 are in test_render.py (M4).
+inactive-band parts of U-6 are in test_render.py (M4), and the inactive-band parts on the gsplat
+backend in test_render_gsplat.py (#52).
 """
 
 import math
