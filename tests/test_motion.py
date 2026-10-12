@@ -473,6 +473,74 @@ def test__slice_auto_falls_back_once_and_compiled_raises(monkeypatch: pytest.Mon
         _slice(m, 0.5, impl="compiled")
 
 
+def _on(m: dict[str, Tensor], device: str, dtype: torch.dtype) -> dict[str, Tensor]:
+    return {k: v.to(device=device, dtype=dtype) for k, v in m.items()}
+
+
+_DEVICES = [pytest.param("cpu", id="cpu"), pytest.param("cuda", id="cuda", marks=pytest.mark.gpu)]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_slice_compiles_as_one_graph_without_breaks(device: str) -> None:
+    """D-50, Q-13 (#51): the compiled slice is one fused function: it compiles to a single graph
+    with no graph break, on CPU and CUDA."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    counters.clear()
+    _slice(_on(_model(64, 23), device, torch.float32), 0.5, impl="compiled")
+    assert int(counters["stats"]["unique_graphs"]) == 1
+    assert not counters["graph_break"], dict(counters["graph_break"])
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_slice_compiled_raises_at_the_recompile_limit(device: str) -> None:
+    """Q-13 (as amended, #51): dynamo reaching its recompile limit for the slice is a failed
+    compilation, so an explicit "compiled" raises. With the limit at 1, float32 inputs compile
+    one graph and float64 inputs would need a second."""
+    import torch._dynamo
+    from torch._dynamo.exc import FailOnRecompileLimitHit
+
+    m = _model(64, 21)
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit=1):
+            _slice(_on(m, device, torch.float32), 0.5, impl="compiled")
+            with pytest.raises(FailOnRecompileLimitHit):
+                _slice(_on(m, device, F64), 0.5, impl="compiled")
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.gpu
+def test__slice_auto_falls_back_at_the_recompile_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Q-13 (as amended, #51; private: it resets the sticky fallback): when dynamo reaches its
+    recompile limit, "auto" warns once, naming eager, and runs eager from then on, without further
+    warnings; the results equal eager."""
+    import torch._dynamo
+
+    monkeypatch.setattr(openftgs.motion, "_auto_fell_back", False)
+    m = _model(64, 22)
+    m32, m64 = _on(m, "cuda", torch.float32), _on(m, "cuda", F64)
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit=1):
+            _slice(m32, 0.5, impl="auto")
+            with pytest.warns(UserWarning, match="eager"):
+                second = _slice(m64, 0.5, impl="auto")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                third = _slice(m32, 0.5, impl="auto")
+    finally:
+        torch._dynamo.reset()
+    for got, inputs in ((second, m64), (third, m32)):
+        want = _slice(inputs, 0.5, impl="eager")
+        for f in ("means_t", "opacities_t", "quats_n", "scales", "opacities", "reg_terms"):
+            assert torch.equal(getattr(got, f), getattr(want, f)), f
+        assert torch.equal(got.passes_cull, want.passes_cull)
+
+
 def test_e14_unit_conversions_of_durations_and_velocities() -> None:
     """E14 (Q-27): s = d/T_τ, v = v_τ·T_τ, and their inverses; worked by hand with T_τ = 4."""
     from openftgs.motion import (

@@ -163,9 +163,21 @@ _auto_fell_back = False
 def _compiled_slice() -> _SliceFn:
     global _compiled
     if _compiled is None:
-        # D-50: dynamic shapes, so growth events don't recompile.
-        _compiled = torch.compile(_slice_eager, dynamic=True)
+        # D-50: dynamic shapes, so growth events don't recompile. Q-13: fullgraph, so a graph
+        # break raises at compile time and reaching dynamo's recompile limit raises
+        # FailOnRecompileLimitHit instead of running the frame eagerly unannounced.
+        _compiled = torch.compile(_slice_eager, dynamic=True, fullgraph=True)
     return _compiled
+
+
+def _compile_failures() -> tuple[type[Exception], ...]:
+    """The exceptions Q-13 counts as a failed compilation: dynamo's and its backends' errors, and
+    reaching the recompile limit, which is a plain Exception (looked up by name, so a torch
+    without it still runs)."""
+    from torch._dynamo import exc  # loaded by torch.compile anyway
+
+    limit = getattr(exc, "FailOnRecompileLimitHit", None)
+    return (exc.TorchDynamoException,) if limit is None else (exc.TorchDynamoException, limit)
 
 
 def temporal_slice(
@@ -183,9 +195,11 @@ def temporal_slice(
     """The temporal slice of a model at normalized time t (§2.4 "Kernels", D-50; Q-12).
 
     ``impl`` takes ``PerfConfig.slice_impl`` (Q-13): "eager" is plain PyTorch; "compiled" is the
-    same body through torch.compile with dynamic shapes; "auto" compiles on CUDA tensors and stays
-    eager on CPU, falling back to eager with one warning if compilation fails; "cuda" is reserved
-    for D-50's custom operator, which waits until B-1 justifies it (M15).
+    same body through torch.compile with dynamic shapes and without graph breaks, raising if
+    compilation fails; "auto" compiles on CUDA tensors and stays eager on CPU, falling back to
+    eager with one warning if compilation fails, which includes reaching dynamo's recompile
+    limit; "cuda" is reserved for D-50's custom operator, which waits until B-1 justifies it
+    (M15).
     """
     global _auto_fell_back
     if impl not in _IMPLS:
@@ -210,11 +224,9 @@ def temporal_slice(
     if impl == "compiled":
         out = _compiled_slice()(*views, t_tensor)
     else:
-        from torch._dynamo.exc import TorchDynamoException  # loaded by torch.compile anyway
-
         try:
             out = _compiled_slice()(*views, t_tensor)
-        except TorchDynamoException as exc:  # Q-13: only "auto" falls back
+        except _compile_failures() as exc:  # Q-13: only "auto" falls back
             _auto_fell_back = True
             warnings.warn(
                 f"torch.compile failed for the temporal slice; using the eager slice ({exc})",
