@@ -2,7 +2,7 @@
 
 openftgs is a clean-room Python implementation of FreeTimeGS (Wang et al., CVPR 2025), written from the paper and from the owner's spec in `docs/spec/openftgs-spec.md`. This glossary fixes the words used in the spec, the milestones, the questions file and commit messages. It says what each thing is; shapes, units, equations and file layouts belong to the spec, and the entry's closing reference points there.
 
-Conventions: the spec's symbols (μx, μt, s, v, σ, σt, ρ, g, τ, t, u, S, Δt_f) and its normative tensor names (`means`, `times`, `log_durations`, `velocities`, `log_scales`, `quats`, `opacity_logits`, `sh0`, `shN`) are canonical. Identifiers fixed by the public API of spec §2.1 (`FreeTimeGaussians`, `num_gaussians`, `gaussian_ids`, `frame_dt`, `scene_scale_factor`, `test_camera`) keep their spelling in code even where this glossary avoids the word in prose. Where the spec and the paper name one thing differently, the spec's name is canonical and the paper's is listed under _Avoid_.
+Conventions: the spec's symbols (μx, μt, s, v, σ, σt, ρ, g, τ, t, u, S, Δt_f) and its normative tensor names (`means`, `times`, `log_durations`, `velocities`, `log_scales`, `quats`, `opacity_logits`, `sh0`, `shN`) are canonical. Identifiers fixed by the public API of spec §2.1 (`FreeTimeGaussians`, `num_gaussians`, `gaussian_ids`, `means2d`, `frame_dt`, `scene_scale_factor`, `test_camera`) keep their spelling in code even where this glossary avoids the word in prose. Where the spec and the paper name one thing differently, the spec's name is canonical and the paper's is listed under _Avoid_.
 
 ## Language
 
@@ -285,7 +285,7 @@ A primitive's moved position projected into an image, in pixels under the contin
 _Avoid_: means2d (the RenderOutput field holding it), projected mean, screen position, image-space mean
 
 **Screen radii**:
-The two whole-pixel half-widths, along x and y, of the box around a primitive's 2D mean that holds every pixel its alpha can reach 1/255 at, set by the opacity-aware extent of at most 3.33 standard deviations; both are zero for a culled primitive. E6
+The two whole-pixel half-widths, along x and y, of the box around a primitive's 2D mean that holds every pixel where its alpha is not skipped, scaled to its effective opacity; both are zero for a culled primitive. E6
 _Avoid_: radius (unqualified), footprint, splat size, bounding radius
 
 **Visible primitive**:
@@ -301,7 +301,7 @@ The explicit placement of the opacity cull: rows whose effective opacity is belo
 _Avoid_: pre-culling, pruning (reserved for the ablation's deletion of primitives from the model), filtering
 
 **Transmittance T**:
-At one pixel, the product of (1 − α) over the primitives already composited front to back: the share of light still passing to what lies behind; a pixel stops before the primitive that would bring it to 10⁻⁴ or below. E6
+At one pixel, the product of (1 − α) over the primitives already composited front to back: the share of light still passing to what lies behind, and the quantity whose threshold ends a pixel's compositing. E6
 _Avoid_: visibility (reserved for visible primitives), transparency, accumulated alpha (its complement, the render's alpha output)
 
 **Packed mode**:
