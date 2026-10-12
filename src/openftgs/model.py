@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FreeTimeGaussians: the nine stored tensors, their activations and at_time().
+"""FreeTimeGaussians: the nine stored tensors, their activations and at_time(); initialization
+from init points (steps 7–9), the exchange model in both directions, and E5.
 
-Spec: §1.1, E5. Band: Core model (§2.1).
+Spec: §1.1, §1.3 Initialization, §2.2 ftgs-if, E5, E14. Band: Core model (§2.1).
 """
 
 import importlib.metadata
 import math
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, NoReturn
 
 import torch
 from torch import Tensor
@@ -30,6 +33,7 @@ __all__ = ["FreeTimeGaussians", "GaussiansAtTime", "covariance", "rotation_matri
 _SH_DEGREES = (0, 1, 2, 3)  # D-3
 _MIN_QUAT_NORM = 1e-8  # §1.1 validity rules
 _OPACITY_EPS = 1e-7  # §2.2 ftgs-if: opacity clamped to [1e-7, 1 − 1e-7] on export and import
+_KNN_CHUNK = 1 << 24  # distances held at once by the 3-NN search (rows × points)
 
 
 # E5 (Q-20): public so the render backends and the split of E17 share one definition.
@@ -75,19 +79,15 @@ class GaussiansAtTime:
     passes_cull: Tensor  # [N] bool, σ_eff ≥ 1/255 (D-32)
 
 
-def _fail(reason: str) -> None:
+def _fail(reason: str) -> NoReturn:
     # Q-26: every rejection is a plain ValueError.
     raise ValueError(f"FreeTimeGaussians: {reason}")
 
 
-def _check_sh_degree(sh_degree: object) -> int:
-    if (
-        isinstance(sh_degree, bool)
-        or not isinstance(sh_degree, int)
-        or sh_degree not in _SH_DEGREES
-    ):
-        _fail(f"sh_degree must be one of {_SH_DEGREES}, got {sh_degree!r}")
-    assert isinstance(sh_degree, int)
+def _check_sh_degree(sh_degree: object, allowed: tuple[int, ...] = _SH_DEGREES) -> int:
+    """An int (not a bool) among `allowed` (D-3)."""
+    if isinstance(sh_degree, bool) or not isinstance(sh_degree, int) or sh_degree not in allowed:
+        _fail(f"sh_degree must be one of {allowed}, got {sh_degree!r}")
     return sh_degree
 
 
@@ -102,7 +102,7 @@ def _knn_mean_distance(positions: Tensor, k: int, floor: float) -> Tensor:
     k = min(k, n - 1)
     x = positions.to(torch.float64)
     out = torch.empty(n, dtype=torch.float64, device=x.device)
-    rows = max(1, (1 << 24) // n)
+    rows = max(1, _KNN_CHUNK // n)
     for start in range(0, n, rows):
         stop = min(n, start + rows)
         d = torch.cdist(x[start:stop], x, compute_mode="donot_use_mm_for_euclid_dist")
@@ -164,8 +164,10 @@ class FreeTimeGaussians(torch.nn.Module):
         self.sh_degree = _check_sh_degree(sh_degree)
         self.time = time
         self.time_unit = time_unit  # Q-17
-        self._slice_impl = "auto"  # Q-13; how PerfConfig.slice_impl reaches it is M10's
-        self._set_params(params)
+        # Q-13; how PerfConfig.slice_impl reaches it is M10's.
+        self._slice_impl: Literal["auto", "eager", "compiled", "cuda"] = "auto"
+        # §2.1: the caller's tensors are plain data, so the parameters get their own storage.
+        self._set_params({k: v.detach().clone() for k, v in params.items()})
 
     @classmethod
     def from_init_points(
@@ -188,6 +190,7 @@ class FreeTimeGaussians(torch.nn.Module):
         if not (math.isfinite(frame_dt) and frame_dt > 0.0):
             _fail(f"frame_dt must be finite and positive, got {frame_dt!r}")
         # §1.3 step 7: F frames of the sequence, 1 for a single timestamp; Q-21: round half up.
+        # Q-28: the total cap F·B, for points from every source.
         frames = 1 if time.tau1 == time.tau0 else math.floor(1.0 / frame_dt + 0.5) + 1
         budget = frames * cfg.points_per_frame
         if n_max is not None and budget > n_max:
@@ -259,23 +262,25 @@ class FreeTimeGaussians(torch.nn.Module):
         """A model from exchange-model contents (§2.2 ftgs-if): validated (Q-22), converted to
         the stored forms in float64, the opacity clamped before the logit."""
         validate_exchange(exchange)
-        a = exchange.arrays
+        arrays = exchange.arrays
         time = TimeNormalizer(exchange.tau0, exchange.tau1)
         f64 = torch.float64
-        span = time.tau1 - time.tau0
-        # E14, μt = (τc − τ₀)/T_τ, computed directly: TimeNormalizer.to_t would warn for time
-        # centers outside the training span, which are legitimate (Q-9); t ≡ 0 when T_τ = 0.
-        center = a["time_center"].to(f64)
-        times = (center - time.tau0) / span if span > 0.0 else torch.zeros_like(center)
-        opacity = a["opacity"].to(f64).clamp(_OPACITY_EPS, 1.0 - _OPACITY_EPS)
-        sh = a["sh"]
+        with warnings.catch_warnings():
+            # E14 through TimeNormalizer (Q-27): time centers outside the training span are
+            # legitimate (Q-9), so to_t's warning doesn't apply to them.
+            warnings.simplefilter("ignore", UserWarning)
+            times = time.to_t(arrays["time_center"].to(f64))
+        opacity = arrays["opacity"].to(f64).clamp(_OPACITY_EPS, 1.0 - _OPACITY_EPS)
+        rotation = arrays["rotation"]
+        sh = arrays["sh"]
         params = {
-            "means": a["position"],
+            "means": arrays["position"],
             "times": times,
-            "log_durations": torch.log(durations_to_normalized(a["duration"].to(f64), time)),
-            "velocities": velocities_to_normalized(a["velocity"].to(f64), time),
-            "log_scales": torch.log(a["scale"].to(f64)),
-            "quats": a["rotation"],
+            "log_durations": torch.log(durations_to_normalized(arrays["duration"].to(f64), time)),
+            "velocities": velocities_to_normalized(arrays["velocity"].to(f64), time),
+            "log_scales": torch.log(arrays["scale"].to(f64)),
+            # Q-24: the importer normalizes the rotation.
+            "quats": rotation / torch.linalg.vector_norm(rotation, dim=-1, keepdim=True),
             "opacity_logits": torch.logit(opacity),
             "sh0": sh[:, :1],
             "shN": sh[:, 1:],
@@ -305,7 +310,7 @@ class FreeTimeGaussians(torch.nn.Module):
         return model
 
     def physical(self) -> dict[str, Tensor]:
-        """Activated values in raw time units under the ftgs-if keys (§2.2; Q-20): exactly the
+        """Physical values in raw time units under the ftgs-if keys (§2.2; Q-20): exactly the
         arrays to_exchange writes, detached."""
         time = self.time
         f64 = torch.float64
@@ -336,7 +341,8 @@ class FreeTimeGaussians(torch.nn.Module):
         )
 
     def _set_params(self, params: Mapping[str, Tensor]) -> None:
-        """Check the §1.1 validity rules, then register the nine tensors as parameters."""
+        """Check the §1.1 validity rules, then register the nine tensors as parameters, sharing
+        their storage."""
         if set(params) != set(self.PARAM_NAMES):
             _fail(f"params must hold exactly {self.PARAM_NAMES}, got {sorted(params)}")
         n = int(params["means"].shape[0]) if params["means"].dim() == 2 else -1
@@ -372,16 +378,11 @@ class FreeTimeGaussians(torch.nn.Module):
     def num_gaussians(self) -> int:
         return int(self.means.shape[0])
 
-    def at_time(self, t: float | Tensor, *, sh_degree: int | None = None) -> GaussiansAtTime:
+    def at_time(self, t: float, *, sh_degree: int | None = None) -> GaussiansAtTime:
         """The per-time arrays at normalized time t (§1.1), with SH cut to `sh_degree` bands
         (default: the model's degree; Q-20)."""
         degree = self.sh_degree if sh_degree is None else sh_degree
-        if (
-            isinstance(degree, bool)
-            or not isinstance(degree, int)
-            or not 0 <= degree <= self.sh_degree
-        ):
-            _fail(f"sh_degree must be an int in [0, {self.sh_degree}], got {sh_degree!r}")
+        degree = _check_sh_degree(degree, tuple(range(self.sh_degree + 1)))
         s = temporal_slice(
             self.means,
             self.times,
@@ -391,7 +392,7 @@ class FreeTimeGaussians(torch.nn.Module):
             self.quats,
             self.opacity_logits,
             t,
-            impl=self._slice_impl,  # type: ignore[arg-type]
+            impl=self._slice_impl,
         )
         sh = torch.cat([self.sh0, self.shN[:, : (degree + 1) ** 2 - 1]], dim=1)
         return GaussiansAtTime(
@@ -411,6 +412,7 @@ class FreeTimeGaussians(torch.nn.Module):
         """Keep the rows `keep` selects, in their old order, then append the rows of `append`
         last (§1.3 Growth step 4). `keep` is a bool mask [N] or strictly increasing int64
         indices (Q-23). The result is revalidated; on error the model is unchanged."""
+        # Q-23: keep is a mask or strictly increasing indices; append matches shape and dtype.
         n = self.num_gaussians
         if keep is not None:
             if keep.dtype == torch.bool:
@@ -436,6 +438,8 @@ class FreeTimeGaussians(torch.nn.Module):
                 extra = append[name]
                 if extra.dim() != value.dim() or extra.shape[1:] != value.shape[1:]:
                     _fail(f"append[{name!r}] must have rows of shape {list(value.shape[1:])}")
+                if extra.dtype != value.dtype:
+                    _fail(f"append[{name!r}] must be {value.dtype}, got {extra.dtype}")
                 value = torch.cat([value, extra.to(value.device)])
             params[name] = value
         self._set_params(params)

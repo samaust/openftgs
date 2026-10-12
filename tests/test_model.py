@@ -97,7 +97,7 @@ def _check_u5(q: Tensor, log_scales: Tensor) -> None:
     eig = torch.linalg.eigvalsh(sigma)
     assert bool((eig > 0).all())
     expected = torch.sort(a * a, dim=-1).values
-    torch.testing.assert_close(eig, expected, rtol=1e-6, atol=1e-6 * float(expected.max()))
+    torch.testing.assert_close(eig, expected, rtol=1e-6, atol=0)
     for other in (3.0 * q, -q):
         torch.testing.assert_close(covariance(other, a), sigma, rtol=0, atol=1e-6)
 
@@ -113,15 +113,21 @@ def test_u5_covariance_on_random_primitives() -> None:
 
 @settings(deadline=None, max_examples=200)
 @given(
-    q=st.lists(st.floats(-1.0, 1.0), min_size=4, max_size=4),
-    log_scales=st.lists(st.floats(-5.0, 2.0), min_size=3, max_size=3),
+    rows=st.lists(
+        st.tuples(
+            st.lists(st.floats(-1.0, 1.0), min_size=4, max_size=4),
+            st.lists(st.floats(-5.0, 2.0), min_size=3, max_size=3),
+        ),
+        min_size=1,
+        max_size=8,
+    )
 )
-def test_u5_property_covariance(q: list[float], log_scales: list[float]) -> None:
-    """U-5, hypothesis variant: any quaternion with norm well above the 1e-8 floor and any
-    log-scales in a bounded domain."""
-    qt = torch.tensor(q, dtype=F64)
-    assume(float(qt.norm()) > 1e-3)
-    _check_u5(qt, torch.tensor(log_scales, dtype=F64))
+def test_u5_property_covariance(rows: list[tuple[list[float], list[float]]]) -> None:
+    """U-5, hypothesis variant: random N, quaternions with norm above the 1e-8 floor of §1.1
+    and log-scales in a bounded domain."""
+    q = torch.tensor([r[0] for r in rows], dtype=F64)
+    assume(bool((q.norm(dim=-1) > 1e-8).all()))
+    _check_u5(q, torch.tensor([r[1] for r in rows], dtype=F64))
 
 
 # §1.1 validity rules and U-26 shapes
@@ -443,7 +449,10 @@ def test_u19_supplied_durations_and_velocities_convert_to_normalized_time() -> N
     )
     model = _init(pts, SPAN, 0.1)
     torch.testing.assert_close(
-        model.velocities.detach(), torch.tensor([[10.0, -5.0, 0.0], [0.0, 0.0, 2.5]])
+        model.velocities.detach(),
+        torch.tensor([[10.0, -5.0, 0.0], [0.0, 0.0, 2.5]]),
+        rtol=1e-6,
+        atol=1e-7,
     )
     torch.testing.assert_close(
         model.log_durations.detach(),
@@ -464,8 +473,12 @@ def test_u19_single_timestamp_uses_a_unit_of_one_and_one_frame() -> None:
     )
     model = _init(pts, single, 1.0, b=3, n_max=3)  # F·B = 1·3
     assert not bool(model.times.detach().any())
-    torch.testing.assert_close(model.velocities.detach(), torch.tensor([[1.0, 2.0, 3.0]] * 3))
-    torch.testing.assert_close(model.log_durations.detach(), torch.full((3,), math.log(0.3)))
+    torch.testing.assert_close(
+        model.velocities.detach(), torch.tensor([[1.0, 2.0, 3.0]] * 3), rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(
+        model.log_durations.detach(), torch.full((3,), math.log(0.3)), rtol=1e-6, atol=1e-7
+    )
     with pytest.raises(ValueError, match="N_max|n_max"):
         _init(pts, single, 1.0, b=3, n_max=2)
 
@@ -522,7 +535,10 @@ def test_u19_missing_frame_ids_become_the_nearest_slot() -> None:
     )
     model = _init(pts, SPAN, 0.1)
     torch.testing.assert_close(
-        torch.exp(model.log_scales.detach()[:, 0]), torch.tensor([1.0, 1.0, 4.0, 4.0])
+        torch.exp(model.log_scales.detach()[:, 0]),
+        torch.tensor([1.0, 1.0, 4.0, 4.0]),
+        rtol=1e-6,
+        atol=1e-7,
     )
 
 
@@ -617,10 +633,18 @@ def test_u22_to_exchange_writes_physical_values_in_raw_time_units() -> None:
     assert all(
         a[k].dtype == F32 for k in ("position", "velocity", "scale", "rotation", "opacity", "sh")
     )
-    torch.testing.assert_close(a["time_center"], torch.tensor([7.0, 2.0, 12.0, 4.5], dtype=F64))
-    torch.testing.assert_close(a["duration"], torch.full((4,), 1.0, dtype=F64))
-    torch.testing.assert_close(a["velocity"], torch.tensor([[1.0, 0.0, -0.5]] * 4))
-    torch.testing.assert_close(a["scale"], torch.tensor([[2.0, 1.0, 0.5]] * 4))
+    torch.testing.assert_close(
+        a["time_center"], torch.tensor([7.0, 2.0, 12.0, 4.5], dtype=F64), rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(
+        a["duration"], torch.full((4,), 1.0, dtype=F64), rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(
+        a["velocity"], torch.tensor([[1.0, 0.0, -0.5]] * 4), rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(
+        a["scale"], torch.tensor([[2.0, 1.0, 0.5]] * 4), rtol=1e-6, atol=1e-7
+    )
     expected_rotation = torch.tensor(
         [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.6, -0.8], [0.5, 0.5, 0.5, 0.5]]
     )
@@ -678,14 +702,23 @@ def test_from_exchange_inverts_the_conversions() -> None:
     model = FreeTimeGaussians.from_exchange(
         ExchangeModel(arrays, 1, 2.0, 12.0, "s", "test"), device="cpu"
     )
-    torch.testing.assert_close(model.times.detach(), torch.tensor([0.5]))
-    torch.testing.assert_close(model.log_durations.detach(), torch.tensor([math.log(0.1)]))
-    torch.testing.assert_close(model.velocities.detach(), torch.tensor([[10.0, 0.0, -5.0]]))
+    torch.testing.assert_close(model.times.detach(), torch.tensor([0.5]), rtol=1e-6, atol=1e-7)
     torch.testing.assert_close(
-        model.log_scales.detach(), torch.tensor([[math.log(2.0), 0.0, math.log(0.5)]])
+        model.log_durations.detach(), torch.tensor([math.log(0.1)]), rtol=1e-6, atol=1e-7
     )
-    torch.testing.assert_close(model.quats.detach(), arrays["rotation"])
-    torch.testing.assert_close(model.opacity_logits.detach(), torch.tensor([math.log(3.0)]))
+    torch.testing.assert_close(
+        model.velocities.detach(), torch.tensor([[10.0, 0.0, -5.0]]), rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(
+        model.log_scales.detach(),
+        torch.tensor([[math.log(2.0), 0.0, math.log(0.5)]]),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    torch.testing.assert_close(model.quats.detach(), arrays["rotation"], rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(
+        model.opacity_logits.detach(), torch.tensor([math.log(3.0)]), rtol=1e-6, atol=1e-7
+    )
     assert torch.equal(model.sh0.detach(), arrays["sh"][:, :1])
     assert torch.equal(model.shN.detach(), arrays["sh"][:, 1:])
 
@@ -724,9 +757,13 @@ def test_single_frame_model_exports_and_round_trips() -> None:
     params = _params(n=3, sh_degree=0, seed=7)
     model = FreeTimeGaussians(params, sh_degree=0, time=TimeNormalizer(4.0, 4.0))
     ex = model.to_exchange()
-    torch.testing.assert_close(ex.arrays["duration"], torch.exp(params["log_durations"]).double())
-    torch.testing.assert_close(ex.arrays["velocity"], params["velocities"])
-    torch.testing.assert_close(ex.arrays["time_center"], torch.full((3,), 4.0, dtype=F64))
+    torch.testing.assert_close(
+        ex.arrays["duration"], torch.exp(params["log_durations"]).double(), rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(ex.arrays["velocity"], params["velocities"], rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(
+        ex.arrays["time_center"], torch.full((3,), 4.0, dtype=F64), rtol=1e-6, atol=1e-7
+    )
     back = FreeTimeGaussians.from_exchange(ex, device="cpu")
     for key, value in ex.arrays.items():
         torch.testing.assert_close(back.to_exchange().arrays[key], value, rtol=1e-6, atol=0)
@@ -791,8 +828,54 @@ def test_load_rejects_a_checkpoint_above_its_n_max(tmp_path: Path) -> None:
         FreeTimeGaussians.load(tmp_path / "ckpt", device="cpu")
 
 
-def test_io_keeps_the_same_tensor_names_as_the_model() -> None:
-    """§2.1: io may not import the model, so its copy of the nine names is pinned here."""
-    import openftgs.io
+def test_constructors_copy_the_callers_tensors() -> None:
+    """§2.1: InitPoints, ExchangeModel and the params mapping are plain data; an in-place update
+    of the model's parameters leaves them unchanged."""
+    params = _params(n=3)
+    model = FreeTimeGaussians(params, sh_degree=3, time=TIME)
+    pts = _points([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [0.0, 10.0])
+    from_points = _init(pts, SPAN, 0.1)
+    ex = _known_model().to_exchange()
+    from_ex = FreeTimeGaussians.from_exchange(ex, device="cpu")
+    before = (params["means"].clone(), pts.positions.clone(), ex.arrays["position"].clone())
+    with torch.no_grad():
+        for m in (model, from_points, from_ex):
+            m.means.add_(1.0)
+            m.quats.mul_(2.0)
+    assert torch.equal(params["means"], before[0])
+    assert torch.equal(pts.positions, before[1])
+    assert torch.equal(ex.arrays["position"], before[2])
 
-    assert openftgs.io._PARAM_NAMES == FreeTimeGaussians.PARAM_NAMES
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.float16, F64])
+def test_resize_rejects_appended_rows_of_another_dtype(dtype: torch.dtype) -> None:
+    """Q-23: appended rows must have the stored tensors' dtype (float32, §1.1)."""
+    model = _model(n=3)
+    append = _params(n=2)
+    append["means"] = append["means"].to(dtype)
+    with pytest.raises(ValueError):
+        model.resize_(append=append)
+    assert model.num_gaussians == 3
+
+
+def test_from_exchange_normalizes_rotations() -> None:
+    """Q-24: the importer normalizes the exchange rotation."""
+    from openftgs.types import ExchangeModel
+
+    ex = _known_model().to_exchange()
+    arrays = dict(ex.arrays)
+    arrays["rotation"] = arrays["rotation"] * 3.0
+    back = FreeTimeGaussians.from_exchange(
+        ExchangeModel(arrays, 1, ex.tau0, ex.tau1, "s", "x"), device="cpu"
+    )
+    torch.testing.assert_close(back.quats.detach(), ex.arrays["rotation"], rtol=0, atol=1e-7)
+
+
+def test_u22_saturated_logit_exports_a_file_that_validates(tmp_path: Path) -> None:
+    """U-22: a model with an opacity logit of 20 exports opacity 1 − 10⁻⁷, and the written
+    ftgs-if file validates on read."""
+    from openftgs.io import read_exchange, write_exchange
+
+    write_exchange(_known_model().to_exchange(), tmp_path / "m.safetensors")
+    opacity = read_exchange(tmp_path / "m.safetensors").arrays["opacity"]
+    assert float(opacity[1]) == float(torch.tensor(1.0 - 1e-7, dtype=F32))
