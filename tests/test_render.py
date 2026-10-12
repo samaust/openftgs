@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 import torch
-from builders import UNIT_TIME, pinhole
+from builders import UNIT_TIME, pinhole, random_model, ring
 
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
@@ -270,3 +270,106 @@ def test_e6_box_touching_the_image_edge_counts_as_off_it() -> None:
     assert out.means2d is not None and out.visible is not None
     assert out.means2d[0, [1, 3], 0].tolist() == [65.9375, -1.9375]
     assert out.visible.tolist() == [[False, True, False, True]]
+
+
+# U-6 · E2 color, the parts that need a renderer (D-4; the basis parts are in test_sh.py)
+
+
+def _band1(index: int, values: Sequence[float]) -> list[list[float]]:
+    """shN of degree 1 with one l = 1 coefficient set: index 0, 1, 2 is m = −1, 0, +1, whose
+    basis functions are C₁·(−y), C₁·z and C₁·(−x) (Q-14)."""
+    rows = [[0.0, 0.0, 0.0] for _ in range(3)]
+    rows[index] = list(values)
+    return rows
+
+
+def test_u6_direction_from_the_moved_mean_flips_the_l1_response() -> None:
+    """U-6: a primitive moving past the camera, from (−3, 0, 4) at t = 0 to (3, 0, 4) at t = 1
+    (μx = (0, 0, 4) at μt = 0.5), with only the m = +1 coefficient 1/(2.4·C₁) in channel 0. The
+    direction from the moved mean, (∓0.6, 0, 0.8), gives the l = 1 response ±0.25, so the centered
+    pixels read 0.5·0.75 = 0.375 at t = 0 and 0.5·0.25 = 0.125 at t = 1; the stored mean would give
+    the response 0 and 0.25 both times."""
+    s = 1.0 / (2.4 * C1)
+    row = {"mean": (0.0, 0.0, 4.0), "velocity": (6.0, 0.0, 0.0), "shN": _band1(2, (s, 0.0, 0.0))}
+    model = _model([row], sh_degree=1)
+    for t, pixel, red in [(0.0, (24, 20), 0.375), (1.0, (24, 44), 0.125)]:
+        image = _render(model, CAM_A, t).image.detach()
+        torch.testing.assert_close(
+            image[0, pixel[0], pixel[1]], torch.tensor([red, 0.25, 0.25]), rtol=0, atol=1e-6
+        )
+
+
+def test_u6_direction_starts_at_the_camera_center() -> None:
+    """U-6, E2: world_to_camera = [[0, 0, −1, 0], [0, 1, 0, 0], [1, 0, 0, 4]] puts the camera
+    center o = −R_wᵀ t_w at (−4, 0, 0), so a row at the origin is seen along d = (1, 0, 0) and lands
+    on pixel (24, 32). The m = +1 coefficient 1/(4·C₁) in channel 0 gives −0.25 (0.5·0.25 = 0.125
+    on screen) and the m = 0 coefficient 1/(4·C₁) in channel 1 gives 0 (0.25 on screen); the
+    camera-frame direction (0, 0, 1) would give 0.25 and 0.375 instead."""
+    w2c = [[0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 4.0]]
+    camera = pinhole(64, 48, fx=16.0, fy=16.0, cx=32.5, cy=24.5, world_to_camera=w2c)
+    k = 1.0 / (4.0 * C1)
+    sh_n = [[0.0, 0.0, 0.0], [0.0, k, 0.0], [k, 0.0, 0.0]]
+    model = _model([{"mean": (0.0, 0.0, 0.0), "shN": sh_n}], sh_degree=1)
+    image = _render(model, camera, 0.5).image.detach()
+    torch.testing.assert_close(
+        image[0, 24, 32], torch.tensor([0.125, 0.25, 0.25]), rtol=0, atol=1e-6
+    )
+
+
+def test_u6_negative_sums_clamp_to_zero_per_channel() -> None:
+    """U-6, E2: sh0 = (−5, 0, 1) gives the color (max(0, 0.5 − 5·C₀), 0.5, 0.5 + C₀) = (0, 0.5,
+    0.782): the red channel is exactly 0 on screen and its gradient with respect to the clamped
+    coefficient is exactly 0, while the other channels keep theirs."""
+    model = _model([{"mean": (0.0, 0.0, 4.0), "sh0": (-5.0, 0.0, 1.0)}])
+    pixel = _render(model, CAM_A, 0.5).image[0, 24, 32]
+    torch.testing.assert_close(
+        pixel.detach(), torch.tensor([0.0, 0.25, 0.5 * (0.5 + C0)]), rtol=0, atol=1e-6
+    )
+    assert pixel[0].item() == 0.0
+    (grad,) = torch.autograd.grad(pixel.sum(), model.sh0)
+    assert grad[0, 0, 0].item() == 0.0
+    torch.testing.assert_close(grad[0, 0, 1:], torch.full((2,), 0.5 * C0), rtol=1e-6, atol=0)
+
+
+def test_e2_colors_are_not_clamped_at_one() -> None:
+    """E2, E7: colors are clamped only at 0, so a color of 1.6 at α = 0.999 renders 0.999·1.6."""
+    model = _model([{"mean": (0.0, 0.0, 4.0), "logit": 20.0, "sh0": _sh0((1.6, 1.6, 1.6))}])
+    image = _render(model, CAM_A, 0.5).image.detach()
+    torch.testing.assert_close(image[0, 24, 32], torch.full((3,), 0.999 * 1.6), rtol=0, atol=1e-6)
+
+
+def _band_scene(seed: int, *, sh_degree: int = 3) -> FreeTimeGaussians:
+    return random_model(20, seed=seed, sh_degree=sh_degree, spread=0.6)
+
+
+def test_u6_inactive_bands_contribute_nothing() -> None:
+    """U-6, E13: rendered with sh_degree = 1, a degree-3 model equals the degree-1 model holding
+    only its first three higher bands, whatever its bands 2 and 3 hold, and those bands get exactly
+    zero gradient."""
+    cameras = ring(2)
+    model = _band_scene(0)
+    params = {name: getattr(model, name).detach() for name in _PARAM_NAMES}
+    low = FreeTimeGaussians({**params, "shN": params["shN"][:, :3]}, sh_degree=1, time=model.time)
+    expected = _render(low, cameras, 0.4).image.detach()
+    out = _render(model, cameras, 0.4, sh_degree=1)
+    assert torch.equal(out.image.detach(), expected)
+    (grad,) = torch.autograd.grad(out.image.sum(), model.shN)
+    assert torch.equal(grad[:, 3:], torch.zeros_like(grad[:, 3:]))
+    assert bool(grad[:, :3].abs().sum() > 0)
+    other = FreeTimeGaussians(
+        {**params, "shN": torch.cat([params["shN"][:, :3], -params["shN"][:, 3:]], dim=1)},
+        sh_degree=3,
+        time=model.time,
+    )
+    assert torch.equal(_render(other, cameras, 0.4, sh_degree=1).image.detach(), expected)
+
+
+def test_u6_degree_zero_renders_the_dc_color() -> None:
+    """U-6: with sh_degree = 0 a centered pixel of a row with higher-band energy reads
+    σ·(C₀·c₀₀ + 0.5) = 0.5·(C₀·c₀₀ + 0.5)."""
+    sh0 = (0.3, -0.2, 0.9)
+    sh_n = [[0.4, -0.3, 0.2]] * 15
+    model = _model([{"mean": (0.0, 0.0, 4.0), "sh0": sh0, "shN": sh_n}], sh_degree=3)
+    image = _render(model, CAM_A, 0.5, sh_degree=0).image.detach()
+    expected = torch.tensor([0.5 * (C0 * c + 0.5) for c in sh0])
+    torch.testing.assert_close(image[0, 24, 32], expected, rtol=0, atol=1e-6)
