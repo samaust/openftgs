@@ -12,12 +12,14 @@ import math
 from collections.abc import Sequence
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from builders import UNIT_TIME, pinhole, random_model, ring
 
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
+from openftgs.sh import sh_basis
 from openftgs.types import Camera, RenderOutput, TimeNormalizer
 
 F32 = torch.float32
@@ -373,3 +375,124 @@ def test_u6_degree_zero_renders_the_dc_color() -> None:
     image = _render(model, CAM_A, 0.5, sh_degree=0).image.detach()
     expected = torch.tensor([0.5 * (C0 * c + 0.5) for c in sh0])
     torch.testing.assert_close(image[0, 24, 32], expected, rtol=0, atol=1e-6)
+
+
+# An independent float64 evaluation of E1 to E6, pixel by pixel
+
+
+def _oracle(
+    model: FreeTimeGaussians, camera: Camera, t: float, background: Sequence[float]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Image [H, W, 3], alpha [H, W] and visibility [N] of one camera by E1–E6, in float64 NumPy
+    with an explicit loop over pixels and depth-sorted primitives. Only `sh_basis` (pinned by U-6
+    in test_sh.py) is shared with the code under test."""
+    p = {name: getattr(model, name).detach().to(F64).numpy() for name in _PARAM_NAMES}
+    n = p["means"].shape[0]
+    means_t = p["means"] + p["velocities"] * (t - p["times"])[:, None]  # E1
+    sigma_t = np.exp(-0.5 * ((t - p["times"]) / np.exp(p["log_durations"])) ** 2)  # E4
+    opacity = sigma_t / (1.0 + np.exp(-p["opacity_logits"]))  # E3
+    w, x, y, z = (p["quats"] / np.linalg.norm(p["quats"], axis=1, keepdims=True)).T
+    rot = np.stack(  # E5
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    ).transpose(2, 0, 1)
+    rs = rot * np.exp(p["log_scales"])[:, None, :]
+    cov = rs @ rs.transpose(0, 2, 1)
+    k_mat = camera.K.to(F64).numpy()
+    w2c = camera.world_to_camera.to(F64).numpy()
+    r_w, t_w = w2c[:3, :3], w2c[:3, 3]
+    fx, fy, cx, cy = k_mat[0, 0], k_mat[1, 1], k_mat[0, 2], k_mat[1, 2]
+    width, height = camera.width, camera.height
+    center = -r_w.T @ t_w
+    dirs = torch.from_numpy(means_t - center)
+    sh = np.concatenate([p["sh0"], p["shN"]], axis=1)
+    basis = sh_basis(dirs, model.sh_degree).numpy()
+    colors = np.maximum(0.0, (sh * basis[:, :, None]).sum(axis=1) + 0.5)  # E2
+
+    mean2d = np.zeros((n, 2))
+    conic = np.zeros((n, 2, 2))
+    depth = np.zeros(n)
+    visible = np.zeros(n, dtype=bool)
+    for i in range(n):
+        xc = r_w @ means_t[i] + t_w
+        depth[i] = xc[2]
+        if not 0.01 <= xc[2] <= 1e10 or opacity[i] < 1.0 / 255.0:
+            continue
+        mean2d[i] = (fx * xc[0] / xc[2] + cx, fy * xc[1] / xc[2] + cy)
+        lim_x = (cx / fx + 0.15 * width / fx, (width - cx) / fx + 0.15 * width / fx)
+        lim_y = (cy / fy + 0.15 * height / fy, (height - cy) / fy + 0.15 * height / fy)
+        tx = min(max(xc[0] / xc[2], -lim_x[0]), lim_x[1])
+        ty = min(max(xc[1] / xc[2], -lim_y[0]), lim_y[1])
+        jac = np.array([[fx / xc[2], 0.0, -fx * tx / xc[2]], [0.0, fy / xc[2], -fy * ty / xc[2]]])
+        cov2d = jac @ r_w @ cov[i] @ r_w.T @ jac.T + 0.3 * np.eye(2)
+        det = cov2d[0, 0] * cov2d[1, 1] - cov2d[0, 1] ** 2
+        if not det > 0:
+            continue
+        extent = min(3.33, math.sqrt(2.0 * math.log(255.0 * opacity[i])))
+        rx = math.ceil(extent * math.sqrt(cov2d[0, 0]))
+        ry = math.ceil(extent * math.sqrt(cov2d[1, 1]))
+        mx, my = mean2d[i]
+        if mx + rx <= 0 or mx - rx >= width or my + ry <= 0 or my - ry >= height:
+            continue
+        visible[i] = rx > 0 and ry > 0
+        conic[i] = np.linalg.inv(cov2d)
+    order = [i for i in np.lexsort((np.arange(n), depth)) if visible[i]]
+
+    image = np.zeros((height, width, 3))
+    alpha_out = np.zeros((height, width))
+    for v in range(height):
+        for u in range(width):
+            pix = np.array([u + 0.5, v + 0.5])
+            color, trans = np.zeros(3), 1.0
+            for i in order:
+                d = pix - mean2d[i]
+                quad = 0.5 * d @ conic[i] @ d
+                if quad < 0:
+                    continue
+                alpha = min(0.999, opacity[i] * math.exp(-quad))
+                if alpha < 1.0 / 255.0:
+                    continue
+                if trans * (1.0 - alpha) <= 1e-4:
+                    break
+                color += colors[i] * alpha * trans
+                trans *= 1.0 - alpha
+            image[v, u] = color + trans * np.asarray(background)
+            alpha_out[v, u] = 1.0 - trans
+    return image, alpha_out, visible
+
+
+def _oracle_scene(seed: int) -> FreeTimeGaussians:
+    """Up to 32 primitives spread around two ring cameras: some behind or close to a camera,
+    some below the opacity cull or away from their time center, anisotropic and rotated."""
+    n = 8 + seed * 3
+    return random_model(
+        n, seed=seed, spread=4.5, log_scale=(-2.5, -0.5), logit=(-6.0, 3.0), speed=0.5
+    )
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_e6_reference_matches_an_independent_evaluation(seed: int) -> None:
+    """E1–E6: the reference backend in float64 against the pixel-by-pixel float64 evaluation, to
+    1e-9, with the same visible primitives; and in float32, to 1e-5."""
+    cameras = ring(2)
+    background = (0.125, 0.25, 0.375)  # exact in float32
+    model = _oracle_scene(seed)
+    out32 = _render(model, cameras, 0.37, background=torch.tensor(background))
+    model64 = _oracle_scene(seed).double()
+    out64 = _render(model64, cameras, 0.37, background=torch.tensor(background), return_aux=True)
+    assert out64.visible is not None
+    for c, camera in enumerate(cameras):
+        image, alpha, visible = _oracle(model64, camera, 0.37, background)
+        assert out64.visible[c].tolist() == visible.tolist()
+        torch.testing.assert_close(
+            out64.image[c].detach(), torch.from_numpy(image), rtol=0, atol=1e-9
+        )
+        torch.testing.assert_close(
+            out64.alpha[c, ..., 0].detach(), torch.from_numpy(alpha), rtol=0, atol=1e-9
+        )
+        torch.testing.assert_close(
+            out32.image[c].detach().to(F64), torch.from_numpy(image), rtol=0, atol=1e-5
+        )
