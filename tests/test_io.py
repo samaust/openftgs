@@ -580,11 +580,11 @@ def test_checkpoint_directory_holds_the_section_2_2_files(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
-    "case", ["tampered params", "missing rng.json", "extra file", "version 2", "eight params"]
+    "case", ["tampered params", "missing rng.json", "version 2", "eight params"]
 )
 def test_checkpoint_loader_rejects_damaged_directories(tmp_path: Path, case: str) -> None:
-    """§2.2 and §2.1 (integrity check): a changed or missing file, an unknown file, an unknown
-    major version, or a params file without the nine tensors is rejected (Q-25, Q-26)."""
+    """§2.2 and §2.1 (integrity check): a changed or missing file, an unknown major version, or
+    a params file without the nine tensors is rejected (Q-25, Q-26)."""
     out = save_checkpoint(_trainer_state(), tmp_path / "ckpt")
     if case == "eight params":
         params = _params(7, 3)
@@ -600,8 +600,6 @@ def test_checkpoint_loader_rejects_damaged_directories(tmp_path: Path, case: str
         (out / "params.safetensors").write_bytes(bytes(data))
     elif case == "missing rng.json":
         (out / "rng.json").unlink()
-    elif case == "extra file":
-        (out / "notes.txt").write_text("hello")
     elif case == "version 2":
         manifest = json.loads((out / "manifest.json").read_text())
         manifest["version"] = 2
@@ -798,3 +796,68 @@ def test_checkpoint_save_checks_params_and_stats(tmp_path: Path, case: str) -> N
     with pytest.raises(ValueError):
         save_checkpoint(state, tmp_path / "ckpt")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_checkpoint_loader_ignores_unlisted_files(tmp_path: Path) -> None:
+    """§2.2 introduction (readers ignore what they don't know; Q-25): a file the manifest doesn't
+    list, such as a log or an editor backup, doesn't block loading."""
+    state = _trainer_state()
+    out = save_checkpoint(state, tmp_path / "ckpt")
+    (out / "notes.txt").write_text("hello")
+    _assert_states_equal(state, load_checkpoint(out))
+
+
+def test_checkpoint_save_recovers_from_an_interrupted_swap(tmp_path: Path) -> None:
+    """§2.2 "Saves are atomic" (Q-25): a kill between the two renames of a save leaves the old
+    checkpoint aside and nothing at the target; the next save of that target puts the new one in
+    place and removes every leftover temporary or set-aside directory."""
+    target = tmp_path / "ckpt"
+    save_checkpoint(_trainer_state(n=4), target)
+    target.rename(tmp_path / ".ckpt.old-99999")
+    (tmp_path / ".ckpt.tmp-99998").mkdir()
+    second = _trainer_state(n=9)
+    save_checkpoint(second, target)
+    _assert_states_equal(second, load_checkpoint(target))
+    assert [p.name for p in tmp_path.iterdir()] == ["ckpt"]
+
+
+def test_checkpoint_save_over_a_regular_file_is_rejected(tmp_path: Path) -> None:
+    """Q-25, Q-26: a target that is a file, not a directory, is refused with ValueError."""
+    target = tmp_path / "ckpt"
+    target.write_text("not a checkpoint")
+    with pytest.raises(ValueError):
+        save_checkpoint(_trainer_state(), target)
+    assert target.read_text() == "not a checkpoint"
+
+
+def test_ftgs_init_reader_requires_time_unit_metadata(tmp_path: Path) -> None:
+    """§2.2 ftgs-init metadata includes time_unit (Q-22): a file without it is rejected."""
+    meta = _init_metadata()
+    del meta["time_unit"]
+    path = tmp_path / "init.safetensors"
+    save_file(_init_tensors(), str(path), metadata=meta)
+    with pytest.raises(ValueError, match="time_unit"):
+        read_init_points(path)
+
+
+@pytest.mark.parametrize("case", ["nan mean", "zero scale", "inf sh"])
+def test_ply_snapshot_rejects_values_it_cannot_write(tmp_path: Path, case: str) -> None:
+    """Q-18, Q-26: non-finite values and scales ≤ 0 (whose log is not finite) are refused."""
+    from openftgs.io import write_ply
+
+    arrays = {
+        "means": torch.zeros(2, 3),
+        "scales": torch.ones(2, 3),
+        "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2),
+        "opacities": torch.full((2,), 0.5),
+        "sh": torch.zeros(2, 1, 3),
+    }
+    if case == "nan mean":
+        arrays["means"][0, 0] = float("nan")
+    elif case == "zero scale":
+        arrays["scales"][1, 2] = 0.0
+    elif case == "inf sh":
+        arrays["sh"][0, 0, 1] = float("inf")
+    with pytest.raises(ValueError):
+        write_ply(tmp_path / "x.ply", **arrays)
+    assert not (tmp_path / "x.ply").exists()

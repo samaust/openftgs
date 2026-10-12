@@ -168,6 +168,8 @@ def read_init_points(path: Path, *, time_unit: str | None = None) -> InitPoints:
     unit is rejected."""
     tensors, meta = _read_safetensors(Path(path))
     _check_header(meta, _INIT, str(path))
+    if "time_unit" not in meta:  # §2.2 ftgs-init metadata
+        _fail(str(path), "missing metadata 'time_unit'")
     if time_unit is not None and meta.get("time_unit") != time_unit:
         _fail(str(path), f"time_unit is {meta.get('time_unit')!r}, expected {time_unit!r}")
     for name in ("positions", "colors", "timestamps"):
@@ -412,7 +414,9 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
 
     The files are written into a temporary sibling directory that then replaces `directory`, so
     a reader sees either the old checkpoint or the new one. An existing directory is replaced
-    only if it is a checkpoint or empty."""
+    only if it is a checkpoint or empty. POSIX can't swap two directories in one rename: a kill
+    between the two renames leaves the old checkpoint set aside beside the target, and the next
+    save of the same target restores it before replacing it (Q-25)."""
     directory = Path(directory)
     where = f"checkpoint {directory}"
     if set(state.params) != set(_PARAM_NAMES):
@@ -431,15 +435,20 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
     for name, value in stats_tensors.items():
         if tuple(value.shape) != (n,):
             _fail(where, f"stats[{name!r}] must have shape [{n}], got {list(value.shape)}")
+    # Q-25: recover from a save killed between its two renames, then sweep leftovers.
+    aside = sorted(directory.parent.glob(f".{directory.name}.old-*"))
+    if not directory.exists() and aside and _is_checkpoint(aside[-1]):
+        aside.pop().rename(directory)
+    for leftover in [*aside, *directory.parent.glob(f".{directory.name}.tmp-*")]:
+        shutil.rmtree(leftover, ignore_errors=True)
     # Q-25: a save never deletes a directory that isn't a checkpoint.
+    if directory.exists() and not directory.is_dir():
+        _fail(where, "exists and is not a directory; refusing to replace it")
     if directory.exists() and not (_is_checkpoint(directory) or not any(directory.iterdir())):
         _fail(where, "exists and is not a checkpoint; refusing to replace it")
 
     tmp = directory.with_name(f".{directory.name}.tmp-{os.getpid()}")
     old = directory.with_name(f".{directory.name}.old-{os.getpid()}")
-    for leftover in (tmp, old):
-        if leftover.exists():
-            shutil.rmtree(leftover)
     tmp.mkdir(parents=True)
     try:
         # §2.2: every file carries format and version; the JSON parts are covered by the
@@ -502,9 +511,9 @@ def load_checkpoint(directory: Path) -> TrainerState:
         {k: str(v) for k, v in manifest.items() if k in ("format", "version")}, _CKPT, where
     )
     present = {p.name for p in directory.iterdir()}
-    expected = {_MANIFEST, *_CKPT_FILES}
-    if present != expected:
-        _fail(where, f"expected the files {sorted(expected)}, found {sorted(present)}")
+    missing = {_MANIFEST, *_CKPT_FILES} - present
+    if missing:  # Q-25: files the manifest doesn't list are ignored
+        _fail(where, f"missing the files {sorted(missing)}")
     files = manifest.get("files")
     if not isinstance(files, dict) or set(files) != set(_CKPT_FILES):
         _fail(where, "the manifest must list the SHA-256 of every other file")
@@ -533,12 +542,14 @@ def load_checkpoint(directory: Path) -> TrainerState:
             scene_sha256=manifest.get("scene_sha256"),
             time_unit=str(manifest.get("time_unit", "s")),
         )
+        if not isinstance(optim, dict) or not isinstance(rng, dict):
+            _fail(where, "optim.json and rng.json must hold objects")
+        _merge_tensors(state.optim, optim_tensors, where)
+        _merge_tensors(state.rng, rng_tensors, where)
     except (KeyError, TypeError, ValueError) as err:
         raise ValueError(f"{where}: {err}") from None
     if set(params) != set(_PARAM_NAMES):
         _fail(where, f"params.safetensors must hold exactly {_PARAM_NAMES}")
-    _merge_tensors(state.optim, optim_tensors, where)
-    _merge_tensors(state.rng, rng_tensors, where)
     return state
 
 
@@ -572,6 +583,10 @@ def write_ply(
     for name, (value, shape) in expected.items():
         if tuple(value.shape) != shape:
             _fail(where, f"{name} must have shape {list(shape)}, got {list(value.shape)}")
+        if not bool(torch.isfinite(value).all()):
+            _fail(where, f"{name} has values that are not finite")
+    if not bool((scales > 0).all()):
+        _fail(where, "scales must be positive")
     f64 = torch.float64
     opacity = opacities.detach().to("cpu", f64).clamp(_OPACITY_EPS, 1.0 - _OPACITY_EPS)
     sh_cpu = sh.detach().to("cpu", f64)
