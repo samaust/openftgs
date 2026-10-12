@@ -769,10 +769,11 @@ def test_depth_ties_composite_the_lower_row_first(packed: bool, precull: str) ->
     front of green: 0.5·(1, 0, 0) + 0.5·0.5·(0, 1, 0) = (0.5, 0.25, 0), as on the reference. Rows
     below the opacity cull between and before them change nothing, which under compaction checks
     that the kept rows keep their relative order."""
-    red = {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((1.0, 0.0, 0.0))}
-    green = {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((0.0, 1.0, 0.0))}
-    culled = {"mean": (0.0, 0.0, 4.0), "logit": -9.0, "sh0": sh0_for((0.0, 0.0, 1.0))}
-    for rows in ([red, green], [culled, red, culled, culled, green]):
+    red: dict[str, Any] = {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((1.0, 0.0, 0.0))}
+    green: dict[str, Any] = {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((0.0, 1.0, 0.0))}
+    culled: dict[str, Any] = {"mean": (0.0, 0.0, 4.0), "logit": -9.0, "sh0": sh0_for((0, 0, 1))}
+    scenes: list[list[dict[str, Any]]] = [[red, green], [culled, red, culled, culled, green]]
+    for rows in scenes:
         model = _cuda(model_from_rows(rows))
         image = _gsplat(model, CAM_A, 0.5, packed=packed, precull=precull).image.detach()
         reference = render(model, CAM_A, 0.5, time_units="normalized", backend="reference")
