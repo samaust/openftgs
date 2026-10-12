@@ -66,6 +66,7 @@ def _defined_public_names(module_file: Path) -> set[str]:
     re-export its own public names.
     """
     tree = ast.parse(module_file.read_text(encoding="utf-8"))
+    is_package = module_file.name == "__init__.py"
     names: set[str] = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -74,7 +75,7 @@ def _defined_public_names(module_file: Path) -> set[str]:
             names.update(t.id for t in node.targets if isinstance(t, ast.Name))
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names.add(node.target.id)
-        elif isinstance(node, ast.ImportFrom) and node.level:
+        elif isinstance(node, ast.ImportFrom) and node.level and is_package:
             names.update(alias.asname or alias.name for alias in node.names)
     return {n for n in names if not n.startswith("_")}
 
