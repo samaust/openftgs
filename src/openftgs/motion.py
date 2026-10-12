@@ -103,7 +103,7 @@ def reg4d_terms(
 
 
 def _span_or_one(time: TimeNormalizer) -> float:
-    # Q-19: with a single timestamp (T_τ = 0), durations and velocities convert with a unit of 1.
+    # D-70: with a single timestamp (T_τ = 0), durations and velocities convert with a unit of 1.
     span = time.tau1 - time.tau0
     return span if span > 0.0 else 1.0
 

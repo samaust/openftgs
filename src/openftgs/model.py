@@ -191,7 +191,7 @@ class FreeTimeGaussians(torch.nn.Module):
         if not (math.isfinite(frame_dt) and frame_dt > 0.0):
             _fail(f"frame_dt must be finite and positive, got {frame_dt!r}")
         # §1.3 step 7: F frames of the sequence, 1 for a single timestamp; Q-21: round half up.
-        # Q-28: the total cap F·B, for points from every source.
+        # D-74: the total cap F·B, for points from every source.
         frames = 1 if time.tau1 == time.tau0 else math.floor(1.0 / frame_dt + 0.5) + 1
         budget = frames * cfg.points_per_frame
         if n_max is not None and budget > n_max:
@@ -229,7 +229,7 @@ class FreeTimeGaussians(torch.nn.Module):
         else:
             durations = durations_to_normalized(durations_tau, time)  # E14, Q-27
         if time.tau1 == time.tau0:
-            # §1.4 "Time", Q-30: velocities are frozen at 0 when T_τ = 0 (t ≡ 0 already, Q-9).
+            # §1.4 "Time", D-71: velocities are frozen at 0 when T_τ = 0 (t ≡ 0 already, Q-9).
             velocities = torch.zeros_like(velocities)
         if frame_ids is None:
             # D-47: the nearest slot t_k = k·Δt_f; Q-21: ties to the lower slot, within [0, F).
@@ -371,7 +371,7 @@ class FreeTimeGaussians(torch.nn.Module):
                 _fail(f"{name} has values that are not finite")
         if not bool((torch.linalg.vector_norm(params["quats"], dim=-1) > _MIN_QUAT_NORM).all()):
             _fail(f"every quaternion norm must exceed {_MIN_QUAT_NORM}")
-        # Q-30: §1.4 "Time": with T_τ = 0, t ≡ 0 and velocities are frozen at 0, so time centers
+        # D-71: §1.4 "Time": with T_τ = 0, t ≡ 0 and velocities are frozen at 0, so time centers
         # and velocities must be 0 (an exchange file can't carry anything else).
         if self.time.tau1 == self.time.tau0 and (
             bool(params["times"].any()) or bool(params["velocities"].any())
