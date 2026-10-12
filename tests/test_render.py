@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from builders import UNIT_TIME, pinhole, random_model, ring
+from builders import UNIT_TIME, pinhole, random_model, random_params, ring
 
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
@@ -496,3 +496,74 @@ def test_e6_reference_matches_an_independent_evaluation(seed: int) -> None:
         torch.testing.assert_close(
             out32.image[c].detach().to(F64), torch.from_numpy(image), rtol=0, atol=1e-5
         )
+
+
+# U-8 · culling σ_eff < 1/255 before the backend changes nothing (D-32, D-57; Q-31)
+
+
+def _u8_scene(n: int, dtype: torch.dtype) -> FreeTimeGaussians:
+    """n random rows, about a third of them below the opacity cull (logits down to −9), some
+    behind a camera of `ring(3)` or off the image. With n = 1 the row is culled (no row kept), with
+    n = 2 one row is (one kept); from n = 33 on, rows 3 and 5 sit at the same place with different
+    colors, so they tie in depth in every camera."""
+    generator = torch.Generator().manual_seed(n)
+    params = random_params(
+        n, generator=generator, spread=4.5, log_scale=(-2.5, -0.5), logit=(-9.0, 3.0)
+    )
+    if n <= 2:
+        params["opacity_logits"] = torch.tensor([-9.0, 3.0][:n])
+    if n >= 33:
+        for row in (3, 5):
+            params["means"][row] = torch.tensor([0.1, 0.2, 0.3])
+            params["velocities"][row] = 0.0
+            params["times"][row] = 0.37
+            params["opacity_logits"][row] = 2.0
+    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME)
+    return model.double() if dtype == F64 else model
+
+
+@pytest.mark.parametrize("dtype", [F32, F64])
+@pytest.mark.parametrize("n", [1, 2, 7, 33, 64])
+def test_u8_compaction_leaves_renders_bitwise_unchanged(n: int, dtype: torch.dtype) -> None:
+    """U-8: rendering with compaction (precull = "compact") and with the opacity cull inside the
+    backend's projection ("internal") gives bitwise-identical images, alpha, 2D means and
+    visibility on the reference backend, including a depth tie."""
+    cameras = ring(3)
+    model = _u8_scene(n, dtype)
+    out = {
+        precull: _render(model, cameras, 0.37, return_aux=True, precull=precull)
+        for precull in ("internal", "compact")
+    }
+    if n <= 2:
+        assert int(model.at_time(0.37).passes_cull.sum()) == n - 1  # rows kept: 0, then 1
+    for field in ("image", "alpha", "means2d", "visible"):
+        a, b = getattr(out["internal"], field), getattr(out["compact"], field)
+        assert torch.equal(a, b), field
+    if n >= 33:
+        visible = out["internal"].visible
+        assert visible is not None and bool(visible[:, [3, 5]].all())
+
+
+@pytest.mark.parametrize("precull", ["internal", "compact"])
+@pytest.mark.parametrize("dtype", [F32, F64])
+def test_u8_culled_primitives_get_exactly_zero_render_gradient(
+    precull: str, dtype: torch.dtype
+) -> None:
+    """U-8: after backpropagating a random weighting of image and alpha, every primitive visible
+    in no camera (below the opacity cull, behind a camera or off the image) has an exactly zero
+    gradient in all nine stored tensors, in both placements of the opacity cull."""
+    cameras = ring(3)
+    model = _u8_scene(64, dtype)
+    out = _render(model, cameras, 0.37, return_aux=True, precull=precull)
+    weights = torch.Generator().manual_seed(1)
+    loss = (out.image * torch.rand(out.image.shape, generator=weights, dtype=dtype)).sum() + (
+        out.alpha * torch.rand(out.alpha.shape, generator=weights, dtype=dtype)
+    ).sum()
+    params = [getattr(model, name) for name in _PARAM_NAMES]
+    grads = torch.autograd.grad(loss, params)
+    assert out.visible is not None
+    culled = ~out.visible.any(dim=0)
+    assert int(culled.sum()) >= 20 and int((~culled).sum()) >= 10
+    for name, grad in zip(_PARAM_NAMES, grads, strict=True):
+        assert torch.equal(grad[culled], torch.zeros_like(grad[culled])), name
+        assert bool(torch.isfinite(grad).all()), name
