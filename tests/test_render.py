@@ -1050,9 +1050,9 @@ def test_scene_with_every_primitive_culled_renders_the_background(precull: str) 
 
 
 def test_render_constants_agree_with_their_copies() -> None:
-    """Private: E6's constants appear in render and in the ftgs-if render_conventions (Q-24); the
-    opacity cull that render reads is motion's (D-32); the default background is TrainConfig's
-    (D-34); the precull choices are PerfConfig's (Q-31)."""
+    """Private: E6's constants appear in render and in the ftgs-if render_conventions (Q-24, and
+    D-73's entries under Q-35's keys); the opacity cull that render reads is motion's (D-32); the
+    default background is TrainConfig's (D-34); the precull choices are PerfConfig's (Q-31)."""
     import openftgs.io
     import openftgs.motion
     import openftgs.render
@@ -1070,6 +1070,11 @@ def test_render_constants_agree_with_their_copies() -> None:
     assert conventions["pixel_center_offset"] == r._PIXEL_CENTER == 0.5
     assert conventions["background"] == list(r._BACKGROUND) == list(TrainConfig().background)
     assert r._EXTENT_MAX == 3.33 and r._CLAMP_MARGIN == 0.15 and r._SH_OFFSET == 0.5
+    # D-73, Q-35: the conventions files record are the ones render applies (D-72).
+    assert conventions["jacobian_clamp_margin"] == r._CLAMP_MARGIN
+    assert conventions["screen_extent_max"] == r._EXTENT_MAX
+    assert conventions["screen_extent_rule"] == "opacity_aware"  # E6's √(2 ln(255·σ_eff)) rule
+    assert conventions["rasterize_mode"] == "classic"  # D-6; the reference has no other mode
     # Q-31: precull takes PerfConfig.precull's values.
     assert get_args(r._Precull) == get_args(get_type_hints(PerfConfig)["precull"])
 
