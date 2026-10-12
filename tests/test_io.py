@@ -928,3 +928,21 @@ def test_ftgs_if_single_frame_file_must_have_no_motion(tmp_path: Path, case: str
     save_file(arrays, str(path), metadata=meta)
     with pytest.raises(ValueError, match="single timestamp"):
         read_exchange(path)
+
+
+def test_spec_constant_copies_agree_across_modules() -> None:
+    """Private: io may not import the model (§2.1), so the SH degrees (D-3), the quaternion norm
+    floor (§1.1) and the opacity clamp (§2.2 ftgs-if) are copied; the copies must agree, and
+    TrainConfig must accept exactly the same SH degrees."""
+    import openftgs.io
+    import openftgs.model
+
+    assert openftgs.io._SH_DEGREES == openftgs.model._SH_DEGREES == (0, 1, 2, 3)
+    assert openftgs.io._MIN_ROTATION_NORM == openftgs.model._MIN_QUAT_NORM == 1e-8
+    assert openftgs.io._OPACITY_EPS == openftgs.model._OPACITY_EPS == 1e-7
+    for degree in range(-1, 5):
+        if degree in openftgs.io._SH_DEGREES:
+            TrainConfig(sh_degree=degree)
+        else:
+            with pytest.raises(ValueError):
+                TrainConfig(sh_degree=degree)
