@@ -1,6 +1,6 @@
 # Loss terms and their paths in `openftgs.losses`
 
-How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are provisional decisions (Q-41, Q-42). The signature of `total_loss` is the owner's answer to a contradiction between §2.1 and §2.4 rule 3 (Q-40).
+How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are provisional decisions (Q-41, Q-42); U-11's reading of the stop-gradient is the owner's answer (Q-43). The signature of `total_loss` is the owner's answer to a contradiction between §2.1 and §2.4 rule 3 (Q-40).
 
 ## Input layout
 
@@ -23,7 +23,7 @@ The two paths agree in value. "same" means zero padding in both, and fused-ssim'
 
 ## The 4D regularization
 
-`reg4d_loss` is the mean of the per-row terms of E8 that `openftgs.motion.reg4d_terms` computes (Q-12). The stop-gradient on the temporal opacity therefore lives in one place, the motion module's private helper, which the temporal slice shares. The mean runs over all N rows, visible or not (D-11), and an empty model gives zero rather than NaN (Q-41). The function reads the model's parameters when it is called, so a test can substitute them with `torch.func.functional_call` (U-11). The terms are recomputed eagerly, one elementwise pass over N, because `render` doesn't hand the trainer its slice; M15 can revisit that if B-1 shows a cost.
+`reg4d_loss` is the mean of the per-row terms of E8 that `openftgs.motion.reg4d_terms` computes (Q-12). The stop-gradient on the temporal opacity therefore lives in one place, the motion module's private helper, which the temporal slice shares. The mean runs over all N rows, visible or not (D-11), and an empty model gives zero rather than NaN (Q-41). The function reads the model's parameters when it is called, so a test can substitute them with `torch.func.functional_call` (U-11). Because the stop-gradient leaves L_reg's value moving with μt and ŝ while its gradient through them is zero, U-11's gradient check evaluates L_reg with only the opacity logits substituted (Q-43). The terms are recomputed eagerly, one elementwise pass over N, because `render` doesn't hand the trainer its slice; M15 can revisit that if B-1 shows a cost.
 
 ## The total loss
 
