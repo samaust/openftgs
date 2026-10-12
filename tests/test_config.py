@@ -5,9 +5,8 @@ the checkpoint manifest stores (§2.2; Q-10).
 Expected defaults are copied from the config blocks of spec §2.1 and §2.4.
 """
 
-import dataclasses
 import json
-from typing import Any, Literal, get_args, get_origin, get_type_hints
+from typing import Any
 
 import pytest
 
@@ -130,45 +129,25 @@ def test_u26_sh_degree_rejected(degree: Any) -> None:
         config_from_dict({"sh_degree": degree})
 
 
-SUBCONFIGS = {
-    "init": InitConfig,
-    "loss": LossConfig,
-    "growth": GrowthConfig,
-    "reloc": RelocConfig,
-    "optim": OptimConfig,
-    "perf": PerfConfig,
+# Allowed values of every Literal field, from spec §2.1 and §2.4.
+LITERALS: dict[str, tuple[str, ...]] = {
+    "loss.ssim_padding": ("valid", "same"),
+    "loss.perc_net": ("vgg", "alex"),
+    "growth.mode": ("gradient", "score", "none"),
+    "reloc.copy_position": ("sample", "stack"),
+    "perf.slice_impl": ("auto", "eager", "compiled", "cuda"),
+    "perf.precull": ("internal", "compact"),
+    "perf.frame_cache": ("auto", "gpu", "mmap", "off"),
+    "perf.perc_precision": ("tf32", "ieee", "bf16"),
+    "perf.adam": ("fused", "foreach", "selective"),
 }
-LITERAL_FIELDS = [
-    f"{name}.{f.name}"
-    for name, cls in SUBCONFIGS.items()
-    for f in dataclasses.fields(cls)
-    if get_origin(get_type_hints(cls)[f.name]) is Literal
-]
 
 
-def test_literal_fields_are_the_spec_ones() -> None:
-    assert sorted(LITERAL_FIELDS) == sorted(
-        [
-            "loss.ssim_padding",
-            "loss.perc_net",
-            "growth.mode",
-            "reloc.copy_position",
-            "perf.slice_impl",
-            "perf.precull",
-            "perf.frame_cache",
-            "perf.perc_precision",
-            "perf.adam",
-        ]
-    )
-
-
-@pytest.mark.parametrize("path", LITERAL_FIELDS)
-def test_literal_fields_reject_other_values(path: str) -> None:
-    """§2.1, §2.4: a Literal field takes only its listed values (Q-11)."""
-    head, tail = path.split(".")
-    allowed = get_args(get_type_hints(SUBCONFIGS[head])[tail])
+@pytest.mark.parametrize(("path", "allowed"), LITERALS.items())
+def test_literal_fields_take_exactly_their_spec_values(path: str, allowed: tuple[str, ...]) -> None:
+    """§2.1, §2.4: a Literal field takes its listed values and nothing else (Q-10)."""
     for value in allowed:
-        config_from_dict(_with(path, value))
+        assert _get(config_from_dict(_with(path, value)), path) == value
     for bad in ("not-a-choice", allowed[0].upper(), 1, None):
         with pytest.raises(ValueError, match=path.replace(".", r"\.")):
             config_from_dict(_with(path, bad))
@@ -229,12 +208,13 @@ RANGES: list[tuple[str, Any, Any]] = [
 def test_q11_ranges(path: str, good: Any, bad: Any) -> None:
     """Q-11: one accepted boundary and one rejected value per range."""
     config_from_dict(_with(path, good))
-    with pytest.raises(ValueError, match=path.split(".")[-1]):
+    with pytest.raises(ValueError, match=path.replace(".", r"\.")):
         config_from_dict(_with(path, bad))
 
 
 @pytest.mark.parametrize("section", ["growth", "reloc"])
 def test_q11_window_start_must_not_exceed_stop(section: str) -> None:
+    """Q-11: a growth or relocation window with start > stop is rejected; start = stop is not."""
     config_from_dict({section: {"start": 700, "stop": 700}})
     with pytest.raises(ValueError, match=rf"{section}\.start"):
         config_from_dict({section: {"start": 701, "stop": 700}})
@@ -253,11 +233,12 @@ def test_q11_window_start_must_not_exceed_stop(section: str) -> None:
         ("perf.packed", "true"),
         ("loss.lambda_reg", None),
         ("init.points_per_frame", 1000.0),
+        ("optim.eps", 10**400),
     ],
 )
 def test_q10_field_types_are_checked(path: str, bad: Any) -> None:
-    """Q-10: ints for int fields, numbers for float fields, booleans for bool fields."""
-    with pytest.raises(ValueError, match=path.split(".")[-1]):
+    """Q-10: ints for int fields, finite numbers for float fields, booleans for bool fields."""
+    with pytest.raises(ValueError, match=path.replace(".", r"\.")):
         config_from_dict(_with(path, bad))
 
 
@@ -332,6 +313,7 @@ def _every_field_changed() -> TrainConfig:
 
 
 def test_every_field_changed_really_changes_every_field() -> None:
+    """The round-trip fixture differs from the §2.1 defaults in every field."""
     changed, default = _every_field_changed(), TrainConfig()
     for path in DEFAULTS:
         assert _get(changed, path) != _get(default, path), path
@@ -383,5 +365,6 @@ def test_unknown_key_is_rejected_with_its_dotted_path(data: dict[str, Any], path
 
 
 def test_sub_config_must_be_an_object() -> None:
+    """Q-10: a sub-config is a nested JSON object."""
     with pytest.raises(ValueError, match="growth"):
         config_from_dict({"growth": 3})

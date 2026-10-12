@@ -6,6 +6,7 @@ holds; and the frame interval Δt_f of E14.
 Spec: §1.4, §2.2, E14. Band: Foundation (§2.1).
 """
 
+import itertools
 import math
 import statistics
 import warnings
@@ -79,12 +80,15 @@ class TimeNormalizer:
     def to_t(self, tau: Tensor) -> Tensor: ...
     def to_t(self, tau: float | Tensor) -> float | Tensor:
         """Raw τ → normalized t; warns outside [τ₀, τ₁] (§1.4; Q-9)."""
+        # Q-9: NaN counts as outside; the tensor check syncs with the host (training passes
+        # floats); integer tensors become float64 (D-30).
         if isinstance(tau, Tensor):
-            # Q-9: the tensor check syncs with the host; training passes floats.
-            outside = bool(((tau < self.tau0) | (tau > self.tau1)).any())
+            if not tau.is_floating_point():
+                tau = tau.to(torch.float64)
+            outside = bool((~((tau >= self.tau0) & (tau <= self.tau1))).any())
         else:
             tau = float(tau)
-            outside = tau < self.tau0 or tau > self.tau1
+            outside = not self.tau0 <= tau <= self.tau1
         if outside:
             warnings.warn(
                 f"timestamp outside the training span [{self.tau0!r}, {self.tau1!r}]: "
@@ -106,6 +110,8 @@ class TimeNormalizer:
         """Normalized t → raw τ; never warns (Q-9)."""
         if not isinstance(t, Tensor):
             t = float(t)
+        elif not t.is_floating_point():
+            t = t.to(torch.float64)  # Q-9
         return self.tau0 + t * (self.tau1 - self.tau0)
 
 
@@ -177,4 +183,4 @@ def frame_interval(camera_timestamps: Mapping[str, Sequence[float]], time: TimeN
 
 
 def _gaps(ordered: list[float]) -> list[float]:
-    return [b - a for a, b in zip(ordered, ordered[1:], strict=False)]
+    return [b - a for a, b in itertools.pairwise(ordered)]

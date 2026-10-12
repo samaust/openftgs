@@ -19,13 +19,12 @@ SPANS = [(0.0, 10.0), (-3.0, 2.0), (5.0, 5.001), (1.7e3, 1.7e3 + 9.9666666666666
 def test_u18_round_trip_tau_t_tau_floats(tau0: float, tau1: float) -> None:
     """U-18: τ → t → τ and t → τ → t within 1e-12 for Python floats."""
     time = TimeNormalizer(tau0, tau1)
-    tol = 1e-12 * max(1.0, abs(tau0), abs(tau1))
     for k in range(11):
         tau = tau0 + (tau1 - tau0) * k / 10
         t = time.to_t(tau)
         assert isinstance(t, float)
-        assert abs(time.to_tau(t) - tau) <= tol
-        assert abs(time.to_t(time.to_tau(k / 10)) - k / 10) <= tol / (tau1 - tau0)
+        assert abs(time.to_tau(t) - tau) <= 1e-12
+        assert abs(time.to_t(time.to_tau(k / 10)) - k / 10) <= 1e-12
 
 
 @pytest.mark.parametrize(("tau0", "tau1"), SPANS)
@@ -40,8 +39,7 @@ def test_u18_round_trip_float64_tensors(tau0: float, tau1: float) -> None:
     back = time.to_tau(t)
     assert isinstance(back, torch.Tensor)
     assert back.dtype == torch.float64
-    tol = 1e-12 * max(1.0, abs(tau0), abs(tau1))
-    torch.testing.assert_close(back, tau, rtol=0.0, atol=tol)
+    torch.testing.assert_close(back, tau, rtol=0.0, atol=1e-12)
 
 
 def test_u18_bounds_map_to_zero_and_one_exactly() -> None:
@@ -74,6 +72,7 @@ def test_u18_to_t_warns_outside_the_training_span(tau: float) -> None:
 
 
 def test_u18_to_t_warns_for_a_tensor_with_one_element_outside() -> None:
+    """U-18 (§1.4): one element outside [τ₀, τ₁] is enough for the warning (Q-9)."""
     time = TimeNormalizer(-3.0, 2.0)
     tau = torch.tensor([-3.0, 0.0, 2.0, 2.5], dtype=torch.float64)
     with pytest.warns(UserWarning):
@@ -168,3 +167,25 @@ def test_frame_interval_rejects_empty_input_and_a_zero_result() -> None:
         frame_interval({}, TimeNormalizer(0.0, 1.0))
     with pytest.raises(ValueError):
         frame_interval({"a": [0.0, 0.0, 0.0, 1.0]}, TimeNormalizer(0.0, 1.0))
+
+
+def test_u18_to_t_warns_for_nan() -> None:
+    """§1.4, Q-9: NaN is not inside [τ₀, τ₁], so it warns, as a float and in a tensor."""
+    time = TimeNormalizer(-3.0, 2.0)
+    with pytest.warns(UserWarning):
+        time.to_t(math.nan)
+    with pytest.warns(UserWarning):
+        time.to_t(torch.tensor([0.0, math.nan], dtype=torch.float64))
+
+
+def test_integer_tensors_convert_to_float64() -> None:
+    """Q-9, D-30: integer tensors of raw timestamps or times come back as float64."""
+    time = TimeNormalizer(0.0, 4.0)
+    t = time.to_t(torch.tensor([0, 1, 4]))
+    assert isinstance(t, torch.Tensor)
+    assert t.dtype == torch.float64
+    assert t.tolist() == [0.0, 0.25, 1.0]
+    tau = time.to_tau(torch.tensor([0, 1]))
+    assert isinstance(tau, torch.Tensor)
+    assert tau.dtype == torch.float64
+    assert tau.tolist() == [0.0, 4.0]

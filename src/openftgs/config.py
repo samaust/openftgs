@@ -87,8 +87,7 @@ class GrowthConfig:  # §1.3 Growth and count-control modes
         _check_window(self)
         _check_positive(self, "grad_threshold", "split_scale")
         _check_count(self, "n_max")
-        if not 0.0 < self.score_rate <= 1.0:
-            _fail(self, "score_rate", "must lie in (0, 1]")
+        _check_half_open_unit(self, "score_rate")
 
 
 @dataclass
@@ -114,8 +113,7 @@ class RelocConfig:  # E10, E11, §1.3 Relocation
         _check_count(self, "every")
         _check_window(self)
         _check_non_negative(self, "lambda_g", "lambda_o")
-        if not 0.0 < self.grad_quantile <= 1.0:
-            _fail(self, "grad_quantile", "must lie in (0, 1]")
+        _check_half_open_unit(self, "grad_quantile")
         _check_open_unit(self, "dead_opacity")
         if self.prune_opacity is not None:
             _check_open_unit(self, "prune_opacity")
@@ -211,6 +209,7 @@ class TrainConfig:
 
 def config_to_dict(cfg: TrainConfig) -> dict[str, Any]:
     """TrainConfig as JSON-ready values, nested by sub-config (§2.2 manifest; Q-10)."""
+    # Q-10: nested objects, tuples as lists, None as null.
     result: dict[str, Any] = _to_json(dataclasses.asdict(cfg))
     return result
 
@@ -220,15 +219,16 @@ def config_from_dict(data: Mapping[str, Any]) -> TrainConfig:
 
     Raises ValueError for an unknown key, naming its dotted path, and for invalid values.
     """
+    # Q-10: missing keys take their defaults; unknown keys are errors.
     kwargs: dict[str, Any] = {}
     hints = get_type_hints(TrainConfig)
-    for key, value in _known(TrainConfig, data, "").items():
+    for key, value in _reject_unknown_keys(TrainConfig, data).items():
         sub = hints[key]
         if dataclasses.is_dataclass(sub):
             if not isinstance(value, Mapping):
-                raise ValueError(f"{key} must be an object")
+                raise ValueError(f"{key} must be an object, got {value!r}")
             assert isinstance(sub, type)
-            kwargs[key] = sub(**_known(sub, value, f"{key}."))
+            kwargs[key] = sub(**_reject_unknown_keys(sub, value))
         else:
             kwargs[key] = value
     return TrainConfig(**kwargs)
@@ -238,12 +238,18 @@ def config_from_dict(data: Mapping[str, Any]) -> TrainConfig:
 # Private helpers
 
 
-def _known(cls: type, data: Mapping[str, Any], prefix: str) -> dict[str, Any]:
+def _reject_unknown_keys(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
+    # Q-10: an unknown key is an error naming its dotted path.
     names = {f.name for f in dataclasses.fields(cls)}
     for key in data:
         if key not in names:
-            raise ValueError(f"unknown configuration key {prefix}{key}")
+            raise ValueError(f"unknown configuration key {_path(cls, key)}")
     return dict(data)
+
+
+def _path(obj: object, name: str) -> str:
+    """The dotted path of a field, from its class's prefix ("growth.n_max")."""
+    return f"{getattr(obj, '_prefix', '')}{name}"
 
 
 def _to_json(value: Any) -> Any:
@@ -255,12 +261,12 @@ def _to_json(value: Any) -> Any:
 
 
 def _fail(obj: object, name: str, reason: str) -> None:
-    prefix = getattr(obj, "_prefix", "")
-    raise ValueError(f"{prefix}{name} {reason}, got {getattr(obj, name)!r}")
+    raise ValueError(f"{_path(obj, name)} {reason}, got {getattr(obj, name)!r}")
 
 
 def _check_types(obj: object) -> None:
     """Check each field against its annotation, normalizing ints to floats and lists to tuples."""
+    # Q-10: runs on construction, so the constructor and config_from_dict accept the same values.
     hints = get_type_hints(type(obj))
     assert dataclasses.is_dataclass(obj)
     for f in dataclasses.fields(obj):
@@ -269,8 +275,7 @@ def _check_types(obj: object) -> None:
 
 
 def _coerce(obj: object, name: str, hint: Any, value: Any) -> Any:
-    prefix = getattr(obj, "_prefix", "")
-    path = f"{prefix}{name}"
+    path = _path(obj, name)
     origin = get_origin(hint)
     if origin in (Union, types.UnionType):
         args = get_args(hint)
@@ -304,9 +309,13 @@ def _coerce(obj: object, name: str, hint: Any, value: Any) -> Any:
     if hint is float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{path} must be a number, got {value!r}")
-        if not math.isfinite(value):
+        try:
+            number = float(value)
+        except OverflowError:
+            raise ValueError(f"{path} must be a finite number, got {value!r}") from None
+        if not math.isfinite(number):  # Q-10
             raise ValueError(f"{path} must be finite, got {value!r}")
-        return float(value)
+        return number
     raise TypeError(f"unsupported annotation {hint!r} for {path}")  # pragma: no cover
 
 
@@ -333,9 +342,16 @@ def _check_count(obj: object, *names: str) -> None:
             _fail(obj, name, "must be at least 1")
 
 
-def _check_open_unit(obj: object, name: str) -> None:
-    if not 0.0 < getattr(obj, name) < 1.0:
-        _fail(obj, name, "must lie in (0, 1)")
+def _check_open_unit(obj: object, *names: str) -> None:
+    for name in names:
+        if not 0.0 < getattr(obj, name) < 1.0:
+            _fail(obj, name, "must lie in (0, 1)")
+
+
+def _check_half_open_unit(obj: object, *names: str) -> None:
+    for name in names:
+        if not 0.0 < getattr(obj, name) <= 1.0:
+            _fail(obj, name, "must lie in (0, 1]")
 
 
 def _check_window(obj: GrowthConfig | RelocConfig) -> None:
