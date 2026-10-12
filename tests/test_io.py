@@ -907,3 +907,24 @@ def test_save_checkpoint_restores_the_newest_set_aside_checkpoint(
         save_checkpoint(_trainer_state(n=9), tmp_path / "ckpt")
     monkeypatch.undo()
     _assert_states_equal(newer, load_checkpoint(tmp_path / "ckpt"))
+
+
+@pytest.mark.parametrize("case", ["velocity", "time_center"])
+def test_ftgs_if_single_frame_file_must_have_no_motion(tmp_path: Path, case: str) -> None:
+    """§1.4 "Time" and Q-30: with τ₀ = τ₁, every time center must be τ₀ and every velocity 0;
+    a file that says otherwise is rejected."""
+    arrays = _exchange_arrays()
+    arrays["time_center"] = torch.full((6,), 2.0, dtype=F64)
+    arrays["velocity"] = torch.zeros(6, 3)
+    meta = _exchange_metadata(tau0="2.0", tau1="2.0")
+    good = tmp_path / "good.safetensors"
+    save_file(arrays, str(good), metadata=meta)
+    read_exchange(good)
+    if case == "velocity":
+        arrays["velocity"][3, 1] = 1e-3
+    else:
+        arrays["time_center"][2] = 2.5
+    path = tmp_path / "bad.safetensors"
+    save_file(arrays, str(path), metadata=meta)
+    with pytest.raises(ValueError, match="single timestamp"):
+        read_exchange(path)

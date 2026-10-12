@@ -749,8 +749,9 @@ def test_from_exchange_validates_its_input() -> None:
 
 def test_single_frame_model_exports_and_round_trips() -> None:
     """Q-19: with T_τ = 0, duration = s and velocity = v; the model validates and round-trips.
-    Its velocities are 0, as §1.4 "Time" freezes them."""
+    Its time centers and velocities are 0, as §1.4 "Time" requires (Q-30)."""
     params = _params(n=3, sh_degree=0, seed=7)
+    params["times"] = torch.zeros(3)
     params["velocities"] = torch.zeros(3, 3)
     model = FreeTimeGaussians(params, sh_degree=0, time=TimeNormalizer(4.0, 4.0))
     ex = model.to_exchange()
@@ -878,11 +879,44 @@ def test_u22_saturated_logit_exports_a_file_that_validates(tmp_path: Path) -> No
     assert float(opacity[1]) == float(torch.tensor(1.0 - 1e-7, dtype=F32))
 
 
-def test_single_frame_import_freezes_velocities_at_zero() -> None:
-    """§1.4 "Time": with T_τ = 0, velocities are frozen at 0, also for an imported model."""
+@pytest.mark.parametrize("field", ["velocities", "times"])
+def test_single_frame_model_requires_zero_time_centers_and_velocities(field: str) -> None:
+    """§1.4 "Time" (t ≡ 0, velocities frozen at 0) as a validity rule (Q-30): with T_τ = 0,
+    a nonzero time center or velocity is rejected, on construction and on resize_, because
+    an exchange file can't carry it (every time center is τ₀)."""
+    single = TimeNormalizer(4.0, 4.0)
+    params = _params(n=3, sh_degree=0, seed=7)
+    params["times"] = torch.zeros(3)
+    params["velocities"] = torch.zeros(3, 3)
+    model = FreeTimeGaussians(params, sh_degree=0, time=single)
+    bad = dict(params)
+    bad[field] = torch.full_like(params[field], 0.25)
+    with pytest.raises(ValueError, match="T_τ = 0"):
+        FreeTimeGaussians(bad, sh_degree=0, time=single)
+    append = _params(n=1, sh_degree=0, seed=8)
+    append["times"] = torch.zeros(1)
+    append["velocities"] = torch.zeros(1, 3)
+    append[field] = torch.full_like(append[field], -0.5)
+    with pytest.raises(ValueError, match="T_τ = 0"):
+        model.resize_(append=append)
+    assert model.num_gaussians == 3
+
+
+def test_single_frame_import_rejects_motion_the_file_cannot_hold() -> None:
+    """Q-30: a single-frame ftgs-if file with a velocity other than 0 or a time center other
+    than τ₀ is rejected, so import → export is a faithful round trip."""
     from openftgs.types import ExchangeModel
 
     ex = _known_model().to_exchange()
-    single = ExchangeModel(dict(ex.arrays), 1, 3.0, 3.0, "s", "x")
-    model = FreeTimeGaussians.from_exchange(single, device="cpu")
+    arrays = dict(ex.arrays)
+    arrays["time_center"] = torch.full((4,), 3.0, dtype=F64)
+    with pytest.raises(ValueError):
+        FreeTimeGaussians.from_exchange(
+            ExchangeModel(dict(arrays), 1, 3.0, 3.0, "s", "x"), device="cpu"
+        )
+    arrays["velocity"] = torch.zeros(4, 3)
+    model = FreeTimeGaussians.from_exchange(
+        ExchangeModel(arrays, 1, 3.0, 3.0, "s", "x"), device="cpu"
+    )
     assert not bool(model.velocities.detach().any())
+    assert not bool(model.times.detach().any())
