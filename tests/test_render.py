@@ -917,9 +917,9 @@ def test_reference_backend_ignores_packed() -> None:
         packed: _render(model, CAM_A, 0.5, return_aux=True, packed=packed)
         for packed in (True, False)
     }
-    for packed in (True, False):
-        assert out[packed].gaussian_ids is None
-        assert out[packed].means2d is not None and out[packed].means2d.shape == (1, 2, 2)
+    for result in out.values():
+        assert result.gaussian_ids is None
+        assert result.means2d is not None and result.means2d.shape == (1, 2, 2)
     for field in ("image", "alpha", "means2d", "visible"):
         assert torch.equal(getattr(out[True], field), getattr(out[False], field)), field
 
