@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import math
 import os
+import re
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
@@ -39,6 +40,7 @@ __all__ = [
 ]
 
 _VERSION = 1  # the major version this module reads and writes (§2.2)
+_VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?")
 
 
 # Shared helpers: safetensors files with the §2.2 metadata header.
@@ -56,11 +58,11 @@ def _check_header(meta: Mapping[str, str], fmt: str, where: str) -> None:
     version = meta.get("version")
     if version is None:
         _fail(where, "missing version")
-    try:
-        major = int(str(version).split(".")[0])
-    except ValueError:
-        major = -1
-    if major != _VERSION:
+    # §2.2: integers in decimal; a major number, optionally with a minor part.
+    match = _VERSION_PATTERN.fullmatch(str(version))
+    if match is None:
+        _fail(where, f"version must be a decimal major[.minor], got {version!r}")
+    if int(match.group(1)) != _VERSION:
         _fail(where, f"unsupported version {version!r}; this reader handles major version 1")
 
 
@@ -196,6 +198,7 @@ def read_init_points(path: Path, *, time_unit: str | None = None) -> InitPoints:
 _IF = "ftgs-if"
 _SH_DEGREES = (0, 1, 2, 3)  # D-3
 _MIN_ROTATION_NORM = 1e-8  # §1.1 validity rules
+_UNIT_TOLERANCE = 1e-6  # Q-24: |‖q‖ − 1| allowed on write, a few float32 roundings
 
 # Q-24: the render conventions written with every exchange file, from E6's normative constants
 # (gsplat 1.5.3 classic mode, D-6, D-31) and the black background of D-34.
@@ -260,12 +263,25 @@ def validate_exchange(model: ExchangeModel) -> None:
             )
 
 
+def _check_canonical_rotation(rotation: Tensor, where: str) -> None:
+    """§2.2 ftgs-if: unit quaternions with w ≥ 0; Q-24: where w = 0, the first nonzero component
+    is positive. Checked on write only; readers accept any rotation of norm > 1e-8."""
+    norm = torch.linalg.vector_norm(rotation.to(torch.float64), dim=-1)
+    if not bool(((norm - 1.0).abs() <= _UNIT_TOLERANCE).all()):
+        _fail(where, "rotation must hold unit quaternions")
+    first = torch.argmax((rotation != 0).to(torch.int8), dim=-1, keepdim=True)
+    if bool((torch.gather(rotation, -1, first) < 0).any()):
+        _fail(where, "rotation must have w >= 0 (where w = 0, the first nonzero component > 0)")
+
+
 _IF_KEYS = ("position", "time_center", "duration", "velocity", "scale", "rotation", "opacity", "sh")
 
 
 def write_exchange(model: ExchangeModel, path: Path) -> None:
-    """Write a ftgs-if v1 file (§2.2), validating first (Q-22)."""
+    """Write a ftgs-if v1 file (§2.2), validating first (Q-22). Writing is stricter than
+    reading: rotations must be unit quaternions with the canonical sign (Q-24)."""
     validate_exchange(model)
+    _check_canonical_rotation(model.arrays["rotation"], f"ftgs-if {path}")
     meta = {
         "format": _IF,
         "version": str(_VERSION),

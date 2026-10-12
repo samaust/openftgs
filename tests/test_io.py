@@ -946,3 +946,34 @@ def test_spec_constant_copies_agree_across_modules() -> None:
         else:
             with pytest.raises(ValueError):
                 TrainConfig(sh_degree=degree)
+
+
+@pytest.mark.parametrize(
+    "rotation",
+    [[-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -0.6, 0.8], [2.0, 0.0, 0.0, 0.0]],
+)
+def test_ftgs_if_writer_requires_canonical_unit_rotations(
+    tmp_path: Path, rotation: list[float]
+) -> None:
+    """§2.2 ftgs-if table: rotation is a unit quaternion with w ≥ 0. The writer enforces it,
+    with Q-24's tie-break at w = 0 (first nonzero component positive); the reader stays lenient
+    (Q-24)."""
+    arrays = _exchange_arrays()
+    arrays["rotation"][2] = torch.tensor(rotation)
+    model = ExchangeModel(arrays, 3, 2.0, 12.0, "s", "x")
+    path = tmp_path / "m.safetensors"
+    with pytest.raises(ValueError, match="rotation"):
+        write_exchange(model, path)
+    assert not path.exists()
+    save_file(arrays, str(path), metadata=_exchange_metadata())
+    assert torch.equal(read_exchange(path).arrays["rotation"][2], torch.tensor(rotation))
+
+
+@pytest.mark.parametrize("version", ["01", "1.", "+1", " 1", "1.03", "1.x", "1e0"])
+def test_readers_reject_non_canonical_version_strings(tmp_path: Path, version: str) -> None:
+    """§2.2 introduction: integers are written in decimal; a version is a major number,
+    optionally with a minor part, without signs, spaces or leading zeros."""
+    path = tmp_path / "init.safetensors"
+    save_file(_init_tensors(), str(path), metadata=_init_metadata(version=version))
+    with pytest.raises(ValueError, match="version"):
+        read_init_points(path)

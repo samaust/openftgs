@@ -117,7 +117,8 @@ def _canonical_sign(quats: Tensor) -> Tensor:
     the next nonzero component decides."""
     first = torch.argmax((quats != 0).to(torch.int8), dim=-1, keepdim=True)
     lead = torch.gather(quats, -1, first)
-    return torch.where(lead < 0, -quats, quats)
+    # + 0.0 turns the −0.0 that a sign flip makes of zero components into +0.0.
+    return torch.where(lead < 0, -quats, quats) + 0.0
 
 
 def _producer() -> str:

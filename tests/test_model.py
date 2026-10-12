@@ -939,3 +939,19 @@ def test_resize_rejects_tensors_on_another_device(what: str) -> None:
         model.resize_(keep=keep, append=append)
     for name in PARAM_NAMES:
         assert torch.equal(getattr(model, name).detach(), before[name])
+
+
+def test_canonical_rotation_has_no_negative_zeros() -> None:
+    """Q-24: flipping a quaternion's sign yields +0.0 where it held zeros, so exports of one
+    rotation are bitwise identical however its sign was stored."""
+    from openftgs.types import ExchangeModel
+
+    ex = _known_model().to_exchange()
+    arrays = dict(ex.arrays)
+    arrays["rotation"] = torch.tensor([[-1.0, 0.0, 0.0, 0.0]] * 4)
+    model = FreeTimeGaussians.from_exchange(
+        ExchangeModel(arrays, 1, ex.tau0, ex.tau1, "s", "x"), device="cpu"
+    )
+    rotation = model.to_exchange().arrays["rotation"]
+    assert torch.equal(rotation, torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 4))
+    assert not bool(torch.signbit(rotation).any())
