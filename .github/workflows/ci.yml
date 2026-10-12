@@ -53,8 +53,10 @@ jobs:
           names = zipfile.ZipFile(glob.glob("dist/openftgs-*.whl")[0]).namelist()
           for required in ("openftgs/py.typed", "licenses/LICENSE", "licenses/NOTICE"):
               assert any(n.endswith(required) for n in names), required
+          assert not any(n.startswith("ftgs_harness/") for n in names), "Q-5"
           names = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0]).namelist()
           for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):
               assert any(n.endswith(required) for n in names), required
+          assert not any(n.startswith("openftgs/") for n in names), "Q-5"
           print("wheel contents ok")
           PY

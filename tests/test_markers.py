@@ -5,22 +5,22 @@ Added tests, not §3 rows: unmarked tests get the cpu marker, and gpu, dataset a
 weights tests are skipped when their resource is missing.
 """
 
+import tomllib
 from pathlib import Path
 
 import pytest
 
 pytest_plugins = ["pytester"]
 
-CONFTEST = Path(__file__).with_name("conftest.py").read_text(encoding="utf-8")
-INI = """
-[pytest]
-addopts = --strict-markers
-markers =
-    cpu: cpu
-    gpu: gpu
-    dataset: dataset
-    weights: weights
-"""
+ROOT = Path(__file__).resolve().parents[1]
+CONFTEST = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+# The marker definitions come from pyproject.toml, so they are written in one place.
+MARKERS: list[str] = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"][
+    "pytest"
+]["ini_options"]["markers"]
+INI = "[pytest]\naddopts = --strict-markers\nmarkers =\n" + "".join(
+    f"    {marker}\n" for marker in MARKERS
+)
 TESTS = """
 import pytest
 
@@ -35,6 +35,10 @@ def test_dataset(): pass
 @pytest.mark.weights
 def test_weights(): pass
 """
+
+
+def test_pyproject_defines_the_four_markers() -> None:
+    assert sorted(m.split(":")[0] for m in MARKERS) == ["cpu", "dataset", "gpu", "weights"]
 
 
 @pytest.fixture

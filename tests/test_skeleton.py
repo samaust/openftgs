@@ -7,6 +7,8 @@ SPDX header, imports point down the bands, and the harness never imports openftg
 
 import ast
 import importlib
+import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -145,3 +147,30 @@ def test_harness_never_imports_openftgs() -> None:
         if any(n.split(".")[0] == "openftgs" for n in _imported_modules(p))
     ]
     assert offenders == []
+
+
+def _pyproject(path: Path) -> dict[str, object]:
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _requirement_name(requirement: str) -> str:
+    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
+    assert match is not None, requirement
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower()
+
+
+def test_harness_is_a_separate_distribution_without_openftgs() -> None:
+    project = _pyproject(ROOT / "harness" / "pyproject.toml")["project"]
+    assert isinstance(project, dict)
+    assert project["name"] == "ftgs-harness"
+    requirements = list(project.get("dependencies", []))
+    for extra in project.get("optional-dependencies", {}).values():
+        requirements.extend(extra)
+    assert "openftgs" not in {_requirement_name(r) for r in requirements}
+
+
+def test_openftgs_distribution_packages_only_src() -> None:
+    tool = _pyproject(ROOT / "pyproject.toml")["tool"]
+    assert isinstance(tool, dict)
+    assert tool["setuptools"]["packages"]["find"]["where"] == ["src"]
+    assert not (ROOT / "src" / "ftgs_harness").exists()
