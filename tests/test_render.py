@@ -17,7 +17,20 @@ from typing import Any, Literal, get_args, get_type_hints
 import numpy as np
 import pytest
 import torch
-from builders import UNIT_TIME, look_at, pinhole, random_model, random_params, ring
+from builders import (
+    C0,
+    CAM_A,
+    UNIT_TIME,
+    logit_of,
+    look_at,
+    model_from_rows,
+    pinhole,
+    random_model,
+    random_params,
+    ring,
+    sh0_for,
+    sigmoid64,
+)
 from real_sh import real_sh
 from torch import Tensor
 
@@ -28,7 +41,6 @@ from openftgs.types import Camera, ExchangeModel, RenderOutput, TimeNormalizer
 
 F32 = torch.float32
 F64 = torch.float64
-C0 = 0.28209479177387814  # §1.1
 C1 = 0.4886025119029199  # √(3/(4π)), the l = 1 real SH constant
 ALPHA_MAX_F32 = torch.tensor(0.999, dtype=F32)  # E6, D-31
 
@@ -43,50 +55,6 @@ PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
     "sh0",
     "shN",
 )
-
-# Camera A: the point (X, Y, 4) lands at (32.5 + 4X, 24.5 + 4Y).
-CAM_A = pinhole(64, 48, fx=16.0, fy=16.0, cx=32.5, cy=24.5)
-
-
-def _model(
-    rows: Sequence[dict[str, Any]],
-    *,
-    sh_degree: int = 0,
-    time: TimeNormalizer = UNIT_TIME,
-) -> FreeTimeGaussians:
-    """A model with one primitive per row. Defaults: time center 0.5, ŝ = 20 (σt = 1 within
-    |t − μt| ≤ 1), no velocity, isotropic scale 0.25, identity quaternion, logit 0 (σ = 0.5),
-    sh0 = 0 (color 0.5) and no higher bands."""
-    k = (sh_degree + 1) ** 2 - 1
-    cols: dict[str, list[Any]] = {name: [] for name in PARAM_NAMES}
-    for row in rows:
-        scale = row.get("scale", 0.25)
-        scales = [scale] * 3 if isinstance(scale, int | float) else list(scale)
-        cols["means"].append(list(row["mean"]))
-        cols["times"].append(row.get("time", 0.5))
-        cols["log_durations"].append(row.get("log_duration", 20.0))
-        cols["velocities"].append(list(row.get("velocity", (0.0, 0.0, 0.0))))
-        cols["log_scales"].append([math.log(a) for a in scales])
-        cols["quats"].append(list(row.get("quat", (1.0, 0.0, 0.0, 0.0))))
-        cols["opacity_logits"].append(row.get("logit", 0.0))
-        cols["sh0"].append([list(row.get("sh0", (0.0, 0.0, 0.0)))])
-        cols["shN"].append(row.get("shN", [[0.0, 0.0, 0.0]] * k))
-    shapes = {
-        "means": (3,),
-        "times": (),
-        "log_durations": (),
-        "velocities": (3,),
-        "log_scales": (3,),
-        "quats": (4,),
-        "opacity_logits": (),
-        "sh0": (1, 3),
-        "shN": (k, 3),
-    }
-    params = {
-        name: torch.tensor(cols[name], dtype=F32).reshape(len(rows), *shapes[name])
-        for name in PARAM_NAMES
-    }
-    return FreeTimeGaussians(params, sh_degree=sh_degree, time=time)
 
 
 def _render(
@@ -111,7 +79,7 @@ def test_empty_model_renders_the_background(precull: str) -> None:
     """Q-32: a model with no primitives renders the background with alpha 0, in the §2.1 shapes
     [C, H, W, 3] and [C, H, W, 1]."""
     background = torch.tensor([0.25, 0.5, 0.75])
-    out = _render(_model([]), CAM_A, 0.5, background=background, precull=precull)
+    out = _render(model_from_rows([]), CAM_A, 0.5, background=background, precull=precull)
     assert out.image.shape == (1, 48, 64, 3)
     assert out.alpha.shape == (1, 48, 64, 1)
     _assert_background(out, background)
@@ -123,7 +91,7 @@ def test_empty_model_renders_the_background(precull: str) -> None:
 def test_u7_opaque_primitive_on_a_pixel_center_has_alpha_0999() -> None:
     """U-7: a primitive with σ_eff = 1 centered on a pixel center has alpha α_max = 0.999 there
     (logit 20 rounds to σ = 1 in float32; σt = 1)."""
-    model = _model([{"mean": (0.0, 0.0, 4.0), "logit": 20.0}])
+    model = model_from_rows([{"mean": (0.0, 0.0, 4.0), "logit": 20.0}])
     out = _render(model, CAM_A, 0.5)
     assert out.alpha[0, 24, 32, 0] == ALPHA_MAX_F32
     assert float(out.alpha.detach().max()) == float(ALPHA_MAX_F32)
@@ -132,7 +100,7 @@ def test_u7_opaque_primitive_on_a_pixel_center_has_alpha_0999() -> None:
 def test_u7_tiny_gaussian_peaks_at_its_pixel() -> None:
     """U-7, U-20: a tiny Gaussian at (1.25, −0.75, 4) projects to (37.5, 21.5) = (u + ½, v + ½)
     exactly (§1.4), and its alpha peaks at pixel (21, 37)."""
-    model = _model([{"mean": (1.25, -0.75, 4.0), "scale": 1e-3, "logit": 20.0}])
+    model = model_from_rows([{"mean": (1.25, -0.75, 4.0), "scale": 1e-3, "logit": 20.0}])
     out = _render(model, CAM_A, 0.5, return_aux=True)
     assert out.means2d is not None and out.visible is not None
     assert torch.equal(out.means2d, torch.tensor([[[37.5, 21.5]]]))
@@ -141,30 +109,15 @@ def test_u7_tiny_gaussian_peaks_at_its_pixel() -> None:
     assert divmod(peak, 64) == (21, 37)
 
 
-def _sh0(rgb: Sequence[float]) -> tuple[float, float, float]:
-    """sh0 giving the color rgb at degree 0 (E2: C₀·sh0 + 0.5)."""
-    r, g, b = ((c - 0.5) / C0 for c in rgb)
-    return (r, g, b)
-
-
-def _logit(p: float) -> float:
-    return math.log(p / (1.0 - p))
-
-
-def _sigmoid64(logit: float) -> float:
-    """σ of a logit as stored (float32), evaluated in float64."""
-    return float(torch.sigmoid(torch.tensor(logit, dtype=F32).to(F64)))
-
-
 def test_u7_second_of_two_stacked_opaque_layers_is_excluded() -> None:
     """U-7, E6: two stacked primitives with α = 0.999 give 0.999·c₁ + 0.001·c_bg; the far layer
     would bring T to about 1e-6 ≤ 1e-4, so it is excluded (it would add about 1e-3). The far row
     comes first, so the order is by depth, not by row."""
     c1, c2, background = (1.0, 0.5, 0.25), (0.0, 1.0, 0.0), (0.25, 0.5, 0.75)
-    model = _model(
+    model = model_from_rows(
         [
-            {"mean": (0.0, 0.0, 6.0), "logit": 20.0, "sh0": _sh0(c2)},
-            {"mean": (0.0, 0.0, 4.0), "logit": 20.0, "sh0": _sh0(c1)},
+            {"mean": (0.0, 0.0, 6.0), "logit": 20.0, "sh0": sh0_for(c2)},
+            {"mean": (0.0, 0.0, 4.0), "logit": 20.0, "sh0": sh0_for(c1)},
         ]
     )
     out = _render(model, CAM_A, 0.5, background=torch.tensor(background))
@@ -178,10 +131,10 @@ def test_u7_primitives_outside_the_depth_range_are_culled() -> None:
     is the background and nothing is visible; z_c = 0.01 itself is kept."""
     background = torch.tensor([0.25, 0.5, 0.75])
     rows = [{"mean": (0.0, 0.0, z), "logit": 20.0} for z in (0.005, -4.0, 2e10)]
-    out = _render(_model(rows), CAM_A, 0.5, background=background, return_aux=True)
+    out = _render(model_from_rows(rows), CAM_A, 0.5, background=background, return_aux=True)
     _assert_background(out, background)
     assert out.visible is not None and out.visible.tolist() == [[False, False, False]]
-    near = _render(_model([{"mean": (0.0, 0.0, 0.01)}]), CAM_A, 0.5, return_aux=True)
+    near = _render(model_from_rows([{"mean": (0.0, 0.0, 0.01)}]), CAM_A, 0.5, return_aux=True)
     assert near.visible is not None and near.visible.tolist() == [[True]]
 
 
@@ -192,19 +145,19 @@ def test_e6_pixel_stops_before_the_primitive_reaching_the_transmittance_threshol
     sigmas = [0.9, 0.9, 0.95, 0.9]  # in depth order
     depths = [2.0, 3.0, 4.0, 5.0]
     order = [2, 0, 3, 1]  # row r holds depth layer order[r]
-    model = _model(
+    model = model_from_rows(
         [
             {
                 "mean": (0.0, 0.0, depths[k]),
-                "logit": _logit(sigmas[k]),
-                "sh0": _sh0(colors[k]),
+                "logit": logit_of(sigmas[k]),
+                "sh0": sh0_for(colors[k]),
             }
             for k in order
         ]
     )
     background = (0.25, 0.5, 0.75)
     out = _render(model, CAM_A, 0.5, background=torch.tensor(background))
-    alphas = [_sigmoid64(_logit(s)) for s in sigmas]
+    alphas = [sigmoid64(logit_of(s)) for s in sigmas]
     expected = [0.0, 0.0, 0.0]
     t = 1.0
     for k in range(3):
@@ -226,7 +179,7 @@ def test_e6_terms_below_the_alpha_threshold_are_skipped() -> None:
     """E6: with Σ′ = 1.3·I (a = 0.25 on the axis) and σ = 0.5, pixel (24, 36), 4 px from the
     mean, has α = 0.5·e^(−8/1.3) ≈ 0.00106 < 1/255 and stays exactly black; pixel (24, 35) has
     α = 0.5·e^(−4.5/1.3) and shows the color 0.5."""
-    out = _render(_model([{"mean": (0.0, 0.0, 4.0)}]), CAM_A, 0.5)
+    out = _render(model_from_rows([{"mean": (0.0, 0.0, 4.0)}]), CAM_A, 0.5)
     image = out.image.detach()
     assert torch.equal(image[0, 24, 36], torch.zeros(3))
     alpha = 0.5 * math.exp(-4.5 / 1.3)
@@ -243,7 +196,7 @@ def test_e6_jacobian_uses_the_clamped_direction_and_the_mean_does_not() -> None:
         (-10.0, (-20.0, 24.5), (24, 0), 71.06),
         (14.0, (76.0, 24.5), (24, 63), 195.86),
     ]:
-        model = _model([{"mean": (x, 0.0, 4.0), "scale": 1.0}])
+        model = model_from_rows([{"mean": (x, 0.0, 4.0), "scale": 1.0}])
         out = _render(model, cam_b, 0.5, return_aux=True)
         assert out.means2d is not None and torch.equal(out.means2d[0, 0], torch.tensor(mean2d))
         dx = pixel[1] + 0.5 - mean2d[0]
@@ -261,8 +214,8 @@ def test_e6_screen_radii_follow_the_opacity_aware_extent() -> None:
     Σ′₀₀ = (4² + 10²)·0.0625 + 0.3 = 7.55. With σ = 1 the extent is √(2 ln 255) = 3.329 and
     r_x = ⌈9.15⌉ = 10 reaches the image; with σ = 0.05 it is √(2 ln 12.75) = 2.256 and
     r_x = ⌈6.20⌉ = 7 does not (a fixed 3σ extent would give 9 and reach it)."""
-    for logit, visible in [(20.0, True), (_logit(0.05), False)]:
-        model = _model([{"mean": (10.0, 0.0, 4.0), "logit": logit}])
+    for logit, visible in [(20.0, True), (logit_of(0.05), False)]:
+        model = model_from_rows([{"mean": (10.0, 0.0, 4.0), "logit": logit}])
         out = _render(model, CAM_A, 0.5, return_aux=True)
         assert out.visible is not None and out.visible.tolist() == [[visible]]
 
@@ -275,7 +228,7 @@ def test_e6_box_touching_the_image_edge_counts_as_off_it() -> None:
         {"mean": (x, 0.0, 4.0), "scale": 1e-3, "logit": 20.0}
         for x in (8.375, 8.359375, -8.625, -8.609375)
     ]
-    out = _render(_model(rows), CAM_A, 0.5, return_aux=True)
+    out = _render(model_from_rows(rows), CAM_A, 0.5, return_aux=True)
     assert out.means2d is not None and out.visible is not None
     assert out.means2d[0, [1, 3], 0].tolist() == [65.9375, -1.9375]
     assert out.visible.tolist() == [[False, True, False, True]]
@@ -285,10 +238,10 @@ def test_e6_depth_ties_composite_the_lower_row_first() -> None:
     """E6, Q-33: two rows at the same place tie in depth and composite in row order: red row 0
     (σ = 0.5) in front of green row 1 gives 0.5·(1, 0, 0) + 0.5·0.5·(0, 1, 0) = (0.5, 0.25, 0)."""
     rows = [
-        {"mean": (0.0, 0.0, 4.0), "sh0": _sh0((1.0, 0.0, 0.0))},
-        {"mean": (0.0, 0.0, 4.0), "sh0": _sh0((0.0, 1.0, 0.0))},
+        {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((1.0, 0.0, 0.0))},
+        {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((0.0, 1.0, 0.0))},
     ]
-    image = _render(_model(rows), CAM_A, 0.5).image.detach()
+    image = _render(model_from_rows(rows), CAM_A, 0.5).image.detach()
     torch.testing.assert_close(image[0, 24, 32], torch.tensor([0.5, 0.25, 0.0]), rtol=0, atol=1e-6)
 
 
@@ -311,7 +264,7 @@ def test_u6_direction_from_the_moved_mean_flips_the_l1_response() -> None:
     the response 0 and 0.25 both times."""
     s = 1.0 / (2.4 * C1)
     row = {"mean": (0.0, 0.0, 4.0), "velocity": (6.0, 0.0, 0.0), "shN": _band1(2, (s, 0.0, 0.0))}
-    model = _model([row], sh_degree=1)
+    model = model_from_rows([row], sh_degree=1)
     for t, pixel, red in [(0.0, (24, 20), 0.375), (1.0, (24, 44), 0.125)]:
         image = _render(model, CAM_A, t).image.detach()
         torch.testing.assert_close(
@@ -329,7 +282,7 @@ def test_u6_direction_starts_at_the_camera_center() -> None:
     camera = pinhole(64, 48, fx=16.0, fy=16.0, cx=32.5, cy=24.5, world_to_camera=w2c)
     k = 1.0 / (4.0 * C1)
     sh_n = [[0.0, 0.0, 0.0], [0.0, k, 0.0], [k, 0.0, 0.0]]
-    model = _model([{"mean": (0.0, 0.0, 0.0), "shN": sh_n}], sh_degree=1)
+    model = model_from_rows([{"mean": (0.0, 0.0, 0.0), "shN": sh_n}], sh_degree=1)
     image = _render(model, camera, 0.5).image.detach()
     torch.testing.assert_close(
         image[0, 24, 32], torch.tensor([0.125, 0.25, 0.25]), rtol=0, atol=1e-6
@@ -340,7 +293,7 @@ def test_u6_negative_sums_clamp_to_zero_per_channel() -> None:
     """U-6, E2: sh0 = (−5, 0, 1) gives the color (max(0, 0.5 − 5·C₀), 0.5, 0.5 + C₀) = (0, 0.5,
     0.782): the red channel is exactly 0 on screen and its gradient with respect to the clamped
     coefficient is exactly 0, while the other channels keep theirs."""
-    model = _model([{"mean": (0.0, 0.0, 4.0), "sh0": (-5.0, 0.0, 1.0)}])
+    model = model_from_rows([{"mean": (0.0, 0.0, 4.0), "sh0": (-5.0, 0.0, 1.0)}])
     pixel = _render(model, CAM_A, 0.5).image[0, 24, 32]
     torch.testing.assert_close(
         pixel.detach(), torch.tensor([0.0, 0.25, 0.5 * (0.5 + C0)]), rtol=0, atol=1e-6
@@ -353,7 +306,9 @@ def test_u6_negative_sums_clamp_to_zero_per_channel() -> None:
 
 def test_e2_colors_are_not_clamped_at_one() -> None:
     """E2, E7: colors are clamped only at 0, so a color of 1.6 at α = 0.999 renders 0.999·1.6."""
-    model = _model([{"mean": (0.0, 0.0, 4.0), "logit": 20.0, "sh0": _sh0((1.6, 1.6, 1.6))}])
+    model = model_from_rows(
+        [{"mean": (0.0, 0.0, 4.0), "logit": 20.0, "sh0": sh0_for((1.6, 1.6, 1.6))}]
+    )
     image = _render(model, CAM_A, 0.5).image.detach()
     torch.testing.assert_close(image[0, 24, 32], torch.full((3,), 0.999 * 1.6), rtol=0, atol=1e-6)
 
@@ -389,7 +344,7 @@ def test_u6_degree_zero_renders_the_dc_color() -> None:
     σ·(C₀·c₀₀ + 0.5) = 0.5·(C₀·c₀₀ + 0.5)."""
     sh0 = (0.3, -0.2, 0.9)
     sh_n = [[0.4, -0.3, 0.2]] * 15
-    model = _model([{"mean": (0.0, 0.0, 4.0), "sh0": sh0, "shN": sh_n}], sh_degree=3)
+    model = model_from_rows([{"mean": (0.0, 0.0, 4.0), "sh0": sh0, "shN": sh_n}], sh_degree=3)
     image = _render(model, CAM_A, 0.5, sh_degree=0).image.detach()
     expected = torch.tensor([0.5 * (C0 * c + 0.5) for c in sh0])
     torch.testing.assert_close(image[0, 24, 32], expected, rtol=0, atol=1e-6)
@@ -625,7 +580,7 @@ def test_u20_known_point_projects_to_the_expected_pixel() -> None:
     (32·0.125 + 20.5, 24·0.75 + 10.5) = (24.5, 28.5), the center of pixel (28, 24), where the
     render peaks."""
     camera = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
-    model = _model([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
+    model = model_from_rows([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
     out = _render(model, camera, 0.5, return_aux=True)
     assert out.means2d is not None
     assert torch.equal(out.means2d[0, 0].detach(), torch.tensor([24.5, 28.5]))
@@ -636,7 +591,7 @@ def test_u20_opencv_calibration_converts_with_a_half_pixel_shift() -> None:
     """U-20, §1.4: an OpenCV calibration with c = (20, 10) (pixel centers at integers) puts the
     point at (24, 28), a pixel center in its convention; converted with c + 0.5 it projects to
     (24.5, 28.5), the same pixel's center in the continuous convention."""
-    model = _model([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
+    model = model_from_rows([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
     opencv = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.0, cy=10.0, world_to_camera=_U20_W2C)
     shifted = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
     assert torch.equal(_means2d(model, opencv)[0], torch.tensor([24.0, 28.0]))
@@ -646,7 +601,7 @@ def test_u20_opencv_calibration_converts_with_a_half_pixel_shift() -> None:
 def test_u20_resizing_by_one_half_halves_projections() -> None:
     """U-20, §1.4: resizing 48×40 by r = 0.5 multiplies f and c by 0.5, so (24.5, 28.5) becomes
     (12.25, 14.25)."""
-    model = _model([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
+    model = model_from_rows([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}])
     half = pinhole(24, 20, fx=16.0, fy=12.0, cx=10.25, cy=5.25, world_to_camera=_U20_W2C)
     assert torch.equal(_means2d(model, half)[0], torch.tensor([12.25, 14.25]))
 
@@ -683,7 +638,7 @@ def test_u20_points_project_to_their_pixels_at_full_resolution(seed: int) -> Non
     depths = 2.0 + 3.0 * rng.uniform(size=count)
     points = _backproject(camera, pixels, depths)
     rows = [{"mean": tuple(p), "scale": 1e-2, "logit": 20.0} for p in points.tolist()]
-    model = _model(rows).double()
+    model = model_from_rows(rows).double()
     model.means.data = torch.from_numpy(points)  # the float64 positions, not float32 roundings
     torch.testing.assert_close(_means2d(model, camera), torch.from_numpy(pixels), rtol=0, atol=1e-5)
 
@@ -856,7 +811,9 @@ def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean(precull: s
     (Q-31). For the on-axis row (Σ′ = 1.3·I, σ = 0.5, color 0.5) and L = the red value of pixel
     (24, 34), 2 px right of μ′, L = 0.5·0.5·e^(−q) with q = ½·(34.5 − μ′x)²/1.3, so
     ∂L/∂μ′ = (L·2/1.3, 0); the second row is below the opacity cull and gets (0, 0)."""
-    model = _model([{"mean": (0.0, 0.0, 4.0)}, {"mean": (1.0, 0.0, 4.0), "logit": -9.0}]).double()
+    model = model_from_rows(
+        [{"mean": (0.0, 0.0, 4.0)}, {"mean": (1.0, 0.0, 4.0), "logit": -9.0}]
+    ).double()
     model.log_scales.data.fill_(math.log(0.25))  # a = 0.25 exactly, not via float32
     out = _render(model, CAM_A, 0.5, return_aux=True, precull=precull)
     assert out.means2d is not None
@@ -870,7 +827,7 @@ def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean(precull: s
 def test_row_at_the_camera_center_keeps_gradients_finite() -> None:
     """E6: a row exactly at the camera center (z_c = 0, a zero view direction) is culled; every
     gradient stays finite and that row's are exactly 0."""
-    model = _model([{"mean": (0.0, 0.0, 0.0)}, {"mean": (0.0, 0.0, 4.0)}], sh_degree=1)
+    model = model_from_rows([{"mean": (0.0, 0.0, 0.0)}, {"mean": (0.0, 0.0, 4.0)}], sh_degree=1)
     out = _render(model, CAM_A, 0.5)
     params = [getattr(model, name) for name in PARAM_NAMES]
     grads = torch.autograd.grad(out.image.sum() + out.alpha.sum(), params)
@@ -884,7 +841,7 @@ def test_row_at_the_camera_center_keeps_gradients_finite() -> None:
 
 
 def _api_model() -> FreeTimeGaussians:
-    return _model([{"mean": (0.0, 0.0, 4.0)}, {"mean": (0.5, 0.25, 5.0), "logit": 1.0}])
+    return model_from_rows([{"mean": (0.0, 0.0, 4.0)}, {"mean": (0.5, 0.25, 5.0), "logit": 1.0}])
 
 
 def test_all_lists_the_public_api() -> None:
@@ -949,8 +906,10 @@ def test_gsplat_backend_arrives_in_m5() -> None:
 def test_render_warns_outside_the_training_time_range() -> None:
     """§1.4 "Time", Q-9, Q-32: exactly one UserWarning for a raw τ outside [τ₀, τ₁] and for a
     normalized t outside [0, 1] (≠ 0 with a single timestamp); none inside, ends included."""
-    model = _model([{"mean": (0.0, 0.0, 4.0)}], time=_SPAN)
-    single = _model([{"mean": (0.0, 0.0, 4.0), "time": 0.0}], time=TimeNormalizer(3.0, 3.0))
+    model = model_from_rows([{"mean": (0.0, 0.0, 4.0)}], time=_SPAN)
+    single = model_from_rows(
+        [{"mean": (0.0, 0.0, 4.0), "time": 0.0}], time=TimeNormalizer(3.0, 3.0)
+    )
     warned: list[tuple[FreeTimeGaussians, float, Literal["raw", "normalized"]]] = [
         (model, 1.5, "raw"),
         (model, 12.5, "raw"),
@@ -1042,7 +1001,7 @@ def test_float64_models_render_in_float64() -> None:
 def test_scene_with_every_primitive_culled_renders_the_background(precull: str) -> None:
     """Q-32, E6: when every primitive is culled (below the opacity cull, behind the camera), the
     render is the background with alpha 0, in both placements of the opacity cull."""
-    model = _model([{"mean": (0.0, 0.0, 4.0), "logit": -8.0}, {"mean": (0.0, 0.0, -4.0)}])
+    model = model_from_rows([{"mean": (0.0, 0.0, 4.0), "logit": -8.0}, {"mean": (0.0, 0.0, -4.0)}])
     background = torch.tensor([0.25, 0.5, 0.75])
     out = _render(model, CAM_A, 0.5, background=background, precull=precull, return_aux=True)
     _assert_background(out, background)

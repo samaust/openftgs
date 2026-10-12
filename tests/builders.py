@@ -7,6 +7,7 @@ independent expectation, not a duplicate to share.
 
 import math
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -15,6 +16,7 @@ from openftgs.model import FreeTimeGaussians
 from openftgs.types import Camera, TimeNormalizer
 
 UNIT_TIME = TimeNormalizer(0.0, 1.0)
+C0 = 0.28209479177387814  # §1.1
 
 
 def random_params(
@@ -159,3 +161,66 @@ def ring(
         )
         for k in range(count)
     ]
+
+
+# Hand-built render scenes, shared by the render tests of both backends (E2, E6).
+
+
+def model_from_rows(
+    rows: Sequence[dict[str, Any]],
+    *,
+    sh_degree: int = 0,
+    time: TimeNormalizer = UNIT_TIME,
+) -> FreeTimeGaussians:
+    """A model with one primitive per row. Defaults: time center 0.5, ŝ = 20 (σt = 1 within
+    |t − μt| ≤ 1), no velocity, isotropic scale 0.25, identity quaternion, logit 0 (σ = 0.5),
+    sh0 = 0 (color 0.5) and no higher bands."""
+    k = (sh_degree + 1) ** 2 - 1
+    shapes: dict[str, tuple[int, ...]] = {
+        "means": (3,),
+        "times": (),
+        "log_durations": (),
+        "velocities": (3,),
+        "log_scales": (3,),
+        "quats": (4,),
+        "opacity_logits": (),
+        "sh0": (1, 3),
+        "shN": (k, 3),
+    }
+    cols: dict[str, list[Any]] = {name: [] for name in shapes}
+    for row in rows:
+        scale = row.get("scale", 0.25)
+        scales = [scale] * 3 if isinstance(scale, int | float) else list(scale)
+        cols["means"].append(list(row["mean"]))
+        cols["times"].append(row.get("time", 0.5))
+        cols["log_durations"].append(row.get("log_duration", 20.0))
+        cols["velocities"].append(list(row.get("velocity", (0.0, 0.0, 0.0))))
+        cols["log_scales"].append([math.log(a) for a in scales])
+        cols["quats"].append(list(row.get("quat", (1.0, 0.0, 0.0, 0.0))))
+        cols["opacity_logits"].append(row.get("logit", 0.0))
+        cols["sh0"].append([list(row.get("sh0", (0.0, 0.0, 0.0)))])
+        cols["shN"].append(row.get("shN", [[0.0, 0.0, 0.0]] * k))
+    params = {
+        name: torch.tensor(cols[name], dtype=torch.float32).reshape(len(rows), *shape)
+        for name, shape in shapes.items()
+    }
+    return FreeTimeGaussians(params, sh_degree=sh_degree, time=time)
+
+
+# Camera A: the point (X, Y, 4) lands at (32.5 + 4X, 24.5 + 4Y).
+CAM_A = pinhole(64, 48, fx=16.0, fy=16.0, cx=32.5, cy=24.5)
+
+
+def sh0_for(rgb: Sequence[float]) -> tuple[float, float, float]:
+    """sh0 giving the color rgb at degree 0 (E2: C₀·sh0 + 0.5)."""
+    r, g, b = ((c - 0.5) / C0 for c in rgb)
+    return (r, g, b)
+
+
+def logit_of(p: float) -> float:
+    return math.log(p / (1.0 - p))
+
+
+def sigmoid64(logit: float) -> float:
+    """σ of a logit as stored (float32), evaluated in float64."""
+    return float(torch.sigmoid(torch.tensor(logit, dtype=torch.float32).to(torch.float64)))
