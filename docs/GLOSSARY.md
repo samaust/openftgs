@@ -208,6 +208,10 @@ _Avoid_: small model, capped model, lite
 A number the paper reports (training time, FPS, model size, primitive count, PSNR) that serves as a target when calibrating, never as a setting. §1.5
 _Avoid_: target metric, baseline number, spec value
 
+**Training configuration**:
+The nested set of hyperparameters, `TrainConfig` and its sub-configs, whose field names are the spec's hyperparameter names; stored in full in every checkpoint manifest and named the same way in the harness config. §2.1, §2.2, §3.3
+_Avoid_: hparams, settings file, options, config (unqualified, in prose)
+
 ### Initialization
 
 **Init frame slot**:
