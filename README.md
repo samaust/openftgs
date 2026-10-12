@@ -21,7 +21,7 @@ The code is written from the paper (arXiv 2506.05348 v2) and from the owner's sp
 pip install -e .[dev]
 ```
 
-Training needs a CUDA build of PyTorch: install it from the [PyTorch index](https://pytorch.org/get-started/locally/) for your CUDA version before installing openftgs. A CPU build is enough for the tests on the reference backend.
+Training needs a CUDA build of PyTorch. On Linux x86_64 the default `torch` wheel on PyPI already is one (torch 2.14.1 bundles the CUDA 13.0 libraries), so the command above installs it. For another CUDA version, or on Windows, install torch from the [PyTorch index](https://pytorch.org/get-started/locally/) before installing openftgs. A CPU build is enough for the tests on the reference backend; CI uses one because its runners have no GPU.
 
 Optional extras:
 

@@ -13,7 +13,7 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Samuel Austin" }]
 # Q-1: Python floor.
 requires-python = ">=3.11"
-# §2.3. Training needs a CUDA build of torch, which metadata can't express (Q-3).
+# §2.3. Training needs a CUDA build of torch; on Linux x86_64 PyPI's default wheel is one (Q-3).
 dependencies = [
     "gsplat==1.5.3",
     "torch>=2.1",
