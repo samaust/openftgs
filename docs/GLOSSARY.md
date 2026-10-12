@@ -280,6 +280,14 @@ _Avoid_: time index, temporal culling, bucket cache
 One span of time, one frame interval wide, in the temporal index, listing every primitive whose effective opacity can reach 1/255 inside it, widened by a margin. D-55
 _Avoid_: bin, time slot, window (reserved for SelfCap)
 
+**2D mean μ′**:
+A primitive's moved position projected into an image, in pixels under the continuous pixel convention; the point whose gradient, rescaled to NDC units, feeds the accumulated gradient g. E6, E10
+_Avoid_: means2d (the RenderOutput field holding it), projected mean, screen position, image-space mean
+
+**Screen radii**:
+The two whole-pixel half-widths, along x and y, of the box around a primitive's 2D mean that holds every pixel its alpha can reach 1/255 at, set by the opacity-aware extent of at most 3.33 standard deviations; both are zero for a culled primitive. E6
+_Avoid_: radius (unqualified), footprint, splat size, bounding radius
+
 **Visible primitive**:
 A primitive whose two screen radii are both positive in an image, which is what the gradient statistics count. E6
 _Avoid_: active primitive, rendered Gaussian, in-view primitive, visibility mask (the tensor)
@@ -287,6 +295,14 @@ _Avoid_: active primitive, rendered Gaussian, in-view primitive, visibility mask
 **Culling**:
 The removal of primitives from a render before compositing: effective opacity below 1/255, depth outside [0.01, 10¹⁰], det Σ′ ≤ 0, or a screen box wholly off-image; the opacity cull happens inside gsplat's projection by default. E6, D-32, D-57
 _Avoid_: pre-culling (one placement of the opacity cull), frustum culling (part of it), filtering, compaction (the explicit alternative)
+
+**Compaction**:
+The explicit placement of the opacity cull: rows whose effective opacity is below 1/255 are removed from the per-time arrays after the temporal slice and before the render backend, which leaves images unchanged. D-32, D-57
+_Avoid_: pre-culling, pruning (reserved for the ablation's deletion of primitives from the model), filtering
+
+**Transmittance T**:
+At one pixel, the product of (1 − α) over the primitives already composited front to back: the share of light still passing to what lies behind; a pixel stops before the primitive that would bring it to 10⁻⁴ or below. E6
+_Avoid_: visibility (reserved for visible primitives), transparency, accumulated alpha (its complement, the render's alpha output)
 
 **Packed mode**:
 gsplat's rasterization layout in which only visible primitive–camera pairs carry data, each row of means2d labeled by `gaussian_ids`; the default until B-2 calibrates. D-57
