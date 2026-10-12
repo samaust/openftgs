@@ -346,6 +346,49 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
     assert int(out.visible.sum()) >= 20
 
 
+@LAYOUTS
+def test__backend_follows_the_rasterize_mode_constant(
+    packed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Private, D-6, D-72 (#52): the rasterize mode has one source, `_RASTERIZE_MODE`. Set to
+    "antialiased" (which D-6 doesn't use), the backend computes gsplat's compensations and applies
+    them to the opacities, so it matches gsplat's own antialiased rasterization() within 1e-6."""
+    import gsplat
+
+    import openftgs.render
+
+    monkeypatch.setattr(openftgs.render, "_RASTERIZE_MODE", "antialiased")
+    model = _cuda(random_model(40, seed=4, spread=1.5, log_scale=(-2.5, -1.0)))
+    out = _gsplat(model, _CAMERAS, 0.37, packed=packed)
+    g = model.at_time(0.37)
+    image, alpha, _ = gsplat.rasterization(
+        g.means_t,
+        g.quats_n,
+        g.scales,
+        g.opacities_t,
+        g.sh,
+        torch.stack([cam.world_to_camera for cam in _CAMERAS]).cuda(),
+        torch.stack([cam.K for cam in _CAMERAS]).cuda(),
+        64,
+        48,
+        near_plane=0.01,
+        far_plane=1e10,
+        radius_clip=0.0,
+        eps2d=0.3,
+        sh_degree=3,
+        packed=packed,
+        tile_size=16,
+        rasterize_mode="antialiased",
+    )
+    torch.testing.assert_close(out.image, image, rtol=0, atol=1e-6)
+    torch.testing.assert_close(out.alpha, alpha, rtol=0, atol=1e-6)
+    monkeypatch.undo()
+    classic = _gsplat(model, _CAMERAS, 0.37, packed=packed)
+    assert float((out.image - classic.image).detach().abs().max()) > 1e-3, (
+        "the mode changed nothing"
+    )
+
+
 # Layouts: packed and unpacked give the same render (D-57, D-75, D-76; Q-36)
 
 PLACEMENTS = pytest.mark.parametrize("precull", ["internal", "compact"])

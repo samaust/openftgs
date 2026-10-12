@@ -445,7 +445,8 @@ def _render_gsplat(
         radius_clip=_RADIUS_CLIP,
         packed=packed,
         sparse_grad=False,
-        calc_compensations=False,  # classic mode (D-6, _RASTERIZE_MODE): no compensation
+        # D-6: the mode's one source; antialiasing would scale the opacities (below), classic not.
+        calc_compensations=_RASTERIZE_MODE == "antialiased",
         camera_model="pinhole",
         opacities=g.opacities_t,  # E6, D-32: the opacity cull and the opacity-aware extent
     )
@@ -453,9 +454,11 @@ def _render_gsplat(
     local_ids: Tensor | None = None
     gaussian_ids: Tensor | None = None
     if packed:
-        _, camera_ids, local_ids, radii, means2d, depths, conics, _ = projection
-        # Every packed row is written and visible (both radii positive), so gsplat's own 2D means
-        # are the anchor (D-75). Rows come camera-major, ascending within a camera (D-76).
+        _, camera_ids, local_ids, radii, means2d, depths, conics, compensations = projection
+        # Every packed row is written and visible: gsplat drops a row only when both radii are 0,
+        # and ε keeps both diagonals of Σ′ positive while the extent is shared, so a row's radii
+        # are both positive or both 0 (E6, D-6). gsplat's own 2D means are therefore the anchor
+        # (D-75). Rows come camera-major, ascending within a camera (D-76).
         anchor = rasterized = means2d
         passed_visible = (radii > 0).all(dim=-1)
         dirs = g.means_t[local_ids] - centers[camera_ids]
@@ -466,7 +469,7 @@ def _render_gsplat(
         # A value already on the device, so the scatter doesn't synchronize (D-49).
         visible.index_put_((camera_ids, gaussian_ids), visible.new_ones(()))
     else:
-        radii, means2d, depths, conics, _ = projection
+        radii, means2d, depths, conics, compensations = projection
         passed_visible = (radii > 0).all(dim=-1)  # E6: both screen radii positive
         # gsplat leaves the 2D means of culled rows uninitialized; Q-32 wants 0 there, in the
         # tensor the rasterizer reads (D-75).
@@ -485,6 +488,8 @@ def _render_gsplat(
         dirs = g.means_t[None] - centers[:, None]
         coeffs = g.sh.expand(num_cams, *g.sh.shape)
         opacities = g.opacities_t.expand(num_cams, -1)
+    if compensations is not None:
+        opacities = opacities * compensations  # as gsplat's rasterization() does
     # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; at_time has
     # already cut the bands above the active degree (D-3).
     degree = math.isqrt(g.sh.shape[1]) - 1
