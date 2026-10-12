@@ -251,7 +251,7 @@ def validate_exchange(model: ExchangeModel) -> None:
         _fail(where, f"rotation norms must exceed {_MIN_ROTATION_NORM}")
     if not bool(((opacity > 0.0) & (opacity < 1.0)).all()):
         _fail(where, "opacity must lie within (0, 1)")
-    # Q-30: §1.4 "Time": with a single timestamp, t ≡ 0 and velocities are frozen at 0.
+    # D-71: §1.4 "Time": with a single timestamp, t ≡ 0 and velocities are frozen at 0.
     if tau1 == tau0:
         time_center = a["time_center"]
         velocity = a["velocity"]
