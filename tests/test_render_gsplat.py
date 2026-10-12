@@ -553,19 +553,23 @@ def _random_scene(seed: int, *, min_rows: int = 1) -> FreeTimeGaussians:
 
 def _compare(
     seed: int, gsplat_out: RenderOutput, reference: RenderOutput, model: FreeTimeGaussians
-) -> tuple[float, float]:
+) -> tuple[float, float, int, int]:
     """U-7 on one scene: image and alpha within 1e-4 outside Q-39's excluded pixels, `visible`
     equal outside its excluded rows, 2D means of the rows visible in both within 1e-4 px. Returns
-    the largest difference outside the mask and the excluded share."""
+    the largest difference outside the mask, the excluded share, the number of excluded pixels,
+    and how many of them differ by more than 1e-4 in image or alpha (Q-39)."""
     margins = boundary_margins(model, _CAMERAS, _T)
     share = excluded_share(margins)
     assert share <= 0.01, (seed, share)
     keep = torch.from_numpy(~margins.pixels).to("cuda")
     worst = 0.0
+    differs = torch.zeros_like(keep)
     for field in ("image", "alpha"):
+        diff = (getattr(gsplat_out, field) - getattr(reference, field)).detach().abs()
         a, b = getattr(gsplat_out, field).detach()[keep], getattr(reference, field).detach()[keep]
         torch.testing.assert_close(a, b, rtol=0, atol=1e-4, msg=lambda m: f"seed {seed}: {m}")
         worst = max(worst, float((a - b).abs().max()))
+        differs |= diff.amax(dim=-1) > 1e-4
     assert gsplat_out.visible is not None and reference.visible is not None
     rows = torch.from_numpy(~margins.rows).to("cuda")
     assert torch.equal(gsplat_out.visible[rows], reference.visible[rows]), seed
@@ -573,7 +577,7 @@ def _compare(
     torch.testing.assert_close(
         _unpacked(gsplat_out)[both], _unpacked(reference)[both], rtol=0, atol=1e-4
     )
-    return worst, share
+    return worst, share, int((~keep).sum()), int((differs & ~keep).sum())
 
 
 @LAYOUTS
@@ -581,21 +585,26 @@ def test_u7_random_scenes_match_the_reference(packed: bool) -> None:
     """U-7: 50 random scenes (N ≤ 64, 64×48, two cameras) rendered by gsplat and by the reference
     from the same CUDA model agree within 1e-4 in RGB and alpha, outside the pixels Q-39 excludes
     (at most 1% of a camera's pixels); `visible` agrees outside the excluded rows, and the 2D
-    means of rows visible in both within 1e-4 px. Prints the largest difference outside the mask
-    and the largest excluded share (Q-39)."""
+    means of rows visible in both within 1e-4 px. Prints the largest difference outside the mask,
+    the largest excluded share, and how many excluded pixels differ by more than 1e-4 (Q-39)."""
     worst, share = 0.0, 0.0
+    excluded, excluded_differ = 0, 0
     visible_rows = 0
     for seed in range(50):
         model = _random_scene(seed)
         out = _gsplat(model, _CAMERAS, _T, return_aux=True, packed=packed)
         reference = _reference(model, _CAMERAS, _T, return_aux=True)
-        scene_worst, scene_share = _compare(seed, out, reference, model)
+        scene_worst, scene_share, scene_excluded, scene_differ = _compare(
+            seed, out, reference, model
+        )
         worst, share = max(worst, scene_worst), max(share, scene_share)
+        excluded, excluded_differ = excluded + scene_excluded, excluded_differ + scene_differ
         assert reference.visible is not None
         visible_rows += int(reference.visible.sum())
     print(
         f"\nU-7 ({'packed' if packed else 'unpacked'}): largest |Δ| outside the mask {worst:.3g}, "
-        f"largest excluded share {share:.3g}, visible primitive–camera pairs {visible_rows}"
+        f"largest excluded share {share:.3g}, excluded pixels differing by more than 1e-4 "
+        f"{excluded_differ} of {excluded}, visible primitive–camera pairs {visible_rows}"
     )
     assert visible_rows >= 500
 
