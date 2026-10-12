@@ -12,7 +12,7 @@ import math
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args, get_type_hints
 
 import numpy as np
 import pytest
@@ -850,20 +850,21 @@ def test_reference_render_gradients_pass_gradcheck() -> None:
     assert torch.autograd.gradcheck(fn, inputs, eps=1e-6, atol=1e-5)
 
 
-def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean() -> None:
-    """Q-32: with return_aux, `means2d` keeps its gradient. For the on-axis row (Σ′ = 1.3·I,
-    σ = 0.5, color 0.5) and L = the red value of pixel (24, 34), 2 px right of μ′,
-    L = 0.5·0.5·e^(−q) with q = ½·(34.5 − μ′x)²/1.3, so ∂L/∂μ′ = (L·2/1.3, 0)."""
-    model = _model([{"mean": (0.0, 0.0, 4.0)}]).double()
+@pytest.mark.parametrize("precull", ["internal", "compact"])
+def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean(precull: str) -> None:
+    """Q-32: with return_aux, `means2d` keeps its gradient, in both placements of the opacity cull
+    (Q-31). For the on-axis row (Σ′ = 1.3·I, σ = 0.5, color 0.5) and L = the red value of pixel
+    (24, 34), 2 px right of μ′, L = 0.5·0.5·e^(−q) with q = ½·(34.5 − μ′x)²/1.3, so
+    ∂L/∂μ′ = (L·2/1.3, 0); the second row is below the opacity cull and gets (0, 0)."""
+    model = _model([{"mean": (0.0, 0.0, 4.0)}, {"mean": (1.0, 0.0, 4.0), "logit": -9.0}]).double()
     model.log_scales.data.fill_(math.log(0.25))  # a = 0.25 exactly, not via float32
-    out = _render(model, CAM_A, 0.5, return_aux=True)
+    out = _render(model, CAM_A, 0.5, return_aux=True, precull=precull)
     assert out.means2d is not None
     torch.autograd.backward(out.image[0, 24, 34, 0])
     value = 0.25 * math.exp(-0.5 * 4.0 / 1.3)
     assert out.means2d.grad is not None
-    torch.testing.assert_close(
-        out.means2d.grad, torch.tensor([[[value * 2.0 / 1.3, 0.0]]], dtype=F64), rtol=1e-12, atol=0
-    )
+    expected = torch.tensor([[[value * 2.0 / 1.3, 0.0], [0.0, 0.0]]], dtype=F64)
+    torch.testing.assert_close(out.means2d.grad, expected, rtol=1e-12, atol=0)
 
 
 def test_row_at_the_camera_center_keeps_gradients_finite() -> None:
@@ -1051,11 +1052,11 @@ def test_scene_with_every_primitive_culled_renders_the_background(precull: str) 
 def test_render_constants_agree_with_their_copies() -> None:
     """Private: E6's constants appear in render and in the ftgs-if render_conventions (Q-24); the
     opacity cull that render reads is motion's (D-32); the default background is TrainConfig's
-    (D-34)."""
+    (D-34); the precull choices are PerfConfig's (Q-31)."""
     import openftgs.io
     import openftgs.motion
     import openftgs.render
-    from openftgs.config import TrainConfig
+    from openftgs.config import PerfConfig, TrainConfig
 
     conventions = openftgs.io._RENDER_CONVENTIONS
     r = openftgs.render
@@ -1069,6 +1070,8 @@ def test_render_constants_agree_with_their_copies() -> None:
     assert conventions["pixel_center_offset"] == r._PIXEL_CENTER == 0.5
     assert conventions["background"] == list(r._BACKGROUND) == list(TrainConfig().background)
     assert r._EXTENT_MAX == 3.33 and r._CLAMP_MARGIN == 0.15 and r._SH_OFFSET == 0.5
+    # Q-31: precull takes PerfConfig.precull's values.
+    assert get_args(r._Precull) == get_args(get_type_hints(PerfConfig)["precull"])
 
 
 def test_rasterize_composites_chunks_of_pixel_rows_like_one(
