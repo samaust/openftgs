@@ -19,7 +19,7 @@ A save is atomic: the files go into a temporary sibling directory, which replace
 
 ## Exchange and init-point files
 
-`ftgs-if` and `ftgs-init` files are validated on write and on read by the same functions that `openftgs.model` calls on in-memory data (Q-22): exact dtypes and shapes, finite values, and the ranges of §2.2. `ftgs-if`'s `render_conventions` metadata is written from E6's constants and ignored on read, since the exchange model has no field for it (Q-24). Metadata follows the §2.2 introduction: integers in decimal, floats in shortest round-trip form, structured values as compact JSON; unknown keys are ignored and an unknown major version is refused.
+`ftgs-if` and `ftgs-init` files are validated on write and on read by the same functions that `openftgs.model` calls on in-memory data (Q-22): exact dtypes and shapes, finite values, and the ranges of §2.2. `ftgs-if`'s `render_conventions` metadata is written from E6's constants, D-6's rasterize mode and D-34's background, including D-73's Jacobian clamp margin, screen-extent rule and rasterize mode under the keys of Q-35, and ignored on read, since the exchange model has no field for it (Q-24). Files written before D-73, without those entries, therefore read the same. Metadata follows the §2.2 introduction: integers in decimal, floats in shortest round-trip form, structured values as compact JSON; unknown keys are ignored and an unknown major version is refused.
 
 ## PLY snapshot
 
