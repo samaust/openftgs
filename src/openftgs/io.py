@@ -6,21 +6,28 @@ openftgs.train.
 Spec: §2.2, D-30. Band: Foundation (§2.1).
 """
 
+import hashlib
+import importlib.metadata
 import json
 import math
+import os
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
-from openftgs.types import ExchangeModel, InitPoints
+from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer, TrainerState
 
 __all__ = [
+    "load_checkpoint",
     "read_exchange",
     "read_init_points",
+    "save_checkpoint",
     "validate_exchange",
     "validate_init_points",
     "write_exchange",
@@ -277,3 +284,238 @@ def read_exchange(path: Path) -> ExchangeModel:
     except ValueError as err:
         raise ValueError(f"{path}: {err}") from None
     return model
+
+
+# ftgs-checkpoint (§2.2): a directory holding a TrainerState in full.
+
+_CKPT = "ftgs-checkpoint"
+# §1.1: the nine stored tensors, in FreeTimeGaussians.PARAM_NAMES' order; io may not import the
+# model, so a test pins this copy to it.
+_PARAM_NAMES = (
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
+_MANIFEST = "manifest.json"
+_CKPT_FILES = (
+    "params.safetensors",
+    "optim.safetensors",
+    "optim.json",
+    "stats.safetensors",
+    "rng.safetensors",
+    "rng.json",
+    "sampler.json",
+)
+_SEP = "/"  # Q-25: separator of the key paths under which nested tensors are stored
+
+
+def _split_tensors(
+    tree: Mapping[str, Any], where: str, prefix: str = ""
+) -> tuple[dict[str, Tensor], dict[str, Any]]:
+    """Q-25: every tensor in a tree of dicts goes to a flat map under its `/`-joined key path;
+    the rest stays in a JSON-ready tree. Tensors inside lists are refused."""
+    tensors: dict[str, Tensor] = {}
+    rest: dict[str, Any] = {}
+    for key, value in tree.items():
+        if not isinstance(key, str) or _SEP in key:
+            _fail(where, f"keys must be strings without {_SEP!r}, got {key!r}")
+        path = prefix + key
+        if isinstance(value, Tensor):
+            tensors[path] = value
+        elif isinstance(value, Mapping):
+            sub_tensors, sub_rest = _split_tensors(value, where, path + _SEP)
+            tensors.update(sub_tensors)
+            rest[key] = sub_rest
+        else:
+            _check_json(value, f"{where}: {path}")
+            rest[key] = value
+    return tensors, rest
+
+
+def _check_json(value: Any, where: str) -> None:
+    """A JSON value with finite numbers and string keys; tensors are refused here."""
+    if value is None or isinstance(value, bool | int | str):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _fail(where, f"non-finite number {value!r}")
+        return
+    if isinstance(value, list | tuple):
+        for item in value:
+            _check_json(item, where)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                _fail(where, f"keys must be strings, got {key!r}")
+            _check_json(item, where)
+        return
+    _fail(where, f"{type(value).__name__} is not a JSON value")
+
+
+def _merge_tensors(tree: dict[str, Any], tensors: Mapping[str, Tensor], where: str) -> None:
+    """The inverse of _split_tensors: put each tensor back at its key path."""
+    for path, value in tensors.items():
+        *parents, leaf = path.split(_SEP)
+        node = tree
+        for part in parents:
+            child = node.setdefault(part, {})
+            if not isinstance(child, dict):
+                _fail(where, f"tensor path {path!r} collides with a JSON value")
+            node = child
+        if leaf in node:
+            _fail(where, f"tensor path {path!r} collides with a JSON value")
+        node[leaf] = value
+
+
+def _json_bytes(value: Any) -> bytes:
+    # §2.2: floats in Python's shortest round-trip repr, which json writes; NaN and inf refused.
+    return json.dumps(value, allow_nan=False, indent=1).encode("utf-8")
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _is_checkpoint(directory: Path) -> bool:
+    try:
+        manifest = json.loads((directory / _MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(manifest, dict) and manifest.get("format") == _CKPT
+
+
+def save_checkpoint(state: TrainerState, directory: Path) -> Path:
+    """Write `state` as a ftgs-checkpoint v1 directory (§2.2; Q-17, Q-25) and return its path.
+
+    The files are written into a temporary sibling directory that then replaces `directory`, so
+    a reader sees either the old checkpoint or the new one. An existing directory is replaced
+    only if it is a checkpoint or empty."""
+    directory = Path(directory)
+    where = f"checkpoint {directory}"
+    if set(state.params) != set(_PARAM_NAMES):
+        _fail(where, f"params must hold exactly {_PARAM_NAMES}, got {sorted(state.params)}")
+    optim_tensors, optim_rest = _split_tensors(state.optim, f"{where} optim")
+    rng_tensors, rng_rest = _split_tensors(state.rng, f"{where} rng")
+    stats_tensors, stats_rest = _split_tensors(state.stats, f"{where} stats")
+    if stats_rest:
+        _fail(where, f"stats must hold tensors only, got {sorted(stats_rest)}")
+    _check_json(state.sampler, f"{where} sampler")
+    _check_json(state.config, f"{where} config")
+    if directory.exists() and not (_is_checkpoint(directory) or not any(directory.iterdir())):
+        _fail(where, "exists and is not a checkpoint; refusing to replace it")
+
+    tmp = directory.with_name(f".{directory.name}.tmp-{os.getpid()}")
+    old = directory.with_name(f".{directory.name}.old-{os.getpid()}")
+    for leftover in (tmp, old):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    tmp.mkdir(parents=True)
+    try:
+        _write_safetensors({k: state.params[k] for k in _PARAM_NAMES}, tmp / _CKPT_FILES[0], {})
+        _write_safetensors(optim_tensors, tmp / "optim.safetensors", {})
+        (tmp / "optim.json").write_bytes(_json_bytes(optim_rest))
+        _write_safetensors(stats_tensors, tmp / "stats.safetensors", {})
+        _write_safetensors(rng_tensors, tmp / "rng.safetensors", {})
+        (tmp / "rng.json").write_bytes(_json_bytes(rng_rest))
+        (tmp / "sampler.json").write_bytes(_json_bytes(state.sampler))
+        manifest = {
+            "format": _CKPT,
+            "version": _VERSION,
+            "iteration": state.iteration,
+            "config": state.config,
+            "tau0": state.time.tau0,
+            "tau1": state.time.tau1,
+            "spatial_scale": state.spatial_scale,
+            "frame_dt": state.frame_dt,
+            "sh_degree": state.config.get("sh_degree"),
+            "seed": state.config.get("seed"),
+            "scene_sha256": state.scene_sha256,
+            "time_unit": state.time_unit,
+            "versions": {
+                "openftgs": _package_version("openftgs"),
+                "torch": torch.__version__,
+                "gsplat": _package_version("gsplat"),
+                "cuda": torch.version.cuda,
+            },
+            "files": {name: _sha256(tmp / name) for name in _CKPT_FILES},
+        }
+        (tmp / _MANIFEST).write_bytes(_json_bytes(manifest))
+        if directory.exists():
+            directory.rename(old)
+        tmp.rename(directory)
+    except BaseException:
+        if old.exists() and not directory.exists():
+            old.rename(directory)
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+    return directory
+
+
+def load_checkpoint(directory: Path) -> TrainerState:
+    """Read a ftgs-checkpoint directory (§2.2; Q-25), checking its format, major version, file
+    set and every SHA-256 first. Tensors are returned on the CPU."""
+    directory = Path(directory)
+    where = f"checkpoint {directory}"
+    try:
+        manifest = json.loads((directory / _MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise ValueError(f"{where}: cannot read {_MANIFEST}: {err}") from None
+    if not isinstance(manifest, dict):
+        _fail(where, f"{_MANIFEST} must hold an object")
+    _check_header(
+        {k: str(v) for k, v in manifest.items() if k in ("format", "version")}, _CKPT, where
+    )
+    present = {p.name for p in directory.iterdir()}
+    expected = {_MANIFEST, *_CKPT_FILES}
+    if present != expected:
+        _fail(where, f"expected the files {sorted(expected)}, found {sorted(present)}")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != set(_CKPT_FILES):
+        _fail(where, "the manifest must list the SHA-256 of every other file")
+    for name in _CKPT_FILES:
+        if _sha256(directory / name) != files[name]:
+            _fail(where, f"{name} does not match its SHA-256 in the manifest")
+    try:
+        params, _ = _read_safetensors(directory / "params.safetensors")
+        optim_tensors, _ = _read_safetensors(directory / "optim.safetensors")
+        stats, _ = _read_safetensors(directory / "stats.safetensors")
+        rng_tensors, _ = _read_safetensors(directory / "rng.safetensors")
+        optim = json.loads((directory / "optim.json").read_text(encoding="utf-8"))
+        rng = json.loads((directory / "rng.json").read_text(encoding="utf-8"))
+        sampler = json.loads((directory / "sampler.json").read_text(encoding="utf-8"))
+        state = TrainerState(
+            iteration=int(manifest["iteration"]),
+            config=manifest["config"],
+            time=TimeNormalizer(float(manifest["tau0"]), float(manifest["tau1"])),
+            spatial_scale=float(manifest["spatial_scale"]),
+            frame_dt=float(manifest["frame_dt"]),
+            params=params,
+            optim=optim,
+            stats=stats,
+            rng=rng,
+            sampler=sampler,
+            scene_sha256=manifest.get("scene_sha256"),
+            time_unit=str(manifest.get("time_unit", "s")),
+        )
+    except (KeyError, TypeError, ValueError) as err:
+        raise ValueError(f"{where}: {err}") from None
+    if set(params) != set(_PARAM_NAMES):
+        _fail(where, f"params.safetensors must hold exactly {_PARAM_NAMES}")
+    _merge_tensors(state.optim, optim_tensors, where)
+    _merge_tensors(state.rng, rng_tensors, where)
+    return state

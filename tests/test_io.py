@@ -7,24 +7,30 @@ values worked by hand; files with invalid content are written with safetensors d
 readers' validation is tested without the writers'.
 """
 
+import hashlib
 import json
+import random
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
+from openftgs.config import TrainConfig, config_to_dict
 from openftgs.io import (
+    load_checkpoint,
     read_exchange,
     read_init_points,
+    save_checkpoint,
     validate_exchange,
     validate_init_points,
     write_exchange,
     write_init_points,
 )
-from openftgs.types import ExchangeModel, InitPoints
+from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer, TrainerState
 
 F32 = torch.float32
 F64 = torch.float64
@@ -386,3 +392,262 @@ def test_ftgs_if_writer_validates_before_writing(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         validate_exchange(bad)
     validate_exchange(_exchange())
+
+
+# ftgs-checkpoint (§2.2; U-21 and U-26 file parts; Q-17, Q-25)
+
+PARAM_NAMES = (
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
+CHECKPOINT_FILES = {
+    "manifest.json",
+    "params.safetensors",
+    "optim.safetensors",
+    "optim.json",
+    "stats.safetensors",
+    "rng.safetensors",
+    "rng.json",
+    "sampler.json",
+}
+
+
+def _params(n: int, sh_degree: int, seed: int = 0) -> dict[str, Tensor]:
+    g = _gen(seed)
+    return {
+        "means": torch.randn(n, 3, generator=g),
+        "times": torch.rand(n, generator=g),
+        "log_durations": torch.randn(n, generator=g) - 3.0,
+        "velocities": torch.randn(n, 3, generator=g),
+        "log_scales": torch.randn(n, 3, generator=g) - 4.0,
+        "quats": torch.randn(n, 4, generator=g),
+        "opacity_logits": torch.randn(n, generator=g),
+        "sh0": torch.randn(n, 1, 3, generator=g),
+        "shN": torch.randn(n, (sh_degree + 1) ** 2 - 1, 3, generator=g),
+    }
+
+
+def _trainer_state(n: int = 7, sh_degree: int = 3) -> TrainerState:
+    params = _params(n, sh_degree)
+    g = _gen(99)
+    optim: dict[str, object] = {
+        name: {
+            "exp_avg": torch.randn(p.shape, generator=g),
+            "exp_avg_sq": torch.rand(p.shape, generator=g),
+            "step": torch.tensor(123.0),
+            "lr": [1.6e-4, 1.6e-6],
+            "schedule": "exponential",
+        }
+        for name, p in params.items()
+    }
+    optim["betas"] = [0.9, 0.999]
+    optim["eps"] = 1e-15
+    reloc = torch.Generator().manual_seed(5)
+    torch.rand(3, generator=reloc)
+    py = random.Random(11)
+    py.random()
+    version, internal, gauss = py.getstate()
+    rng = {
+        "torch_cpu": torch.Generator().manual_seed(1).get_state(),
+        "cuda": {},
+        "relocation": reloc.get_state(),
+        "sampler": torch.Generator().manual_seed(2).get_state(),
+        "python": [version, list(internal), gauss],
+        "numpy": np.random.default_rng(3).bit_generator.state,
+    }
+    return TrainerState(
+        iteration=1500,
+        config=config_to_dict(TrainConfig(sh_degree=sh_degree, seed=4)),
+        time=TimeNormalizer(0.1, 10.0 / 3.0),
+        spatial_scale=1.1 * 2.718281828459045,
+        frame_dt=1.0 / 299.0,
+        params=params,
+        optim=optim,
+        stats={"g_sum": torch.rand(n, generator=g), "count": torch.randint(0, 9, (n,))},
+        rng=rng,
+        sampler={"epoch": 3, "cursor": 17, "permutation": [4, 0, 2, 1, 3]},
+        scene_sha256="ab" * 32,
+        time_unit="frame",
+    )
+
+
+def _assert_same(a: object, b: object, path: str = "") -> None:
+    """Bitwise equality of nested tensors, dicts, lists and scalars (tuples compare as lists)."""
+    if isinstance(a, Tensor):
+        assert isinstance(b, Tensor), path
+        assert a.dtype == b.dtype and a.shape == b.shape, path
+        assert torch.equal(a, b), path
+    elif isinstance(a, dict):
+        assert isinstance(b, dict) and set(a) == set(b), path
+        for k in a:
+            _assert_same(a[k], b[k], f"{path}/{k}")
+    elif isinstance(a, list | tuple):
+        assert isinstance(b, list) and len(a) == len(b), path
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):
+            _assert_same(x, y, f"{path}/{i}")
+    else:
+        assert type(a) is type(b) and a == b, path
+
+
+def _assert_states_equal(a: TrainerState, b: TrainerState) -> None:
+    assert b.iteration == a.iteration
+    assert b.time == a.time
+    assert (b.spatial_scale, b.frame_dt) == (a.spatial_scale, a.frame_dt)
+    assert (b.scene_sha256, b.time_unit) == (a.scene_sha256, a.time_unit)
+    for name in ("config", "params", "optim", "stats", "rng", "sampler"):
+        _assert_same(getattr(a, name), getattr(b, name), name)
+
+
+@pytest.mark.parametrize("sh_degree", [0, 1, 2, 3])
+def test_u26_checkpoint_round_trip_for_each_sh_degree(tmp_path: Path, sh_degree: int) -> None:
+    """U-21 (round trip of every tensor, moment, step counter, generator state, sampler and
+    statistic) and U-26 (checkpoint round trip per L, including L = 0's empty shN): bitwise."""
+    state = _trainer_state(sh_degree=sh_degree)
+    out = save_checkpoint(state, tmp_path / "ckpt")
+    assert out == tmp_path / "ckpt"
+    back = load_checkpoint(out)
+    _assert_states_equal(state, back)
+    assert back.params["shN"].shape == (7, (sh_degree + 1) ** 2 - 1, 3)
+
+
+def test_checkpoint_generator_states_restore_the_same_draws(tmp_path: Path) -> None:
+    """U-21: the stored generator states reproduce the draws (torch, Python, NumPy)."""
+    state = _trainer_state()
+    back = load_checkpoint(save_checkpoint(state, tmp_path / "ckpt"))
+    g = torch.Generator()
+    g.set_state(back.rng["relocation"])
+    h = torch.Generator()
+    h.set_state(state.rng["relocation"])
+    assert torch.equal(torch.rand(5, generator=g), torch.rand(5, generator=h))
+    version, internal, gauss = back.rng["python"]
+    py = random.Random()
+    py.setstate((version, tuple(internal), gauss))
+    ref = random.Random(11)
+    ref.random()
+    assert py.random() == ref.random()
+    bit_generator = np.random.PCG64()
+    bit_generator.state = back.rng["numpy"]
+    assert np.random.Generator(bit_generator).random() == np.random.default_rng(3).random()
+
+
+def test_checkpoint_directory_holds_the_section_2_2_files(tmp_path: Path) -> None:
+    """§2.2 ftgs-checkpoint: exactly the eight files, and a manifest with format, version,
+    iteration, the full TrainConfig, τ₀, τ₁, S, Δt_f, SH degree, seed, scene hash, versions and
+    the SHA-256 of every other file (Q-17, Q-25)."""
+    state = _trainer_state()
+    out = save_checkpoint(state, tmp_path / "ckpt")
+    assert {p.name for p in out.iterdir()} == CHECKPOINT_FILES
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["format"] == "ftgs-checkpoint"
+    assert manifest["version"] == 1
+    assert manifest["iteration"] == 1500
+    assert manifest["config"] == state.config
+    assert (manifest["tau0"], manifest["tau1"]) == (0.1, 10.0 / 3.0)
+    assert manifest["spatial_scale"] == state.spatial_scale
+    assert manifest["frame_dt"] == 1.0 / 299.0
+    assert manifest["sh_degree"] == 3
+    assert manifest["seed"] == 4
+    assert manifest["scene_sha256"] == "ab" * 32
+    assert manifest["time_unit"] == "frame"
+    assert set(manifest["versions"]) == {"openftgs", "torch", "gsplat", "cuda"}
+    assert manifest["versions"]["torch"] == torch.__version__
+    assert set(manifest["files"]) == CHECKPOINT_FILES - {"manifest.json"}
+    for name, digest in manifest["files"].items():
+        assert hashlib.sha256((out / name).read_bytes()).hexdigest() == digest
+    with safe_open(str(out / "params.safetensors"), framework="pt") as f:
+        names = set(f.keys())
+        dtypes = {f.get_tensor(k).dtype for k in names}
+    assert names == set(PARAM_NAMES)
+    assert dtypes == {F32}
+    with safe_open(str(out / "optim.safetensors"), framework="pt") as f:
+        assert "means/exp_avg" in set(f.keys())
+    optim_json = json.loads((out / "optim.json").read_text())
+    assert optim_json["means"]["lr"] == [1.6e-4, 1.6e-6]
+    assert "exp_avg" not in optim_json["means"]
+    sampler = json.loads((out / "sampler.json").read_text())
+    assert sampler == {"epoch": 3, "cursor": 17, "permutation": [4, 0, 2, 1, 3]}
+
+
+@pytest.mark.parametrize(
+    "case", ["tampered params", "missing rng.json", "extra file", "version 2", "eight params"]
+)
+def test_checkpoint_loader_rejects_damaged_directories(tmp_path: Path, case: str) -> None:
+    """§2.2 and §2.1 (integrity check): a changed or missing file, an unknown file, an unknown
+    major version, or a params file without the nine tensors is rejected (Q-25, Q-26)."""
+    out = save_checkpoint(_trainer_state(), tmp_path / "ckpt")
+    if case == "eight params":
+        params = _params(7, 3)
+        del params["shN"]
+        save_file(params, str(out / "params.safetensors"))
+        manifest = json.loads((out / "manifest.json").read_text())
+        digest = hashlib.sha256((out / "params.safetensors").read_bytes()).hexdigest()
+        manifest["files"]["params.safetensors"] = digest
+        (out / "manifest.json").write_text(json.dumps(manifest))
+    elif case == "tampered params":
+        data = bytearray((out / "params.safetensors").read_bytes())
+        data[-1] ^= 0x01
+        (out / "params.safetensors").write_bytes(bytes(data))
+    elif case == "missing rng.json":
+        (out / "rng.json").unlink()
+    elif case == "extra file":
+        (out / "notes.txt").write_text("hello")
+    elif case == "version 2":
+        manifest = json.loads((out / "manifest.json").read_text())
+        manifest["version"] = 2
+        (out / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        load_checkpoint(out)
+
+
+def test_checkpoint_save_replaces_an_existing_checkpoint_atomically(tmp_path: Path) -> None:
+    """§2.2 "Saves are atomic" (Q-25): saving over a checkpoint replaces it, and no temporary
+    directory is left beside it."""
+    first = _trainer_state(n=4)
+    second = _trainer_state(n=9)
+    target = tmp_path / "ckpt"
+    save_checkpoint(first, target)
+    save_checkpoint(second, target)
+    _assert_states_equal(second, load_checkpoint(target))
+    assert [p.name for p in tmp_path.iterdir()] == ["ckpt"]
+
+
+def test_checkpoint_save_refuses_to_replace_a_directory_that_is_not_a_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Q-25: a save never deletes a directory that isn't a checkpoint."""
+    target = tmp_path / "ckpt"
+    target.mkdir()
+    (target / "precious.txt").write_text("keep me")
+    with pytest.raises(ValueError):
+        save_checkpoint(_trainer_state(), target)
+    assert (target / "precious.txt").read_text() == "keep me"
+
+
+@pytest.mark.parametrize(
+    "case", ["slash in key", "tensor in sampler", "nan in json", "eight params", "tensor in list"]
+)
+def test_checkpoint_save_rejects_state_the_layout_cannot_hold(tmp_path: Path, case: str) -> None:
+    """Q-25: keys containing "/" (the tensor key separator), tensors in sampler.json or inside
+    lists, non-finite JSON numbers and params without the nine tensors are refused, and nothing
+    is written."""
+    state = _trainer_state()
+    if case == "slash in key":
+        state.optim["a/b"] = torch.zeros(1)
+    elif case == "tensor in sampler":
+        state.sampler["permutation"] = torch.arange(5)
+    elif case == "nan in json":
+        state.optim["eps"] = float("nan")
+    elif case == "eight params":
+        del state.params["shN"]
+    elif case == "tensor in list":
+        state.rng["cuda"] = [torch.zeros(4, dtype=torch.uint8)]
+    with pytest.raises(ValueError):
+        save_checkpoint(state, tmp_path / "ckpt")
+    assert list(tmp_path.iterdir()) == []
