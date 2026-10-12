@@ -9,6 +9,7 @@ readers' validation is tested without the writers'.
 
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 
@@ -651,3 +652,94 @@ def test_checkpoint_save_rejects_state_the_layout_cannot_hold(tmp_path: Path, ca
     with pytest.raises(ValueError):
         save_checkpoint(state, tmp_path / "ckpt")
     assert list(tmp_path.iterdir()) == []
+
+
+# PLY snapshot for viewers (§2.1 io row; Q-18)
+
+
+def _read_ply(path: Path) -> tuple[list[str], int, np.ndarray]:
+    """A minimal reader for the test: the header's property names, the vertex count and the
+    float32 body as an [N, P] array."""
+    data = path.read_bytes()
+    end = data.index(b"end_header\n") + len(b"end_header\n")
+    header = data[:end].decode("ascii").splitlines()
+    assert header[0] == "ply"
+    assert header[1] == "format binary_little_endian 1.0"
+    count = next(int(line.split()[2]) for line in header if line.startswith("element vertex"))
+    props = [line.split() for line in header if line.startswith("property")]
+    assert all(p[1] == "float" for p in props)
+    names = [p[2] for p in props]
+    body = np.frombuffer(data[end:], dtype="<f4").reshape(count, len(names))
+    return names, count, body
+
+
+def test_ply_snapshot_uses_the_3dgs_viewer_layout(tmp_path: Path) -> None:
+    """Q-18: x y z, nx ny nz (zero), f_dc_0..2, f_rest_* channel-major, opacity as a logit,
+    scale_0..2 as logs, rot_0..3; values worked by hand."""
+    from openftgs.io import write_ply
+
+    means = torch.tensor([[1.0, 2.0, 3.0], [-1.0, 0.5, 0.25]])
+    scales = torch.tensor([[1.0, math.e, 0.5], [2.0, 1.0, 1.0]])
+    quats = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5]])
+    opacities = torch.tensor([0.5, 0.75])
+    sh = torch.arange(2 * 4 * 3, dtype=F32).reshape(2, 4, 3)  # L = 1
+    path = tmp_path / "snapshot.ply"
+    write_ply(path, means=means, scales=scales, quats=quats, opacities=opacities, sh=sh)
+    names, count, body = _read_ply(path)
+    rest = [f"f_rest_{i}" for i in range(9)]
+    assert names == [
+        "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2", *rest,
+        "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+    ]  # fmt: skip
+    assert count == 2
+    col = {name: body[:, i] for i, name in enumerate(names)}
+    np.testing.assert_array_equal(np.stack([col["x"], col["y"], col["z"]], 1), means.numpy())
+    assert not np.any(np.stack([col["nx"], col["ny"], col["nz"]]))
+    np.testing.assert_array_equal(col["f_dc_1"], [1.0, 13.0])  # sh[n, 0, 1]
+    # channel-major: f_rest_{c·3 + (k − 1)} = sh[n, k, c]
+    np.testing.assert_array_equal(col["f_rest_0"], [3.0, 15.0])  # k = 1, c = 0
+    np.testing.assert_array_equal(col["f_rest_2"], [9.0, 21.0])  # k = 3, c = 0
+    np.testing.assert_array_equal(col["f_rest_3"], [4.0, 16.0])  # k = 1, c = 1
+    np.testing.assert_array_equal(col["f_rest_8"], [11.0, 23.0])  # k = 3, c = 2
+    np.testing.assert_allclose(col["opacity"], [0.0, math.log(3.0)], rtol=0, atol=1e-6)
+    np.testing.assert_allclose(col["scale_1"], [1.0, 0.0], rtol=0, atol=1e-6)
+    np.testing.assert_allclose(col["scale_2"], [math.log(0.5), 0.0], rtol=0, atol=1e-6)
+    np.testing.assert_array_equal(col["rot_0"], [1.0, 0.5])
+    np.testing.assert_array_equal(col["rot_3"], [0.0, 0.5])
+
+
+def test_ply_snapshot_of_degree_0_and_saturated_opacity(tmp_path: Path) -> None:
+    """Q-18: L = 0 writes no f_rest; an opacity of 1 or 0 takes the ftgs-if clamp
+    [1e-7, 1 − 1e-7] before the logit, so the file stays finite."""
+    from openftgs.io import write_ply
+
+    path = tmp_path / "snapshot.ply"
+    write_ply(
+        path,
+        means=torch.zeros(2, 3),
+        scales=torch.ones(2, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2),
+        opacities=torch.tensor([1.0, 0.0]),
+        sh=torch.zeros(2, 1, 3),
+    )
+    names, _, body = _read_ply(path)
+    assert not any(n.startswith("f_rest") for n in names)
+    opacity = body[:, names.index("opacity")]
+    logit = math.log((1.0 - 1e-7) / 1e-7)
+    np.testing.assert_allclose(opacity, [logit, -logit], rtol=1e-6)
+
+
+def test_ply_snapshot_rejects_mismatched_arrays(tmp_path: Path) -> None:
+    """Q-18, Q-26: arrays of different N or wrong trailing shapes are refused."""
+    from openftgs.io import write_ply
+
+    with pytest.raises(ValueError):
+        write_ply(
+            tmp_path / "x.ply",
+            means=torch.zeros(3, 3),
+            scales=torch.ones(2, 3),
+            quats=torch.ones(2, 4),
+            opacities=torch.ones(2) / 2,
+            sh=torch.zeros(2, 1, 3),
+        )
+    assert not (tmp_path / "x.ply").exists()

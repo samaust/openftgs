@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -32,6 +33,7 @@ __all__ = [
     "validate_init_points",
     "write_exchange",
     "write_init_points",
+    "write_ply",
 ]
 
 _VERSION = 1  # the major version this module reads and writes (§2.2)
@@ -519,3 +521,59 @@ def load_checkpoint(directory: Path) -> TrainerState:
     _merge_tensors(state.optim, optim_tensors, where)
     _merge_tensors(state.rng, rng_tensors, where)
     return state
+
+
+# PLY snapshot for viewers (Q-18): export-only, never read back.
+
+# §2.2 ftgs-if opacity clamp, applied before the logit so saturated opacities stay finite.
+_OPACITY_EPS = 1e-7
+
+
+def write_ply(
+    path: Path, *, means: Tensor, scales: Tensor, quats: Tensor, opacities: Tensor, sh: Tensor
+) -> None:
+    """Write per-time arrays as a static 3DGS-viewer PLY (Q-18): binary little-endian float32
+    properties x y z, nx ny nz (zero), f_dc_0..2, f_rest_* (channel-major), opacity as a logit,
+    scale_0..2 as logs, rot_0..3. Inputs are activated values: scales > 0, opacities in [0, 1]
+    (clamped to [1e-7, 1 − 1e-7] before the logit), quaternions (w, x, y, z)."""
+    where = f"ply {path}"
+    n = int(means.shape[0]) if means.dim() == 2 else -1
+    k = int(sh.shape[1]) if sh.dim() == 3 else -1
+    expected = {
+        "means": (means, (n, 3)),
+        "scales": (scales, (n, 3)),
+        "quats": (quats, (n, 4)),
+        "opacities": (opacities, (n,)),
+        "sh": (sh, (n, k, 3)),
+    }
+    for name, (value, shape) in expected.items():
+        if n < 0 or k < 1 or tuple(value.shape) != shape:
+            _fail(where, f"{name} must have shape {list(shape)}, got {list(value.shape)}")
+    f64 = torch.float64
+    opacity = opacities.detach().to("cpu", f64).clamp(_OPACITY_EPS, 1.0 - _OPACITY_EPS)
+    sh_cpu = sh.detach().to("cpu", f64)
+    columns = [
+        means.detach().to("cpu", f64),
+        torch.zeros(n, 3, dtype=f64),
+        sh_cpu[:, 0, :],
+        sh_cpu[:, 1:, :].transpose(1, 2).reshape(n, 3 * (k - 1)),  # channel-major
+        torch.logit(opacity)[:, None],
+        torch.log(scales.detach().to("cpu", f64)),
+        quats.detach().to("cpu", f64),
+    ]
+    body = torch.cat(columns, dim=1).to(torch.float32).numpy().astype("<f4", copy=False)
+    names = [
+        "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
+        *(f"f_rest_{i}" for i in range(3 * (k - 1))),
+        "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+    ]  # fmt: skip
+    header = [
+        "ply",
+        "format binary_little_endian 1.0",
+        f"element vertex {n}",
+        *(f"property float {name}" for name in names),
+        "end_header",
+    ]
+    with open(path, "wb") as out:
+        out.write(("\n".join(header) + "\n").encode("ascii"))
+        out.write(np.ascontiguousarray(body).tobytes())
