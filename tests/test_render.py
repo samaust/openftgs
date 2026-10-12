@@ -763,3 +763,79 @@ def test_u22_renders_agree_before_and_after_export_and_import(tmp_path: Path) ->
             torch.testing.assert_close(
                 getattr(y, field).detach(), getattr(x, field).detach(), rtol=0, atol=1e-6
             )
+
+
+# Gradients through the reference backend (E1–E6; U-11 runs the losses through it in M6)
+
+
+class _RenderModule(torch.nn.Module):
+    """Holds a model so that torch.func.functional_call can substitute its nine tensors."""
+
+    def __init__(self, model: FreeTimeGaussians, camera: Camera, t: float) -> None:
+        super().__init__()
+        self.model = model
+        self.camera = camera
+        self.t = t
+
+    def forward(self) -> tuple[Tensor, Tensor]:
+        out = _render(self.model, self.camera, self.t)
+        return out.image, out.alpha
+
+
+def test_reference_render_gradients_pass_gradcheck() -> None:
+    """E1–E6 are differentiable end to end: float64 gradcheck of image and alpha with respect to
+    all nine stored tensors, 3 primitives on an 8×8 image, kept away from the clamps and thresholds
+    of E6 (σ′ ≈ 3 px so every α is above 1/255, σ ≤ 0.6, distinct depths, means near the axis,
+    colors away from 0), at eps 1e-6 and atol 1e-5."""
+    camera = pinhole(8, 8, fx=8.0, fy=8.0, cx=4.0, cy=4.0)
+    gen = torch.Generator().manual_seed(7)
+    params = {
+        "means": torch.tensor([[0.2, -0.1, 3.6], [-0.3, 0.2, 4.0], [0.1, 0.3, 4.4]]),
+        "times": torch.tensor([0.5, 0.6, 0.4]),
+        "log_durations": torch.zeros(3),
+        "velocities": 0.3 * torch.randn(3, 3, generator=gen),
+        "log_scales": torch.log(1.2 + 0.6 * torch.rand(3, 3, generator=gen)),
+        "quats": torch.randn(3, 4, generator=gen),
+        "opacity_logits": torch.tensor([-0.8, 0.0, 0.4]),
+        "sh0": 0.3 + 0.2 * torch.rand(3, 1, 3, generator=gen),
+        "shN": 0.05 * torch.randn(3, 15, 3, generator=gen),
+    }
+    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME).double()
+    module = _RenderModule(model, camera, 0.3)
+    inputs = tuple(getattr(model, name).detach().clone().requires_grad_() for name in _PARAM_NAMES)
+
+    def fn(*tensors: Tensor) -> tuple[Tensor, Tensor]:
+        substituted = {f"model.{name}": x for name, x in zip(_PARAM_NAMES, tensors, strict=True)}
+        image, alpha = torch.func.functional_call(module, substituted, ())
+        return image, alpha
+
+    assert torch.autograd.gradcheck(fn, inputs, eps=1e-6, atol=1e-5)
+
+
+def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean() -> None:
+    """Q-32: with return_aux, `means2d` keeps its gradient. For the on-axis row (Σ′ = 1.3·I,
+    σ = 0.5, color 0.5) and L = the red value of pixel (24, 34), 2 px right of μ′,
+    L = 0.5·0.5·e^(−q) with q = ½·(34.5 − μ′x)²/1.3, so ∂L/∂μ′ = (L·2/1.3, 0)."""
+    model = _model([{"mean": (0.0, 0.0, 4.0)}]).double()
+    model.log_scales.data.fill_(math.log(0.25))  # a = 0.25 exactly, not via float32
+    out = _render(model, CAM_A, 0.5, return_aux=True)
+    assert out.means2d is not None
+    torch.autograd.backward(out.image[0, 24, 34, 0])
+    value = 0.25 * math.exp(-0.5 * 4.0 / 1.3)
+    assert out.means2d.grad is not None
+    torch.testing.assert_close(
+        out.means2d.grad, torch.tensor([[[value * 2.0 / 1.3, 0.0]]], dtype=F64), rtol=1e-12, atol=0
+    )
+
+
+def test_row_at_the_camera_center_keeps_gradients_finite() -> None:
+    """E6: a row exactly at the camera center (z_c = 0, a zero view direction) is culled; every
+    gradient stays finite and that row's are exactly 0."""
+    model = _model([{"mean": (0.0, 0.0, 0.0)}, {"mean": (0.0, 0.0, 4.0)}], sh_degree=1)
+    out = _render(model, CAM_A, 0.5)
+    params = [getattr(model, name) for name in _PARAM_NAMES]
+    grads = torch.autograd.grad(out.image.sum() + out.alpha.sum(), params)
+    for name, grad in zip(_PARAM_NAMES, grads, strict=True):
+        assert bool(torch.isfinite(grad).all()), name
+        assert torch.equal(grad[0], torch.zeros_like(grad[0])), name
+    assert bool(grads[0][1].abs().sum() > 0)
