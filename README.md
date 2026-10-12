@@ -25,7 +25,13 @@ Training needs a CUDA build of PyTorch: install it from the [PyTorch index](http
 
 Optional extras:
 
-- `[init]`: the dependencies of the RoMa-based 4D initialization.
+- `[init]`: the dependencies of the RoMa-based 4D initialization. On Linux it includes [fused-local-corr](https://github.com/Parskatt/fused-local-corr) (MIT), an optional RoMa speed-up whose wheels stop at Python 3.13. On Python 3.14, build it from source; this needs the CUDA toolkit (`nvcc`) and a CUDA build of PyTorch already installed:
+
+  ```bash
+  pip install --no-build-isolation git+https://github.com/Parskatt/fused-local-corr@689f2f7303ca0d97ac1f3d1364c732c6d8e889a8
+  ```
+
+  Without it, RoMa runs with its `use_custom_corr` option off and computes the local correlation in plain PyTorch, which is slower.
 - `[fast]`: currently empty. The faster SSIM loss uses [fused-ssim](https://github.com/rahul-goel/fused-ssim) (MIT), which is not on PyPI; install it from its repository.
 
 The differential harness is a separate package in `harness/` (`pip install -e harness`).

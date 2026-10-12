@@ -26,12 +26,13 @@ dependencies = [
 
 [project.optional-dependencies]
 # §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1; fused-local-corr is a Linux-only speed-up.
+# Q-6: it has no wheels for Python 3.14; there it is built from source (README).
 init = [
     "torch>=2.5.1",
     "torchvision",
     "einops",
     "loguru",
-    "fused-local-corr>=0.2.2; sys_platform == 'linux'",
+    "fused-local-corr>=0.2.2; sys_platform == 'linux' and python_version < '3.14'",
 ]
 # Q-2: fused-ssim is not on PyPI; the README says how to install it.
 fast = []
