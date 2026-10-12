@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """U-6, basis parts: the real SH basis and the RGB ↔ DC conversion (E2, D-3, D-4; Q-14).
 
-The independent evaluation below is written from the general definition of the real spherical
-harmonics (normalization from factorials, associated Legendre functions with the Condon–Shortley
-phase by the standard recurrence, cos/sin combinations), not from the table `openftgs.sh` uses.
-The direction, clamp and inactive-band parts of U-6 come with the render backend (M4).
+The independent evaluation, `real_sh` in tests/real_sh.py, is written from the general definition
+of the real spherical harmonics, not from the table `openftgs.sh` uses. The direction, clamp and
+inactive-band parts of U-6 are in test_render.py (M4).
 """
 
 import math
@@ -13,47 +12,10 @@ import numpy as np
 import pytest
 import scipy.special
 import torch
+from real_sh import real_sh
 
 import openftgs.sh
 from openftgs.sh import C0, rgb_to_sh0, sh0_to_rgb, sh_basis
-
-
-def _legendre_cs(l_max: int, x: np.ndarray) -> dict[tuple[int, int], np.ndarray]:
-    """P_l^m(x) for 0 ≤ m ≤ l ≤ l_max, with the Condon–Shortley phase (−1)^m."""
-    p: dict[tuple[int, int], np.ndarray] = {(0, 0): np.ones_like(x)}
-    s = np.sqrt(np.maximum(0.0, 1.0 - x * x))
-    for m in range(1, l_max + 1):
-        p[(m, m)] = -(2 * m - 1) * s * p[(m - 1, m - 1)]
-    for m in range(0, l_max):
-        p[(m + 1, m)] = (2 * m + 1) * x * p[(m, m)]
-    for m in range(0, l_max + 1):
-        for ell in range(m + 2, l_max + 1):
-            p[(ell, m)] = (
-                (2 * ell - 1) * x * p[(ell - 1, m)] - (ell + m - 1) * p[(ell - 2, m)]
-            ) / (ell - m)
-    return p
-
-
-def _real_sh_reference(dirs: np.ndarray, l_max: int) -> np.ndarray:
-    """Real SH keeping the Condon–Shortley phase, ordered l = 0 … l_max, m = −l … l (float64)."""
-    d = dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
-    x, y, z = d[..., 0], d[..., 1], d[..., 2]
-    phi = np.arctan2(y, x)
-    p = _legendre_cs(l_max, z)
-    out = []
-    for ell in range(l_max + 1):
-        for m in range(-ell, ell + 1):
-            a = abs(m)
-            k = math.sqrt(
-                (2 * ell + 1) / (4 * math.pi) * math.factorial(ell - a) / math.factorial(ell + a)
-            )
-            if m == 0:
-                out.append(k * p[(ell, 0)])
-            elif m > 0:
-                out.append(math.sqrt(2) * k * np.cos(a * phi) * p[(ell, a)])
-            else:
-                out.append(math.sqrt(2) * k * np.sin(a * phi) * p[(ell, a)])
-    return np.stack(out, axis=-1)
 
 
 def _directions(n: int, seed: int) -> np.ndarray:
@@ -83,7 +45,7 @@ def test_c0_is_the_l0_constant() -> None:
 def test_reference_matches_scipy_complex_sh() -> None:
     """The test oracle itself: √2·Re/Im of SciPy's complex Y_l^|m| (Condon–Shortley phase)."""
     d = _directions(200, 1)
-    ref = _real_sh_reference(d, 3)
+    ref = real_sh(d, 3)
     u = d / np.linalg.norm(d, axis=-1, keepdims=True)
     theta = np.arccos(np.clip(u[:, 2], -1.0, 1.0))  # polar angle
     phi = np.arctan2(u[:, 1], u[:, 0])  # azimuth
@@ -132,7 +94,7 @@ def test_u6_degrees_1_to_3_match_independent_real_sh(degree: int, dtype: torch.d
     """U-6: degrees 1–3 against the independent evaluation, within 1e-6; directions need not be
     unit vectors (Q-14)."""
     d = _directions(500, 3 + degree)
-    expected = torch.from_numpy(_real_sh_reference(d, degree)).to(dtype)
+    expected = torch.from_numpy(real_sh(d, degree)).to(dtype)
     got = sh_basis(torch.from_numpy(d).to(dtype), degree)
     assert got.shape == (d.shape[0], (degree + 1) ** 2)
     assert got.dtype == dtype
