@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""render() with the gsplat backend on a CUDA device (E2, E6, D-6, D-31, D-32, D-57, D-75, D-76;
-§1.4; Q-31 to Q-33, Q-36, Q-39): U-7, U-12, the GPU variants of U-4, U-8 and U-20, the Q-33
-boundary cases and the exact 1/255 boundary, both layouts (packed and unpacked) and a cross-check
-against gsplat's own rasterization().
+"""render() with the gsplat backend on a CUDA device (E2, E6, E13, D-3, D-6, D-31, D-32, D-57,
+D-75, D-76; §1.4; Q-31 to Q-33, Q-36, Q-39): U-7, U-12, the GPU variants of U-4, U-8 and U-20,
+U-6's inactive-band cases, the Q-33 boundary cases and the exact 1/255 boundary, both layouts
+(packed and unpacked), and cross-checks against gsplat's own rasterization().
 
-Expected values are M4's worked values (`test_render.py`), or come from the reference backend
-rendering the same CUDA model, so both backends see bit-identical per-time arrays. Pixels are
-written as (row v, column u).
+Expected values are M4's worked values (`test_render.py`), properties U-6 states (bands cut by
+sh_degree change nothing), gsplat's own rasterization(), or the reference backend rendering the
+same CUDA model, so both backends see bit-identical per-time arrays. Pixels are written as (row v,
+column u).
 """
 
 import math
@@ -88,6 +89,41 @@ def _warm_up() -> None:
     for rows in ([{"mean": (0.0, 0.0, 4.0)}], [{"mean": (0.0, 0.0, 4.0)}] * 3):
         for packed in (True, False):
             _gsplat(_cuda(model_from_rows(rows)), CAM_A, 0.5, packed=packed)
+
+
+def _gsplat_rasterization(
+    g: Any,
+    cameras: list[Camera],
+    *,
+    packed: bool,
+    rasterize_mode: Literal["classic", "antialiased"] = "classic",
+    backgrounds: Tensor | None = None,
+) -> tuple[Tensor, Tensor, dict[str, Any]]:
+    """gsplat's own rasterization() of per-time arrays `g` (64×48, SH degree 3), with D-6's and
+    D-57's arguments: the oracle for the backend's adapted glue."""
+    import gsplat
+
+    image, alpha, meta = gsplat.rasterization(
+        g.means_t,
+        g.quats_n,
+        g.scales,
+        g.opacities_t,
+        g.sh,
+        torch.stack([cam.world_to_camera for cam in cameras]).cuda(),
+        torch.stack([cam.K for cam in cameras]).cuda(),
+        64,
+        48,
+        near_plane=0.01,
+        far_plane=1e10,
+        radius_clip=0.0,
+        eps2d=0.3,
+        sh_degree=3,
+        packed=packed,
+        tile_size=16,
+        rasterize_mode=rasterize_mode,
+        backgrounds=backgrounds,
+    )
+    return image, alpha, meta
 
 
 def _unpacked(out: RenderOutput) -> Tensor:
@@ -295,7 +331,8 @@ def test_u6_inactive_bands_contribute_nothing(packed: bool) -> None:
         sh_degree=3,
         time=model.time,
     )
-    assert torch.equal(_gsplat(other, cameras, 0.4, sh_degree=1, packed=packed).image, expected)
+    again = _gsplat(other, cameras, 0.4, sh_degree=1, packed=packed).image.detach()
+    assert torch.equal(again, expected)
 
 
 @LAYOUTS
@@ -322,31 +359,12 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
     (only the camera center is computed differently, D-76), and so do the 2D means and the
     visible primitives; in unpacked mode, a per-camera background composited outside the kernel
     agrees with gsplat's own within 1e-6 too (D-76)."""
-    import gsplat
 
     cameras = _CAMERAS
     model = _cuda(random_model(40, seed=3, spread=1.5, log_scale=(-2.5, -1.0)))
     out = _gsplat(model, cameras, 0.37, return_aux=True, packed=packed)
     g = model.at_time(0.37)
-    image, alpha, meta = gsplat.rasterization(
-        g.means_t,
-        g.quats_n,
-        g.scales,
-        g.opacities_t,
-        g.sh,
-        torch.stack([cam.world_to_camera for cam in cameras]).cuda(),
-        torch.stack([cam.K for cam in cameras]).cuda(),
-        64,
-        48,
-        near_plane=0.01,
-        far_plane=1e10,
-        radius_clip=0.0,
-        eps2d=0.3,
-        sh_degree=3,
-        packed=packed,
-        tile_size=16,
-        rasterize_mode="classic",
-    )
+    image, alpha, meta = _gsplat_rasterization(g, cameras, packed=packed)
     torch.testing.assert_close(out.image, image, rtol=0, atol=1e-6)
     torch.testing.assert_close(out.alpha, alpha, rtol=0, atol=1e-6)
     if not packed:
@@ -354,26 +372,7 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
         # gsplat 1.5.3 accepts per camera in unpacked mode only.
         backgrounds = torch.tensor([[0.25, 0.5, 0.75], [1.0, 0.0, 0.5]], device="cuda")
         with_background = _gsplat(model, cameras, 0.37, background=backgrounds, packed=False)
-        in_kernel, _, _ = gsplat.rasterization(
-            g.means_t,
-            g.quats_n,
-            g.scales,
-            g.opacities_t,
-            g.sh,
-            torch.stack([cam.world_to_camera for cam in cameras]).cuda(),
-            torch.stack([cam.K for cam in cameras]).cuda(),
-            64,
-            48,
-            near_plane=0.01,
-            far_plane=1e10,
-            radius_clip=0.0,
-            eps2d=0.3,
-            sh_degree=3,
-            packed=False,
-            tile_size=16,
-            rasterize_mode="classic",
-            backgrounds=backgrounds,
-        )
+        in_kernel, _, _ = _gsplat_rasterization(g, cameras, packed=False, backgrounds=backgrounds)
         torch.testing.assert_close(with_background.image, in_kernel, rtol=0, atol=1e-6)
     visible = (meta["radii"] > 0).all(dim=-1)
     assert out.visible is not None and out.means2d is not None
@@ -388,13 +387,12 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
 
 
 @LAYOUTS
-def test__backend_follows_the_rasterize_mode_constant(
+def test__rasterize_mode_drives_the_compensations(
     packed: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Private, D-6, D-72 (#52): the rasterize mode has one source, `_RASTERIZE_MODE`. Set to
     "antialiased" (which D-6 doesn't use), the backend computes gsplat's compensations and applies
     them to the opacities, so it matches gsplat's own antialiased rasterization() within 1e-6."""
-    import gsplat
 
     import openftgs.render
 
@@ -402,24 +400,8 @@ def test__backend_follows_the_rasterize_mode_constant(
     model = _cuda(random_model(40, seed=4, spread=1.5, log_scale=(-2.5, -1.0)))
     out = _gsplat(model, _CAMERAS, 0.37, packed=packed)
     g = model.at_time(0.37)
-    image, alpha, _ = gsplat.rasterization(
-        g.means_t,
-        g.quats_n,
-        g.scales,
-        g.opacities_t,
-        g.sh,
-        torch.stack([cam.world_to_camera for cam in _CAMERAS]).cuda(),
-        torch.stack([cam.K for cam in _CAMERAS]).cuda(),
-        64,
-        48,
-        near_plane=0.01,
-        far_plane=1e10,
-        radius_clip=0.0,
-        eps2d=0.3,
-        sh_degree=3,
-        packed=packed,
-        tile_size=16,
-        rasterize_mode="antialiased",
+    image, alpha, _ = _gsplat_rasterization(
+        g, _CAMERAS, packed=packed, rasterize_mode="antialiased"
     )
     torch.testing.assert_close(out.image, image, rtol=0, atol=1e-6)
     torch.testing.assert_close(out.alpha, alpha, rtol=0, atol=1e-6)
