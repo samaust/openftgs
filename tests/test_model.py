@@ -463,7 +463,8 @@ def test_u19_supplied_durations_and_velocities_convert_to_normalized_time() -> N
 
 
 def test_u19_single_timestamp_uses_a_unit_of_one_and_one_frame() -> None:
-    """§1.3 step 7 (F = 1 for a single timestamp) and Q-19 (unit of 1 when T_τ = 0)."""
+    """§1.3 step 7 (F = 1 for a single timestamp), §1.4 "Time" (with T_τ = 0, velocities are
+    frozen at 0) and Q-19 (durations convert with a unit of 1 when T_τ = 0)."""
     single = TimeNormalizer(5.0, 5.0)
     pts = _points(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
@@ -473,9 +474,7 @@ def test_u19_single_timestamp_uses_a_unit_of_one_and_one_frame() -> None:
     )
     model = _init(pts, single, 1.0, b=3, n_max=3)  # F·B = 1·3
     assert not bool(model.times.detach().any())
-    torch.testing.assert_close(
-        model.velocities.detach(), torch.tensor([[1.0, 2.0, 3.0]] * 3), rtol=1e-6, atol=1e-7
-    )
+    assert not bool(model.velocities.detach().any())
     torch.testing.assert_close(
         model.log_durations.detach(), torch.full((3,), math.log(0.3)), rtol=1e-6, atol=1e-7
     )
@@ -753,8 +752,10 @@ def test_from_exchange_validates_its_input() -> None:
 
 
 def test_single_frame_model_exports_and_round_trips() -> None:
-    """Q-19: with T_τ = 0, duration = s and velocity = v; the model validates and round-trips."""
+    """Q-19: with T_τ = 0, duration = s and velocity = v; the model validates and round-trips.
+    Its velocities are 0, as §1.4 "Time" freezes them."""
     params = _params(n=3, sh_degree=0, seed=7)
+    params["velocities"] = torch.zeros(3, 3)
     model = FreeTimeGaussians(params, sh_degree=0, time=TimeNormalizer(4.0, 4.0))
     ex = model.to_exchange()
     torch.testing.assert_close(
@@ -879,3 +880,13 @@ def test_u22_saturated_logit_exports_a_file_that_validates(tmp_path: Path) -> No
     write_exchange(_known_model().to_exchange(), tmp_path / "m.safetensors")
     opacity = read_exchange(tmp_path / "m.safetensors").arrays["opacity"]
     assert float(opacity[1]) == float(torch.tensor(1.0 - 1e-7, dtype=F32))
+
+
+def test_single_frame_import_freezes_velocities_at_zero() -> None:
+    """§1.4 "Time": with T_τ = 0, velocities are frozen at 0, also for an imported model."""
+    from openftgs.types import ExchangeModel
+
+    ex = _known_model().to_exchange()
+    single = ExchangeModel(dict(ex.arrays), 1, 3.0, 3.0, "s", "x")
+    model = FreeTimeGaussians.from_exchange(single, device="cpu")
+    assert not bool(model.velocities.detach().any())

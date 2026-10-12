@@ -227,6 +227,8 @@ class FreeTimeGaussians(torch.nn.Module):
             durations = torch.full((m,), frame_dt, dtype=torch.float64, device=device)  # D-21
         else:
             durations = durations_to_normalized(durations_tau, time)  # E14, Q-27
+        if time.tau1 == time.tau0:
+            velocities = torch.zeros_like(velocities)  # §1.4 "Time": frozen at 0 when T_τ = 0
         if frame_ids is None:
             # D-47: the nearest slot t_k = k·Δt_f; Q-21: ties to the lower slot, within [0, F).
             frame_ids = torch.ceil(t / frame_dt - 0.5).clamp(0, frames - 1).to(torch.int64)
@@ -277,7 +279,9 @@ class FreeTimeGaussians(torch.nn.Module):
             "means": arrays["position"],
             "times": times,
             "log_durations": torch.log(durations_to_normalized(arrays["duration"].to(f64), time)),
-            "velocities": velocities_to_normalized(arrays["velocity"].to(f64), time),
+            # §1.4 "Time": velocities are frozen at 0 when T_τ = 0.
+            "velocities": velocities_to_normalized(arrays["velocity"].to(f64), time)
+            * float(time.tau1 > time.tau0),
             "log_scales": torch.log(arrays["scale"].to(f64)),
             # Q-24: the importer normalizes the rotation.
             "quats": rotation / torch.linalg.vector_norm(rotation, dim=-1, keepdim=True),
