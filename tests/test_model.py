@@ -258,9 +258,11 @@ def test_at_time_carries_gradients_to_the_stored_tensors() -> None:
     """The per-time arrays are differentiable functions of the nine stored tensors."""
     model = _model(n=4)
     out = model.at_time(0.3)
-    (out.means_t.sum() + out.opacities_t.sum() + out.sh.sum() + out.scales.sum()).backward()
-    for name in ("means", "times", "velocities", "log_durations", "opacity_logits", "sh0", "shN"):
-        assert getattr(model, name).grad is not None, name
+    loss = out.means_t.sum() + out.opacities_t.sum() + out.sh.sum() + out.scales.sum()
+    names = [n for n in PARAM_NAMES if n != "quats"]
+    grads = torch.autograd.grad(loss, [getattr(model, n) for n in names])
+    for name, grad in zip(names, grads, strict=True):
+        assert bool(grad.abs().sum() > 0), name
 
 
 # resize_ (§1.3 Growth step 4; Q-23)
