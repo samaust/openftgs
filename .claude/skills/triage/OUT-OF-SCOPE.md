@@ -5,7 +5,7 @@ Rejected feature requests are recorded as closed GitHub issues labelled `out-of-
 1. **Institutional memory**: why a request was rejected, so the reasoning isn't lost when the issue is closed.
 2. **Deduplication**: when a new request matches a prior rejection, triage surfaces the earlier decision instead of re-litigating it.
 
-In this repository, scope is the spec. Most rejections read "not in spec revision 549a" and cite the item that bounds it. A request that should change the spec is not rejected here: it is the owner's decision, made in the spec and arriving in a new export.
+In this repository, scope is the spec. Most rejections read "not in spec revision 549b" and cite the item that bounds it. A request that should change the spec is not rejected here: it is the owner's decision, made in the spec and arriving in a new export.
 
 ## The canonical issue
 

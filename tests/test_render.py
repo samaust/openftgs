@@ -852,7 +852,7 @@ def test_render_rejects_cameras_it_cannot_batch() -> None:
 
 @pytest.mark.parametrize("packed", [True, False])
 def test_gsplat_backend_rejects_models_it_cannot_render(packed: bool) -> None:
-    """Q-38: the gsplat backend (the §2.1 default) renders float32 models on a CUDA device only; a
+    """D-76: the gsplat backend (the §2.1 default) renders float32 models on a CUDA device only; a
     CPU model, in float32 or float64, raises ValueError naming the reference backend."""
     for model in (_api_model(), _api_model().double()):
         with pytest.raises(ValueError, match="reference"):

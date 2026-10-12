@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""render() with the gsplat backend on a CUDA device (E2, E6, D-6, D-31, D-32, D-57; §1.4; Q-31 to
-Q-33, Q-36 to Q-39): U-7, U-12, the GPU variants of U-4, U-8 and U-20, the Q-33 boundary cases and
-the exact 1/255 boundary, both layouts (packed and unpacked) and a cross-check against gsplat's own
-rasterization().
+"""render() with the gsplat backend on a CUDA device (E2, E6, D-6, D-31, D-32, D-57, D-75, D-76;
+§1.4; Q-31 to Q-33, Q-36, Q-39): U-7, U-12, the GPU variants of U-4, U-8 and U-20, the Q-33
+boundary cases and the exact 1/255 boundary, both layouts (packed and unpacked) and a cross-check
+against gsplat's own rasterization().
 
 Expected values are M4's worked values (`test_render.py`), or come from the reference backend
 rendering the same CUDA model, so both backends see bit-identical per-time arrays. Pixels are
@@ -91,7 +91,7 @@ def _warm_up() -> None:
 
 def _unpacked(out: RenderOutput) -> Tensor:
     """The 2D means as [C, N, 2], zero where not visible, from either layout: packed rows are
-    camera-major and ascending within a camera (Q-38), which is the order of the True entries of
+    camera-major and ascending within a camera (D-76), which is the order of the True entries of
     `visible` read row by row."""
     assert out.means2d is not None and out.visible is not None
     if out.gaussian_ids is None:
@@ -271,16 +271,16 @@ def test_e2_colors_are_not_clamped_at_one(packed: bool) -> None:
     torch.testing.assert_close(image[0, 24, 32], torch.full((3,), 0.999 * 1.6), rtol=0, atol=1e-6)
 
 
-# The backend against gsplat's own rasterization() (Q-37, Q-38)
+# The backend against gsplat's own rasterization() (D-75, D-76)
 
 
 @LAYOUTS
 def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
-    """Q-37: the backend runs the kernels gsplat's rasterization() runs, with D-6's and D-57's
+    """D-75: the backend runs the kernels gsplat's rasterization() runs, with D-6's and D-57's
     arguments: on the same per-time arrays and no background, images and alpha agree within 1e-6
-    (only the camera center is computed differently, Q-38), and so do the 2D means and the
+    (only the camera center is computed differently, D-76), and so do the 2D means and the
     visible primitives; in unpacked mode, a per-camera background composited outside the kernel
-    agrees with gsplat's own within 1e-6 too (Q-38)."""
+    agrees with gsplat's own within 1e-6 too (D-76)."""
     import gsplat
 
     cameras = _CAMERAS
@@ -309,7 +309,7 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
     torch.testing.assert_close(out.image, image, rtol=0, atol=1e-6)
     torch.testing.assert_close(out.alpha, alpha, rtol=0, atol=1e-6)
     if not packed:
-        # Q-38: the background composited outside the kernel agrees with gsplat's own, which
+        # D-76: the background composited outside the kernel agrees with gsplat's own, which
         # gsplat 1.5.3 accepts per camera in unpacked mode only.
         backgrounds = torch.tensor([[0.25, 0.5, 0.75], [1.0, 0.0, 0.5]], device="cuda")
         with_background = _gsplat(model, cameras, 0.37, background=backgrounds, packed=False)
@@ -346,7 +346,7 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
     assert int(out.visible.sum()) >= 20
 
 
-# Layouts: packed and unpacked give the same render (D-57; Q-36 to Q-38)
+# Layouts: packed and unpacked give the same render (D-57, D-75, D-76; Q-36)
 
 PLACEMENTS = pytest.mark.parametrize("precull", ["internal", "compact"])
 
@@ -362,7 +362,7 @@ def _culling_scene(seed: int) -> FreeTimeGaussians:
 
 @PLACEMENTS
 def test_packed_and_unpacked_layouts_render_alike(precull: str) -> None:
-    """D-57, Q-37, Q-38: packed mode changes memory and speed, not results. Images and alpha agree
+    """D-57, D-75, D-76: packed mode changes memory and speed, not results. Images and alpha agree
     within 1e-6, `visible` is equal, and the packed 2D means are the unpacked ones at the visible
     entries read camera by camera in ascending row order, labeled by gaussian_ids."""
     model = _culling_scene(0)
@@ -387,7 +387,7 @@ def test_packed_and_unpacked_layouts_render_alike(precull: str) -> None:
 
 @PLACEMENTS
 def test_unpacked_means2d_is_zero_off_the_visible_rows(precull: str) -> None:
-    """Q-32, Q-37: in unpacked mode, means2d is μ′ for visible rows and exactly 0 elsewhere (gsplat
+    """Q-32, D-75: in unpacked mode, means2d is μ′ for visible rows and exactly 0 elsewhere (gsplat
     leaves those rows uninitialized), with and without compaction."""
     model = _culling_scene(1)
     out = _gsplat(model, _CAMERAS, 0.37, return_aux=True, precull=precull, packed=False)
@@ -402,7 +402,7 @@ def test_unpacked_means2d_is_zero_off_the_visible_rows(precull: str) -> None:
 def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean(
     packed: bool, precull: str
 ) -> None:
-    """Q-32, Q-37: with return_aux, means2d keeps its gradient in all four layouts and placements.
+    """Q-32, D-75: with return_aux, means2d keeps its gradient in all four layouts and placements.
     For the on-axis row (Σ′ = 1.3·I, σ = 0.5, color 0.5) and L = the red value of pixel (24, 34),
     2 px right of μ′, L = 0.5·0.5·e^(−q) with q = ½·2²/1.3, so ∂L/∂μ′ = (L·2/1.3, 0); the second
     row is below the opacity cull and has no visible entry, so its gradient is 0 (unpacked) or
@@ -429,7 +429,7 @@ def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean(
 @LAYOUTS
 @PLACEMENTS
 def test_empty_and_fully_culled_scenes_render_the_background(packed: bool, precull: str) -> None:
-    """Q-32, Q-38: a model with no primitives, and a scene whose primitives are all culled (below
+    """Q-32, D-76: a model with no primitives, and a scene whose primitives are all culled (below
     the opacity cull, behind the camera), render the background with alpha 0 in every layout and
     placement, with no visible entry: zero means2d [C, N, 2] unpacked, empty [0, 2] means2d and
     gaussian_ids packed."""
@@ -469,7 +469,7 @@ def test_empty_and_fully_culled_scenes_render_the_background(packed: bool, precu
 def test_renders_with_no_visible_row_keep_exactly_zero_gradients(
     packed: bool, precull: str
 ) -> None:
-    """U-8, D-57, Q-32, Q-38: when no row is visible, whether none reaches gsplat (an empty model,
+    """U-8, D-57, Q-32, D-76: when no row is visible, whether none reaches gsplat (an empty model,
     or compaction keeping none) or gsplat culls them all, the render stays on the autograd graph:
     backpropagating image and alpha gives every stored tensor an exactly zero gradient and the 2D
     means a zero gradient, in every layout and placement, as on the reference backend."""
@@ -494,7 +494,7 @@ def test_renders_with_no_visible_row_keep_exactly_zero_gradients(
 
 @LAYOUTS
 def test_cameras_render_independently(packed: bool) -> None:
-    """Q-32, Q-38: a single Camera renders like a one-element list, and a batch of cameras like
+    """Q-32, D-76: a single Camera renders like a one-element list, and a batch of cameras like
     each camera alone, with a per-camera background [C, 3] in both layouts."""
     model = _culling_scene(2)
     cameras = ring(3, width_px=64, height_px=48, focal=40.0)
@@ -510,7 +510,7 @@ def test_cameras_render_independently(packed: bool) -> None:
 
 
 def test_gsplat_backend_rejects_float64_models_on_the_device() -> None:
-    """Q-38 (GPU): gsplat's kernels compute in float32, so a float64 model on a CUDA device raises
+    """D-76 (GPU): gsplat's kernels compute in float32, so a float64 model on a CUDA device raises
     ValueError naming the reference backend, in both layouts."""
     model = _cuda(model_from_rows([{"mean": (0.0, 0.0, 4.0)}])).double()
     for packed in (True, False):
@@ -949,7 +949,7 @@ def _on_device(camera: Camera) -> Camera:
 
 @LAYOUTS
 def test_render_synchronizes_only_inside_gsplat(packed: bool) -> None:
-    """§2.4 rule 3, D-49, Q-38: with cameras and background already on the device, a render
+    """§2.4 rule 3, D-49, D-76: with cameras and background already on the device, a render
     (opacity cull inside the projection) synchronizes with the host only inside gsplat's own
     calls: every synchronization torch's debug mode reports comes from gsplat's files, with the
     default black background and with a given one. The debug mode is a prototype that misses some

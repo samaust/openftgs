@@ -68,7 +68,7 @@ def render(
     of inside its projection (Q-31); images are unchanged. `packed` selects gsplat's packed mode
     (D-57, Q-36); the reference backend is always unpacked. With `return_aux`, the output also
     holds the 2D means, whose gradient is retained, the visibility mask and, in packed mode, the
-    primitive behind each row of the 2D means (Q-32, Q-37, Q-38).
+    primitive behind each row of the 2D means (Q-32, D-75, D-76).
     """
     _check_choice("backend", backend, get_args(_Backend))
     _check_choice("time_units", time_units, get_args(_TimeUnits))
@@ -134,7 +134,7 @@ def _check_cameras(cameras: Camera | Sequence[Camera]) -> list[Camera]:
 
 
 def _check_gsplat_model(model: FreeTimeGaussians) -> None:
-    # Q-38: gsplat's kernels compute in float32 on a CUDA device; the float64 path of Q-32 is the
+    # D-76: gsplat's kernels compute in float32 on a CUDA device; the float64 path of Q-32 is the
     # reference backend's.
     param = model.means
     if param.device.type != "cuda" or param.dtype != torch.float32:
@@ -412,11 +412,11 @@ def _render_gsplat(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
     """Image [C, H, W, 3], alpha [C, H, W, 1], 2D means ([C, N, 2] unpacked, [nnz, 2] packed),
     visibility [C, N] and, packed, the model row behind each row of the 2D means [nnz], of the
-    per-time arrays `g`, which hold all N rows or the ascending subset `rows` (Q-37, Q-38)."""
+    per-time arrays `g`, which hold all N rows or the ascending subset `rows` (D-75, D-76)."""
     num_cams, width, height = len(cameras), cameras[0].width, cameras[0].height
     like = g.means_t
     if like.shape[0] == 0:
-        # Q-38: gsplat's kernels cannot run on zero rows; this is Q-32's empty render.
+        # D-76: gsplat's kernels cannot run on zero rows; this is Q-32's empty render.
         return _empty_gsplat_render(g, background, width, height, num_rows=num_rows, packed=packed)
 
     import gsplat
@@ -424,8 +424,8 @@ def _render_gsplat(
     # Adapted from gsplat 1.5.3, gsplat/rendering.py, rasterization() (lines 407-525, 631-648 and
     # 746-759), Apache-2.0: its stage functions in its order, for this package's one configuration
     # (pinhole camera, classic mode, no distortion, one GPU, RGB). Calling the stages directly
-    # keeps Q-32's 2D means in every layout (Q-37); the background and the camera center are this
-    # package's own (Q-38).
+    # keeps Q-32's 2D means in every layout (D-75); the background and the camera center are this
+    # package's own (D-76).
     cams = [_camera_tensors(camera, like) for camera in cameras]
     viewmats = torch.stack([_view_matrix(cam) for cam in cams])
     intrinsics = torch.stack([_intrinsics(cam) for cam in cams])
@@ -455,7 +455,7 @@ def _render_gsplat(
     if packed:
         _, camera_ids, local_ids, radii, means2d, depths, conics, _ = projection
         # Every packed row is written and visible (both radii positive), so gsplat's own 2D means
-        # are the anchor (Q-37). Rows come camera-major, ascending within a camera (Q-38).
+        # are the anchor (D-75). Rows come camera-major, ascending within a camera (D-76).
         anchor = rasterized = means2d
         passed_visible = (radii > 0).all(dim=-1)
         dirs = g.means_t[local_ids] - centers[camera_ids]
@@ -469,13 +469,13 @@ def _render_gsplat(
         radii, means2d, depths, conics, _ = projection
         passed_visible = (radii > 0).all(dim=-1)  # E6: both screen radii positive
         # gsplat leaves the 2D means of culled rows uninitialized; Q-32 wants 0 there, in the
-        # tensor the rasterizer reads (Q-37).
+        # tensor the rasterizer reads (D-75).
         means2d = torch.where(passed_visible[..., None], means2d, torch.zeros_like(means2d))
         if rows is None:
             anchor = rasterized = means2d
             visible = passed_visible
         else:
-            # Q-31, Q-37: the 2D means go back among all N rows, and the rasterizer reads the kept
+            # Q-31, D-75: the 2D means go back among all N rows, and the rasterizer reads the kept
             # rows from there, so that [C, N, 2] tensor is the anchor.
             anchor = means2d.new_zeros((num_cams, num_rows, 2)).index_copy(1, rows, means2d)
             rasterized = anchor.index_select(1, rows)
@@ -521,7 +521,7 @@ def _render_gsplat(
         packed=packed,
         absgrad=False,
     )
-    # Q-38: E6's background, T_final·c_bg = (1 − alpha)·c_bg, composited here in both layouts,
+    # D-76: E6's background, T_final·c_bg = (1 − alpha)·c_bg, composited here in both layouts,
     # since gsplat 1.5.3 cannot take a per-camera background in packed mode.
     image = image + (1.0 - alpha) * background[:, None, None, :]
     return image, alpha, anchor, visible, gaussian_ids
@@ -555,7 +555,7 @@ def _empty_gsplat_render(
     num_rows: int,
     packed: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
-    """Q-32's empty render, in the gsplat backend's layouts (Q-38), for per-time arrays `g` with no
+    """Q-32's empty render, in the gsplat backend's layouts (D-76), for per-time arrays `g` with no
     rows. It stays on the autograd graph, as the reference's empty render does: the outputs depend
     with weight zero on the 2D means, which depend with weight zero on every per-time array, so
     every stored tensor and the 2D means get an exactly zero gradient (U-8, D-57)."""
