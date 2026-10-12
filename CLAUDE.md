@@ -32,7 +32,7 @@ Source log: every source you consult (a URL, a document, a third-party file or d
 
 - Don't search the web for FreeTimeGS or its implementations; the paper and the spec cover what you need, and search results are where implementations turn up.
 - For gsplat, work from the pinned 1.5.3. Never open `gsplat/contrib/dynamic` or other dynamic-scene code on newer branches; the spec's author left them unopened (Appendix A, #9).
-- A PreToolUse hook, `.claude/hooks/clean_room_guard.py`, blocks tool calls that name FreeTimeGS or EasyVolcap in searches, downloads, URLs and paths, apart from the project page (the paper is read on arXiv, whose URLs don't name it). It is a tripwire, not a permission: the rules above cover everything it can't see. Never work around it, and don't put "freetime" in file or directory names.
+- A PreToolUse hook, `.claude/hooks/clean_room_guard.py`, blocks tool calls that name FreeTimeGS or EasyVolcap in web searches, downloads, URLs, paths and local searches outside the repository, apart from the project page (the paper is read on arXiv, whose URLs don't name it). Searches of the repository's own files may name them (owner rule, 2026-10-12): grep, rg, ag, ack, find, fd and git grep with every search root inside the repository, and the Grep and Glob tools pointed inside it; a tool that doesn't skip `.gitignore`'d files (grep -r, find, ack, Glob) must not walk into `.venv`. It is a tripwire, not a permission: the rules above cover everything it can't see. Never work around it, and don't put "freetime" in file or directory names.
 
 ## Working from the spec
 
