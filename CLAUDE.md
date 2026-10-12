@@ -36,7 +36,7 @@ Source log: every source you consult (a URL, a document, a third-party file or d
 
 ## Working from the spec
 
-- The spec is the source of truth. Its provenance tags (§0) say what may change: [P] items are fixed by the paper; [P→3DGS] and [L: …] items change only with a logged reason; [D-n] decisions are configurable and never change silently.
+- The spec is the source of truth. Its provenance tags (§0) say what may change: [P] items are fixed by the paper; [P→3DGS] and [L: …] items change only with a logged reason; [D-n] decisions change via config where §2.1 defines a field for them, otherwise by a logged change, and never silently (§0, D-72).
 - Never edit `docs/spec/`. It is a copy of the owner's document; changes come from the owner as a new export.
 - Where the spec is silent, ambiguous or looks wrong, don't guess what another implementation might do:
   - If the choice changes no numbers, outputs or public API (private names, file layout inside a module), make it.
