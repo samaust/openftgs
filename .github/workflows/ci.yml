@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        job: [lint, test, licenses]
+        job: [lint, test, licenses, wheel]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,3 +43,17 @@ jobs:
       - name: License scan (fails on GPL or AGPL)
         if: matrix.job == 'licenses'
         run: python scripts/license_scan.py
+      - name: Build the wheels and check their contents
+        if: matrix.job == 'wheel'
+        run: |
+          python -m pip wheel . ./harness --no-deps -w dist
+          python - <<'PY'
+          import glob, zipfile
+          names = zipfile.ZipFile(glob.glob("dist/openftgs-*.whl")[0]).namelist()
+          for required in ("openftgs/py.typed", "licenses/LICENSE", "licenses/NOTICE"):
+              assert any(n.endswith(required) for n in names), required
+          names = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0]).namelist()
+          for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):
+              assert any(n.endswith(required) for n in names), required
+          print("wheel contents ok")
+          PY
