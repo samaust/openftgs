@@ -32,7 +32,13 @@ Optional extras:
   ```
 
   Without it, RoMa runs with its `use_custom_corr` option off and computes the local correlation in plain PyTorch, which is slower.
-- `[fast]`: currently empty. The faster SSIM loss uses [fused-ssim](https://github.com/rahul-goel/fused-ssim) (MIT), which is not on PyPI; install it from its repository.
+- `[fast]`: currently empty. The faster SSIM loss uses [fused-ssim](https://github.com/rahul-goel/fused-ssim) (MIT), which is not on PyPI. Install it from its repository, at the commit openftgs is tested with; this needs the CUDA toolkit (`nvcc`) and a CUDA build of PyTorch already installed:
+
+  ```bash
+  pip install --no-build-isolation git+https://github.com/rahul-goel/fused-ssim@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38
+  ```
+
+  Without it, the SSIM loss runs in plain PyTorch and gives the same values.
 
 The differential harness is a separate package in `harness/` (`pip install -e harness`).
 

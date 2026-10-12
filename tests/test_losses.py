@@ -1,0 +1,726 @@
+# SPDX-License-Identifier: Apache-2.0
+"""openftgs.losses (E7, E8, E9; D-7 to D-11, D-37, D-38, D-52, D-68; Q-40 to Q-43): U-9, U-10,
+U-11 and the added tests of PRD #53.
+
+Expected values are worked by hand from the spec, come from scikit-image's
+`structural_similarity` or from a brute-force float64 SSIM written in this file from Wang et al.
+2004 and E7, or from E8's closed-form gradient. Images are in §1.4's layout, [..., H, W, 3].
+"""
+
+import copy
+import importlib
+import sys
+import warnings
+from collections.abc import Iterator
+
+import numpy as np
+import pytest
+import torch
+from builders import CAM_A, UNIT_TIME, model_from_rows, pinhole, random_model
+from skimage.metrics import structural_similarity
+from torch import Tensor
+
+import openftgs.losses
+from openftgs.config import LossConfig, OptimConfig
+from openftgs.losses import LPIPSLoss, l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.model import FreeTimeGaussians
+from openftgs.render import render
+from openftgs.types import Camera
+
+F32 = torch.float32
+F64 = torch.float64
+
+PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
+
+
+# U-9: L1 (E7, D-7)
+
+
+@pytest.mark.parametrize("shape", [(5, 7, 3), (2, 5, 7, 3)])
+def test_u9_l1_of_constant_images_is_their_difference(shape: tuple[int, ...]) -> None:
+    """U-9: L1 between constant images a and b is |a − b| (mean over pixels and channels)."""
+    pred = torch.full(shape, 0.75)
+    gt = torch.full(shape, 0.25)
+    assert l1_loss(pred, gt).item() == 0.5
+    assert l1_loss(gt, pred).item() == 0.5
+
+
+# U-9: SSIM (E7, D-8)
+
+
+def _image_pair(
+    shape: tuple[int, ...], *, seed: int, correlated: bool, dtype: torch.dtype = F64
+) -> tuple[Tensor, Tensor]:
+    """Two images in [0, 1]: independent noise, or a target and the target plus noise."""
+    gen = torch.Generator().manual_seed(seed)
+    gt = torch.rand(shape, generator=gen, dtype=F64)
+    if correlated:
+        pred = (gt + 0.1 * torch.randn(shape, generator=gen, dtype=F64)).clamp(0.0, 1.0)
+    else:
+        pred = torch.rand(shape, generator=gen, dtype=F64)
+    return pred.to(dtype), gt.to(dtype)
+
+
+def _skimage_ssim(pred: Tensor, gt: Tensor) -> float:
+    """scikit-image's SSIM with Wang et al.'s settings (Gaussian weights, σ = 1.5, population
+    covariance, data range 1); its mean runs over the valid region. A batch is the mean of its
+    images."""
+    a = pred.to(F64).reshape(-1, *pred.shape[-3:]).numpy()
+    b = gt.to(F64).reshape(-1, *gt.shape[-3:]).numpy()
+    values = [
+        structural_similarity(  # type: ignore[no-untyped-call]
+            x,
+            y,
+            channel_axis=-1,
+            gaussian_weights=True,
+            sigma=1.5,
+            use_sample_covariance=False,
+            data_range=1.0,
+        )
+        for x, y in zip(a, b, strict=True)
+    ]
+    return float(np.mean(values))
+
+
+@pytest.mark.parametrize("dtype", [F32, F64])
+@pytest.mark.parametrize("correlated", [True, False])
+@pytest.mark.parametrize(
+    ("shape", "seed"), [((32, 40, 3), 0), ((27, 19, 3), 1), ((2, 24, 30, 3), 2)]
+)
+def test_u9_ssim_matches_scikit_image(
+    shape: tuple[int, ...], seed: int, correlated: bool, dtype: torch.dtype
+) -> None:
+    """U-9: SSIM (valid padding, data range 1) agrees with scikit-image's structural_similarity
+    to 1e-4."""
+    pred, gt = _image_pair(shape, seed=seed, correlated=correlated, dtype=dtype)
+    value = ssim(pred, gt)
+    assert value.shape == () and value.dtype == dtype
+    torch.testing.assert_close(value.item(), _skimage_ssim(pred, gt), rtol=0.0, atol=1e-4)
+
+
+def _brute_force_ssim(pred: np.ndarray, gt: np.ndarray, *, padding: str) -> float:
+    """SSIM of two [H, W, 3] float64 images written from Wang et al. 2004 and E7, one window at a
+    time: an 11×11 Gaussian window (σ = 1.5) normalized to sum 1, population moments under it,
+    C₁ = 0.01², C₂ = 0.03². "valid" visits only windows wholly inside the image; "same" visits
+    every pixel, with zeros outside the image (Q-42)."""
+    r = 5
+    offsets = np.arange(-r, r + 1, dtype=np.float64)
+    g1 = np.exp(-(offsets**2) / (2 * 1.5**2))
+    w = np.outer(g1, g1)
+    w /= w.sum()
+    h, wd, _ = pred.shape
+    if padding == "same":
+        pad = ((r, r), (r, r), (0, 0))
+        x_img, y_img = np.pad(pred, pad), np.pad(gt, pad)
+        rows, cols = range(h), range(wd)
+    else:
+        x_img, y_img = pred, gt
+        rows, cols = range(h - 2 * r), range(wd - 2 * r)
+    values = []
+    for i in rows:
+        for j in cols:
+            for c in range(3):
+                x = x_img[i : i + 2 * r + 1, j : j + 2 * r + 1, c]
+                y = y_img[i : i + 2 * r + 1, j : j + 2 * r + 1, c]
+                mx, my = (w * x).sum(), (w * y).sum()
+                vx = (w * (x - mx) ** 2).sum()
+                vy = (w * (y - my) ** 2).sum()
+                cxy = (w * (x - mx) * (y - my)).sum()
+                c1, c2 = 0.01**2, 0.03**2
+                values.append(
+                    (2 * mx * my + c1) * (2 * cxy + c2) / ((mx**2 + my**2 + c1) * (vx + vy + c2))
+                )
+    return float(np.mean(values))
+
+
+@pytest.mark.parametrize("padding", ["valid", "same"])
+@pytest.mark.parametrize("correlated", [True, False])
+def test_ssim_matches_a_brute_force_evaluation(padding: str, correlated: bool) -> None:
+    """Added (E7, D-8, Q-42): SSIM in float64 equals a window-by-window evaluation of its
+    definition to 1e-10, for valid and zero ("same") padding."""
+    pred, gt = _image_pair((16, 18, 3), seed=3, correlated=correlated)
+    value = ssim(pred, gt, padding=padding)  # type: ignore[arg-type]
+    expected = _brute_force_ssim(pred.numpy(), gt.numpy(), padding=padding)
+    torch.testing.assert_close(value.item(), expected, rtol=0.0, atol=1e-10)
+
+
+@pytest.mark.parametrize("dtype", [F32, F64])
+@pytest.mark.parametrize("padding", ["valid", "same"])
+def test_u9_ssim_of_an_image_with_itself_gives_a_zero_ssim_loss(
+    padding: str, dtype: torch.dtype
+) -> None:
+    """U-9: L_ssim = 1 − SSIM(I, I) = 0."""
+    image, _ = _image_pair((2, 20, 23, 3), seed=4, correlated=False, dtype=dtype)
+    assert 1.0 - ssim(image, image.clone(), padding=padding).item() == 0.0  # type: ignore[arg-type]
+
+
+# Q-41: input validation
+
+
+@pytest.mark.parametrize(
+    ("pred", "gt"),
+    [
+        (torch.zeros(4, 5, 3), torch.zeros(5, 4, 3)),
+        (torch.zeros(4, 5, 4), torch.zeros(4, 5, 4)),
+        (torch.zeros(5, 3), torch.zeros(5, 3)),
+        (torch.zeros(4, 5, 3, dtype=torch.int64), torch.zeros(4, 5, 3, dtype=torch.int64)),
+        (torch.zeros(4, 5, 3, dtype=F64), torch.zeros(4, 5, 3)),
+    ],
+    ids=["shapes", "channels", "rank", "integer", "dtypes"],
+)
+def test_image_pairs_must_match_and_be_float_rgb(pred: Tensor, gt: Tensor) -> None:
+    """Q-41: pred and gt share one [..., H, W, 3] shape and one floating dtype."""
+    with pytest.raises(ValueError):
+        l1_loss(pred, gt)
+    with pytest.raises(ValueError):
+        ssim(pred, gt)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"window": 10},
+        {"window": 0},
+        {"window": -3},
+        {"window": True},
+        {"window": 11.0},
+        {"sigma": 0.0},
+        {"sigma": -1.5},
+        {"data_range": 0.0},
+        {"padding": "reflect"},
+    ],
+)
+def test_ssim_rejects_invalid_parameters(kwargs: dict[str, object]) -> None:
+    """Q-41: the window is an odd int ≥ 1, σ and the data range are positive, and the padding is
+    valid or same."""
+    image = torch.rand(16, 16, 3, generator=torch.Generator().manual_seed(0))
+    with pytest.raises(ValueError):
+        ssim(image, image, **kwargs)  # type: ignore[arg-type]
+
+
+def test_ssim_with_valid_padding_needs_an_image_as_large_as_the_window() -> None:
+    """Q-41: "valid" padding on an image smaller than the window would leave an empty map."""
+    image = torch.rand(10, 16, 3, generator=torch.Generator().manual_seed(0))
+    with pytest.raises(ValueError):
+        ssim(image, image)
+    with pytest.raises(ValueError):
+        ssim(image.transpose(0, 1), image.transpose(0, 1))
+    assert ssim(image, image, padding="same").item() == 1.0
+    corner = image[:, :11]
+    assert ssim(corner, corner.clone(), window=9).item() == 1.0
+
+
+# Q-42: the SSIM paths on the GPU (fused-ssim when installed, the PyTorch fallback otherwise)
+
+
+def _relative(a: Tensor, b: Tensor) -> float:
+    return float((a.double() - b.double()).norm() / b.double().norm())
+
+
+def _cuda_ssim_against_float64(padding: str) -> None:
+    """SSIM and its gradient for CUDA float32 images against the float64 evaluation on the CPU:
+    value to 1e-5 relative, gradient to 1e-4 relative L2. TF32 is off, so the fallback's
+    convolution runs in plain float32 (D-52)."""
+    pred64, gt64 = _image_pair((2, 40, 52, 3), seed=5, correlated=True)
+    pred64.requires_grad_()
+    expected = ssim(pred64, gt64, padding=padding)  # type: ignore[arg-type]
+    (expected_grad,) = torch.autograd.grad(expected, pred64)
+    pred = pred64.detach().to("cuda", F32).requires_grad_()
+    with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
+        value = ssim(pred, gt64.to("cuda", F32), padding=padding)  # type: ignore[arg-type]
+        (grad,) = torch.autograd.grad(value, pred)
+    assert value.device.type == "cuda" and value.dtype == F32 and value.shape == ()
+    torch.testing.assert_close(value.item(), expected.item(), rtol=1e-5, atol=0.0)
+    assert _relative(grad.cpu(), expected_grad) <= 1e-4
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("padding", ["valid", "same"])
+def test_ssim_on_the_gpu_agrees_with_float64(padding: str) -> None:
+    """Added (§2.4 SSIM row, D-52, Q-42): on CUDA float32 images, the path ssim takes
+    (fused-ssim when installed) gives the float64 value and gradient."""
+    _cuda_ssim_against_float64(padding)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("padding", ["valid", "same"])
+def test_fused_ssim_agrees_with_float64(padding: str) -> None:
+    """Added (§2.4 SSIM row, Q-2, Q-42): with fused-ssim installed, CUDA float32 SSIM matches the
+    float64 fallback in value and gradient."""
+    pytest.importorskip("fused_ssim")
+    _cuda_ssim_against_float64(padding)
+
+
+@pytest.fixture
+def without_fused_ssim(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """openftgs.losses reloaded with fused-ssim made unimportable; reloaded again afterwards."""
+    monkeypatch.setitem(sys.modules, "fused_ssim", None)
+    importlib.reload(openftgs.losses)
+    yield
+    monkeypatch.undo()
+    importlib.reload(openftgs.losses)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("padding", ["valid", "same"])
+def test_ssim_without_fused_ssim_falls_back_on_the_gpu(
+    without_fused_ssim: None, padding: str
+) -> None:
+    """Added (Q-2's optional-import test, Q-42): without fused-ssim, SSIM on CUDA still works and
+    gives the float64 value and gradient."""
+    assert openftgs.losses.ssim is not ssim
+    ssim_reloaded = openftgs.losses.ssim
+    pred64, gt64 = _image_pair((24, 30, 3), seed=6, correlated=True)
+    pred64.requires_grad_()
+    expected = ssim(pred64, gt64, padding=padding)  # type: ignore[arg-type]
+    (expected_grad,) = torch.autograd.grad(expected, pred64)
+    pred = pred64.detach().to("cuda", F32).requires_grad_()
+    with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
+        value = ssim_reloaded(
+            pred,
+            gt64.to("cuda", F32),
+            padding=padding,  # type: ignore[arg-type]
+        )
+        (grad,) = torch.autograd.grad(value, pred)
+    torch.testing.assert_close(value.item(), expected.item(), rtol=1e-5, atol=0.0)
+    assert _relative(grad.cpu(), expected_grad) <= 1e-4
+
+
+@pytest.mark.gpu
+def test_ssim_gives_the_target_a_gradient_when_it_requires_one() -> None:
+    """Added (Q-42): fused-ssim differentiates only its first image, so a target that requires a
+    gradient takes the fallback and receives the float64 gradient."""
+    pred64, gt64 = _image_pair((24, 30, 3), seed=7, correlated=True)
+    gt64.requires_grad_()
+    (expected,) = torch.autograd.grad(ssim(pred64, gt64), gt64)
+    gt = gt64.detach().to("cuda", F32).requires_grad_()
+    with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
+        (grad,) = torch.autograd.grad(ssim(pred64.to("cuda", F32), gt), gt)
+    assert _relative(grad.cpu(), expected) <= 1e-4
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("padding", ["valid", "same"])
+def test_u9_ssim_of_an_image_with_itself_on_the_gpu(padding: str) -> None:
+    """U-9: L_ssim = 1 − SSIM(I, I) = 0 on CUDA float32 too."""
+    image, _ = _image_pair((2, 20, 23, 3), seed=4, correlated=False, dtype=F32)
+    image = image.cuda()
+    value = ssim(image, image.clone(), padding=padding)  # type: ignore[arg-type]
+    assert 1.0 - value.item() == 0.0
+
+
+@pytest.mark.gpu
+def test__fused_ssim_finds_the_installed_package() -> None:
+    """The private loader returns fused-ssim's function when the package imports."""
+    fused = pytest.importorskip("fused_ssim")
+    assert openftgs.losses._fused_ssim() is fused.fused_ssim
+
+
+@pytest.mark.gpu
+def test__fused_ssim_is_called_only_under_q42_conditions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-42: fused-ssim runs only for CUDA float32 images, window 11, σ 1.5, data range 1, and a
+    target that doesn't require a gradient; `train` follows grad mode and pred.requires_grad."""
+    calls: list[tuple[tuple[int, ...], str, bool]] = []
+
+    def stub(img1: Tensor, img2: Tensor, padding: str = "same", train: bool = True) -> Tensor:
+        assert img1.is_contiguous() and img2.is_contiguous()
+        calls.append((tuple(img1.shape), padding, train))
+        return img1.sum() * 0.0 + 0.5
+
+    monkeypatch.setattr(openftgs.losses, "_fused_ssim", lambda: stub)
+    pred, gt = (x.to("cuda", F32) for x in _image_pair((2, 16, 20, 3), seed=8, correlated=True))
+    assert ssim(pred, gt, padding="same").item() == 0.5
+    assert calls == [((2, 3, 16, 20), "same", False)]
+    assert ssim(pred.requires_grad_(), gt).item() == 0.5
+    assert calls[-1] == ((2, 3, 16, 20), "valid", True)
+    with torch.no_grad():
+        ssim(pred, gt)
+    assert calls[-1][2] is False
+    calls.clear()
+    ssim(pred, gt, window=9)
+    ssim(pred, gt, sigma=1.0)
+    ssim(pred, gt, data_range=2.0)
+    ssim(pred, gt.clone().requires_grad_())
+    ssim(pred.double(), gt.double())
+    ssim(pred.cpu(), gt.cpu())
+    assert calls == []
+
+
+# U-9: LPIPS (E7, D-9, D-68; Q-41)
+
+
+@pytest.fixture(scope="module")
+def lpips_nets() -> dict[str, LPIPSLoss]:
+    """One LPIPSLoss per backbone, built once (the trunk weights are downloaded)."""
+    return {net: LPIPSLoss(net) for net in ("vgg", "alex")}
+
+
+def test_lpips_rejects_an_unknown_backbone() -> None:
+    """Q-41: the backbone is vgg or alex, checked before anything is downloaded."""
+    with pytest.raises(ValueError):
+        LPIPSLoss("squeeze")  # type: ignore[arg-type]
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_u9_lpips_of_an_image_with_itself_is_zero(
+    lpips_nets: dict[str, LPIPSLoss], net: str
+) -> None:
+    """U-9: LPIPS(I, I) = 0, also after .train(), which must not switch on lpips's dropout."""
+    loss = lpips_nets[net]
+    image, _ = _image_pair((2, 32, 40, 3), seed=9, correlated=False, dtype=F32)
+    assert loss(image, image.clone()).item() == 0.0
+    loss.train()
+    try:
+        assert loss(image, image.clone()).item() == 0.0
+        pred, gt = _image_pair((32, 40, 3), seed=10, correlated=True, dtype=F32)
+        assert loss(pred, gt).item() == loss(pred, gt).item()
+    finally:
+        loss.eval()
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_u9_lpips_maps_inputs_from_unit_range_to_plus_minus_one(
+    lpips_nets: dict[str, LPIPSLoss], net: str
+) -> None:
+    """U-9 (D-9, D-68): LPIPSLoss on [0, 1] images equals lpips 0.1.4's network on the images
+    mapped to [−1, 1] by 2x − 1, exactly, as a mean over the batch. The reference gets the
+    [B, 3, H, W] view of the same channels-last memory, since the CPU convolutions pick their
+    kernels by memory format and would otherwise differ by rounding (about 1e-8)."""
+    import lpips
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # torchvision's `pretrained` deprecation
+        reference = lpips.LPIPS(net=net, verbose=False)
+    pred, gt = _image_pair((2, 32, 40, 3), seed=11, correlated=True, dtype=F32)
+    nchw = [x.permute(0, 3, 1, 2) for x in (pred, gt)]
+    with torch.no_grad():
+        expected = reference(2 * nchw[0] - 1, 2 * nchw[1] - 1).mean()
+        unmapped = reference(nchw[0], nchw[1]).mean()
+        value = lpips_nets[net](pred, gt)
+    assert value.shape == ()
+    assert value.item() == expected.item()
+    assert value.item() != unmapped.item()
+
+
+@pytest.mark.weights
+def test_lpips_weights_are_frozen_and_only_the_prediction_gets_a_gradient(
+    lpips_nets: dict[str, LPIPSLoss],
+) -> None:
+    """Q-41, D-52: every LPIPS parameter is frozen; the loss differentiates the prediction, and a
+    target that doesn't require a gradient gets none."""
+    loss = lpips_nets["vgg"]
+    assert all(not p.requires_grad for p in loss.parameters())
+    pred, gt = _image_pair((32, 40, 3), seed=12, correlated=True, dtype=F32)
+    pred.requires_grad_()
+    loss(pred, gt).backward()
+    assert pred.grad is not None and bool(pred.grad.abs().sum() > 0)
+    assert gt.grad is None
+    assert all(p.grad is None for p in loss.parameters())
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_u9_lpips_of_an_image_with_itself_is_zero_on_the_gpu() -> None:
+    """U-9: LPIPS(I, I) = 0 on CUDA too."""
+    loss = LPIPSLoss("vgg").cuda()
+    image, _ = _image_pair((2, 32, 40, 3), seed=13, correlated=False, dtype=F32)
+    image = image.cuda()
+    assert loss(image, image.clone()).item() == 0.0
+
+
+# U-10: the 4D regularization (E8, D-11)
+
+
+def _reg_oracle(model: FreeTimeGaussians, t: float) -> tuple[float, np.ndarray]:
+    """E8 in float64 from the stored tensors: L_reg = mean(σ·σt(t)) with σ = 1/(1 + e^−ô) and
+    σt = exp(−½((t − μt)/e^ŝ)²), and its closed-form gradient (1/N)·σt·σ(1 − σ) w.r.t. ô."""
+    logits = model.opacity_logits.detach().double().numpy()
+    times = model.times.detach().double().numpy()
+    log_durations = model.log_durations.detach().double().numpy()
+    sigma = 1.0 / (1.0 + np.exp(-logits))
+    sigma_t = np.exp(-0.5 * ((t - times) / np.exp(log_durations)) ** 2)
+    n = len(logits)
+    return float(np.mean(sigma * sigma_t)), sigma_t * sigma * (1.0 - sigma) / n
+
+
+def _all_grads(loss: Tensor, model: FreeTimeGaussians) -> dict[str, Tensor]:
+    params = [getattr(model, name) for name in PARAM_NAMES]
+    grads = torch.autograd.grad(loss, params, allow_unused=True, materialize_grads=True)
+    return dict(zip(PARAM_NAMES, grads, strict=True))
+
+
+@pytest.mark.parametrize("t", [0.0, 0.37, 1.0])
+def test_u10_regularization_is_the_mean_of_opacity_times_temporal_opacity(t: float) -> None:
+    """U-10: L_reg(t) = mean(σ·σt(t)) over all N primitives, to 1e-7 (float64 model; a float32
+    model too)."""
+    model = random_model(40, seed=20, logit=(-4.0, 4.0)).double()
+    expected, _ = _reg_oracle(model, t)
+    value = reg4d_loss(model, t)
+    assert value.shape == () and value.dtype == F64
+    torch.testing.assert_close(value.item(), expected, rtol=0.0, atol=1e-7)
+    model32 = random_model(40, seed=20, logit=(-4.0, 4.0))
+    torch.testing.assert_close(reg4d_loss(model32, t).item(), expected, rtol=0.0, atol=1e-7)
+
+
+@pytest.mark.parametrize("t", [0.0, 0.37, 1.0])
+def test_u10_regularization_gradient_reaches_only_the_opacity_logits(t: float) -> None:
+    """U-10: ∂L_reg/∂ô = (1/N)·σt·σ(1 − σ) to 1e-7 relative; every other gradient, μt and ŝ
+    included (the stop-gradient on σt), is exactly 0."""
+    model = random_model(40, seed=21, logit=(-4.0, 4.0)).double()
+    _, expected = _reg_oracle(model, t)
+    grads = _all_grads(reg4d_loss(model, t), model)
+    torch.testing.assert_close(
+        grads["opacity_logits"], torch.from_numpy(expected), rtol=1e-7, atol=0.0
+    )
+    for name in PARAM_NAMES:
+        if name != "opacity_logits":
+            assert bool((grads[name] == 0).all()), name
+
+
+def test_regularization_of_an_empty_model_is_zero() -> None:
+    """Q-41: with N = 0 the mean of E8 is taken as 0, not NaN."""
+    model = random_model(0, seed=0)
+    assert reg4d_loss(model, 0.5).item() == 0.0
+
+
+# U-10 and U-9: the total loss (E9, D-10, D-37, D-38; Q-40, Q-41)
+
+NO_PERC = LossConfig(lambda_perc=0.0)  # E9 at its defaults, without the downloaded network
+T_IT = OptimConfig().iterations  # T_it, the default run length
+
+
+def _detached_pair(seed: int, dtype: torch.dtype = F64) -> tuple[Tensor, Tensor]:
+    """A render-sized image pair that doesn't depend on any model."""
+    return _image_pair((48, 64, 3), seed=seed, correlated=True, dtype=dtype)
+
+
+@pytest.mark.parametrize("it", [1, T_IT])
+def test_u10_regularization_weight_is_one_hundredth_at_every_iteration_by_default(it: int) -> None:
+    """U-10 (E9, D-10, D-38): with reg_until unset, λ_reg = 10⁻² applies at it = 1 and at
+    it = T_it: the total is the weighted sum of the terms to 1e-6, and with images independent of
+    the model ∂L/∂ô is 10⁻² times E8's gradient, to 1e-7 relative."""
+    model = random_model(30, seed=22, logit=(-4.0, 4.0)).double()
+    pred, gt = _detached_pair(23)
+    loss, terms = total_loss(pred, gt, model, 0.4, it, NO_PERC)
+    reg, expected_grad = _reg_oracle(model, 0.4)
+    assert set(terms) == {"l1", "one_minus_ssim", "reg", "total"}
+    weighted = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt)) + 1e-2 * reg
+    torch.testing.assert_close(loss.item(), weighted.item(), rtol=0.0, atol=1e-6)
+    torch.testing.assert_close(terms["reg"].item(), reg, rtol=0.0, atol=1e-7)
+    grads = _all_grads(loss, model)
+    torch.testing.assert_close(
+        grads["opacity_logits"], 1e-2 * torch.from_numpy(expected_grad), rtol=1e-7, atol=0.0
+    )
+
+
+def test_u10_regularization_stops_after_reg_until() -> None:
+    """U-10 (D-10, Q-41): reg_until is the last iteration with L_reg: at it = reg_until it
+    applies, after it the term is absent and ∂L/∂ô is exactly 0; reg_until = 0 never applies."""
+    model = random_model(30, seed=24).double()
+    pred, gt = _detached_pair(25)
+    cfg = LossConfig(lambda_perc=0.0, reg_until=100)
+    loss, terms = total_loss(pred, gt, model, 0.4, 100, cfg)
+    assert "reg" in terms
+    assert bool((_all_grads(loss, model)["opacity_logits"] != 0).all())
+    for it, until in [(101, 100), (T_IT, 100), (1, 0)]:
+        cfg = LossConfig(lambda_perc=0.0, reg_until=until)
+        # pred requires a gradient so that the loss has a graph whose ô gradient can be read.
+        loss, terms = total_loss(pred.clone().requires_grad_(), gt, model, 0.4, it, cfg)
+        assert "reg" not in terms
+        expected = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt))
+        assert loss.item() == expected.item()
+        assert bool((_all_grads(loss, model)["opacity_logits"] == 0).all())
+
+
+def _off_screen_scene() -> FreeTimeGaussians:
+    """Two primitives in front of camera A and one 100 units to its side, off its image."""
+    return model_from_rows(
+        [
+            {"mean": (0.0, 0.0, 4.0), "logit": 1.0},
+            {"mean": (1.0, 0.5, 5.0), "logit": -0.5, "log_duration": -1.0},
+            {"mean": (100.0, 0.0, 4.0), "logit": 0.3, "log_duration": -0.5, "time": 0.2},
+        ]
+    ).double()
+
+
+def test_u10_regularization_is_independent_of_the_camera() -> None:
+    """U-10 (D-11): L_reg is identical for renders from two cameras, and a primitive off one
+    camera's image still gets E8's gradient λ_reg·(1/N)·σt·σ(1 − σ) through the total loss."""
+    model = _off_screen_scene()
+    cam_b = pinhole(
+        64,
+        48,
+        fx=16.0,
+        fy=16.0,
+        cx=32.5,
+        cy=24.5,
+        world_to_camera=[[1.0, 0.0, 0.0, -100.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+    )
+    gt = _detached_pair(26)[1]
+    regs, losses = [], []
+    for camera, visible in ((CAM_A, [True, True, False]), (cam_b, [False, False, True])):
+        out = render(
+            model, camera, 0.4, time_units="normalized", backend="reference", return_aux=True
+        )
+        assert out.visible is not None and out.visible[0].tolist() == visible
+        loss, terms = total_loss(out.image[0], gt, model, 0.4, 1, NO_PERC)
+        regs.append(terms["reg"])
+        losses.append(loss)
+    assert torch.equal(regs[0], regs[1])
+    loss = losses[0]
+    _, expected = _reg_oracle(model, 0.4)
+    grad = _all_grads(loss, model)["opacity_logits"]
+    torch.testing.assert_close(
+        grad[2], torch.tensor(1e-2 * expected[2], dtype=F64), rtol=1e-7, atol=0.0
+    )
+
+
+def test_total_loss_returns_detached_scalars_without_host_sync() -> None:
+    """Q-40: the terms are detached 0-d tensors on the images' device, and "total" is the
+    returned loss's value."""
+    model = random_model(10, seed=27)
+    pred, gt = _detached_pair(28, dtype=F32)
+    loss, terms = total_loss(pred.requires_grad_(), gt, model, 0.5, 1, NO_PERC)
+    assert loss.shape == () and loss.requires_grad
+    for value in terms.values():
+        assert isinstance(value, Tensor) and value.shape == () and not value.requires_grad
+        assert value.device == pred.device
+    assert terms["total"].item() == loss.item()
+
+
+@pytest.mark.parametrize("it", [0, -1, True, 1.0], ids=["zero", "negative", "bool", "float"])
+def test_total_loss_rejects_an_iteration_below_one(it: object) -> None:
+    """Q-41: iterations are counted from 1 (D-41)."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(29, dtype=F32)
+    with pytest.raises(ValueError):
+        total_loss(pred, gt, model, 0.5, it, NO_PERC)  # type: ignore[arg-type]
+
+
+def test_total_loss_needs_the_perceptual_network_when_its_weight_is_positive() -> None:
+    """Q-40: λ_perc > 0 with no network passed is a ValueError."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(30, dtype=F32)
+    with pytest.raises(ValueError):
+        total_loss(pred, gt, model, 0.5, 1, LossConfig())
+
+
+def test_total_loss_skips_terms_whose_weight_is_zero() -> None:
+    """Q-41: a term with weight 0 is not computed and has no key."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(31, dtype=F32)
+    cfg = LossConfig(lambda_img=0.0, lambda_ssim=0.0, lambda_perc=0.0, lambda_reg=1e-2)
+    loss, terms = total_loss(pred, gt, model, 0.5, 1, cfg)
+    assert set(terms) == {"reg", "total"}
+    torch.testing.assert_close(loss, 1e-2 * reg4d_loss(model, 0.5), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.weights
+def test_u9_total_loss_is_the_weighted_sum_of_its_terms(lpips_nets: dict[str, LPIPSLoss]) -> None:
+    """U-9 (E7, E9, D-37): L = 0.8·L1 + 0.2·(1 − SSIM) + 0.01·LPIPS-VGG + 0.01·L_reg, to 1e-6,
+    each term recomputed with the public functions."""
+    model = random_model(30, seed=32)
+    pred, gt = _detached_pair(33, dtype=F32)
+    perc = lpips_nets["vgg"]
+    loss, terms = total_loss(pred, gt, model, 0.6, 1, LossConfig(), perceptual=perc)
+    assert set(terms) == {"l1", "one_minus_ssim", "perceptual", "reg", "total"}
+    expected = (
+        0.8 * l1_loss(pred, gt).item()
+        + 0.2 * (1.0 - ssim(pred, gt).item())
+        + 0.01 * perc(pred, gt).item()
+        + 0.01 * reg4d_loss(model, 0.6).item()
+    )
+    torch.testing.assert_close(loss.item(), expected, rtol=0.0, atol=1e-6)
+    assert terms["perceptual"].item() == perc(pred, gt).item()
+
+
+@pytest.mark.weights
+def test_total_loss_needs_the_backbone_the_config_names(lpips_nets: dict[str, LPIPSLoss]) -> None:
+    """Q-41 (D-9): a perceptual network with another backbone than cfg.perc_net is a
+    ValueError."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(34, dtype=F32)
+    with pytest.raises(ValueError):
+        total_loss(pred, gt, model, 0.5, 1, LossConfig(), perceptual=lpips_nets["alex"])
+    cfg = LossConfig(perc_net="alex")
+    _, terms = total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=lpips_nets["alex"])
+    assert "perceptual" in terms
+
+
+# U-11: the full forward through the reference backend
+
+
+class _LossModule(torch.nn.Module):
+    """Holds a model, and a copy of it for L_reg, so that torch.func.functional_call can
+    substitute their tensors; forward renders `model` with the reference backend and returns
+    L1 + L_reg, with L_reg evaluated on `reg_model`."""
+
+    def __init__(self, model: FreeTimeGaussians, camera: Camera, t: float, gt: Tensor) -> None:
+        super().__init__()
+        self.model = model
+        self.reg_model = copy.deepcopy(model)
+        self.camera = camera
+        self.t = t
+        self.gt = gt
+
+    def forward(self) -> Tensor:
+        out = render(self.model, self.camera, self.t, time_units="normalized", backend="reference")
+        return l1_loss(out.image[0], self.gt) + reg4d_loss(self.reg_model, self.t)
+
+
+def test_u11_l1_plus_regularization_passes_gradcheck_through_the_reference_renderer() -> None:
+    """U-11: float64 gradcheck of L1 + L_reg through the reference backend, 3 primitives on an
+    8×8 image, all nine stored tensors, at eps 1e-6 and atol 1e-5. The scene stays away from the
+    clamps and thresholds of E6 (σ′ ≈ 3 px, σ ≤ 0.6, distinct depths, colors away from 0), and
+    the target sits 0.1 from the initial render in every pixel and channel, away from L1's kink.
+
+    Q-43: E8's sg[σt] gives L_reg no gradient through μt and ŝ while finite differences see its
+    value move, so L_reg is evaluated with the substituted opacity logits and μt and ŝ held at
+    their base values, which is what the stop-gradient means to first order; L1 sees all nine
+    substituted tensors. U-10 pins the exact zeros."""
+    camera = pinhole(8, 8, fx=8.0, fy=8.0, cx=4.0, cy=4.0)
+    gen = torch.Generator().manual_seed(11)
+    params = {
+        "means": torch.tensor([[0.2, -0.1, 3.6], [-0.3, 0.2, 4.0], [0.1, 0.3, 4.4]]),
+        "times": torch.tensor([0.5, 0.6, 0.4]),
+        "log_durations": torch.zeros(3),
+        "velocities": 0.3 * torch.randn(3, 3, generator=gen),
+        "log_scales": torch.log(1.2 + 0.6 * torch.rand(3, 3, generator=gen)),
+        "quats": torch.randn(3, 4, generator=gen),
+        "opacity_logits": torch.tensor([-0.8, 0.0, 0.4]),
+        "sh0": 0.3 + 0.2 * torch.rand(3, 1, 3, generator=gen),
+        "shN": 0.05 * torch.randn(3, 15, 3, generator=gen),
+    }
+    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME).double()
+    t = 0.3
+    with torch.no_grad():
+        image = render(model, camera, t, time_units="normalized", backend="reference").image[0]
+    signs = torch.randint(0, 2, image.shape, generator=gen).to(F64) * 2 - 1
+    module = _LossModule(model, camera, t, image + 0.1 * signs)
+    inputs = tuple(getattr(model, name).detach().clone().requires_grad_() for name in PARAM_NAMES)
+
+    def fn(*tensors: Tensor) -> Tensor:
+        substituted = {f"model.{name}": x for name, x in zip(PARAM_NAMES, tensors, strict=True)}
+        # Q-43: L_reg's μt and ŝ stay at their base values.
+        substituted["reg_model.opacity_logits"] = substituted["model.opacity_logits"]
+        loss: Tensor = torch.func.functional_call(module, substituted, ())
+        return loss
+
+    assert torch.autograd.gradcheck(fn, inputs, eps=1e-6, atol=1e-5)
+    # Every tensor gets a gradient: L1 reaches all nine through the render, L_reg the logits.
+    grads = torch.autograd.grad(fn(*inputs), inputs)
+    assert all(bool(g.abs().sum() > 0) for g in grads)
