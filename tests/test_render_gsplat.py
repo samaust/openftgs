@@ -10,21 +10,29 @@ written as (row v, column u).
 """
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
 from builders import (
     CAM_A,
     U8_CASES,
+    UNIT_TIME,
     logit_of,
     model_from_rows,
     pinhole,
     random_model,
+    random_params,
     ring,
     sh0_for,
     sigmoid64,
     u8_scene,
+)
+from render_margins import (
+    boundary_margins,
+    depth_near_plane,
+    excluded_share,
+    opacity_near_cull,
 )
 from torch import Tensor
 
@@ -485,3 +493,135 @@ def test_u8_culled_primitives_get_exactly_zero_render_gradient(packed: bool, pre
         assert torch.equal(grad[culled], torch.zeros_like(grad[culled])), name
         assert bool(torch.isfinite(grad).all()), name
         assert float(grad[~culled].abs().sum()) > 0.0, name
+
+
+# U-7's random scenes and U-12, gsplat against the reference (Q-39's margins)
+
+_T = 0.37
+_SCENE_CAMERAS = ring(2, width_px=64, height_px=48, focal=40.0)
+
+
+def _random_scene(seed: int, *, min_rows: int = 1) -> FreeTimeGaussians:
+    """U-7's and U-12's random scenes: N from `min_rows` to 64 rows around two ring cameras, some
+    behind a camera, off the image or below the opacity cull, anisotropic and rotated, SH degree
+    3, σ_eff ≤ 0.95. Rows whose σ_eff or z_c lands within Q-39's margins of the culls' bounds are
+    moved off them."""
+    n = min_rows + (37 * seed) % (65 - min_rows)
+    params = random_params(
+        n,
+        generator=torch.Generator().manual_seed(500 + seed),
+        spread=4.5,
+        log_scale=(-2.5, -0.5),
+        logit=(-6.0, 2.9),
+        speed=0.5,
+    )
+    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME)
+    for _ in range(10):
+        near_cull = torch.from_numpy(opacity_near_cull(model, _T))
+        near_plane = torch.from_numpy(depth_near_plane(model, _SCENE_CAMERAS, _T))
+        if not (bool(near_cull.any()) or bool(near_plane.any())):
+            return _cuda(model)
+        with torch.no_grad():
+            model.opacity_logits[near_cull] += 0.05
+            model.means[near_plane] += 0.01
+    raise AssertionError(f"scene {seed} keeps rows near a cull's bound")
+
+
+def _compare(
+    seed: int, gsplat_out: RenderOutput, reference: RenderOutput, model: FreeTimeGaussians
+) -> tuple[float, float]:
+    """U-7 on one scene: image and alpha within 1e-4 outside Q-39's excluded pixels, `visible`
+    equal outside its excluded rows, 2D means of the rows visible in both within 1e-4 px. Returns
+    the largest difference outside the mask and the excluded share."""
+    margins = boundary_margins(model, _SCENE_CAMERAS, _T)
+    share = excluded_share(margins)
+    assert share <= 0.01, (seed, share)
+    keep = torch.from_numpy(~margins.pixels).to("cuda")
+    worst = 0.0
+    for field in ("image", "alpha"):
+        diff = (getattr(gsplat_out, field) - getattr(reference, field)).detach().abs()
+        worst = max(worst, float(diff.amax(dim=-1)[keep].max()))
+    assert worst <= 1e-4, (seed, worst)
+    assert gsplat_out.visible is not None and reference.visible is not None
+    rows = torch.from_numpy(~margins.rows).to("cuda")
+    assert torch.equal(gsplat_out.visible[rows], reference.visible[rows]), seed
+    both = gsplat_out.visible & reference.visible
+    means2d = (_unpacked(gsplat_out) - _unpacked(reference)).abs()
+    assert float(means2d[both].max()) <= 1e-4 if bool(both.any()) else True, seed
+    return worst, share
+
+
+@LAYOUTS
+def test_u7_random_scenes_match_the_reference(packed: bool) -> None:
+    """U-7: 50 random scenes (N ≤ 64, 64×48, two cameras) rendered by gsplat and by the reference
+    from the same CUDA model agree within 1e-4 in RGB and alpha, outside the pixels Q-39 excludes
+    (at most 1% of a camera's pixels); `visible` agrees outside the excluded rows, and the 2D
+    means of rows visible in both within 1e-4 px. Prints the largest difference outside the mask
+    and the largest excluded share (Q-39)."""
+    worst, share = 0.0, 0.0
+    visible_rows = 0
+    for seed in range(50):
+        model = _random_scene(seed)
+        out = _gsplat(model, _SCENE_CAMERAS, _T, return_aux=True, packed=packed)
+        reference = render(
+            model,
+            _SCENE_CAMERAS,
+            _T,
+            time_units="normalized",
+            backend="reference",
+            return_aux=True,
+        )
+        scene_worst, scene_share = _compare(seed, out, reference, model)
+        worst, share = max(worst, scene_worst), max(share, scene_share)
+        assert reference.visible is not None
+        visible_rows += int(reference.visible.sum())
+    print(
+        f"\nU-7 ({'packed' if packed else 'unpacked'}): largest |Δ| outside the mask {worst:.3g}, "
+        f"largest excluded share {share:.3g}, visible primitive–camera pairs {visible_rows}"
+    )
+    assert visible_rows >= 500
+
+
+def _weighted_loss(out: RenderOutput, keep: Tensor, seed: int) -> Tensor:
+    """A random weighting of image and alpha, zero at the pixels Q-39 excludes."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    image_w = torch.rand(out.image.shape, generator=gen, device="cuda") * keep[..., None]
+    alpha_w = torch.rand(out.alpha.shape, generator=gen, device="cuda") * keep[..., None]
+    return (out.image * image_w).sum() + (out.alpha * alpha_w).sum()
+
+
+@LAYOUTS
+def test_u12_gradients_match_the_reference(packed: bool) -> None:
+    """U-12: for 20 random scenes (U-7's generator, at least 8 rows), the gradients of a random
+    weighting of image and alpha with respect to each of the nine stored tensors agree between
+    gsplat and the reference: cosine ≥ 0.999 and relative L2 error ≤ 1e-3. The weights are zero
+    at the pixels Q-39 excludes. Prints the worst cosine and relative error."""
+    worst_cos, worst_rel = 1.0, 0.0
+    for seed in range(20):
+        model = _random_scene(100 + seed, min_rows=8)
+        keep = torch.from_numpy(~boundary_margins(model, _SCENE_CAMERAS, _T).pixels).to("cuda")
+        params = [getattr(model, name) for name in PARAM_NAMES]
+        grads = {}
+        backends: tuple[Literal["gsplat", "reference"], ...] = ("gsplat", "reference")
+        for backend in backends:
+            out = render(
+                model,
+                _SCENE_CAMERAS,
+                _T,
+                time_units="normalized",
+                backend=backend,
+                packed=packed,
+            )
+            grads[backend] = torch.autograd.grad(_weighted_loss(out, keep, seed), params)
+        for name, a, b in zip(PARAM_NAMES, grads["gsplat"], grads["reference"], strict=True):
+            a64, b64 = a.double().flatten(), b.double().flatten()
+            norm = float(torch.linalg.vector_norm(b64))
+            assert norm > 0.0, (seed, name)
+            cos = float(a64 @ b64) / (float(torch.linalg.vector_norm(a64)) * norm)
+            rel = float(torch.linalg.vector_norm(a64 - b64)) / norm
+            assert cos >= 0.999 and rel <= 1e-3, (seed, name, cos, rel)
+            worst_cos, worst_rel = min(worst_cos, cos), max(worst_rel, rel)
+    print(
+        f"\nU-12 ({'packed' if packed else 'unpacked'}): worst cosine {worst_cos:.7f}, "
+        f"worst relative L2 error {worst_rel:.3g}"
+    )
