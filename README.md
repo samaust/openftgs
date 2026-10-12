@@ -43,7 +43,7 @@ pytest                       # CPU tests; GPU, dataset and weights tests skip wh
 pytest -m gpu                # tests that need a CUDA device
 OPENFTGS_DATASETS=/path pytest -m dataset         # converter checks on real datasets
 OPENFTGS_ALLOW_DOWNLOADS=1 pytest -m weights      # tests that download pretrained weights
-python scripts/license_scan.py                    # fails on GPL or AGPL dependencies
+python scripts/license_scan.py                    # GPL, AGPL, non-commercial fail; others need a sign-off in scripts/license_signoff.json
 ```
 
 ## License

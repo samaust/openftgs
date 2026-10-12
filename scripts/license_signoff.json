@@ -1,0 +1,11 @@
+[
+  {
+    "name": "gsplat",
+    "version": "1.5.3",
+    "license": "UNKNOWN",
+    "actual": "Apache-2.0",
+    "reason": "gsplat's package metadata declares no license; its repository's LICENSE file is Apache-2.0.",
+    "source": "spec §2.3 dependency table: Apache-2.0, verified at tag v1.5.3 (spec Appendix A)",
+    "date": "2026-10-11"
+  }
+]
