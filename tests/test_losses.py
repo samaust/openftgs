@@ -529,9 +529,12 @@ def test_u10_regularization_weight_is_one_hundredth_at_every_iteration_by_defaul
 
 def test_u10_regularization_stops_after_reg_until() -> None:
     """U-10 (D-10, Q-41): reg_until is the last iteration with L_reg: at it = reg_until it
-    applies, after it the term is absent and ∂L/∂ô is exactly 0; reg_until = 0 never applies."""
+    applies; after it, and at every iteration with reg_until = 0, the total leaves it out and
+    ∂L/∂ô is exactly 0, while "reg" still reports L_reg's value, detached (owner's answer to
+    Q-41)."""
     model = random_model(30, seed=24).double()
     pred, gt = _detached_pair(25)
+    reg, _ = _reg_oracle(model, 0.4)
     cfg = LossConfig(lambda_perc=0.0, reg_until=100)
     loss, terms = total_loss(pred, gt, model, 0.4, 100, cfg)
     assert "reg" in terms
@@ -540,7 +543,9 @@ def test_u10_regularization_stops_after_reg_until() -> None:
         cfg = LossConfig(lambda_perc=0.0, reg_until=until)
         # pred requires a gradient so that the loss has a graph whose ô gradient can be read.
         loss, terms = total_loss(pred.clone().requires_grad_(), gt, model, 0.4, it, cfg)
-        assert "reg" not in terms
+        assert set(terms) == {"l1", "one_minus_ssim", "reg", "total"}
+        assert not terms["reg"].requires_grad
+        torch.testing.assert_close(terms["reg"].item(), reg, rtol=0.0, atol=1e-7)
         expected = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt))
         assert loss.item() == expected.item()
         assert bool((_all_grads(loss, model)["opacity_logits"] == 0).all())
@@ -620,13 +625,18 @@ def test_total_loss_needs_the_perceptual_network_when_its_weight_is_positive() -
 
 
 def test_total_loss_skips_terms_whose_weight_is_zero() -> None:
-    """Q-41: a term with weight 0 is not computed and has no key."""
+    """Q-41: a term whose λ is 0 is not computed and has no key, L_reg included, also after
+    reg_until."""
     model = random_model(4, seed=0)
     pred, gt = _detached_pair(31, dtype=F32)
     cfg = LossConfig(lambda_img=0.0, lambda_ssim=0.0, lambda_perc=0.0, lambda_reg=1e-2)
     loss, terms = total_loss(pred, gt, model, 0.5, 1, cfg)
     assert set(terms) == {"reg", "total"}
     torch.testing.assert_close(loss, 1e-2 * reg4d_loss(model, 0.5), rtol=0.0, atol=0.0)
+    for it in (1, 200):
+        cfg = LossConfig(lambda_perc=0.0, lambda_reg=0.0, reg_until=100)
+        _, terms = total_loss(pred, gt, model, 0.5, it, cfg)
+        assert set(terms) == {"l1", "one_minus_ssim", "total"}
 
 
 @pytest.mark.weights
