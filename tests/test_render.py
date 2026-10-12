@@ -32,6 +32,18 @@ C0 = 0.28209479177387814  # §1.1
 C1 = 0.4886025119029199  # √(3/(4π)), the l = 1 real SH constant
 ALPHA_MAX_F32 = torch.tensor(0.999, dtype=F32)  # E6, D-31
 
+PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
+
 # Camera A: the point (X, Y, 4) lands at (32.5 + 4X, 24.5 + 4Y).
 CAM_A = pinhole(64, 48, fx=16.0, fy=16.0, cx=32.5, cy=24.5)
 
@@ -46,7 +58,7 @@ def _model(
     |t − μt| ≤ 1), no velocity, isotropic scale 0.25, identity quaternion, logit 0 (σ = 0.5),
     sh0 = 0 (color 0.5) and no higher bands."""
     k = (sh_degree + 1) ** 2 - 1
-    cols: dict[str, list[Any]] = {name: [] for name in _PARAM_NAMES}
+    cols: dict[str, list[Any]] = {name: [] for name in PARAM_NAMES}
     for row in rows:
         scale = row.get("scale", 0.25)
         scales = [scale] * 3 if isinstance(scale, int | float) else list(scale)
@@ -72,22 +84,9 @@ def _model(
     }
     params = {
         name: torch.tensor(cols[name], dtype=F32).reshape(len(rows), *shapes[name])
-        for name in _PARAM_NAMES
+        for name in PARAM_NAMES
     }
     return FreeTimeGaussians(params, sh_degree=sh_degree, time=time)
-
-
-_PARAM_NAMES = (
-    "means",
-    "times",
-    "log_durations",
-    "velocities",
-    "log_scales",
-    "quats",
-    "opacity_logits",
-    "sh0",
-    "shN",
-)
 
 
 def _render(
@@ -96,6 +95,12 @@ def _render(
     """The reference backend at normalized time t."""
     kw.setdefault("time_units", "normalized")
     return render(model, cameras, t, backend="reference", **kw)
+
+
+def _assert_background(out: RenderOutput, background: Tensor) -> None:
+    """Every pixel shows the background and alpha is 0 (D-34)."""
+    assert torch.equal(out.image, background.expand(out.image.shape))
+    assert torch.equal(out.alpha, torch.zeros_like(out.alpha))
 
 
 # Empty renders and the background (Q-32, D-34)
@@ -109,8 +114,7 @@ def test_empty_model_renders_the_background(precull: str) -> None:
     out = _render(_model([]), CAM_A, 0.5, background=background, precull=precull)
     assert out.image.shape == (1, 48, 64, 3)
     assert out.alpha.shape == (1, 48, 64, 1)
-    assert torch.equal(out.image, background.expand(1, 48, 64, 3))
-    assert torch.equal(out.alpha, torch.zeros(1, 48, 64, 1))
+    _assert_background(out, background)
 
 
 # U-7's single-backend cases (E6, D-31)
@@ -175,8 +179,7 @@ def test_u7_primitives_outside_the_depth_range_are_culled() -> None:
     background = torch.tensor([0.25, 0.5, 0.75])
     rows = [{"mean": (0.0, 0.0, z), "logit": 20.0} for z in (0.005, -4.0, 2e10)]
     out = _render(_model(rows), CAM_A, 0.5, background=background, return_aux=True)
-    assert torch.equal(out.image, background.expand(1, 48, 64, 3))
-    assert torch.equal(out.alpha, torch.zeros(1, 48, 64, 1))
+    _assert_background(out, background)
     assert out.visible is not None and out.visible.tolist() == [[False, False, False]]
     near = _render(_model([{"mean": (0.0, 0.0, 0.01)}]), CAM_A, 0.5, return_aux=True)
     assert near.visible is not None and near.visible.tolist() == [[True]]
@@ -278,6 +281,17 @@ def test_e6_box_touching_the_image_edge_counts_as_off_it() -> None:
     assert out.visible.tolist() == [[False, True, False, True]]
 
 
+def test_e6_depth_ties_composite_the_lower_row_first() -> None:
+    """E6, Q-33: two rows at the same place tie in depth and composite in row order: red row 0
+    (σ = 0.5) in front of green row 1 gives 0.5·(1, 0, 0) + 0.5·0.5·(0, 1, 0) = (0.5, 0.25, 0)."""
+    rows = [
+        {"mean": (0.0, 0.0, 4.0), "sh0": _sh0((1.0, 0.0, 0.0))},
+        {"mean": (0.0, 0.0, 4.0), "sh0": _sh0((0.0, 1.0, 0.0))},
+    ]
+    image = _render(_model(rows), CAM_A, 0.5).image.detach()
+    torch.testing.assert_close(image[0, 24, 32], torch.tensor([0.5, 0.25, 0.0]), rtol=0, atol=1e-6)
+
+
 # U-6 · E2 color, the parts that need a renderer (D-4; the basis parts are in test_sh.py)
 
 
@@ -354,7 +368,7 @@ def test_u6_inactive_bands_contribute_nothing() -> None:
     zero gradient."""
     cameras = ring(2)
     model = _band_scene(0)
-    params = {name: getattr(model, name).detach() for name in _PARAM_NAMES}
+    params = {name: getattr(model, name).detach() for name in PARAM_NAMES}
     low = FreeTimeGaussians({**params, "shN": params["shN"][:, :3]}, sh_degree=1, time=model.time)
     expected = _render(low, cameras, 0.4).image.detach()
     out = _render(model, cameras, 0.4, sh_degree=1)
@@ -391,7 +405,7 @@ def _oracle(
     with an explicit loop over pixels and depth-sorted primitives, sharing no code with the code
     under test: the SH basis is `real_sh` (U-6 pins `sh_basis` to it). Q-33's readings: ties in
     depth to the lower row, a box touching the image counts as off it, det Σ′ > 0 required."""
-    p = {name: getattr(model, name).detach().to(F64).numpy() for name in _PARAM_NAMES}
+    p = {name: getattr(model, name).detach().to(F64).numpy() for name in PARAM_NAMES}
     n = p["means"].shape[0]
     means_t = p["means"] + p["velocities"] * (t - p["times"])[:, None]  # E1
     sigma_t = np.exp(-0.5 * ((t - p["times"]) / np.exp(p["log_durations"])) ** 2)  # E4
@@ -508,19 +522,25 @@ def test_e6_reference_matches_an_independent_evaluation(seed: int) -> None:
 # U-8 · culling σ_eff < 1/255 before the backend changes nothing (D-32, D-57; Q-31)
 
 
-def _u8_scene(n: int, dtype: torch.dtype) -> FreeTimeGaussians:
-    """n random rows, about a third of them below the opacity cull (logits down to −9), some
-    behind a camera of `ring(3)` or off the image. With n = 1 the row is culled (no row kept), with
-    n = 2 one row is (one kept); from n = 33 on, rows 3 and 5 sit at the same place with different
-    colors, so they tie in depth in every camera."""
-    generator = torch.Generator().manual_seed(n)
+def _u8_scene(
+    n: int, dtype: torch.dtype, *, kept: int | None = None, tie: bool = False
+) -> FreeTimeGaussians:
+    """n random rows around `ring(3)`, some behind a camera or off the image, with every third row
+    below the opacity cull (logit −9). With `kept`, exactly that many rows pass the cull. With
+    `tie`, rows 4 and 5 sit at the same place, opaque enough to be seen by every camera, with
+    different colors, so they tie in depth."""
     params = random_params(
-        n, generator=generator, spread=4.5, log_scale=(-2.5, -0.5), logit=(-9.0, 3.0)
+        n,
+        generator=torch.Generator().manual_seed(n),
+        spread=4.5,
+        log_scale=(-2.5, -0.5),
+        logit=(-3.0, 3.0),
     )
-    if n <= 2:
-        params["opacity_logits"] = torch.tensor([-9.0, 3.0][:n])
-    if n >= 33:
-        for row in (3, 5):
+    params["opacity_logits"][::3] = -9.0
+    if kept is not None:
+        params["opacity_logits"] = torch.tensor([3.0] * kept + [-9.0] * (n - kept))
+    if tie:
+        for row in (4, 5):
             params["means"][row] = torch.tensor([0.1, 0.2, 0.3])
             params["velocities"][row] = 0.0
             params["times"][row] = 0.37
@@ -529,26 +549,37 @@ def _u8_scene(n: int, dtype: torch.dtype) -> FreeTimeGaussians:
     return model.double() if dtype == F64 else model
 
 
+_U8_CASES: dict[str, tuple[int, int | None, bool]] = {  # n, rows passing the cull, depth tie
+    "no row kept": (1, 0, False),
+    "one row kept": (2, 1, False),
+    "a third culled": (7, None, False),
+    "depth tie": (33, None, True),
+    "depth tie, more rows": (64, None, True),
+}
+
+
 @pytest.mark.parametrize("dtype", [F32, F64])
-@pytest.mark.parametrize("n", [1, 2, 7, 33, 64])
-def test_u8_compaction_leaves_renders_bitwise_unchanged(n: int, dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("case", list(_U8_CASES))
+def test_u8_compaction_leaves_renders_bitwise_unchanged(case: str, dtype: torch.dtype) -> None:
     """U-8: rendering with compaction (precull = "compact") and with the opacity cull inside the
     backend's projection ("internal") gives bitwise-identical images, alpha, 2D means and
-    visibility on the reference backend, including a depth tie."""
+    visibility on the reference backend, with 0 or 1 rows kept, a third of the rows culled, and a
+    depth tie between visible rows."""
+    n, kept, tie = _U8_CASES[case]
     cameras = ring(3)
-    model = _u8_scene(n, dtype)
+    model = _u8_scene(n, dtype, kept=kept, tie=tie)
+    passing = int(model.at_time(0.37).passes_cull.sum())
+    assert passing == kept if kept is not None else 0 < passing < n
     out = {
         precull: _render(model, cameras, 0.37, return_aux=True, precull=precull)
         for precull in ("internal", "compact")
     }
-    if n <= 2:
-        assert int(model.at_time(0.37).passes_cull.sum()) == n - 1  # rows kept: 0, then 1
     for field in ("image", "alpha", "means2d", "visible"):
         a, b = getattr(out["internal"], field), getattr(out["compact"], field)
         assert torch.equal(a, b), field
-    if n >= 33:
+    if tie:
         visible = out["internal"].visible
-        assert visible is not None and bool(visible[:, [3, 5]].all())
+        assert visible is not None and bool(visible[:, [4, 5]].all())
 
 
 @pytest.mark.parametrize("precull", ["internal", "compact"])
@@ -560,18 +591,18 @@ def test_u8_culled_primitives_get_exactly_zero_render_gradient(
     in no camera (below the opacity cull, behind a camera or off the image) has an exactly zero
     gradient in all nine stored tensors, in both placements of the opacity cull."""
     cameras = ring(3)
-    model = _u8_scene(64, dtype)
+    model = _u8_scene(64, dtype, tie=True)
     out = _render(model, cameras, 0.37, return_aux=True, precull=precull)
     weights = torch.Generator().manual_seed(1)
     loss = (out.image * torch.rand(out.image.shape, generator=weights, dtype=dtype)).sum() + (
         out.alpha * torch.rand(out.alpha.shape, generator=weights, dtype=dtype)
     ).sum()
-    params = [getattr(model, name) for name in _PARAM_NAMES]
+    params = [getattr(model, name) for name in PARAM_NAMES]
     grads = torch.autograd.grad(loss, params)
     assert out.visible is not None
     culled = ~out.visible.any(dim=0)
     assert int(culled.sum()) >= 20 and int((~culled).sum()) >= 10
-    for name, grad in zip(_PARAM_NAMES, grads, strict=True):
+    for name, grad in zip(PARAM_NAMES, grads, strict=True):
         assert torch.equal(grad[culled], torch.zeros_like(grad[culled])), name
         assert bool(torch.isfinite(grad).all()), name
 
@@ -620,41 +651,41 @@ def test_u20_resizing_by_one_half_halves_projections() -> None:
     assert torch.equal(_means2d(model, half)[0], torch.tensor([12.25, 14.25]))
 
 
-def _backproject(camera: Camera, pixels: Tensor, depths: Tensor) -> Tensor:
-    """World points that the camera (its float32 values, in float64) sees at the given continuous
-    pixel coordinates and depths, by inverting §1.4's projection in float64."""
-    k = camera.K.to(F64)
-    w2c = camera.world_to_camera.to(F64)
-    x_c = torch.stack(
+def _backproject(camera: Camera, pixels: np.ndarray, depths: np.ndarray) -> np.ndarray:
+    """World points that the camera (its float32 values, in float64 NumPy) sees at the given
+    continuous pixel coordinates and depths, by inverting §1.4's projection."""
+    k = camera.K.to(F64).numpy()
+    w2c = camera.world_to_camera.to(F64).numpy()
+    x_c = np.stack(
         [
             (pixels[:, 0] - k[0, 2]) / k[0, 0] * depths,
             (pixels[:, 1] - k[1, 2]) / k[1, 1] * depths,
             depths,
         ],
-        dim=1,
+        axis=1,
     )
     # R_w⁻¹ (x_c − t_w): the float32 rotation is orthonormal only to float32 precision.
-    world: Tensor = torch.linalg.solve(w2c[:3, :3], (x_c - w2c[:3, 3]).T)
-    return world.T
+    world: np.ndarray = np.linalg.solve(w2c[:3, :3], (x_c - w2c[:3, 3]).T).T
+    return world
 
 
 @pytest.mark.parametrize("seed", range(3))
 def test_u20_points_project_to_their_pixels_at_full_resolution(seed: int) -> None:
-    """U-20, §1.4: on random rigid cameras at 1352×1014, points back-projected from random
-    continuous pixel coordinates project back to them within 1e-5 px (float64); resizing by
-    r = 0.37 (500×375) scales the x projections by W′/W = 500/1352 and the y ones by
+    """U-20, §1.4: on random rigid cameras at 1352×1014, one to three points back-projected in
+    NumPy from random continuous pixel coordinates project back to them within 1e-5 px (float64);
+    resizing by r = 0.37 (500×375) scales the x projections by W′/W = 500/1352 and the y ones by
     H′/H = 375/1014."""
-    gen = torch.Generator().manual_seed(seed)
-    eye = (torch.randn(3, generator=gen, dtype=F64) * 3.0).tolist()
-    target = (torch.randn(3, generator=gen, dtype=F64) * 0.5).tolist()
+    rng = np.random.default_rng(seed)
+    count = 1 + seed
+    eye, target = (rng.normal(size=3) * 3.0).tolist(), (rng.normal(size=3) * 0.5).tolist()
     camera = look_at(eye, target, width=1352, height=1014, focal=1100.0)
-    pixels = torch.rand(3, 2, generator=gen, dtype=F64) * torch.tensor([1352.0, 1014.0])
-    depths = 2.0 + 3.0 * torch.rand(3, generator=gen, dtype=F64)
+    pixels = rng.uniform(size=(count, 2)) * np.array([1352.0, 1014.0])
+    depths = 2.0 + 3.0 * rng.uniform(size=count)
     points = _backproject(camera, pixels, depths)
     rows = [{"mean": tuple(p), "scale": 1e-2, "logit": 20.0} for p in points.tolist()]
     model = _model(rows).double()
-    model.means.data = points.clone()  # the float64 positions, not their float32 roundings
-    torch.testing.assert_close(_means2d(model, camera), pixels, rtol=0, atol=1e-5)
+    model.means.data = torch.from_numpy(points)  # the float64 positions, not float32 roundings
+    torch.testing.assert_close(_means2d(model, camera), torch.from_numpy(pixels), rtol=0, atol=1e-5)
 
     # The resize rule of §1.4, with K kept in float64 so the scaled intrinsics are exact.
     w_ratio, h_ratio = 500 / 1352, 375 / 1014
@@ -665,7 +696,7 @@ def test_u20_points_project_to_their_pixels_at_full_resolution(seed: int) -> Non
         width=500,
         height=375,
     )
-    expected = pixels * torch.tensor([w_ratio, h_ratio], dtype=F64)
+    expected = torch.from_numpy(pixels * np.array([w_ratio, h_ratio]))
     torch.testing.assert_close(_means2d(model, resized), expected, rtol=0, atol=1e-5)
 
 
@@ -713,26 +744,28 @@ def test_u4_renders_are_invariant_under_an_affine_time_change(a: float, b: float
         warnings.simplefilter("error")
         for tau in (2.0, 7.3, 12.0):
             x, y = _raw_render(before, tau), _raw_render(after, a * tau + b)
-            assert float(x.alpha.detach().max()) > 0.1
-            for field in ("image", "alpha"):
-                diff = (getattr(x, field) - getattr(y, field)).abs().max()
-                assert float(diff) <= 1e-5, (tau, field, float(diff))
+            assert float(x.alpha.max()) > 0.1
+            torch.testing.assert_close(y.image, x.image, rtol=0, atol=1e-5)
+            torch.testing.assert_close(y.alpha, x.alpha, rtol=0, atol=1e-5)
 
 
-def test_u4_single_timestamp_renders_are_invariant_too() -> None:
+@pytest.mark.parametrize(("a", "b"), [(2.0, 5.0), (1e-3, -3.0), (1e3, 0.0)])
+def test_u4_single_timestamp_renders_are_invariant_too(a: float, b: float) -> None:
     """U-4 with one timestamp (Q-30): t ≡ 0 and every time center is τ₀, so scaling durations by a
-    changes nothing on screen."""
+    changes nothing on screen (≤ 1e-5), and τ₀ itself raises no warning."""
     single = TimeNormalizer(5.0, 5.0)
     params = random_params(16, generator=torch.Generator().manual_seed(3), spread=0.6)
     params["times"] = torch.zeros(16)
     params["velocities"] = torch.zeros(16, 3)
     exchange = FreeTimeGaussians(params, sh_degree=3, time=single).to_exchange()
     before = FreeTimeGaussians.from_exchange(exchange, device="cpu")
-    after = FreeTimeGaussians.from_exchange(_rescaled(exchange, 1e3, -7.0), device="cpu")
-    x, y = _raw_render(before, 5.0), _raw_render(after, 1e3 * 5.0 - 7.0)
-    assert float(x.alpha.detach().max()) > 0.1
-    for field in ("image", "alpha"):
-        assert float((getattr(x, field) - getattr(y, field)).abs().max()) <= 1e-5
+    after = FreeTimeGaussians.from_exchange(_rescaled(exchange, a, b), device="cpu")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        x, y = _raw_render(before, 5.0), _raw_render(after, a * 5.0 + b)
+    assert float(x.alpha.max()) > 0.1
+    torch.testing.assert_close(y.image, x.image, rtol=0, atol=1e-5)
+    torch.testing.assert_close(y.alpha, x.alpha, rtol=0, atol=1e-5)
 
 
 # U-22 · renders before and after an exchange round trip (§2.2 ftgs-if)
@@ -751,7 +784,9 @@ def test_u22_renders_agree_before_and_after_export_and_import(tmp_path: Path) ->
         speed=0.25,
         logit=(-2.0, 2.0),
     )
-    params = {name: getattr(model, name).detach().clone() for name in _PARAM_NAMES}
+    params = {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
+    speed = torch.linalg.vector_norm(params["velocities"], dim=1, keepdim=True)
+    params["velocities"] *= torch.clamp(0.5 / speed, max=1.0)  # |v·(t − μt)| ≤ 0.5
     params["means"][0] = torch.tensor([0.0, 0.0, 2.5])
     params["opacity_logits"][0] = 20.0
     model = FreeTimeGaussians(params, sh_degree=3, time=_SPAN)
@@ -761,7 +796,7 @@ def test_u22_renders_agree_before_and_after_export_and_import(tmp_path: Path) ->
     )
     for tau in (2.0, 4.5, 9.1, 12.0):
         x, y = _raw_render(model, tau), _raw_render(again, tau)
-        assert float(x.alpha.detach().max()) > 0.5
+        assert 0.5 < float(x.alpha.max()) <= 0.9991  # T stays at 1e-3 or above, far from 1e-4
         for field in ("image", "alpha"):
             torch.testing.assert_close(
                 getattr(y, field).detach(), getattr(x, field).detach(), rtol=0, atol=1e-6
@@ -805,10 +840,10 @@ def test_reference_render_gradients_pass_gradcheck() -> None:
     }
     model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME).double()
     module = _RenderModule(model, camera, 0.3)
-    inputs = tuple(getattr(model, name).detach().clone().requires_grad_() for name in _PARAM_NAMES)
+    inputs = tuple(getattr(model, name).detach().clone().requires_grad_() for name in PARAM_NAMES)
 
     def fn(*tensors: Tensor) -> tuple[Tensor, Tensor]:
-        substituted = {f"model.{name}": x for name, x in zip(_PARAM_NAMES, tensors, strict=True)}
+        substituted = {f"model.{name}": x for name, x in zip(PARAM_NAMES, tensors, strict=True)}
         image, alpha = torch.func.functional_call(module, substituted, ())
         return image, alpha
 
@@ -836,9 +871,9 @@ def test_row_at_the_camera_center_keeps_gradients_finite() -> None:
     gradient stays finite and that row's are exactly 0."""
     model = _model([{"mean": (0.0, 0.0, 0.0)}, {"mean": (0.0, 0.0, 4.0)}], sh_degree=1)
     out = _render(model, CAM_A, 0.5)
-    params = [getattr(model, name) for name in _PARAM_NAMES]
+    params = [getattr(model, name) for name in PARAM_NAMES]
     grads = torch.autograd.grad(out.image.sum() + out.alpha.sum(), params)
-    for name, grad in zip(_PARAM_NAMES, grads, strict=True):
+    for name, grad in zip(PARAM_NAMES, grads, strict=True):
         assert bool(torch.isfinite(grad).all()), name
         assert torch.equal(grad[0], torch.zeros_like(grad[0])), name
     assert bool(grads[0][1].abs().sum() > 0)
@@ -884,17 +919,20 @@ def test_render_rejects_timestamps_that_are_not_finite_reals(timestamp: Any) -> 
 
 
 def test_render_rejects_cameras_it_cannot_batch() -> None:
-    """Q-32: one camera or a non-empty sequence of one size, with K [3, 3] and world_to_camera
-    [4, 4]."""
+    """Q-32: one Camera or a non-empty sequence of them, of one positive width and height, with K
+    [3, 3] and world_to_camera [4, 4]."""
     model = _api_model()
     other_size = pinhole(32, 48, fx=16.0, fy=16.0, cx=16.0, cy=24.0)
     bad_k = Camera(K=torch.eye(4), world_to_camera=torch.eye(4), width=64, height=48)
     bad_pose = Camera(K=CAM_A.K, world_to_camera=torch.eye(3), width=64, height=48)
-    cases: list[tuple[Camera | list[Camera], str]] = [
+    no_pixels = Camera(K=CAM_A.K, world_to_camera=CAM_A.world_to_camera, width=0, height=48)
+    cases: list[tuple[Any, str]] = [
         ([], "camera"),
         ([CAM_A, other_size], "same width and height"),
         (bad_k, "K"),
         (bad_pose, "world_to_camera"),
+        (no_pixels, "positive"),
+        ([CAM_A, "camera"], "Camera objects"),
     ]
     for cameras, match in cases:
         with pytest.raises(ValueError, match=match):
@@ -1006,8 +1044,7 @@ def test_scene_with_every_primitive_culled_renders_the_background(precull: str) 
     model = _model([{"mean": (0.0, 0.0, 4.0), "logit": -8.0}, {"mean": (0.0, 0.0, -4.0)}])
     background = torch.tensor([0.25, 0.5, 0.75])
     out = _render(model, CAM_A, 0.5, background=background, precull=precull, return_aux=True)
-    assert torch.equal(out.image, background.expand(1, 48, 64, 3))
-    assert torch.equal(out.alpha, torch.zeros(1, 48, 64, 1))
+    _assert_background(out, background)
     assert out.visible is not None and not bool(out.visible.any())
 
 
@@ -1032,3 +1069,18 @@ def test_render_constants_agree_with_their_copies() -> None:
     assert conventions["pixel_center_offset"] == r._PIXEL_CENTER == 0.5
     assert conventions["background"] == list(r._BACKGROUND) == list(TrainConfig().background)
     assert r._EXTENT_MAX == 3.33 and r._CLAMP_MARGIN == 0.15 and r._SH_OFFSET == 0.5
+
+
+def test_rasterize_composites_chunks_of_pixel_rows_like_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private: compositing one row of pixels at a time (a tiny _CHUNK_ELEMENTS) gives the image
+    of a single chunk, bitwise."""
+    import openftgs.render
+
+    model = _moving_scene(4)
+    whole = _render(model, ring(2), 0.4)
+    monkeypatch.setattr(openftgs.render, "_CHUNK_ELEMENTS", 64)
+    chunked = _render(model, ring(2), 0.4)
+    assert torch.equal(chunked.image, whole.image)
+    assert torch.equal(chunked.alpha, whole.alpha)

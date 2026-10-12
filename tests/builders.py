@@ -55,11 +55,26 @@ def random_model(
     seed: int = 0,
     sh_degree: int = 3,
     time: TimeNormalizer = UNIT_TIME,
-    **ranges: float | tuple[float, float],
+    spread: float = 1.0,
+    log_scale: tuple[float, float] = (-3.0, -1.5),
+    logit: tuple[float, float] = (-2.0, 2.0),
+    log_duration: tuple[float, float] = (-1.5, 0.5),
+    speed: float = 0.5,
+    sh_scale: float = 0.5,
 ) -> FreeTimeGaussians:
-    """A model of n random primitives (see `random_params` for the ranges)."""
-    generator = torch.Generator().manual_seed(seed)
-    params = random_params(n, sh_degree=sh_degree, generator=generator, **ranges)  # type: ignore[arg-type]
+    """A model of n random primitives from a generator seeded with `seed` (see `random_params`
+    for the ranges)."""
+    params = random_params(
+        n,
+        sh_degree=sh_degree,
+        generator=torch.Generator().manual_seed(seed),
+        spread=spread,
+        log_scale=log_scale,
+        logit=logit,
+        log_duration=log_duration,
+        speed=speed,
+        sh_scale=sh_scale,
+    )
     return FreeTimeGaussians(params, sh_degree=sh_degree, time=time)
 
 
@@ -123,18 +138,19 @@ def ring(
     count: int,
     *,
     radius: float = 4.0,
-    height: float = 1.0,
+    elevation: float = 1.0,
     width_px: int = 24,
     height_px: int = 16,
     focal: float = 20.0,
 ) -> list[Camera]:
-    """`count` cameras evenly spaced on a horizontal ring around the origin, looking at it."""
+    """`count` cameras evenly spaced on a horizontal ring of the given radius, `elevation` above
+    the origin, looking at it."""
     return [
         look_at(
             (
                 radius * math.cos(2 * math.pi * k / count),
                 radius * math.sin(2 * math.pi * k / count),
-                height,
+                elevation,
             ),
             width=width_px,
             height=height_px,
