@@ -22,6 +22,8 @@ dependencies = [
     "PyYAML>=6.0",
     "Pillow>=10",
     "scipy>=1.10",
+    # Q-29: openftgs.io imports NumPy itself; §2.3 lists it among gsplat's dependencies.
+    "numpy>=1.23.2",
 ]
 
 [project.optional-dependencies]
