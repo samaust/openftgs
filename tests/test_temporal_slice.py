@@ -56,8 +56,10 @@ def _model(n: int, seed: int, device: str) -> list[Tensor]:
 
 
 def _resize(params: list[Tensor], n: int, seed: int, device: str) -> list[Tensor]:
-    """Resize as at growth events: kept rows keep their order, new rows go last; shrinking keeps
-    a random subset in order (the pruning ablation)."""
+    """Resize as at growth events: kept rows keep their order, new rows go last (§1.1 validity
+    rules). SIZES also shrinks once, to N = 1, as only the "w/o periodic relocation" ablation
+    does (§1.3); that keeps a random subset in order, and is stricter than growth alone because
+    it reaches dynamo's size-1 specialization."""
     n_old = len(params[0])
     if n >= n_old:
         new = _model(n - n_old, seed, device)
@@ -143,3 +145,14 @@ def test_slice_auto_compiles_on_cuda() -> None:
     assert _compiled_frames() == 1
     for f in FIELDS:
         _assert_relative_l2(getattr(auto, f), getattr(eager, f), 1e-6, f)
+
+
+def test__impl_values_match_perf_config() -> None:
+    """D-50 (private): the slice accepts exactly PerfConfig.slice_impl's values."""
+    import typing
+
+    import openftgs.motion
+    from openftgs.config import PerfConfig
+
+    hints = typing.get_type_hints(PerfConfig)
+    assert typing.get_args(hints["slice_impl"]) == openftgs.motion._IMPLS

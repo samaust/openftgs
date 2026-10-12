@@ -23,7 +23,7 @@ The temporal opacity is computed once per call. It is used live in the effective
 
 ## How E4 stays finite
 
-E4 is evaluated by multiplying the time offset t − μt by e^−ŝ instead of dividing it by s. The duration s is never formed, so autograd never builds powers of 1/s, which underflow to zero in float32 at very short durations and turn into inf and NaN. Far from the time center the temporal opacity underflows to exactly zero, and every product in the backward pass is zero times a finite number (U-2). Values and gradients stay finite as long as the scaled offset itself is finite; at an extreme ŝ where it overflows, the gradients become NaN. Nothing is clamped, so no value or gradient changes inside that domain.
+E4 is evaluated by multiplying the time offset t − μt by e^−ŝ instead of dividing it by s. The duration s is never formed, so autograd never builds powers of 1/s, which underflow to zero in float32 at very short durations and turn into inf and NaN. Far from the time center the temporal opacity underflows to exactly zero, and every product in the backward pass is zero times a finite number (U-2). Values and gradients stay finite as long as the scaled offset itself is finite, that is as long as e^−ŝ is finite in the parameters' dtype. Beyond that, at extreme negative ŝ, the gradients become NaN, and so does the value of a row whose time center equals t. Nothing is clamped, so no value or gradient changes inside that domain.
 
 E1 adds the displacement to the stored position last, so a primitive sits exactly at its stored position at its own time center (U-1).
 

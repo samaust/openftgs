@@ -265,7 +265,7 @@ One of the two implementations of E6 behind `render()`: gsplat (CUDA, production
 _Avoid_: rasterizer (ambiguous with gsplat itself), renderer mode, engine
 
 **Temporal slice**:
-The fused per-primitive computation of a model at one time t, producing the per-time arrays, the E8 terms and the culling mask, with eager, compiled and optional CUDA implementations behind one signature. §2.4 Kernels, D-50
+The fused per-primitive computation of a model at one time t, producing the per-time arrays other than the SH coefficients, the base opacity, the E8 terms and the culling mask, with eager, compiled and optional CUDA implementations behind one signature. §2.4 Kernels, D-50
 _Avoid_: deformation, per-time evaluation, `at_time` (the method), `GaussiansAtTime` (the return type)
 
 **Per-time arrays**:

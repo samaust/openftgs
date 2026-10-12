@@ -13,7 +13,7 @@ import warnings
 
 import pytest
 import torch
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 from torch import Tensor
 
@@ -137,6 +137,9 @@ def test_u1_property_random_shapes_and_values(
     n: int, seed: int, t0: float, t1: float, scale: float
 ) -> None:
     """U-1 (hypothesis): the identities hold for random N, positions, velocities and times."""
+    # Keeps U-1's pure rtol by drawing elapsed times well above the float64 rounding of
+    # the positions, instead of adding an absolute floor to the criterion.
+    assume(abs(t1 - t0) >= 1e-3)
     m = _model(n, seed)
     means, v, mu_t = m["means"] * scale, m["velocities"] * scale, m["times"] * 3.0 - 1.0
     at_center = torch.stack(
@@ -147,10 +150,7 @@ def test_u1_property_random_shapes_and_values(
     )
     assert torch.equal(at_center.reshape(n, 3), means)
     d = moved_means(means, v, mu_t, t1) - moved_means(means, v, mu_t, t0)
-    # μx(t₁) − μx(t₀) subtracts two positions of size ~scale; when v·(t₁ − t₀) is far smaller
-    # than that, float64 rounding of the positions (~1e-16·scale) exceeds rtol·|v(t₁ − t₀)|, so
-    # an absolute floor well above that rounding and well below any tested displacement is added.
-    torch.testing.assert_close(d, v * (t1 - t0), rtol=1e-6, atol=1e-12 * scale)
+    torch.testing.assert_close(d, v * (t1 - t0), rtol=1e-6, atol=0.0)
 
 
 # U-2 · E4 temporal opacity
@@ -273,26 +273,32 @@ def test_u2_finite_at_tiny_duration_and_far_from_center_float32(s_hat: float, z:
 
 @settings(deadline=None, max_examples=100)
 @given(
-    mu=st.floats(-1.0, 2.0),
-    s_hat=st.floats(-30.0, 5.0),
+    n=st.integers(1, 64),
+    seed=st.integers(0, 2**31 - 1),
     t=st.floats(-2.0, 3.0),
 )
-def test_u2_property_random_values(mu: float, s_hat: float, t: float) -> None:
-    """U-2 (hypothesis): σt ∈ [0, 1], 1 at t = μt, symmetric about μt, finite gradients."""
+def test_u2_property_random_values(n: int, seed: int, t: float) -> None:
+    """U-2 (hypothesis): for random N, μt ∈ [−1, 2] and ŝ ∈ [−30, 5]: σt ∈ [0, 1], 1 at t = μt,
+    symmetric about μt, finite gradients."""
+    g = _gen(seed)
+    mu64 = torch.empty(n, dtype=F64).uniform_(-1.0, 2.0, generator=g)
+    s64 = torch.empty(n, dtype=F64).uniform_(-30.0, 5.0, generator=g)
     for dtype in (torch.float32, F64):
-        m = torch.tensor([mu], dtype=dtype, requires_grad=True)
-        s = torch.tensor([s_hat], dtype=dtype, requires_grad=True)
+        m = mu64.to(dtype).requires_grad_()
+        s = s64.to(dtype).requires_grad_()
         sig = temporal_opacity(m, s, t)
-        assert 0.0 <= float(sig.detach()) <= 1.0
-        for g in torch.autograd.grad(sig.sum(), (m, s)):
-            assert bool(torch.isfinite(g).all())
-        assert float(temporal_opacity(m, s, m.detach()).detach()) == 1.0
-    s64 = torch.tensor([s_hat], dtype=F64)
-    delta = t - mu
+        assert bool(((sig >= 0.0) & (sig <= 1.0)).all())
+        for grad in torch.autograd.grad(sig.sum(), (m, s)):
+            assert bool(torch.isfinite(grad).all())
+        for i in range(n):
+            at_center = temporal_opacity(m[i : i + 1], s[i : i + 1], m[i].detach())
+            assert float(at_center.detach()) == 1.0
     # With μt = 0 the two times are exactly ±Δ, so the symmetry is exact.
-    a = temporal_opacity(torch.zeros(1, dtype=F64), s64, delta)
-    b = temporal_opacity(torch.zeros(1, dtype=F64), s64, -delta)
-    assert float(a) == float(b)
+    zeros = torch.zeros(n, dtype=F64)
+    for delta in (t, t - 0.5):
+        a = temporal_opacity(zeros, s64, delta)
+        b = temporal_opacity(zeros, s64, -delta)
+        assert torch.equal(a, b)
 
 
 # U-3 · E3 effective opacity
