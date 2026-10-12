@@ -40,4 +40,4 @@ t enters the compiled graph as a zero-dimensional tensor on the parameters' devi
 
 ## Unit conversions
 
-`durations_to_normalized`, `durations_to_raw`, `velocities_to_normalized` and `velocities_to_raw` are E14's unit conversions of primitive quantities, which Q-8 assigns to `motion` (Q-27). With a single timestamp they use a unit of 1 (Q-19). Time centers convert through `TimeNormalizer`.
+`durations_to_normalized`, `durations_to_raw`, `velocities_to_normalized` and `velocities_to_raw` are E14's unit conversions of primitive quantities, which Q-8 assigns to `motion` (Q-27). With a single timestamp they use a unit of 1 (D-70). Time centers convert through `TimeNormalizer`.

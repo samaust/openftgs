@@ -16,7 +16,7 @@ E5 lives here as `rotation_matrix` and `covariance`, below the render backends a
 
 ## Physical values and the exchange model
 
-`physical()` and `to_exchange()` give the same arrays under the `ftgs-if` keys: the physical values in raw time units. The unit conversions of time centers, durations and velocities are E14's, from `TimeNormalizer` and `openftgs.motion` (Q-8, Q-27). With a single timestamp the span is zero: durations convert with a unit of 1 instead (Q-19), and since §1.4 "Time" makes t ≡ 0 and freezes velocities at 0, a single-frame model must hold zero time centers and velocities, and a single-frame exchange file time centers of τ₀ and zero velocities (Q-30). Import and export are then exact inverses.
+`physical()` and `to_exchange()` give the same arrays under the `ftgs-if` keys: the physical values in raw time units. The unit conversions of time centers, durations and velocities are E14's, from `TimeNormalizer` and `openftgs.motion` (Q-8, Q-27). With a single timestamp the span is zero: durations convert with a unit of 1 instead (D-70), and since §1.4 "Time" makes t ≡ 0 and holds time centers and velocities at 0, a single-frame model must hold zero time centers and velocities, and a single-frame exchange file time centers of τ₀ and zero velocities (D-71). Import and export are then exact inverses.
 
 - The opacity is computed in float64 and clamped away from 0 and 1 before it is cast, so saturated logits still validate (§2.2).
 - The rotation is the unit quaternion with a canonical sign: w ≥ 0, and where w = 0 the first nonzero component positive (Q-24).
