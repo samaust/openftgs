@@ -9,7 +9,9 @@ as (row v, column u).
 """
 
 import math
+import warnings
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -18,10 +20,11 @@ import torch
 from builders import UNIT_TIME, look_at, pinhole, random_model, random_params, ring
 from torch import Tensor
 
+from openftgs.io import read_exchange, write_exchange
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.sh import sh_basis
-from openftgs.types import Camera, RenderOutput, TimeNormalizer
+from openftgs.types import Camera, ExchangeModel, RenderOutput, TimeNormalizer
 
 F32 = torch.float32
 F64 = torch.float64
@@ -661,3 +664,102 @@ def test_u20_points_project_to_their_pixels_at_full_resolution(seed: int) -> Non
     )
     expected = pixels * torch.tensor([w_ratio, h_ratio], dtype=F64)
     torch.testing.assert_close(_means2d(model, resized), expected, rtol=0, atol=1e-5)
+
+
+# U-4 · renders are invariant under an affine change of the time unit (E14, §1.4 "Time")
+
+_SPAN = TimeNormalizer(2.0, 12.0)
+
+
+def _moving_scene(seed: int, *, time: TimeNormalizer = _SPAN, **ranges: Any) -> FreeTimeGaussians:
+    """Moving primitives near the origin, seen by `ring(2)`."""
+    return random_model(16, seed=seed, time=time, spread=0.6, log_scale=(-2.0, -0.7), **ranges)
+
+
+def _rescaled(exchange: ExchangeModel, a: float, b: float) -> ExchangeModel:
+    """The exchange model in the time unit τ′ = aτ + b: time centers aτ + b, durations a·d,
+    velocities v_τ/a (float32, as ftgs-if stores them), τ₀ and τ₁ mapped too."""
+    arrays = dict(exchange.arrays)
+    arrays["time_center"] = a * arrays["time_center"] + b
+    arrays["duration"] = a * arrays["duration"]
+    arrays["velocity"] = (arrays["velocity"].to(F64) / a).to(F32)
+    return ExchangeModel(
+        arrays=arrays,
+        sh_degree=exchange.sh_degree,
+        tau0=a * exchange.tau0 + b,
+        tau1=a * exchange.tau1 + b,
+        time_unit=exchange.time_unit,
+        producer=exchange.producer,
+    )
+
+
+def _raw_render(model: FreeTimeGaussians, tau: float) -> RenderOutput:
+    with torch.no_grad():
+        return render(model, ring(2), tau, backend="reference")
+
+
+@pytest.mark.parametrize(("a", "b"), [(2.0, 5.0), (1e-3, -3.0), (1e3, 0.0)])
+def test_u4_renders_are_invariant_under_an_affine_time_change(a: float, b: float) -> None:
+    """U-4: (τ, μτ, d, v_τ) → (aτ + b, aμτ + b, a·d, v_τ/a) leaves renders unchanged, max abs
+    difference ≤ 1e-5 on the reference backend, at τ₀, inside the span and at τ₁; no warning is
+    raised inside the span (Q-9)."""
+    exchange = _moving_scene(0).to_exchange()
+    before = FreeTimeGaussians.from_exchange(exchange, device="cpu")
+    after = FreeTimeGaussians.from_exchange(_rescaled(exchange, a, b), device="cpu")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for tau in (2.0, 7.3, 12.0):
+            x, y = _raw_render(before, tau), _raw_render(after, a * tau + b)
+            assert float(x.alpha.detach().max()) > 0.1
+            for field in ("image", "alpha"):
+                diff = (getattr(x, field) - getattr(y, field)).abs().max()
+                assert float(diff) <= 1e-5, (tau, field, float(diff))
+
+
+def test_u4_single_timestamp_renders_are_invariant_too() -> None:
+    """U-4 with one timestamp (Q-30): t ≡ 0 and every time center is τ₀, so scaling durations by a
+    changes nothing on screen."""
+    single = TimeNormalizer(5.0, 5.0)
+    params = random_params(16, generator=torch.Generator().manual_seed(3), spread=0.6)
+    params["times"] = torch.zeros(16)
+    params["velocities"] = torch.zeros(16, 3)
+    exchange = FreeTimeGaussians(params, sh_degree=3, time=single).to_exchange()
+    before = FreeTimeGaussians.from_exchange(exchange, device="cpu")
+    after = FreeTimeGaussians.from_exchange(_rescaled(exchange, 1e3, -7.0), device="cpu")
+    x, y = _raw_render(before, 5.0), _raw_render(after, 1e3 * 5.0 - 7.0)
+    assert float(x.alpha.detach().max()) > 0.1
+    for field in ("image", "alpha"):
+        assert float((getattr(x, field) - getattr(y, field)).abs().max()) <= 1e-5
+
+
+# U-22 · renders before and after an exchange round trip (§2.2 ftgs-if)
+
+
+def test_u22_renders_agree_before_and_after_export_and_import(tmp_path: Path) -> None:
+    """U-22: export → write → read → import leaves renders within 1e-6 at four times on two
+    cameras. The scene keeps σ′ ≥ 2 px, |v·(t − μt)| small and transmittance far above 1e-4, and
+    holds one opacity logit of 20 (exported as 1 − 10⁻⁷), away from the others."""
+    model = random_model(
+        6,
+        seed=5,
+        time=_SPAN,
+        spread=0.5,
+        log_scale=(-0.9, -0.5),
+        speed=0.25,
+        logit=(-2.0, 2.0),
+    )
+    params = {name: getattr(model, name).detach().clone() for name in _PARAM_NAMES}
+    params["means"][0] = torch.tensor([0.0, 0.0, 2.5])
+    params["opacity_logits"][0] = 20.0
+    model = FreeTimeGaussians(params, sh_degree=3, time=_SPAN)
+    write_exchange(model.to_exchange(), tmp_path / "model.safetensors")
+    again = FreeTimeGaussians.from_exchange(
+        read_exchange(tmp_path / "model.safetensors"), device="cpu"
+    )
+    for tau in (2.0, 4.5, 9.1, 12.0):
+        x, y = _raw_render(model, tau), _raw_render(again, tau)
+        assert float(x.alpha.detach().max()) > 0.5
+        for field in ("image", "alpha"):
+            torch.testing.assert_close(
+                getattr(y, field).detach(), getattr(x, field).detach(), rtol=0, atol=1e-6
+            )
