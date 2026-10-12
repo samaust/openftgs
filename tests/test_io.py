@@ -861,3 +861,49 @@ def test_ply_snapshot_rejects_values_it_cannot_write(tmp_path: Path, case: str) 
     with pytest.raises(ValueError):
         write_ply(tmp_path / "x.ply", **arrays)
     assert not (tmp_path / "x.ply").exists()
+
+
+def test_checkpoint_loader_enforces_n_max_and_a_valid_config(tmp_path: Path) -> None:
+    """§1.1 validity rules, "checked on load": N never exceeds the stored configuration's N_max;
+    the stored configuration must itself be valid (Q-10, Q-11, Q-25)."""
+    from openftgs.config import GrowthConfig
+
+    state = _trainer_state(n=7)
+    state.config = config_to_dict(TrainConfig(growth=GrowthConfig(n_max=6)))
+    out = save_checkpoint(state, tmp_path / "over")
+    with pytest.raises(ValueError, match="N_max"):
+        load_checkpoint(out)
+
+    out = save_checkpoint(_trainer_state(n=7), tmp_path / "bad-config")
+    manifest = json.loads((out / "manifest.json").read_text())
+    manifest["config"]["growth"]["n_max"] = 0
+    (out / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        load_checkpoint(out)
+
+
+def test_save_checkpoint_restores_the_newest_set_aside_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Private (Q-25): with several checkpoints left aside by killed saves, recovery restores
+    the most recently modified one, whatever the pids in their names."""
+    import os
+
+    import openftgs.io
+
+    older, newer = _trainer_state(n=4), _trainer_state(n=5)
+    save_checkpoint(older, tmp_path / "a")
+    save_checkpoint(newer, tmp_path / "b")
+    (tmp_path / "a").rename(tmp_path / ".ckpt.old-99999")
+    (tmp_path / "b").rename(tmp_path / ".ckpt.old-1")
+    os.utime(tmp_path / ".ckpt.old-99999", (1_000_000, 1_000_000))
+    os.utime(tmp_path / ".ckpt.old-1", (2_000_000, 2_000_000))
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(openftgs.io, "_write_safetensors", fail)
+    with pytest.raises(OSError):
+        save_checkpoint(_trainer_state(n=9), tmp_path / "ckpt")
+    monkeypatch.undo()
+    _assert_states_equal(newer, load_checkpoint(tmp_path / "ckpt"))

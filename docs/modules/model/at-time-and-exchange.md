@@ -21,6 +21,6 @@ E5 lives here as `rotation_matrix` and `covariance`, below the render backends a
 - The opacity is computed in float64 and clamped away from 0 and 1 before it is cast, so saturated logits still validate (§2.2).
 - The rotation is the unit quaternion with a canonical sign: w ≥ 0, and where w = 0 the first nonzero component positive (Q-24).
 
-`from_exchange` validates the exchange model (`io.validate_exchange`, Q-22), inverts the conversions in float64 (time centers through `TimeNormalizer`, whose out-of-span warning doesn't apply to them, Q-9), normalizes the rotation (Q-24), clamps the opacity before taking the logit, and splits the SH coefficients into the DC and higher bands. `load` takes either a `ftgs-if` file or a checkpoint directory; from a checkpoint it also enforces the cap N_max of the stored configuration (Q-25).
+`from_exchange` validates the exchange model (`io.validate_exchange`, Q-22), inverts the conversions in float64 (time centers through `TimeNormalizer`, whose out-of-span warning doesn't apply to them, Q-9), normalizes the rotation (Q-24), clamps the opacity before taking the logit, and splits the SH coefficients into the DC and higher bands. `load` takes either a `ftgs-if` file or a checkpoint directory; a checkpoint above the cap N_max of its stored configuration is rejected by `io.load_checkpoint` (Q-25).
 
 The time unit travels with the model (Q-17): set at construction, kept by `from_exchange` and `load`, written by `to_exchange`.

@@ -23,6 +23,7 @@ from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
+from openftgs.config import config_from_dict
 from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer, TrainerState
 
 __all__ = [
@@ -401,6 +402,10 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _mtime(path: Path) -> float:
+    return path.stat().st_mtime
+
+
 def _is_checkpoint(directory: Path) -> bool:
     try:
         manifest = json.loads((directory / _MANIFEST).read_text(encoding="utf-8"))
@@ -416,7 +421,8 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
     a reader sees either the old checkpoint or the new one. An existing directory is replaced
     only if it is a checkpoint or empty. POSIX can't swap two directories in one rename: a kill
     between the two renames leaves the old checkpoint set aside beside the target, and the next
-    save of the same target restores it before replacing it (Q-25)."""
+    save of the same target restores it before replacing it (Q-25). Concurrent saves to one
+    target are not supported."""
     directory = Path(directory)
     where = f"checkpoint {directory}"
     if set(state.params) != set(_PARAM_NAMES):
@@ -436,7 +442,8 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
         if tuple(value.shape) != (n,):
             _fail(where, f"stats[{name!r}] must have shape [{n}], got {list(value.shape)}")
     # Q-25: recover from a save killed between its two renames, then sweep leftovers.
-    aside = sorted(directory.parent.glob(f".{directory.name}.old-*"))
+    # The newest set-aside checkpoint is the one a killed save left last.
+    aside = sorted(directory.parent.glob(f".{directory.name}.old-*"), key=_mtime)
     if not directory.exists() and aside and _is_checkpoint(aside[-1]):
         aside.pop().rename(directory)
     for leftover in [*aside, *directory.parent.glob(f".{directory.name}.tmp-*")]:
@@ -550,6 +557,15 @@ def load_checkpoint(directory: Path) -> TrainerState:
         raise ValueError(f"{where}: {err}") from None
     if set(params) != set(_PARAM_NAMES):
         _fail(where, f"params.safetensors must hold exactly {_PARAM_NAMES}")
+    # §1.1 validity rules, checked on load (Q-25): a valid configuration (Q-10, Q-11), and N
+    # within its N_max, for every reader of a checkpoint.
+    try:
+        n_max = config_from_dict(state.config).growth.n_max
+    except ValueError as err:
+        raise ValueError(f"{where}: invalid configuration: {err}") from None
+    n = int(params["means"].shape[0])
+    if n > n_max:
+        _fail(where, f"N = {n} exceeds N_max = {n_max}")
     return state
 
 

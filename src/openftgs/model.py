@@ -296,22 +296,18 @@ class FreeTimeGaussians(torch.nn.Module):
 
     @classmethod
     def load(cls, path: Path, *, device: str = "cuda") -> "FreeTimeGaussians":
-        """A model from a checkpoint directory or a ftgs-if file (§2.1). From a checkpoint, a
-        model above the stored configuration's N_max is rejected (§1.1; Q-25)."""
+        """A model from a checkpoint directory or a ftgs-if file (§2.1). A checkpoint above its
+        stored configuration's N_max is rejected by `io.load_checkpoint` (§1.1; Q-25)."""
         path = Path(path)
         if not path.is_dir():
             return cls.from_exchange(read_exchange(path), device=device)
         state = load_checkpoint(path)
-        cfg = config_from_dict(state.config)
-        model = cls(
+        return cls(
             {k: v.to(device) for k, v in state.params.items()},
-            sh_degree=cfg.sh_degree,
+            sh_degree=config_from_dict(state.config).sh_degree,
             time=state.time,
             time_unit=state.time_unit,
         )
-        if model.num_gaussians > cfg.growth.n_max:
-            _fail(f"N = {model.num_gaussians} exceeds N_max = {cfg.growth.n_max}")
-        return model
 
     def physical(self) -> dict[str, Tensor]:
         """Physical values in raw time units under the ftgs-if keys (§2.2; Q-20): exactly the

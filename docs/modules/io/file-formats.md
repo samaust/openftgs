@@ -13,9 +13,9 @@ A checkpoint holds exactly the files of the §2.2 table (Q-25):
 
 Tensors are looked for in nested dicts only: a tensor inside a list is refused, so per-device states go in a dict keyed by device. The safetensors files carry the format and version in their metadata; the JSON files are covered by the manifest's. A save also checks the stored-tensor dtype and the length of the statistics.
 
-JSON is the round trip's limit: tuples come back as lists, and non-finite floats are refused. Loading checks the format, the major version, that every listed file is there and every hash before it builds the `TrainerState`, whose tensors are on the CPU; files the manifest doesn't list are ignored.
+JSON is the round trip's limit: tuples come back as lists, and non-finite floats are refused. Loading checks the format, the major version, that every listed file is there and every hash before it builds the `TrainerState`, whose tensors are on the CPU; files the manifest doesn't list are ignored. It also applies the §1.1 validity rule on N: the stored configuration must be valid and N within its cap N_max, so every reader of a checkpoint gets the check.
 
-A save is atomic: the files go into a temporary sibling directory, which replaces the target by renames, the old directory being moved aside first and removed last. It never replaces a directory that isn't a checkpoint, unless that directory is empty. POSIX can't swap two directories in one rename, so a kill between the two renames leaves the old checkpoint set aside next to the target; the next save of that target restores it and clears the leftovers (Q-25).
+A save is atomic: the files go into a temporary sibling directory, which replaces the target by renames, the old directory being moved aside first and removed last. It never replaces a directory that isn't a checkpoint, unless that directory is empty. POSIX can't swap two directories in one rename, so a kill between the two renames leaves the old checkpoint set aside next to the target; the next save of that target restores the most recently modified one and clears the leftovers (Q-25). Two processes saving to one target at once are not supported.
 
 ## Exchange and init-point files
 
