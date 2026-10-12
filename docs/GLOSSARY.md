@@ -475,7 +475,7 @@ The agent or person writing openftgs from the spec under the clean-room rules, i
 _Avoid_: developer, Claude, assistant, contributor
 
 **Spec revision**:
-The numbered version of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", exported to `docs/spec/openftgs-spec.md` with its SHA-256 (revision 549 at present); changes arrive only as a new export that replaces the file in one commit. docs/spec/README.md
+The numbered version of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", exported to `docs/spec/openftgs-spec.md` with its SHA-256 (revision 549a at present: revision 549, amended once in the repository in the owner's name); changes arrive as a new export that replaces the file in one commit. docs/spec/README.md
 _Avoid_: spec version, draft, edition, the spec's git history
 
 **Provenance tag**:
@@ -495,7 +495,7 @@ Standard Gaussian-splatting practice taken from a named allowed source; changed 
 _Avoid_: literature value, convention
 
 **Decision D-n**:
-A numbered design decision in the spec's Appendix B filling a gap the paper leaves, with rationale, alternatives and detecting test; configurable, never changed silently, and this project's decision record. §0, Appendix B
+A numbered design decision in the spec's Appendix B filling a gap the paper leaves (or, for D-70 to D-74, a gap in the spec itself), with rationale, alternatives and detecting test; changed through configuration where §2.1 has a field for it and otherwise by a logged change, never silently; this project's decision record. §0, Appendix B, D-72
 _Avoid_: ambiguity-log row, assumption, choice
 
 **Question Q-n**:
