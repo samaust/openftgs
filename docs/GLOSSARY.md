@@ -261,7 +261,7 @@ _Avoid_: romatch (the upstream package), RoMa package, the matcher
 ### Rendering
 
 **Render backend**:
-One of the two implementations of E6 behind `render()`: gsplat (CUDA, float32, production) or reference (pure PyTorch, in the parameters' dtype and on their device, the readable oracle for tests). §2.1
+One of the two implementations of E6 behind `render()`: gsplat (CUDA, production) or reference (pure PyTorch, the readable oracle for tests). §2.1
 _Avoid_: rasterizer (ambiguous with gsplat itself), renderer mode, engine
 
 **Temporal slice**:
@@ -305,11 +305,11 @@ At one pixel, the product of (1 − α) over the primitives already composited f
 _Avoid_: visibility (reserved for visible primitives), transparency, accumulated alpha (its complement, the render's alpha output)
 
 **Packed mode**:
-The layout of a render's 2D means in which each visible primitive–camera pair has one row, labeled by `gaussian_ids`; gsplat's default until B-2 calibrates, and never the reference render backend's. D-57
+The layout of a render's 2D means in which each visible primitive–camera pair has one row, labeled by `gaussian_ids`; gsplat's default until B-2 calibrates. D-57
 _Avoid_: sparse mode, compact mode (compaction is the explicit placement of the opacity cull)
 
 **Unpacked mode**:
-The layout of a render's 2D means with one row per camera and primitive, zero where the primitive is not visible in that camera; the reference render backend's only layout. D-57
+The layout of a render's 2D means with one row per camera and primitive, whether or not the primitive is visible in that camera. D-57
 _Avoid_: dense mode, full mode
 
 **Background c_bg**:
