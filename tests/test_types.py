@@ -198,3 +198,26 @@ def test_integer_tensors_convert_to_float64() -> None:
     assert isinstance(tau, torch.Tensor)
     assert tau.dtype == torch.float64
     assert tau.tolist() == [0.0, 4.0]
+
+
+def test_trainer_state_carries_scene_hash_and_time_unit_with_defaults() -> None:
+    """Q-17: TrainerState gains scene_sha256 (None) and time_unit ("s"), after its fields."""
+    from openftgs.types import TrainerState
+
+    state = TrainerState(
+        iteration=0,
+        config={},
+        time=TimeNormalizer(0.0, 1.0),
+        spatial_scale=1.0,
+        frame_dt=0.5,
+        params={},
+        optim={},
+        stats={},
+        rng={},
+        sampler={},
+    )
+    assert state.scene_sha256 is None
+    assert state.time_unit == "s"
+    time = TimeNormalizer(0.0, 1.0)
+    named = TrainerState(0, {}, time, 1.0, 0.5, {}, {}, {}, {}, {}, "ab", "frame")
+    assert (named.scene_sha256, named.time_unit) == ("ab", "frame")
