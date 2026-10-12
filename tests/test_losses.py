@@ -534,6 +534,7 @@ def test_u10_regularization_stops_after_reg_until() -> None:
     Q-41)."""
     model = random_model(30, seed=24).double()
     pred, gt = _detached_pair(25)
+    reg, _ = _reg_oracle(model, 0.4)
     cfg = LossConfig(lambda_perc=0.0, reg_until=100)
     loss, terms = total_loss(pred, gt, model, 0.4, 100, cfg)
     assert "reg" in terms
@@ -544,7 +545,7 @@ def test_u10_regularization_stops_after_reg_until() -> None:
         loss, terms = total_loss(pred.clone().requires_grad_(), gt, model, 0.4, it, cfg)
         assert set(terms) == {"l1", "one_minus_ssim", "reg", "total"}
         assert not terms["reg"].requires_grad
-        assert terms["reg"].item() == reg4d_loss(model, 0.4).item()
+        torch.testing.assert_close(terms["reg"].item(), reg, rtol=0.0, atol=1e-7)
         expected = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt))
         assert loss.item() == expected.item()
         assert bool((_all_grads(loss, model)["opacity_logits"] == 0).all())
