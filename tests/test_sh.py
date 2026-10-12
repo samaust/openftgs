@@ -109,15 +109,17 @@ def test_reference_matches_scipy_complex_sh() -> None:
 
 def test_u6_degree_0_gives_c0_and_dc_color() -> None:
     """U-6: degree 0 is the constant C₀, so the DC color is C₀·c₀₀ + 0.5: worked by hand for
-    c₀₀ = (1, −2, 0) as (C₀ + 0.5, 0.5 − 2C₀, 0.5), through the basis and through sh0_to_rgb."""
+    c₀₀ = (1, −1, 0) as (C₀ + 0.5, 0.5 − C₀, 0.5), through the basis and through sh0_to_rgb.
+    Every channel stays non-negative, so E2's clamp at 0 doesn't apply; the clamp belongs to the
+    render backend and is tested with it (M4)."""
     d = torch.from_numpy(_directions(50, 2))
     basis = sh_basis(d, 0)
     assert basis.shape == (d.shape[0], 1)
     torch.testing.assert_close(
         basis, torch.full_like(basis, 0.28209479177387814), rtol=0.0, atol=1e-6
     )
-    c00 = torch.tensor([1.0, -2.0, 0.0], dtype=torch.float64)
-    want = torch.tensor([0.78209479177387814, -0.0641895835477563, 0.5], dtype=torch.float64)
+    c00 = torch.tensor([1.0, -1.0, 0.0], dtype=torch.float64)
+    want = torch.tensor([0.78209479177387814, 0.21790520822612186, 0.5], dtype=torch.float64)
     torch.testing.assert_close(
         basis[:, :1] * c00 + 0.5, want.expand(d.shape[0], 3), rtol=0.0, atol=1e-6
     )
