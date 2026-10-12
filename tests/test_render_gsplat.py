@@ -10,6 +10,7 @@ written as (row v, column u).
 """
 
 import math
+import warnings
 from typing import Any, Literal
 
 import pytest
@@ -23,6 +24,7 @@ from builders import (
     pinhole,
     random_model,
     random_params,
+    rescaled_time_unit,
     ring,
     sh0_for,
     sigmoid64,
@@ -38,7 +40,7 @@ from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
-from openftgs.types import Camera, RenderOutput
+from openftgs.types import Camera, RenderOutput, TimeNormalizer
 
 pytestmark = pytest.mark.gpu
 
@@ -625,3 +627,235 @@ def test_u12_gradients_match_the_reference(packed: bool) -> None:
         f"\nU-12 ({'packed' if packed else 'unpacked'}): worst cosine {worst_cos:.7f}, "
         f"worst relative L2 error {worst_rel:.3g}"
     )
+
+
+# U-4 · renders are invariant under an affine change of the time unit (E14, §1.4 "Time"), on gsplat
+
+_SPAN = TimeNormalizer(2.0, 12.0)
+
+
+def _raw(model: FreeTimeGaussians, tau: float, packed: bool) -> RenderOutput:
+    with torch.no_grad():
+        return render(model, ring(2), tau, packed=packed)
+
+
+@LAYOUTS
+@pytest.mark.parametrize(("a", "b"), [(2.0, 5.0), (1e-3, -3.0), (1e3, 0.0)])
+def test_u4_renders_are_invariant_under_an_affine_time_change(
+    a: float, b: float, packed: bool
+) -> None:
+    """U-4 (GPU): (τ, μτ, d, v_τ) → (aτ + b, aμτ + b, a·d, v_τ/a) leaves gsplat renders unchanged,
+    max abs difference ≤ 1e-4, at τ₀, inside the span and at τ₁; no warning is raised inside the
+    span (Q-9). A first render outside the strict block compiles the temporal slice."""
+    model = random_model(16, seed=0, time=_SPAN, spread=0.6, log_scale=(-2.0, -0.7))
+    exchange = model.to_exchange()
+    before = FreeTimeGaussians.from_exchange(exchange, device="cuda")
+    after = FreeTimeGaussians.from_exchange(rescaled_time_unit(exchange, a, b), device="cuda")
+    _raw(before, 7.3, packed)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for tau in (2.0, 7.3, 12.0):
+            x, y = _raw(before, tau, packed), _raw(after, a * tau + b, packed)
+            assert float(x.alpha.max()) > 0.1
+            torch.testing.assert_close(y.image, x.image, rtol=0, atol=1e-4)
+            torch.testing.assert_close(y.alpha, x.alpha, rtol=0, atol=1e-4)
+
+
+@LAYOUTS
+@pytest.mark.parametrize(("a", "b"), [(2.0, 5.0), (1e-3, -3.0), (1e3, 0.0)])
+def test_u4_single_timestamp_renders_are_invariant_too(a: float, b: float, packed: bool) -> None:
+    """U-4 (GPU) with one timestamp (Q-30): t ≡ 0 and every time center is τ₀, so scaling
+    durations by a changes nothing on screen (≤ 1e-4), and τ₀ itself raises no warning."""
+    single = TimeNormalizer(5.0, 5.0)
+    params = random_params(16, generator=torch.Generator().manual_seed(3), spread=0.6)
+    params["times"] = torch.zeros(16)
+    params["velocities"] = torch.zeros(16, 3)
+    exchange = FreeTimeGaussians(params, sh_degree=3, time=single).to_exchange()
+    before = FreeTimeGaussians.from_exchange(exchange, device="cuda")
+    after = FreeTimeGaussians.from_exchange(rescaled_time_unit(exchange, a, b), device="cuda")
+    _raw(before, 5.0, packed)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        x, y = _raw(before, 5.0, packed), _raw(after, a * 5.0 + b, packed)
+    assert float(x.alpha.max()) > 0.1
+    torch.testing.assert_close(y.image, x.image, rtol=0, atol=1e-4)
+    torch.testing.assert_close(y.alpha, x.alpha, rtol=0, atol=1e-4)
+
+
+# U-20 · camera conventions, the projection cases (§1.4, D-28), on gsplat: the dyadic float32 cases
+# (float32 cannot reach 1e-5 px at 1000 px, so random poses stay with the float64 reference)
+
+_U20_W2C = [[0.0, -1.0, 0.0, 1.0], [0.0, 0.0, -1.0, 2.0], [1.0, 0.0, 0.0, 3.0]]
+_U20_POINT = (1.0, 0.5, -1.0)  # x_c = R_w·p + t_w = (0.5, 3, 4)
+
+
+def _projected(camera: Camera, packed: bool) -> RenderOutput:
+    model = _cuda(model_from_rows([{"mean": _U20_POINT, "scale": 1e-3, "logit": 20.0}]))
+    out = _gsplat(model, camera, 0.5, return_aux=True, packed=packed)
+    assert out.visible is not None and out.visible.tolist() == [[True]]
+    return out
+
+
+@LAYOUTS
+def test_u20_known_point_projects_to_the_expected_pixel(packed: bool) -> None:
+    """U-20 (GPU), §1.4: with world_to_camera = [[0, −1, 0, 1], [0, 0, −1, 2], [1, 0, 0, 3]], the
+    point (1, 0.5, −1) is at x_c = (0.5, 3, 4); with f = (32, 24) and c = (20.5, 10.5) it projects
+    to (24.5, 28.5), the center of pixel (28, 24), where the render peaks."""
+    camera = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
+    out = _projected(camera, packed)
+    torch.testing.assert_close(
+        _unpacked(out)[0, 0].cpu(), torch.tensor([24.5, 28.5]), rtol=0, atol=1e-5
+    )
+    assert divmod(int(torch.argmax(out.alpha.detach()[0, :, :, 0])), 48) == (28, 24)
+
+
+@LAYOUTS
+def test_u20_opencv_calibration_converts_with_a_half_pixel_shift(packed: bool) -> None:
+    """U-20 (GPU), §1.4: an OpenCV calibration with c = (20, 10) puts the point at (24, 28);
+    converted with c + 0.5 it projects to (24.5, 28.5), the same pixel's center in the continuous
+    convention."""
+    opencv = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.0, cy=10.0, world_to_camera=_U20_W2C)
+    shifted = pinhole(48, 40, fx=32.0, fy=24.0, cx=20.5, cy=10.5, world_to_camera=_U20_W2C)
+    for camera, expected in [(opencv, [24.0, 28.0]), (shifted, [24.5, 28.5])]:
+        torch.testing.assert_close(
+            _unpacked(_projected(camera, packed))[0, 0].cpu(),
+            torch.tensor(expected),
+            rtol=0,
+            atol=1e-5,
+        )
+
+
+@LAYOUTS
+def test_u20_resizing_by_one_half_halves_projections(packed: bool) -> None:
+    """U-20 (GPU), §1.4: resizing 48×40 by r = 0.5 multiplies f and c by 0.5, so (24.5, 28.5)
+    becomes (12.25, 14.25)."""
+    resized = pinhole(24, 20, fx=16.0, fy=12.0, cx=10.25, cy=5.25, world_to_camera=_U20_W2C)
+    torch.testing.assert_close(
+        _unpacked(_projected(resized, packed))[0, 0].cpu(),
+        torch.tensor([12.25, 14.25]),
+        rtol=0,
+        atol=1e-5,
+    )
+
+
+# Q-33's boundary cases (forward notes on #37), gsplat against the reference
+
+
+@LAYOUTS
+@PLACEMENTS
+def test_box_touching_the_image_edge_counts_as_off_it(packed: bool, precull: str) -> None:
+    """E6, Q-33 (GPU): with a = 10⁻³ and σ = 1 the radii are ⌈3.329·√0.3001⌉ = 2. A box μ′ ± 2
+    that only touches the image (μ′x = 66 or −2) is culled; one that overlaps it by 1/16 px
+    (65.9375, −1.9375) is visible, as on the reference."""
+    rows = [
+        {"mean": (x, 0.0, 4.0), "scale": 1e-3, "logit": 20.0}
+        for x in (8.375, 8.359375, -8.625, -8.609375)
+    ]
+    model = _cuda(model_from_rows(rows))
+    out = _gsplat(model, CAM_A, 0.5, return_aux=True, packed=packed, precull=precull)
+    reference = render(
+        model, CAM_A, 0.5, time_units="normalized", backend="reference", return_aux=True
+    )
+    assert out.visible is not None and out.visible.tolist() == [[False, True, False, True]]
+    assert reference.visible is not None and torch.equal(out.visible, reference.visible)
+    assert _unpacked(out)[0, [1, 3], 0].tolist() == [65.9375, -1.9375]
+    torch.testing.assert_close(out.image, reference.image, rtol=0, atol=1e-4)
+
+
+@LAYOUTS
+@PLACEMENTS
+def test_depth_ties_composite_the_lower_row_first(packed: bool, precull: str) -> None:
+    """E6, Q-33 (GPU): two rows at the same place tie in depth and composite in row order, red in
+    front of green: 0.5·(1, 0, 0) + 0.5·0.5·(0, 1, 0) = (0.5, 0.25, 0), as on the reference. Rows
+    below the opacity cull between and before them change nothing, which under compaction checks
+    that the kept rows keep their relative order."""
+    red = {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((1.0, 0.0, 0.0))}
+    green = {"mean": (0.0, 0.0, 4.0), "sh0": sh0_for((0.0, 1.0, 0.0))}
+    culled = {"mean": (0.0, 0.0, 4.0), "logit": -9.0, "sh0": sh0_for((0.0, 0.0, 1.0))}
+    for rows in ([red, green], [culled, red, culled, culled, green]):
+        model = _cuda(model_from_rows(rows))
+        image = _gsplat(model, CAM_A, 0.5, packed=packed, precull=precull).image.detach()
+        reference = render(model, CAM_A, 0.5, time_units="normalized", backend="reference")
+        torch.testing.assert_close(
+            image[0, 24, 32].cpu(), torch.tensor([0.5, 0.25, 0.0]), rtol=0, atol=1e-6
+        )
+        torch.testing.assert_close(image, reference.image, rtol=0, atol=1e-4)
+
+
+# The exact 1/255 boundary (E6, D-32; #37, M4 milestone review finding 5; Q-39)
+
+
+def _threshold_rows() -> list[dict[str, Any]]:
+    """Rows whose σ_eff straddles float32(1/255) in steps of about one float32 ulp: 81 logits
+    around logit(1/255) with σt = 1, then the first logit above the threshold with time centers
+    0.5 − δ (s = 1), whose σt < 1 lowers σ_eff in sub-ulp steps so one row can land exactly on
+    the threshold. Each row sits at its own pixel center of camera A, 3 px from the next, with
+    color 1."""
+    threshold = torch.tensor(1.0 / 255.0, dtype=F32)
+    logit = torch.tensor(math.log(1.0 / 254.0), dtype=F32)
+    up, down = [logit], [logit]
+    for _ in range(40):
+        up.append(torch.nextafter(up[-1], torch.tensor(math.inf)))
+        down.append(torch.nextafter(down[-1], torch.tensor(-math.inf)))
+    logits = [float(x) for x in reversed(down[1:])] + [float(x) for x in up]
+    probe = _cuda(model_from_rows([{"mean": (0.0, 0.0, 4.0), "logit": x} for x in logits]))
+    sigma = probe.at_time(0.5).opacities_t.cpu()
+    first_above = logits[int(torch.nonzero(sigma > threshold)[0])]
+    params = [(x, 0.5, 20.0) for x in logits] + [
+        (first_above, 0.5 - 5e-5 * j, 0.0) for j in range(1, 201)
+    ]
+    slots = [(u, v) for v in range(2, 48, 3) for u in range(2, 63, 3)]
+    color = sh0_for((1.0, 1.0, 1.0))
+    return [
+        {
+            "mean": ((u - 32) / 4, (v - 24) / 4, 4.0),
+            "logit": x,
+            "time": time,
+            "log_duration": log_duration,
+            "sh0": color,
+            "pixel": (v, u),
+        }
+        for (x, time, log_duration), (u, v) in zip(params, slots, strict=False)
+    ]
+
+
+@LAYOUTS
+def test_backends_agree_at_the_opacity_cull_threshold(packed: bool) -> None:
+    """E6, D-32, Q-39 (GPU): below float32(1/255) a row is culled in both backends, and exactly at
+    it both give it a zero extent, so it is invisible and its pixel shows the background. Just
+    above, gsplat's extent from σ_eff / (1/255) and the reference's from 255·σ_eff may round to
+    zero in one backend only: then `visible` differs and the row's own pixel differs by at most
+    σ_eff·|c − c_bg|; nothing else differs. Prints how many rows sat exactly on the threshold and
+    how many differ in visibility."""
+    rows = _threshold_rows()
+    model = _cuda(model_from_rows(rows))
+    g = model.at_time(0.5)
+    sigma, passes = g.opacities_t.cpu(), g.passes_cull.cpu()
+    threshold = torch.tensor(1.0 / 255.0, dtype=F32)
+    out = _gsplat(model, CAM_A, 0.5, return_aux=True, packed=packed)
+    reference = render(
+        model, CAM_A, 0.5, time_units="normalized", backend="reference", return_aux=True
+    )
+    assert out.visible is not None and reference.visible is not None
+    image, ref_image = out.image.detach()[0].cpu(), reference.image.detach()[0].cpu()
+    owned = torch.zeros(image.shape[:2], dtype=torch.bool)
+    counts = {"below": 0, "at": 0, "above": 0, "differ": 0}
+    for i, row in enumerate(rows):
+        v, u = row["pixel"]
+        owned[v, u] = True
+        vis, ref_vis = bool(out.visible[0, i]), bool(reference.visible[0, i])
+        if sigma[i] <= threshold:
+            counts["below" if sigma[i] < threshold else "at"] += 1
+            assert bool(passes[i]) == (sigma[i] == threshold), i
+            assert not vis and not ref_vis, i
+            assert torch.equal(image[v, u], torch.zeros(3)), i
+            assert torch.equal(ref_image[v, u], torch.zeros(3)), i
+            continue
+        counts["above"] += 1
+        bound = 1e-6 if vis == ref_vis else float(sigma[i]) * 1.0 + 1e-6
+        counts["differ"] += vis != ref_vis
+        assert float((image[v, u] - ref_image[v, u]).abs().max()) <= bound, i
+    assert torch.equal(image[~owned], torch.zeros_like(image[~owned]))
+    assert torch.equal(ref_image[~owned], torch.zeros_like(ref_image[~owned]))
+    assert counts["below"] >= 10 and counts["above"] >= 10
+    print(f"\n1/255 boundary ({'packed' if packed else 'unpacked'}): {counts}")

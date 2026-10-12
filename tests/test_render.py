@@ -29,6 +29,7 @@ from builders import (
     pinhole,
     random_model,
     random_params,
+    rescaled_time_unit,
     ring,
     sh0_for,
     sigmoid64,
@@ -40,7 +41,7 @@ from torch import Tensor
 from openftgs.io import read_exchange, write_exchange
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
-from openftgs.types import Camera, ExchangeModel, RenderOutput, TimeNormalizer
+from openftgs.types import Camera, RenderOutput, TimeNormalizer
 
 F32 = torch.float32
 F64 = torch.float64
@@ -632,23 +633,6 @@ def _moving_scene(seed: int, *, time: TimeNormalizer = _SPAN, **ranges: Any) -> 
     return random_model(16, seed=seed, time=time, spread=0.6, log_scale=(-2.0, -0.7), **ranges)
 
 
-def _rescaled(exchange: ExchangeModel, a: float, b: float) -> ExchangeModel:
-    """The exchange model in the time unit τ′ = aτ + b: time centers aτ + b, durations a·d,
-    velocities v_τ/a (float32, as ftgs-if stores them), τ₀ and τ₁ mapped too."""
-    arrays = dict(exchange.arrays)
-    arrays["time_center"] = a * arrays["time_center"] + b
-    arrays["duration"] = a * arrays["duration"]
-    arrays["velocity"] = (arrays["velocity"].to(F64) / a).to(F32)
-    return ExchangeModel(
-        arrays=arrays,
-        sh_degree=exchange.sh_degree,
-        tau0=a * exchange.tau0 + b,
-        tau1=a * exchange.tau1 + b,
-        time_unit=exchange.time_unit,
-        producer=exchange.producer,
-    )
-
-
 def _raw_render(model: FreeTimeGaussians, tau: float) -> RenderOutput:
     with torch.no_grad():
         return render(model, ring(2), tau, backend="reference")
@@ -661,7 +645,7 @@ def test_u4_renders_are_invariant_under_an_affine_time_change(a: float, b: float
     raised inside the span (Q-9)."""
     exchange = _moving_scene(0).to_exchange()
     before = FreeTimeGaussians.from_exchange(exchange, device="cpu")
-    after = FreeTimeGaussians.from_exchange(_rescaled(exchange, a, b), device="cpu")
+    after = FreeTimeGaussians.from_exchange(rescaled_time_unit(exchange, a, b), device="cpu")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         for tau in (2.0, 7.3, 12.0):
@@ -681,7 +665,7 @@ def test_u4_single_timestamp_renders_are_invariant_too(a: float, b: float) -> No
     params["velocities"] = torch.zeros(16, 3)
     exchange = FreeTimeGaussians(params, sh_degree=3, time=single).to_exchange()
     before = FreeTimeGaussians.from_exchange(exchange, device="cpu")
-    after = FreeTimeGaussians.from_exchange(_rescaled(exchange, a, b), device="cpu")
+    after = FreeTimeGaussians.from_exchange(rescaled_time_unit(exchange, a, b), device="cpu")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         x, y = _raw_render(before, 5.0), _raw_render(after, a * 5.0 + b)

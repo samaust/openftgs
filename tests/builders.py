@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians
-from openftgs.types import Camera, TimeNormalizer
+from openftgs.types import Camera, ExchangeModel, TimeNormalizer
 
 UNIT_TIME = TimeNormalizer(0.0, 1.0)
 C0 = 0.28209479177387814  # §1.1
@@ -263,3 +263,23 @@ U8_CASES: dict[str, tuple[int, int | None, bool]] = {  # n, rows passing the cul
     "depth tie": (33, None, True),
     "depth tie, more rows": (64, None, True),
 }
+
+
+# U-4's change of time unit (E14, §1.4 "Time"), shared by both backends' U-4 tests.
+
+
+def rescaled_time_unit(exchange: ExchangeModel, a: float, b: float) -> ExchangeModel:
+    """The exchange model in the time unit τ′ = aτ + b: time centers aτ + b, durations a·d,
+    velocities v_τ/a (float32, as ftgs-if stores them), τ₀ and τ₁ mapped too."""
+    arrays = dict(exchange.arrays)
+    arrays["time_center"] = a * arrays["time_center"] + b
+    arrays["duration"] = a * arrays["duration"]
+    arrays["velocity"] = (arrays["velocity"].to(torch.float64) / a).to(torch.float32)
+    return ExchangeModel(
+        arrays=arrays,
+        sh_degree=exchange.sh_degree,
+        tau0=a * exchange.tau0 + b,
+        tau1=a * exchange.tau1 + b,
+        time_unit=exchange.time_unit,
+        producer=exchange.producer,
+    )
