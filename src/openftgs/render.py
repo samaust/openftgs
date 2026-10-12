@@ -10,7 +10,7 @@ import numbers
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
-from typing import Literal
+from typing import Literal, get_args
 
 import torch
 from torch import Tensor
@@ -30,7 +30,6 @@ _ALPHA_SKIP = 1.0 / 255.0  # E6: a term with α < 1/255 is skipped
 _T_STOP = 1e-4  # E6: a pixel stops before the primitive that brings T to ≤ 1e-4
 _NEAR = 0.01  # E6: z_c < 0.01 is culled; D-6
 _FAR = 1e10  # E6: z_c > 1e10 is culled; D-6
-_CULL_OPACITY = 1.0 / 255.0  # E6: σ_eff < 1/255 is culled; D-32
 _EXTENT_MAX = 3.33  # E6: the screen-space extent never exceeds 3.33 standard deviations
 _SH_OFFSET = 0.5  # E2: the SH sum + 0.5, clamped at 0 per channel; D-4
 _BACKGROUND = (0.0, 0.0, 0.0)  # E6: c_bg is black; D-34
@@ -38,7 +37,7 @@ _CHUNK_ELEMENTS = 1 << 22  # pixel–primitive pairs composited at once (bounds 
 
 _Backend = Literal["gsplat", "reference"]
 _TimeUnits = Literal["raw", "normalized"]
-_Precull = Literal["internal", "compact"]
+_Precull = Literal["internal", "compact"]  # Q-31: PerfConfig.precull's values (D-32, D-57)
 
 
 def render(
@@ -61,24 +60,24 @@ def render(
     of inside its projection (Q-31); images are unchanged. With `return_aux`, the output also holds
     the 2D means, whose gradient is retained, and the visibility mask (Q-32).
     """
-    _check_choice("backend", backend, ("gsplat", "reference"))
-    _check_choice("time_units", time_units, ("raw", "normalized"))
-    _check_choice("precull", precull, ("internal", "compact"))
+    _check_choice("backend", backend, get_args(_Backend))
+    _check_choice("time_units", time_units, get_args(_TimeUnits))
+    _check_choice("precull", precull, get_args(_Precull))
     cams = _check_cameras(cameras)
-    if backend == "gsplat":
+    if backend == "gsplat":  # Q-32: until M5
         raise NotImplementedError(
             "the gsplat render backend arrives in milestone M5; use backend='reference'"
         )
     t = _normalized_time(model, timestamp, time_units)
     g = model.at_time(t, sh_degree=sh_degree)
-    bg = _background(background, len(cams), g.means_t)
+    backgrounds = _backgrounds(background, len(cams), g.means_t)
     rows: Tensor | None = None
     if precull == "compact":
         # Q-31, D-57: compaction after the temporal slice, in ascending row order.
         rows = torch.nonzero(g.passes_cull).squeeze(1)
         g = _take_rows(g, rows)
     image, alpha, means2d, visible = _render_reference(
-        g, cams, bg, rows=rows, num_rows=model.num_gaussians
+        g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
     )
     if not return_aux:
         return RenderOutput(image=image, alpha=alpha)
@@ -96,7 +95,8 @@ def _check_choice(name: str, value: object, allowed: tuple[str, ...]) -> None:
 
 
 def _check_cameras(cameras: Camera | Sequence[Camera]) -> list[Camera]:
-    # Q-32: one camera or a non-empty sequence of one size; shapes are checked, values are not.
+    # Q-32: one Camera or a non-empty sequence of them, all of one positive width and height;
+    # the tensors' shapes are checked, their values are not.
     cams = [cameras] if isinstance(cameras, Camera) else list(cameras)
     if not cams:
         raise ValueError("render needs at least one camera")
@@ -115,8 +115,9 @@ def _check_cameras(cameras: Camera | Sequence[Camera]) -> list[Camera]:
     return cams
 
 
-def _normalized_time(model: FreeTimeGaussians, timestamp: float, time_units: str) -> float:
-    # Q-32: a finite real timestamp; raw time warns through to_t (Q-9), normalized time here.
+def _normalized_time(model: FreeTimeGaussians, timestamp: float, time_units: _TimeUnits) -> float:
+    # Q-32: a finite real number (not a bool); raw time warns through to_t (Q-9), normalized time
+    # here, outside [0, 1] or, with a single timestamp, anywhere but 0.
     if isinstance(timestamp, bool) or not isinstance(timestamp, numbers.Real):
         raise ValueError(f"timestamp must be a real number, got {timestamp!r}")
     value = float(timestamp)
@@ -125,7 +126,8 @@ def _normalized_time(model: FreeTimeGaussians, timestamp: float, time_units: str
     if time_units == "raw":
         return model.time.to_t(value)
     single = model.time.tau1 == model.time.tau0
-    if (value != 0.0) if single else not 0.0 <= value <= 1.0:
+    inside = value == 0.0 if single else 0.0 <= value <= 1.0
+    if not inside:
         warnings.warn(
             f"normalized time {value!r} outside the training range "
             f"{'{0}' if single else '[0, 1]'}: motion extrapolates linearly",
@@ -135,17 +137,18 @@ def _normalized_time(model: FreeTimeGaussians, timestamp: float, time_units: str
     return value
 
 
-def _background(background: Tensor | None, num_cameras: int, like: Tensor) -> Tensor:
-    """The background as [C, 3] in the parameters' dtype and device (D-34; Q-32)."""
+def _backgrounds(background: Tensor | None, num_cameras: int, like: Tensor) -> Tensor:
+    """One background color per camera, [C, 3], in the parameters' dtype and device (D-34)."""
+    # Q-32: None (black), [3] for every camera, or [C, 3].
     if background is None:
-        bg = torch.tensor(_BACKGROUND, dtype=like.dtype, device=like.device)
+        color = torch.tensor(_BACKGROUND, dtype=like.dtype, device=like.device)
     else:
-        bg = torch.as_tensor(background).to(dtype=like.dtype, device=like.device)
-    if tuple(bg.shape) == (3,):
-        return bg.expand(num_cameras, 3)
-    if tuple(bg.shape) == (num_cameras, 3):
-        return bg
-    raise ValueError(f"background must be [3] or [{num_cameras}, 3], got {list(bg.shape)}")
+        color = torch.as_tensor(background).to(dtype=like.dtype, device=like.device)
+    if tuple(color.shape) == (3,):
+        return color.expand(num_cameras, 3)
+    if tuple(color.shape) == (num_cameras, 3):
+        return color
+    raise ValueError(f"background must be [3] or [{num_cameras}, 3], got {list(color.shape)}")
 
 
 def _take_rows(g: GaussiansAtTime, rows: Tensor) -> GaussiansAtTime:
@@ -165,8 +168,8 @@ def _scatter_rows(values: Tensor, rows: Tensor | None, num_rows: int) -> Tensor:
 
 
 @dataclass(frozen=True)
-class _Camera:
-    """One camera's parameters as tensors in the parameters' dtype and device."""
+class _CameraTensors:
+    """One camera's parameters as tensors in the model parameters' dtype and device."""
 
     rotation: Tensor  # [3, 3] R_w
     translation: Tensor  # [3] t_w
@@ -190,11 +193,12 @@ class _Projection:
     visible: Tensor  # [M] bool: both screen radii positive
 
 
-def _camera(camera: Camera, like: Tensor) -> _Camera:
+def _camera_tensors(camera: Camera, like: Tensor) -> _CameraTensors:
+    # Q-32: cast to the parameters' dtype and device; only f_x, f_y, c_x, c_y, R_w and t_w are read.
     K = camera.K.to(dtype=like.dtype, device=like.device)
     w2c = camera.world_to_camera.to(dtype=like.dtype, device=like.device)
     rotation, translation = w2c[:3, :3], w2c[:3, 3]
-    return _Camera(
+    return _CameraTensors(
         rotation=rotation,
         translation=translation,
         fx=K[0, 0],
@@ -224,7 +228,7 @@ def _render_reference(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Image [C, H, W, 3], alpha [C, H, W, 1], 2D means [C, N, 2] and visibility [C, N] of the
     per-time arrays `g`, which hold all N rows or the ascending subset `rows`."""
-    cams = [_camera(cam, g.means_t) for cam in cameras]
+    cams = [_camera_tensors(camera, g.means_t) for camera in cameras]
     projections = [_project(g, cam) for cam in cams]
     # Every camera is projected before any is composited: compositing reads μ′ from this stacked
     # tensor, so its retained gradient is ∂L/∂μ′ (Q-32).
@@ -250,7 +254,7 @@ def _render_reference(
     return torch.stack(images), torch.stack(alphas), means2d, visible
 
 
-def _project(g: GaussiansAtTime, cam: _Camera) -> _Projection:
+def _project(g: GaussiansAtTime, cam: _CameraTensors) -> _Projection:
     """E6's projection, EWA covariance and culls, and E2's colors, for every passed row.
 
     Every input that could make a local derivative infinite is replaced before use (the depth of
@@ -287,10 +291,10 @@ def _project(g: GaussiansAtTime, cam: _Camera) -> _Projection:
     conics = torch.stack([s11 / det, -s01 / det, s00 / det], dim=-1)
 
     with torch.no_grad():
-        opacity = g.opacities_t
-        passes = opacity >= _CULL_OPACITY  # D-32
-        # E6: the opacity-aware extent √(2 ln(255 σ_eff)), never above 3.33.
-        extent = torch.sqrt(2.0 * torch.log(torch.where(passes, 255.0 * opacity, 1.0)))
+        # E6, D-32: the opacity cull, as the temporal slice evaluated it (passes_cull, Q-12), and
+        # the opacity-aware extent √(2 ln(255 σ_eff)), never above 3.33.
+        passes = g.passes_cull
+        extent = torch.sqrt(2.0 * torch.log(torch.where(passes, 255.0 * g.opacities_t, 1.0)))
         extent = torch.clamp(extent, max=_EXTENT_MAX)
         radius_x = torch.ceil(extent * torch.sqrt(s00))
         radius_y = torch.ceil(extent * torch.sqrt(s11))

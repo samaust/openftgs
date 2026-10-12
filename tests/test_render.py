@@ -1009,8 +1009,9 @@ def test_scene_with_every_primitive_culled_renders_the_background(precull: str) 
 
 
 def test_render_constants_agree_with_their_copies() -> None:
-    """Private: E6's constants appear in render, in the ftgs-if render_conventions (Q-24) and, for
-    the opacity cull, in motion (D-32); the default background is TrainConfig's (D-34)."""
+    """Private: E6's constants appear in render and in the ftgs-if render_conventions (Q-24); the
+    opacity cull that render reads is motion's (D-32); the default background is TrainConfig's
+    (D-34)."""
     import openftgs.io
     import openftgs.motion
     import openftgs.render
@@ -1022,8 +1023,8 @@ def test_render_constants_agree_with_their_copies() -> None:
     assert conventions["eps2d"] == r._EPS2D == 0.3
     assert conventions["near"] == r._NEAR == 0.01
     assert conventions["far"] == r._FAR == 1e10
-    assert conventions["alpha_skip"] == r._ALPHA_SKIP == r._CULL_OPACITY == 1.0 / 255.0
-    assert openftgs.motion._CULL_OPACITY == r._CULL_OPACITY
+    assert conventions["alpha_skip"] == r._ALPHA_SKIP == 1.0 / 255.0
+    assert openftgs.motion._CULL_OPACITY == 1.0 / 255.0  # the opacity cull render reads (D-32)
     assert conventions["transmittance_stop"] == r._T_STOP == 1e-4
     assert conventions["pixel_center_offset"] == r._PIXEL_CENTER == 0.5
     assert conventions["background"] == list(r._BACKGROUND) == list(TrainConfig().background)
