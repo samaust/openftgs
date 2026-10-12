@@ -12,7 +12,7 @@ import math
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pytest
@@ -839,3 +839,192 @@ def test_row_at_the_camera_center_keeps_gradients_finite() -> None:
         assert bool(torch.isfinite(grad).all()), name
         assert torch.equal(grad[0], torch.zeros_like(grad[0])), name
     assert bool(grads[0][1].abs().sum() > 0)
+
+
+# The render() API (§2.1, Q-31, Q-32)
+
+
+def _api_model() -> FreeTimeGaussians:
+    return _model([{"mean": (0.0, 0.0, 4.0)}, {"mean": (0.5, 0.25, 5.0), "logit": 1.0}])
+
+
+def test_all_lists_the_public_api() -> None:
+    """§2.1: render is the module's only public name."""
+    import openftgs.render
+
+    assert openftgs.render.__all__ == ["render"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"backend": "cuda"}, "backend"),
+        ({"time_units": "seconds"}, "time_units"),
+        ({"precull": "always"}, "precull"),
+        ({"background": torch.zeros(4)}, "background"),
+        ({"background": torch.zeros(2, 3)}, "background"),
+        ({"sh_degree": 1}, "sh_degree"),
+    ],
+)
+def test_render_rejects_invalid_arguments(kwargs: dict[str, Any], match: str) -> None:
+    """Q-32: unknown choices, background shapes other than [3] and [C, 3], and an SH degree above
+    the model's (Q-20) raise ValueError."""
+    with pytest.raises(ValueError, match=match):
+        render(_api_model(), CAM_A, 0.5, **{"backend": "reference", **kwargs})
+
+
+@pytest.mark.parametrize("timestamp", [math.nan, math.inf, -math.inf, True, "0.5"])
+def test_render_rejects_timestamps_that_are_not_finite_reals(timestamp: Any) -> None:
+    """Q-32: a timestamp must be a finite real number."""
+    with pytest.raises(ValueError, match="timestamp"):
+        render(_api_model(), CAM_A, timestamp, backend="reference")
+
+
+def test_render_rejects_cameras_it_cannot_batch() -> None:
+    """Q-32: one camera or a non-empty sequence of one size, with K [3, 3] and world_to_camera
+    [4, 4]."""
+    model = _api_model()
+    other_size = pinhole(32, 48, fx=16.0, fy=16.0, cx=16.0, cy=24.0)
+    bad_k = Camera(K=torch.eye(4), world_to_camera=torch.eye(4), width=64, height=48)
+    bad_pose = Camera(K=CAM_A.K, world_to_camera=torch.eye(3), width=64, height=48)
+    cases: list[tuple[Camera | list[Camera], str]] = [
+        ([], "camera"),
+        ([CAM_A, other_size], "same width and height"),
+        (bad_k, "K"),
+        (bad_pose, "world_to_camera"),
+    ]
+    for cameras, match in cases:
+        with pytest.raises(ValueError, match=match):
+            render(model, cameras, 0.5, backend="reference")
+
+
+def test_gsplat_backend_arrives_in_m5() -> None:
+    """Q-32: until M5, backend="gsplat" (the §2.1 default) raises NotImplementedError."""
+    with pytest.raises(NotImplementedError, match="M5"):
+        render(_api_model(), CAM_A, 0.5)
+
+
+def test_render_warns_outside_the_training_time_range() -> None:
+    """§1.4 "Time", Q-9, Q-32: exactly one UserWarning for a raw τ outside [τ₀, τ₁] and for a
+    normalized t outside [0, 1] (≠ 0 with a single timestamp); none inside, ends included."""
+    model = _model([{"mean": (0.0, 0.0, 4.0)}], time=_SPAN)
+    single = _model([{"mean": (0.0, 0.0, 4.0), "time": 0.0}], time=TimeNormalizer(3.0, 3.0))
+    warned: list[tuple[FreeTimeGaussians, float, Literal["raw", "normalized"]]] = [
+        (model, 1.5, "raw"),
+        (model, 12.5, "raw"),
+        (model, -0.1, "normalized"),
+        (model, 1.25, "normalized"),
+        (single, 0.5, "normalized"),
+        (single, 4.0, "raw"),
+    ]
+    for m, timestamp, units in warned:
+        with pytest.warns(UserWarning) as record:
+            render(m, CAM_A, timestamp, time_units=units, backend="reference")
+        assert len(record) == 1, (timestamp, units)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        quiet: list[tuple[FreeTimeGaussians, float, Literal["raw", "normalized"]]] = [
+            (model, 2.0, "raw"),
+            (model, 12.0, "raw"),
+            (model, 0.0, "normalized"),
+            (model, 1.0, "normalized"),
+            (single, 0.0, "normalized"),
+            (single, 3.0, "raw"),
+        ]
+        for m, timestamp, units in quiet:
+            render(m, CAM_A, timestamp, time_units=units, backend="reference")
+
+
+def test_raw_and_normalized_time_give_the_same_render() -> None:
+    """E14: a raw τ renders exactly as its normalized t = (τ − τ₀)/(τ₁ − τ₀)."""
+    model = _moving_scene(1)
+    raw = render(model, ring(2), 7.3, backend="reference")
+    t = model.time.to_t(7.3)
+    normalized = render(model, ring(2), t, time_units="normalized", backend="reference")
+    assert torch.equal(raw.image, normalized.image)
+    assert torch.equal(raw.alpha, normalized.alpha)
+
+
+def test_render_outputs_follow_return_aux() -> None:
+    """§2.1, Q-32: image [C, H, W, 3] and alpha [C, H, W, 1] always; with return_aux, means2d
+    [C, N, 2] (0 for primitives that are not visible) and visible [C, N]; gaussian_ids stays None
+    on the unpacked reference backend."""
+    model = _api_model()
+    cameras = [
+        CAM_A,
+        pinhole(
+            64,
+            48,
+            fx=16.0,
+            fy=16.0,
+            cx=32.5,
+            cy=24.5,
+            world_to_camera=[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, -4.5]],
+        ),
+    ]
+    plain = _render(model, cameras, 0.5)
+    assert plain.image.shape == (2, 48, 64, 3) and plain.alpha.shape == (2, 48, 64, 1)
+    assert plain.means2d is None and plain.visible is None and plain.gaussian_ids is None
+    aux = _render(model, cameras, 0.5, return_aux=True)
+    assert aux.means2d is not None and aux.visible is not None and aux.gaussian_ids is None
+    assert aux.means2d.shape == (2, 2, 2) and aux.visible.dtype == torch.bool
+    assert aux.visible.tolist() == [[True, True], [False, True]]
+    assert torch.equal(aux.means2d[1, 0], torch.zeros(2))
+    assert torch.equal(aux.image, plain.image)
+
+
+def test_cameras_render_independently() -> None:
+    """Q-32: a single Camera renders like a one-element list, and a batch of cameras like each
+    camera alone, with a per-camera background [C, 3]."""
+    model = _moving_scene(2)
+    cameras = ring(3)
+    backgrounds = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.25, 0.125], [1.0, 1.0, 1.0]])
+    batch = _render(model, cameras, 0.4, background=backgrounds)
+    for c, camera in enumerate(cameras):
+        alone = _render(model, camera, 0.4, background=backgrounds[c])
+        listed = _render(model, [camera], 0.4, background=backgrounds[c])
+        assert torch.equal(alone.image, listed.image)
+        assert torch.equal(batch.image[c], alone.image[0])
+        assert torch.equal(batch.alpha[c], alone.alpha[0])
+
+
+def test_float64_models_render_in_float64() -> None:
+    """Q-32: the render follows the parameters' dtype (float64 through .double(), for gradient
+    checks), whatever the float32 camera tensors."""
+    out = _render(_api_model().double(), CAM_A, 0.5, return_aux=True)
+    assert out.image.dtype == out.alpha.dtype == F64
+    assert out.means2d is not None and out.means2d.dtype == F64
+
+
+@pytest.mark.parametrize("precull", ["internal", "compact"])
+def test_scene_with_every_primitive_culled_renders_the_background(precull: str) -> None:
+    """Q-32, E6: when every primitive is culled (below the opacity cull, behind the camera), the
+    render is the background with alpha 0, in both placements of the opacity cull."""
+    model = _model([{"mean": (0.0, 0.0, 4.0), "logit": -8.0}, {"mean": (0.0, 0.0, -4.0)}])
+    background = torch.tensor([0.25, 0.5, 0.75])
+    out = _render(model, CAM_A, 0.5, background=background, precull=precull, return_aux=True)
+    assert torch.equal(out.image, background.expand(1, 48, 64, 3))
+    assert torch.equal(out.alpha, torch.zeros(1, 48, 64, 1))
+    assert out.visible is not None and not bool(out.visible.any())
+
+
+def test_render_constants_agree_with_their_copies() -> None:
+    """Private: E6's constants appear in render, in the ftgs-if render_conventions (Q-24) and, for
+    the opacity cull, in motion (D-32); the default background is TrainConfig's (D-34)."""
+    import openftgs.io
+    import openftgs.motion
+    import openftgs.render
+    from openftgs.config import TrainConfig
+
+    conventions = openftgs.io._RENDER_CONVENTIONS
+    r = openftgs.render
+    assert conventions["alpha_max"] == r._ALPHA_MAX == 0.999
+    assert conventions["eps2d"] == r._EPS2D == 0.3
+    assert conventions["near"] == r._NEAR == 0.01
+    assert conventions["far"] == r._FAR == 1e10
+    assert conventions["alpha_skip"] == r._ALPHA_SKIP == r._CULL_OPACITY == 1.0 / 255.0
+    assert openftgs.motion._CULL_OPACITY == r._CULL_OPACITY
+    assert conventions["transmittance_stop"] == r._T_STOP == 1e-4
+    assert conventions["pixel_center_offset"] == r._PIXEL_CENTER == 0.5
+    assert conventions["background"] == list(r._BACKGROUND) == list(TrainConfig().background)
+    assert r._EXTENT_MAX == 3.33 and r._CLAMP_MARGIN == 0.15 and r._SH_OFFSET == 0.5
