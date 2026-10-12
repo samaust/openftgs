@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
@@ -63,9 +63,12 @@ def _check_header(meta: Mapping[str, str], fmt: str, where: str) -> None:
 
 
 def _read_safetensors(path: Path) -> tuple[dict[str, Tensor], dict[str, str]]:
-    with safe_open(str(path), framework="pt", device="cpu") as f:
-        meta = dict(f.metadata() or {})
-        tensors = {key: f.get_tensor(key) for key in f.keys()}  # noqa: SIM118
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            meta = dict(f.metadata() or {})
+            tensors = {key: f.get_tensor(key) for key in f.keys()}  # noqa: SIM118
+    except (OSError, SafetensorError) as err:
+        raise ValueError(f"{path}: not a readable safetensors file: {err}") from None
     return tensors, meta
 
 
@@ -73,7 +76,9 @@ def _write_safetensors(tensors: Mapping[str, Tensor], path: Path, meta: Mapping[
     save_file(
         {k: v.detach().to("cpu").contiguous() for k, v in tensors.items()},
         str(path),
-        metadata=dict(meta),
+        # safetensors 0.8.0 writes an unreadable header for no tensors with an empty metadata
+        # map, so an empty map is passed as None (source log #11).
+        metadata=dict(meta) or None,
     )
 
 

@@ -743,3 +743,19 @@ def test_ply_snapshot_rejects_mismatched_arrays(tmp_path: Path) -> None:
             sh=torch.zeros(2, 1, 3),
         )
     assert not (tmp_path / "x.ply").exists()
+
+
+def test_checkpoint_with_empty_optim_rng_and_stats_round_trips(tmp_path: Path) -> None:
+    """§2.2: every file is written even when its part of the state holds no tensor."""
+    state = _trainer_state()
+    state.optim, state.rng, state.stats, state.sampler = {}, {}, {}, {}
+    _assert_states_equal(state, load_checkpoint(save_checkpoint(state, tmp_path / "ckpt")))
+
+
+def test_unreadable_safetensors_files_are_rejected_with_value_error(tmp_path: Path) -> None:
+    """Q-26: a file that isn't safetensors fails schema validation with ValueError."""
+    path = tmp_path / "junk.safetensors"
+    path.write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}garbage")
+    for reader in (read_init_points, read_exchange):
+        with pytest.raises(ValueError):
+            reader(path)
