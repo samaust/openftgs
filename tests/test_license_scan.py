@@ -65,6 +65,10 @@ def _names(rows: list[dict[str, str]]) -> list[str]:
         "Creative Commons Attribution-NonCommercial 4.0",
         "Non-Commercial Research License",
         "MIT AND CC-BY-NC-SA-4.0",
+        "GPL-2.0 or later",
+        "GPLv3 or later",
+        "GNU General Public License v3 or later",
+        "GPL-2.0 or any later version",
     ],
 )
 def test_gpl_agpl_and_non_commercial_fail(license_: str) -> None:
@@ -97,6 +101,8 @@ def test_failure_cannot_be_signed_off() -> None:
         "Some Custom License",
         "MIT AND LicenseRef-Proprietary",
         "BSD-3-Clause AND UNKNOWN",
+        "LGPL-2.1 or later",
+        "GNU Lesser General Public License v2 or later (LGPLv2+)",
     ],
 )
 def test_lgpl_proprietary_and_unrecognised_need_signoff(license_: str) -> None:
@@ -125,6 +131,8 @@ def test_lgpl_proprietary_and_unrecognised_need_signoff(license_: str) -> None:
         "BSL-1.0",
         "CC0-1.0",
         "HPND",
+        "Historical Permission Notice and Disclaimer (HPND)",
+        "Apache Software License 2.0",
         "MPL-2.0",
         "Mozilla Public License 2.0 (MPL 2.0)",
         "MPL-2.0 AND MIT",

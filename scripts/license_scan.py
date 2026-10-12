@@ -2,9 +2,10 @@
 """License scan of the resolved environment (§2.3 notes; Q-4).
 
 Runs pip-licenses (or reads its JSON output from --rows) and judges every installed
-distribution's license string term by term. Terms are joined by AND, ";" or WITH (an
-exception only adds permissions, so the base license is judged); an OR choice takes
-its most favourable option, and a distribution takes its worst term.
+distribution's license string term by term. Terms are joined by AND or ";" (SPDX
+operators, upper case); an OR choice takes its most favourable option, and a
+distribution takes its worst term. "X or later" is one license, and an exception
+(WITH) only adds permissions, so the base license is judged.
 
 - Fail, no sign-off possible: GPL, AGPL, non-commercial; albumentations unless MIT.
 - Needs sign-off: LGPL, proprietary, unknown, unrecognised. The scan fails unless an
@@ -45,7 +46,7 @@ _GPL = re.compile(r"\bA?GPL|General\s+Public\s+License|Affero", re.IGNORECASE)
 _PERMISSIVE = re.compile(
     r"MIT(?:-CMU|-0)?(?:\s+License)?"
     r"|(?:new\s+|simplified\s+|modified\s+)?BSD(?:[-\s][234]-Clause)?(?:\s+License)?|0BSD"
-    r"|Apache(?:-2\.0|\s+2\.0|\s+Software\s+License|\s+License\s+2\.0"
+    r"|Apache(?:-2\.0|\s+2\.0|\s+Software\s+License(?:\s+2\.0)?|\s+License\s+2\.0"
     r"|\s+License,\s+Version\s+2\.0)"
     r"|ISC(?:\s+License(?:\s+\(ISCL\))?)?"
     r"|PSF(?:-2\.0)?|Python\s+Software\s+Foundation\s+License"
@@ -78,8 +79,11 @@ def _split_top_level(text: str, separator: re.Pattern[str]) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-_AND = re.compile(r"\s+AND\s+|;", re.IGNORECASE)
-_OR = re.compile(r"\s+OR\s+", re.IGNORECASE)
+# SPDX writes its operators in upper case; prose names contain "and" and "or".
+_AND = re.compile(r"\s+AND\s+|;")
+_OR = re.compile(r"\s+OR\s+")
+# "GPL-2.0 or later" is one license, not a choice between "GPL-2.0" and "later".
+_OR_LATER = re.compile(r"\s+or\s+(?:any\s+)?(?:later|newer)(?:\s+version)?", re.IGNORECASE)
 
 
 def _strip_parentheses(text: str) -> str:
@@ -113,7 +117,7 @@ def _judge_atom(atom: str) -> Outcome:
 
 def judge(license_: str) -> Outcome:
     """The outcome of one license string, the worst over its terms."""
-    text = _strip_parentheses(license_.strip())
+    text = _strip_parentheses(_OR_LATER.sub("+", license_.strip()))
     if text.lower() in _UNKNOWN:
         return Outcome.SIGNOFF
     terms = _split_top_level(text, _AND)
