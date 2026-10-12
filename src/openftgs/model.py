@@ -417,23 +417,32 @@ class FreeTimeGaussians(torch.nn.Module):
         """Keep the rows the bool mask `keep` [N] selects, in their old order, then append the
         rows of `append` last (§1.3 Growth step 4; Q-23). The result is revalidated; on error
         the model is unchanged."""
-        # Q-23: keep is a bool mask [N], so it can't reorder rows; append matches shape and dtype.
+        # Q-23: keep is a bool mask [N], so it can't reorder rows; append matches shape, dtype
+        # and device; nothing is moved between devices silently.
         n = self.num_gaussians
+        device = self.means.device
         if keep is not None and (keep.dtype != torch.bool or tuple(keep.shape) != (n,)):
             _fail(f"keep must be a bool mask of shape [{n}], got {keep.dtype} {list(keep.shape)}")
+        if keep is not None and keep.device != device:
+            _fail(f"keep must be on the model's device {device}, got {keep.device}")
         if append is not None and set(append) != set(self.PARAM_NAMES):
             _fail(f"append must hold exactly {self.PARAM_NAMES}, got {sorted(append)}")
         params: dict[str, Tensor] = {}
         for name in self.PARAM_NAMES:
             value = getattr(self, name).detach()
             if keep is not None:
-                value = value[keep.to(value.device)]
+                value = value[keep]
             if append is not None:
                 extra = append[name]
                 if extra.dim() != value.dim() or extra.shape[1:] != value.shape[1:]:
                     _fail(f"append[{name!r}] must have rows of shape {list(value.shape[1:])}")
                 if extra.dtype != value.dtype:
                     _fail(f"append[{name!r}] must be {value.dtype}, got {extra.dtype}")
-                value = torch.cat([value, extra.to(value.device)])
+                if extra.device != device:
+                    _fail(
+                        f"append[{name!r}] must be on the model's device {device}, "
+                        f"got {extra.device}"
+                    )
+                value = torch.cat([value, extra])
             params[name] = value
         self._set_params(params)

@@ -920,3 +920,22 @@ def test_single_frame_import_rejects_motion_the_file_cannot_hold() -> None:
     )
     assert not bool(model.velocities.detach().any())
     assert not bool(model.times.detach().any())
+
+
+@pytest.mark.parametrize("what", ["append", "keep"])
+def test_resize_rejects_tensors_on_another_device(what: str) -> None:
+    """Q-23: appended rows and the keep mask must be on the model's device, as the constructor
+    requires of its tensors; nothing is copied silently. ("meta" stands in for another device,
+    so the test runs on CPU-only machines.)"""
+    model = _model(n=3)
+    keep: Tensor | None = None
+    append: dict[str, Tensor] | None = None
+    if what == "append":
+        append = {k: v.to("meta") for k, v in _params(n=2).items()}
+    else:
+        keep = torch.tensor([True, False, True]).to("meta")
+    before = _rows(model)
+    with pytest.raises(ValueError, match="device"):
+        model.resize_(keep=keep, append=append)
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
