@@ -98,7 +98,7 @@ def _assert_relative_l2(got: Tensor, want: Tensor, rtol: float, what: str) -> No
     assert float(err) <= rtol * float(ref), f"{what}: relative L2 {float(err / ref):.3e}"
 
 
-def _compiled_frames() -> int:
+def _compiled_graphs() -> int:
     """The graphs dynamo compiled since the last reset; Q-13 counts recompilations this way."""
     return int(counters["stats"]["unique_graphs"])
 
@@ -149,9 +149,9 @@ def test_u28_eager_and_compiled_agree_across_resizes(device: str) -> None:
         for name, a, b in zip(NAMES, g_compiled, g_eager, strict=True):
             _assert_relative_l2(a, b, 1e-5, f"N={n} grad {name}")
         _assert_mask(compiled.passes_cull, eager, f"N={n}")
-    frames = _compiled_frames()
-    assert frames >= 1, "the compiled slice never compiled"
-    assert frames - 1 <= 2, f"{frames - 1} recompilations over {len(SIZES) - 1} resizes"
+    graphs = _compiled_graphs()
+    assert graphs >= 1, "the compiled slice never compiled"
+    assert graphs - 1 <= 2, f"{graphs - 1} recompilations over {len(SIZES) - 1} resizes"
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -162,7 +162,7 @@ def test_slice_new_time_does_not_recompile(device: str) -> None:
     params = _model(5000, 7, device)
     for t in (0.0, 0.25, 0.731, 1.0, -0.5):
         _run(params, t, "compiled")
-    assert _compiled_frames() == 1
+    assert _compiled_graphs() == 1
 
 
 @pytest.mark.gpu
@@ -173,7 +173,7 @@ def test_slice_auto_compiles_on_cuda() -> None:
     params = _model(20_000, 9, "cuda")
     auto, _ = _run(params, 0.4, "auto")
     eager, _ = _run(params, 0.4, "eager")
-    assert _compiled_frames() == 1
+    assert _compiled_graphs() == 1
     for f in FIELDS:
         _assert_relative_l2(getattr(auto, f), getattr(eager, f), 1e-6, f)
 
@@ -235,9 +235,9 @@ def test_u28_through_the_model_across_resizes() -> None:
             for name, a, b in zip(NAMES, grads["compiled"], grads["eager"], strict=True):
                 _assert_relative_l2(a, b, 1e-5, f"N={n} grad {name}")
             _assert_mask(compiled.passes_cull, eager, f"N={n}")
-    frames = _compiled_frames()
-    assert frames >= 1, "the compiled slice never compiled"
-    assert frames - 1 <= 2, f"{frames - 1} recompilations over {len(SIZES) - 1} resizes"
+    graphs = _compiled_graphs()
+    assert graphs >= 1, "the compiled slice never compiled"
+    assert graphs - 1 <= 2, f"{graphs - 1} recompilations over {len(SIZES) - 1} resizes"
 
 
 @pytest.mark.gpu
@@ -261,5 +261,5 @@ def test_compiled_slice_takes_parameters_like_plain_tensors() -> None:
             impl="compiled",
         )
         assert out.means_t.requires_grad
-    frames = _compiled_frames()
-    assert 1 <= frames <= 3, f"{frames} graphs over 5 sizes"
+    graphs = _compiled_graphs()
+    assert 1 <= graphs <= 3, f"{graphs} graphs over 5 sizes"

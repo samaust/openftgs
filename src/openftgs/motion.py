@@ -172,12 +172,15 @@ def _compiled_slice() -> _SliceFn:
 
 def _compile_failures() -> tuple[type[Exception], ...]:
     """The exceptions Q-13 counts as a failed compilation: dynamo's and its backends' errors, and
-    reaching the recompile limit, which is a plain Exception (looked up by name, so a torch
-    without it still runs)."""
-    from torch._dynamo import exc  # loaded by torch.compile anyway
+    reaching the recompile limit, which is a plain Exception, not a dynamo one."""
+    from torch._dynamo import exc as dynamo_exc  # loaded by torch.compile anyway
 
-    limit = getattr(exc, "FailOnRecompileLimitHit", None)
-    return (exc.TorchDynamoException,) if limit is None else (exc.TorchDynamoException, limit)
+    # Looked up by name, as #51 asks: on a torch without the class, the TorchDynamoException
+    # fallback still works instead of failing with an AttributeError, and Q-13's detecting test
+    # is what reports that the limit is no longer caught there.
+    limit_hit = getattr(dynamo_exc, "FailOnRecompileLimitHit", None)
+    failures: tuple[type[Exception], ...] = (dynamo_exc.TorchDynamoException,)
+    return failures if limit_hit is None else (*failures, limit_hit)
 
 
 def temporal_slice(
