@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# CI for the CPU suite (§3 introduction) and the license scan (§2.3 notes; Q-4).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: ${{ matrix.job }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [lint, test, licenses]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            harness/pyproject.toml
+      - name: Install CPU torch, then the packages (Q-3)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          python -m pip install -e ".[dev]" -e harness
+      - name: Lint and type-check
+        if: matrix.job == 'lint'
+        run: |
+          ruff check .
+          ruff format --check .
+          mypy
+      - name: CPU tests
+        if: matrix.job == 'test'
+        run: pytest -m "not gpu and not dataset and not weights"
+      - name: License scan (fails on GPL or AGPL)
+        if: matrix.job == 'licenses'
+        run: python scripts/license_scan.py
