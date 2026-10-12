@@ -107,13 +107,14 @@ def test_time_normalizer_rejects_invalid_bounds(tau0: float, tau1: float) -> Non
         ([0.0, 1.0, 3.0, 4.0], 1.0 / 4.0),  # gaps 1, 2, 1: median 1, T_τ = 4
         ([4.0, 0.0, 3.0, 1.0], 1.0 / 4.0),  # the same, unsorted
         ([0.0, 1.0, 3.0, 4.0, 8.0], 1.5 / 8.0),  # gaps 1, 2, 1, 4: median (1 + 2)/2, T_τ = 8
-        ([0.0, 0.0, 0.0, 2.0, 4.0], 1.0 / 4.0),  # gaps 0, 0, 2, 2: duplicates kept (Q-8)
+        ([0.0, 0.0, 0.0, 2.0, 4.0], 2.0 / 4.0),  # distinct 0, 2, 4: gaps 2, 2 (Q-8)
     ],
 )
 def test_u18_frame_interval_with_irregular_timestamps(
     timestamps: list[float], expected: float
 ) -> None:
-    """U-18 (E14): one camera's median gap in normalized time; even counts average (Q-8)."""
+    """U-18 (E14): one camera's median gap between its distinct timestamps, in normalized
+    time; even counts average (Q-8)."""
     time = TimeNormalizer(min(timestamps), max(timestamps))
     assert frame_interval({"cam00": timestamps}, time) == expected
 
@@ -161,12 +162,20 @@ def test_u18_frame_interval_single_timestamp_is_one() -> None:
     assert frame_interval({"a": [2.0, 2.0]}, time) == 1.0
 
 
-def test_frame_interval_rejects_empty_input_and_a_zero_result() -> None:
-    """Q-8: an empty mapping or a zero median gap is an error."""
+def test_frame_interval_rejects_empty_input() -> None:
+    """Q-8: an empty mapping is an error."""
     with pytest.raises(ValueError):
         frame_interval({}, TimeNormalizer(0.0, 1.0))
-    with pytest.raises(ValueError):
-        frame_interval({"a": [0.0, 0.0, 0.0, 1.0]}, TimeNormalizer(0.0, 1.0))
+
+
+def test_u18_duplicated_timestamps_neither_shrink_frame_interval_nor_block_the_fallback() -> None:
+    """D-46, Q-8: a camera counts only with two distinct timestamps, so duplicates don't
+    shrink Δt_f, and a camera with one repeated timestamp leaves the pooled fallback in place."""
+    # "a" has one distinct timestamp and doesn't count; "b" has median gap 1, T_τ = 2.
+    cameras = {"a": [0.0, 0.0], "b": [0.0, 1.0, 2.0]}
+    assert frame_interval(cameras, TimeNormalizer(0.0, 2.0)) == 1.0 / 2.0
+    # no camera has two distinct timestamps: pooled distinct 0, 1, gap 1, T_τ = 1.
+    assert frame_interval({"a": [1.0, 1.0], "b": [0.0]}, TimeNormalizer(0.0, 1.0)) == 1.0
 
 
 def test_u18_to_t_warns_for_nan() -> None:

@@ -154,25 +154,23 @@ class TrainerState:  # plain tensors and dicts; a §2.2 checkpoint holds exactly
 def frame_interval(camera_timestamps: Mapping[str, Sequence[float]], time: TimeNormalizer) -> float:
     """Δt_f of E14 in normalized time, from each training camera's raw timestamps (D-46).
 
-    The median over cameras with at least two images of each camera's median gap; without
-    such a camera, the median gap of the pooled distinct timestamps; 1 for a single timestamp.
+    The median over cameras with at least two distinct timestamps of each camera's median gap;
+    without such a camera, the median gap of the pooled distinct timestamps; 1 for a single
+    timestamp.
     """
-    # Q-8: statistical medians (even counts average) over raw gaps, divided by T_τ once;
-    # duplicates within a camera are kept, only the pooled fallback takes distinct values.
+    # Q-8: statistical medians (even counts average) over the gaps between distinct raw
+    # timestamps, divided by T_τ once; duplicates neither shrink Δt_f nor block the fallback.
     if not camera_timestamps:
         raise ValueError("frame_interval needs at least one camera")
     span = time.tau1 - time.tau0
     if span == 0.0:
         return 1.0
-    medians = [
-        statistics.median(_gaps(sorted(float(x) for x in stamps)))
-        for stamps in camera_timestamps.values()
-        if len(stamps) >= 2
-    ]
+    distinct = [sorted({float(x) for x in stamps}) for stamps in camera_timestamps.values()]
+    medians = [statistics.median(_gaps(stamps)) for stamps in distinct if len(stamps) >= 2]
     if medians:
         gap = statistics.median(medians)
     else:
-        pooled = sorted({float(x) for stamps in camera_timestamps.values() for x in stamps})
+        pooled = sorted({x for stamps in distinct for x in stamps})
         if len(pooled) < 2:
             return 1.0
         gap = statistics.median(_gaps(pooled))

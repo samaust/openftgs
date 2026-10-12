@@ -9,7 +9,7 @@ How `openftgs.types` meets the time half of E14 (D-1, D-46) and §1.4 "Time".
 
 ## The contract `frame_interval` offers
 
-`frame_interval` takes the raw training timestamps of each training camera, keyed by camera name, and the time normalizer built from the smallest and largest training timestamps. It returns Δt_f in normalized time, as E14 defines it: medians over raw gaps, divided by the training time span once (Q-8). It is meant to be computed once per scene and passed on as a value (`TrainerState.frame_dt` stores it), never recomputed downstream.
+`frame_interval` takes the raw training timestamps of each training camera, keyed by camera name, and the time normalizer built from the smallest and largest training timestamps. It returns Δt_f in normalized time, as E14 defines it: medians over the gaps between each camera's distinct raw timestamps, divided by the training time span once, so a duplicated timestamp never shrinks it (Q-8). It is meant to be computed once per scene and passed on as a value (`TrainerState.frame_dt` stores it), never recomputed downstream.
 
 ## The warning outside the training span
 
