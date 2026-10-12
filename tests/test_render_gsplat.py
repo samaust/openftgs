@@ -277,3 +277,141 @@ def test_backend_matches_gsplat_rasterization(packed: bool) -> None:
         assert torch.equal(out.visible, visible)
         assert torch.equal(out.means2d[visible], meta["means2d"][visible])
     assert int(out.visible.sum()) >= 20
+
+
+# Layouts: packed and unpacked give the same render (D-57; Q-36 to Q-38)
+
+PLACEMENTS = pytest.mark.parametrize("precull", ["internal", "compact"])
+
+
+def _culling_scene(seed: int) -> FreeTimeGaussians:
+    """Rows around two ring cameras (64×48), some below the opacity cull (every third row), some
+    behind a camera or off the image."""
+    model = random_model(48, seed=seed, spread=4.5, log_scale=(-2.5, -0.5), logit=(-3.0, 3.0))
+    with torch.no_grad():
+        model.opacity_logits[::3] = -9.0
+    return _cuda(model)
+
+
+_RING = ring(2, width_px=64, height_px=48, focal=40.0)
+
+
+@PLACEMENTS
+def test_packed_and_unpacked_layouts_render_alike(precull: str) -> None:
+    """D-57, Q-37, Q-38: packed mode changes memory and speed, not results. Images and alpha agree
+    within 1e-6, `visible` is equal, and the packed 2D means are the unpacked ones at the visible
+    entries read camera by camera in ascending row order, labeled by gaussian_ids."""
+    model = _culling_scene(0)
+    out = {
+        packed: _gsplat(model, _RING, 0.37, return_aux=True, precull=precull, packed=packed)
+        for packed in (True, False)
+    }
+    packed, unpacked = out[True], out[False]
+    torch.testing.assert_close(packed.image, unpacked.image, rtol=0, atol=1e-6)
+    torch.testing.assert_close(packed.alpha, unpacked.alpha, rtol=0, atol=1e-6)
+    assert packed.visible is not None and unpacked.visible is not None
+    assert torch.equal(packed.visible, unpacked.visible)
+    assert unpacked.gaussian_ids is None and unpacked.means2d is not None
+    assert packed.gaussian_ids is not None and packed.means2d is not None
+    assert packed.gaussian_ids.dtype == torch.int64
+    cams, ids = torch.nonzero(unpacked.visible, as_tuple=True)
+    assert torch.equal(packed.gaussian_ids, ids)
+    assert torch.equal(packed.means2d, unpacked.means2d[cams, ids])
+    culled = int((~unpacked.visible).sum())
+    assert culled >= 20 and int(unpacked.visible.sum()) >= 10
+
+
+@PLACEMENTS
+def test_unpacked_means2d_is_zero_off_the_visible_rows(precull: str) -> None:
+    """Q-32, Q-37: in unpacked mode, means2d is μ′ for visible rows and exactly 0 elsewhere (gsplat
+    leaves those rows uninitialized), with and without compaction."""
+    model = _culling_scene(1)
+    out = _gsplat(model, _RING, 0.37, return_aux=True, precull=precull, packed=False)
+    assert out.means2d is not None and out.visible is not None
+    assert out.means2d.shape == (2, 48, 2) and out.visible.shape == (2, 48)
+    hidden = out.means2d[~out.visible]
+    assert hidden.numel() > 0 and torch.equal(hidden, torch.zeros_like(hidden))
+
+
+@LAYOUTS
+@PLACEMENTS
+def test_means2d_gradient_is_the_gradient_with_respect_to_the_2d_mean(
+    packed: bool, precull: str
+) -> None:
+    """Q-32, Q-37: with return_aux, means2d keeps its gradient in all four layouts and placements.
+    For the on-axis row (Σ′ = 1.3·I, σ = 0.5, color 0.5) and L = the red value of pixel (24, 34),
+    2 px right of μ′, L = 0.5·0.5·e^(−q) with q = ½·2²/1.3, so ∂L/∂μ′ = (L·2/1.3, 0); the second
+    row is below the opacity cull and has no visible entry, so its gradient is 0 (unpacked) or
+    absent (packed)."""
+    model = _cuda(
+        model_from_rows([{"mean": (0.0, 0.0, 4.0)}, {"mean": (1.0, 0.0, 4.0), "logit": -9.0}])
+    )
+    out = _gsplat(model, CAM_A, 0.5, return_aux=True, precull=precull, packed=packed)
+    assert out.means2d is not None
+    torch.autograd.backward(out.image[0, 24, 34, 0])
+    value = 0.25 * math.exp(-0.5 * 4.0 / 1.3)
+    grad = out.means2d.grad
+    assert grad is not None
+    if packed:
+        assert out.gaussian_ids is not None and out.gaussian_ids.tolist() == [0]
+        expected = torch.tensor([[value * 2.0 / 1.3, 0.0]], dtype=torch.float64)
+    else:
+        expected = torch.tensor([[[value * 2.0 / 1.3, 0.0], [0.0, 0.0]]], dtype=torch.float64)
+    torch.testing.assert_close(grad.cpu().double(), expected, rtol=1e-5, atol=1e-9)
+    if not packed:
+        assert float(grad[0, 1].abs().sum()) == 0.0
+
+
+@LAYOUTS
+@PLACEMENTS
+def test_empty_and_fully_culled_scenes_render_the_background(packed: bool, precull: str) -> None:
+    """Q-32, Q-38: a model with no primitives, and a scene whose primitives are all culled (below
+    the opacity cull, behind the camera), render the background with alpha 0 in every layout and
+    placement, with no visible entry: zero means2d [C, N, 2] unpacked, empty [0, 2] means2d and
+    gaussian_ids packed."""
+    background = torch.tensor([0.25, 0.5, 0.75], device="cuda")
+    models = [
+        _cuda(model_from_rows([])),
+        _cuda(
+            model_from_rows([{"mean": (0.0, 0.0, 4.0), "logit": -8.0}, {"mean": (0.0, 0.0, -4.0)}])
+        ),
+    ]
+    for model in models:
+        n = model.num_gaussians
+        out = _gsplat(
+            model,
+            [CAM_A, CAM_A],
+            0.5,
+            background=background,
+            return_aux=True,
+            precull=precull,
+            packed=packed,
+        )
+        assert out.image.shape == (2, 48, 64, 3) and out.alpha.shape == (2, 48, 64, 1)
+        assert _background_only(out, background)
+        assert out.visible is not None and out.visible.shape == (2, n)
+        assert not bool(out.visible.any())
+        assert out.means2d is not None
+        if packed:
+            assert out.gaussian_ids is not None and out.gaussian_ids.shape == (0,)
+            assert out.means2d.shape == (0, 2)
+        else:
+            assert out.gaussian_ids is None
+            assert torch.equal(out.means2d, torch.zeros(2, n, 2, device="cuda"))
+
+
+@LAYOUTS
+def test_cameras_render_independently(packed: bool) -> None:
+    """Q-32, Q-38: a single Camera renders like a one-element list, and a batch of cameras like
+    each camera alone, with a per-camera background [C, 3] in both layouts."""
+    model = _culling_scene(2)
+    cameras = ring(3, width_px=64, height_px=48, focal=40.0)
+    backgrounds = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.25, 0.125], [1.0, 1.0, 1.0]])
+    batch = _gsplat(model, cameras, 0.4, background=backgrounds, packed=packed)
+    for c, camera in enumerate(cameras):
+        alone = _gsplat(model, camera, 0.4, background=backgrounds[c], packed=packed)
+        listed = _gsplat(model, [camera], 0.4, background=backgrounds[c], packed=packed)
+        assert torch.equal(alone.image, listed.image)
+        assert torch.equal(batch.image[c], alone.image[0])
+        assert torch.equal(batch.alpha[c], alone.alpha[0])
+    assert float(batch.alpha.detach().max()) > 0.5
