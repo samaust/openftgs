@@ -4,16 +4,18 @@ How `openftgs.io` meets its §2.1 row: plain data in and out for the `ftgs-check
 
 ## Checkpoint directory
 
-A checkpoint holds exactly the eight files of §2.2 (Q-25):
+A checkpoint holds exactly the files of the §2.2 table (Q-25):
 
 - `manifest.json` carries the scalar fields of `TrainerState`, the configuration, the scene hash and time unit (Q-17), the library versions and the SHA-256 of every other file;
 - `params.safetensors` and `stats.safetensors` hold tensors only;
 - the optimizer and generator states are split by one generic rule: every tensor, at any depth of the nested dict, goes to the `.safetensors` file under its key path joined with `/`, and everything else stays in the `.json` file; loading merges them back;
 - `sampler.json` is JSON only.
 
+Tensors are looked for in nested dicts only: a tensor inside a list is refused, so per-device states go in a dict keyed by device. The safetensors files carry the format and version in their metadata; the JSON files are covered by the manifest's. A save also checks the stored-tensor dtype and the length of the statistics.
+
 JSON is the round trip's limit: tuples come back as lists, and non-finite floats are refused. Loading checks the format, the major version, the file set and every hash before it builds the `TrainerState`, whose tensors are on the CPU.
 
-A save is atomic: the files go into a temporary sibling directory, which replaces the target by renames, the old directory being moved aside first and removed last.
+A save is atomic: the files go into a temporary sibling directory, which replaces the target by renames, the old directory being moved aside first and removed last. It never replaces a directory that isn't a checkpoint, unless that directory is empty.
 
 ## Exchange and init-point files
 
@@ -21,4 +23,4 @@ A save is atomic: the files go into a temporary sibling directory, which replace
 
 ## PLY snapshot
 
-`write_ply` writes per-time arrays in the layout 3DGS viewers read, with logit opacities and log scales (Q-18). It is export-only: no reader exists, and no other part of the package consumes it.
+`write_ply` writes per-time arrays, as physical values, in the layout 3DGS viewers read, with logit opacities and log scales (Q-18). It is export-only: no reader exists, and no other part of the package consumes it.
