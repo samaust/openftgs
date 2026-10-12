@@ -13,13 +13,13 @@ Every image term takes `pred` and `gt` in §1.4's layout, height × width × 3, 
 There are two paths behind the one function (§2.4 "Where the time goes", D-52):
 
 - **fused-ssim**, the optional `[fast]` speed-up (Q-2). It hardcodes E7's window, σ, constants and data range, runs on CUDA in float32, and differentiates only its first image. `ssim` uses it only when all of that holds and the target image doesn't require a gradient (Q-42). The module imports it once, lazily, and treats an import failure as "not installed", without a warning.
-- **The PyTorch fallback**, used everywhere else: on the CPU, in float64, with other constants, or when the target needs a gradient. It filters the two images, their squares and their product with the separable Gaussian window in one grouped convolution, and forms SSIM from population moments (D-8). It is written from the SSIM definition, not from either library, and its numerator and denominator are built symmetrically, so SSIM(I, I) is exactly one.
+- **The PyTorch fallback**, used everywhere else: on the CPU, in float64, with other constants, or when the target needs a gradient. It filters the two images, their squares and their product with the separable Gaussian window in one grouped convolution, and forms SSIM from population moments (D-8). It is written from the SSIM definition, not from either library, and its numerator and denominator are built symmetrically, so an image compared with itself gives exactly SSIM's maximum (U-9).
 
 The two paths agree in value. "same" means zero padding in both, and fused-ssim's "valid" is a crop of its zero-padded map, which equals unpadded filtering. Their gradients can differ only where fused-ssim clamps a pixel's SSIM to its mathematical range, a numerical guard the fallback doesn't need (Q-42). On the GPU the fallback's convolution runs in TF32 during training, PyTorch's default, which is D-52's one approximate default; tests that compare the paths clear the flag.
 
 ## The LPIPS wrapper
 
-`LPIPSLoss` wraps the lpips package's network for the backbone `LossConfig.perc_net` names (D-9). It maps its inputs from [0, 1] to [−1, 1] (D-68) and returns the mean over the batch. lpips freezes only its trunk and puts dropout in its linear layers, so the wrapper freezes every parameter and keeps the network in evaluation mode even when a parent module calls `.train()` (Q-41). With the weights frozen and a target that doesn't require a gradient, autograd records nothing on the target's branch, which is the separate no-grad target pass §2.4 asks for, without reimplementing lpips. Channels-last weights and cuDNN autotuning wait for a benchmark (§2.4 rule 2, M15).
+`LPIPSLoss` wraps the lpips package's network for the backbone `LossConfig.perc_net` names (D-9). It maps its inputs from the image range to the network's documented input range (D-9, D-68) and returns the mean over the batch. lpips freezes only its trunk and puts dropout in its linear layers, so the wrapper keeps the network private, freezes every parameter and keeps the network in evaluation mode even when a parent module calls `.train()` (Q-41). With the weights frozen and a target that doesn't require a gradient, autograd records nothing on the target's branch, which is the separate no-grad target pass §2.4 asks for, without reimplementing lpips. Channels-last weights and cuDNN autotuning wait for a benchmark (§2.4 rule 2, M15).
 
 ## The 4D regularization
 
@@ -32,4 +32,5 @@ The two paths agree in value. "same" means zero padding in both, and fused-ssim'
 - The perceptual network is passed in as the keyword `perceptual`, built once by the trainer (Q-40).
 - The returned dict holds detached zero-dimensional tensors on the images' device, so computing the loss never synchronizes with the host (§2.4 rule 3, Q-40). The trainer reads them at its logging period.
 - A term whose effective weight is zero is not computed and has no key. That covers λ_perc = 0 ablations and L_reg after `reg_until`, which names the last iteration with L_reg (D-10, Q-41).
-- The iteration index starts at one (D-41).
+- The iteration index is counted as D-41 counts it.
+- A perceptual network built for another backbone than `LossConfig.perc_net` is rejected (D-9, Q-41).

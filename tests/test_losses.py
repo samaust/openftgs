@@ -21,7 +21,7 @@ from skimage.metrics import structural_similarity
 from torch import Tensor
 
 import openftgs.losses
-from openftgs.config import LossConfig
+from openftgs.config import LossConfig, OptimConfig
 from openftgs.losses import LPIPSLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
@@ -105,7 +105,7 @@ def test_u9_ssim_matches_scikit_image(
     pred, gt = _image_pair(shape, seed=seed, correlated=correlated, dtype=dtype)
     value = ssim(pred, gt)
     assert value.shape == () and value.dtype == dtype
-    assert abs(value.item() - _skimage_ssim(pred, gt)) <= 1e-4
+    torch.testing.assert_close(value.item(), _skimage_ssim(pred, gt), rtol=0.0, atol=1e-4)
 
 
 def _brute_force_ssim(pred: np.ndarray, gt: np.ndarray, *, padding: str) -> float:
@@ -151,7 +151,7 @@ def test_ssim_matches_a_brute_force_evaluation(padding: str, correlated: bool) -
     pred, gt = _image_pair((16, 18, 3), seed=3, correlated=correlated)
     value = ssim(pred, gt, padding=padding)  # type: ignore[arg-type]
     expected = _brute_force_ssim(pred.numpy(), gt.numpy(), padding=padding)
-    assert abs(value.item() - expected) <= 1e-10
+    torch.testing.assert_close(value.item(), expected, rtol=0.0, atol=1e-10)
 
 
 @pytest.mark.parametrize("dtype", [F32, F64])
@@ -240,7 +240,7 @@ def _cuda_ssim_against_float64(padding: str) -> None:
         value = ssim(pred, gt64.to("cuda", F32), padding=padding)  # type: ignore[arg-type]
         (grad,) = torch.autograd.grad(value, pred)
     assert value.device.type == "cuda" and value.dtype == F32 and value.shape == ()
-    assert abs(value.item() - expected.item()) <= 1e-5 * abs(expected.item())
+    torch.testing.assert_close(value.item(), expected.item(), rtol=1e-5, atol=0.0)
     assert _relative(grad.cpu(), expected_grad) <= 1e-4
 
 
@@ -281,14 +281,19 @@ def test_ssim_without_fused_ssim_falls_back_on_the_gpu(
     assert openftgs.losses.ssim is not ssim
     ssim_reloaded = openftgs.losses.ssim
     pred64, gt64 = _image_pair((24, 30, 3), seed=6, correlated=True)
+    pred64.requires_grad_()
     expected = ssim(pred64, gt64, padding=padding)  # type: ignore[arg-type]
+    (expected_grad,) = torch.autograd.grad(expected, pred64)
+    pred = pred64.detach().to("cuda", F32).requires_grad_()
     with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
         value = ssim_reloaded(
-            pred64.to("cuda", F32),
+            pred,
             gt64.to("cuda", F32),
             padding=padding,  # type: ignore[arg-type]
         )
-    assert abs(value.item() - expected.item()) <= 1e-5 * abs(expected.item())
+        (grad,) = torch.autograd.grad(value, pred)
+    torch.testing.assert_close(value.item(), expected.item(), rtol=1e-5, atol=0.0)
+    assert _relative(grad.cpu(), expected_grad) <= 1e-4
 
 
 @pytest.mark.gpu
@@ -307,22 +312,22 @@ def test_ssim_gives_the_target_a_gradient_when_it_requires_one() -> None:
 @pytest.mark.gpu
 @pytest.mark.parametrize("padding", ["valid", "same"])
 def test_u9_ssim_of_an_image_with_itself_on_the_gpu(padding: str) -> None:
-    """U-9: L_ssim = 1 − SSIM(I, I) is 0 on CUDA float32 too, to 1e-6."""
+    """U-9: L_ssim = 1 − SSIM(I, I) = 0 on CUDA float32 too."""
     image, _ = _image_pair((2, 20, 23, 3), seed=4, correlated=False, dtype=F32)
     image = image.cuda()
     value = ssim(image, image.clone(), padding=padding)  # type: ignore[arg-type]
-    assert abs(1.0 - value.item()) <= 1e-6
+    assert 1.0 - value.item() == 0.0
 
 
 @pytest.mark.gpu
-def test_fused_ssim_loader_finds_the_installed_package() -> None:
+def test__fused_ssim_finds_the_installed_package() -> None:
     """The private loader returns fused-ssim's function when the package imports."""
     fused = pytest.importorskip("fused_ssim")
     assert openftgs.losses._fused_ssim() is fused.fused_ssim
 
 
 @pytest.mark.gpu
-def test_ssim_dispatch_takes_fused_ssim_only_under_q42_conditions(
+def test__fused_ssim_is_called_only_under_q42_conditions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Q-42: fused-ssim runs only for CUDA float32 images, window 11, σ 1.5, data range 1, and a
@@ -430,11 +435,11 @@ def test_lpips_weights_are_frozen_and_only_the_prediction_gets_a_gradient(
 @pytest.mark.gpu
 @pytest.mark.weights
 def test_u9_lpips_of_an_image_with_itself_is_zero_on_the_gpu() -> None:
-    """U-9: LPIPS(I, I) = 0 on CUDA, to 1e-6."""
+    """U-9: LPIPS(I, I) = 0 on CUDA too."""
     loss = LPIPSLoss("vgg").cuda()
     image, _ = _image_pair((2, 32, 40, 3), seed=13, correlated=False, dtype=F32)
     image = image.cuda()
-    assert abs(loss(image, image.clone()).item()) <= 1e-6
+    assert loss(image, image.clone()).item() == 0.0
 
 
 # U-10: the 4D regularization (E8, D-11)
@@ -461,14 +466,14 @@ def _all_grads(loss: Tensor, model: FreeTimeGaussians) -> dict[str, Tensor]:
 @pytest.mark.parametrize("t", [0.0, 0.37, 1.0])
 def test_u10_regularization_is_the_mean_of_opacity_times_temporal_opacity(t: float) -> None:
     """U-10: L_reg(t) = mean(σ·σt(t)) over all N primitives, to 1e-7 (float64 model; a float32
-    model to 1e-6)."""
+    model too)."""
     model = random_model(40, seed=20, logit=(-4.0, 4.0)).double()
     expected, _ = _reg_oracle(model, t)
     value = reg4d_loss(model, t)
     assert value.shape == () and value.dtype == F64
-    assert abs(value.item() - expected) <= 1e-7
+    torch.testing.assert_close(value.item(), expected, rtol=0.0, atol=1e-7)
     model32 = random_model(40, seed=20, logit=(-4.0, 4.0))
-    assert abs(reg4d_loss(model32, t).item() - expected) <= 1e-6
+    torch.testing.assert_close(reg4d_loss(model32, t).item(), expected, rtol=0.0, atol=1e-7)
 
 
 @pytest.mark.parametrize("t", [0.0, 0.37, 1.0])
@@ -495,6 +500,7 @@ def test_regularization_of_an_empty_model_is_zero() -> None:
 # U-10 and U-9: the total loss (E9, D-10, D-37, D-38; Q-40, Q-41)
 
 NO_PERC = LossConfig(lambda_perc=0.0)  # E9 at its defaults, without the downloaded network
+T_IT = OptimConfig().iterations  # T_it, the default run length
 
 
 def _detached_pair(seed: int, dtype: torch.dtype = F64) -> tuple[Tensor, Tensor]:
@@ -502,7 +508,7 @@ def _detached_pair(seed: int, dtype: torch.dtype = F64) -> tuple[Tensor, Tensor]
     return _image_pair((48, 64, 3), seed=seed, correlated=True, dtype=dtype)
 
 
-@pytest.mark.parametrize("it", [1, 30_000])
+@pytest.mark.parametrize("it", [1, T_IT])
 def test_u10_regularization_weight_is_one_hundredth_at_every_iteration_by_default(it: int) -> None:
     """U-10 (E9, D-10, D-38): with reg_until unset, λ_reg = 10⁻² applies at it = 1 and at
     it = T_it: the total is the weighted sum of the terms to 1e-6, and with images independent of
@@ -513,8 +519,8 @@ def test_u10_regularization_weight_is_one_hundredth_at_every_iteration_by_defaul
     reg, expected_grad = _reg_oracle(model, 0.4)
     assert set(terms) == {"l1", "one_minus_ssim", "reg", "total"}
     weighted = 0.8 * l1_loss(pred, gt) + 0.2 * (1 - ssim(pred, gt)) + 1e-2 * reg
-    assert abs(loss.item() - weighted.item()) <= 1e-6
-    assert abs(terms["reg"].item() - reg) <= 1e-7
+    torch.testing.assert_close(loss.item(), weighted.item(), rtol=0.0, atol=1e-6)
+    torch.testing.assert_close(terms["reg"].item(), reg, rtol=0.0, atol=1e-7)
     grads = _all_grads(loss, model)
     torch.testing.assert_close(
         grads["opacity_logits"], 1e-2 * torch.from_numpy(expected_grad), rtol=1e-7, atol=0.0
@@ -530,7 +536,7 @@ def test_u10_regularization_stops_after_reg_until() -> None:
     loss, terms = total_loss(pred, gt, model, 0.4, 100, cfg)
     assert "reg" in terms
     assert bool((_all_grads(loss, model)["opacity_logits"] != 0).all())
-    for it, until in [(101, 100), (30_000, 100), (1, 0)]:
+    for it, until in [(101, 100), (T_IT, 100), (1, 0)]:
         cfg = LossConfig(lambda_perc=0.0, reg_until=until)
         loss, terms = total_loss(pred, gt, model, 0.4, it, cfg)
         assert "reg" not in terms
@@ -621,7 +627,7 @@ def test_total_loss_skips_terms_whose_weight_is_zero() -> None:
     cfg = LossConfig(lambda_img=0.0, lambda_ssim=0.0, lambda_perc=0.0, lambda_reg=1e-2)
     loss, terms = total_loss(pred, gt, model, 0.5, 1, cfg)
     assert set(terms) == {"reg", "total"}
-    assert loss.item() == pytest.approx(1e-2 * reg4d_loss(model, 0.5).item(), rel=1e-6)
+    torch.testing.assert_close(loss, 1e-2 * reg4d_loss(model, 0.5), rtol=0.0, atol=0.0)
 
 
 @pytest.mark.weights
@@ -632,15 +638,28 @@ def test_u9_total_loss_is_the_weighted_sum_of_its_terms(lpips_nets: dict[str, LP
     pred, gt = _detached_pair(33, dtype=F32)
     perc = lpips_nets["vgg"]
     loss, terms = total_loss(pred, gt, model, 0.6, 1, LossConfig(), perceptual=perc)
-    assert set(terms) == {"l1", "one_minus_ssim", "lpips", "reg", "total"}
+    assert set(terms) == {"l1", "one_minus_ssim", "perceptual", "reg", "total"}
     expected = (
         0.8 * l1_loss(pred, gt).item()
         + 0.2 * (1.0 - ssim(pred, gt).item())
         + 0.01 * perc(pred, gt).item()
         + 0.01 * reg4d_loss(model, 0.6).item()
     )
-    assert abs(loss.item() - expected) <= 1e-6
-    assert terms["lpips"].item() == perc(pred, gt).item()
+    torch.testing.assert_close(loss.item(), expected, rtol=0.0, atol=1e-6)
+    assert terms["perceptual"].item() == perc(pred, gt).item()
+
+
+@pytest.mark.weights
+def test_total_loss_needs_the_backbone_the_config_names(lpips_nets: dict[str, LPIPSLoss]) -> None:
+    """Q-41 (D-9): a perceptual network with another backbone than cfg.perc_net is a
+    ValueError."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(34, dtype=F32)
+    with pytest.raises(ValueError):
+        total_loss(pred, gt, model, 0.5, 1, LossConfig(), perceptual=lpips_nets["alex"])
+    cfg = LossConfig(perc_net="alex")
+    _, terms = total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=lpips_nets["alex"])
+    assert "perceptual" in terms
 
 
 # U-11: the full forward through the reference backend

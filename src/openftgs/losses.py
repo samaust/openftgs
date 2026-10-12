@@ -47,6 +47,10 @@ def l1_loss(pred: Tensor, gt: Tensor) -> Tensor:
     return (pred - gt).abs().mean()
 
 
+# Q-42: the window, σ and data range fused-ssim hardcodes (E7's).
+_FUSED_SSIM_CONSTANTS = (11, 1.5, 1.0)
+
+
 # Q-2: fused-ssim is optional and not on PyPI; tested at commit
 # a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38 of https://github.com/rahul-goel/fused-ssim (MIT).
 @functools.cache
@@ -121,7 +125,7 @@ def ssim(
         _fused_ssim()
         if pred.is_cuda
         and pred.dtype == torch.float32
-        and (window, sigma, data_range) == (11, 1.5, 1.0)
+        and (window, sigma, data_range) == _FUSED_SSIM_CONSTANTS
         and not gt.requires_grad
         else None
     )
@@ -154,15 +158,16 @@ class LPIPSLoss(torch.nn.Module):
             # torchvision maps to the ImageNet weights with two UserWarnings.
             warnings.filterwarnings("ignore", "The parameter 'pretrained'", UserWarning)
             warnings.filterwarnings("ignore", "Arguments other than a weight enum", UserWarning)
-            self.net: torch.nn.Module = lpips.LPIPS(net=net, verbose=False)
+            self._net: torch.nn.Module = lpips.LPIPS(net=net, verbose=False)
+        self._backbone = net
         # lpips freezes only its trunk; the linear layers would stay trainable.
-        self.net.requires_grad_(False)
-        self.net.eval()
+        self._net.requires_grad_(False)
+        self._net.eval()
 
     def train(self, mode: bool = True) -> "LPIPSLoss":
         # The linear layers hold dropout, which training mode would switch on (Q-41).
         super().train(mode)
-        self.net.eval()
+        self._net.eval()
         return self
 
     def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
@@ -170,7 +175,7 @@ class LPIPSLoss(torch.nn.Module):
         x, y = _batch_first(pred), _batch_first(gt)
         # D-68: the network's documented input range. With frozen weights and a target that
         # doesn't require a gradient, autograd records nothing on the target's branch (§2.4).
-        out: Tensor = self.net(2 * x - 1, 2 * y - 1)
+        out: Tensor = self._net(2 * x - 1, 2 * y - 1)
         return out.mean()
 
 
@@ -200,8 +205,12 @@ def total_loss(
     # Q-41: iterations count from 1 (D-41).
     if isinstance(it, bool) or not isinstance(it, int) or it < 1:
         _fail(f"it must be an int >= 1, got {it!r}")
-    if cfg.lambda_perc > 0.0 and perceptual is None:
-        _fail("lambda_perc > 0 needs the perceptual network (perceptual=LPIPSLoss(...))")
+    if cfg.lambda_perc > 0.0:
+        if perceptual is None:
+            _fail("lambda_perc > 0 needs the perceptual network (perceptual=LPIPSLoss(...))")
+        # Q-41: the network must be the backbone LossConfig names (D-9).
+        if perceptual._backbone != cfg.perc_net:
+            _fail(f"perceptual uses {perceptual._backbone!r}, but cfg.perc_net is {cfg.perc_net!r}")
     _check_pair(pred, gt)
     terms: dict[str, Tensor] = {}
     weighted: list[Tensor] = []
@@ -215,8 +224,8 @@ def total_loss(
         terms["one_minus_ssim"] = 1.0 - value
         weighted.append(cfg.lambda_ssim * terms["one_minus_ssim"])
     if perceptual is not None and cfg.lambda_perc > 0.0:
-        terms["lpips"] = perceptual(pred, gt)
-        weighted.append(cfg.lambda_perc * terms["lpips"])
+        terms["perceptual"] = perceptual(pred, gt)
+        weighted.append(cfg.lambda_perc * terms["perceptual"])
     if cfg.lambda_reg > 0.0 and (cfg.reg_until is None or it <= cfg.reg_until):
         terms["reg"] = reg4d_loss(model, t)
         weighted.append(cfg.lambda_reg * terms["reg"])
