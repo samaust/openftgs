@@ -4,7 +4,7 @@ ftgs-init files (InitPoints) and PLY files for viewers, with the validators of t
 init formats. Plain data in and out: this module imports neither openftgs.model nor
 openftgs.train.
 
-Spec: §2.2, D-30. Band: Foundation (§2.1).
+Spec: §2.2, D-30, D-73. Band: Foundation (§2.1).
 """
 
 import hashlib

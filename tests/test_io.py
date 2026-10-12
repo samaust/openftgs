@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The file formats of §2.2 in openftgs.io: ftgs-init, ftgs-if, ftgs-checkpoint, and the PLY
-snapshot (D-30; U-22 and U-26 file parts; Q-17, Q-18, Q-22, Q-24 to Q-26).
+snapshot (D-30, D-73; U-22 and U-26 file parts; Q-17, Q-18, Q-22, Q-24 to Q-26, Q-35).
 
 Expected values come from the §2.2 tables (keys, dtypes, shapes, validation rules) and from
 values worked by hand; files with invalid content are written with safetensors directly, so the
@@ -260,6 +260,19 @@ def test_u26_ftgs_if_round_trip_for_each_sh_degree(tmp_path: Path, sh_degree: in
     assert (back.time_unit, back.producer) == ("frame", "x")
 
 
+# The render_conventions entries of spec revision 549 (§2.2, Q-24); revision 549a adds D-73's.
+_REVISION_549_CONVENTIONS = {
+    "alpha_max": 0.999,
+    "eps2d": 0.3,
+    "near": 0.01,
+    "far": 1e10,
+    "alpha_skip": 1.0 / 255.0,
+    "transmittance_stop": 1e-4,
+    "pixel_center_offset": 0.5,
+    "background": [0.0, 0.0, 0.0],
+}
+
+
 def test_ftgs_if_metadata_follows_section_2_2(tmp_path: Path) -> None:
     """§2.2 ftgs-if metadata: format, version, sh_degree, time_unit, tau0, tau1 (shortest
     round-trip repr), producer, and render_conventions as compact JSON from E6 and D-34 (Q-24),
@@ -279,14 +292,7 @@ def test_ftgs_if_metadata_follows_section_2_2(tmp_path: Path) -> None:
     conventions = json.loads(meta["render_conventions"])
     assert " " not in meta["render_conventions"]
     assert conventions == {
-        "alpha_max": 0.999,
-        "eps2d": 0.3,
-        "near": 0.01,
-        "far": 1e10,
-        "alpha_skip": 1.0 / 255.0,
-        "transmittance_stop": 1e-4,
-        "pixel_center_offset": 0.5,
-        "background": [0.0, 0.0, 0.0],
+        **_REVISION_549_CONVENTIONS,
         "jacobian_clamp_margin": 0.15,
         "screen_extent_rule": "opacity_aware",
         "screen_extent_max": 3.33,
@@ -392,19 +398,7 @@ def test_ftgs_if_reader_accepts_revision_549_render_conventions(tmp_path: Path) 
     spec revision 549 (no clamp margin, extent rule or rasterize mode) still reads, the block
     ignored, so D-73 needs no version bump."""
     arrays = _exchange_arrays()
-    old_block = json.dumps(
-        {
-            "alpha_max": 0.999,
-            "eps2d": 0.3,
-            "near": 0.01,
-            "far": 1e10,
-            "alpha_skip": 1.0 / 255.0,
-            "transmittance_stop": 1e-4,
-            "pixel_center_offset": 0.5,
-            "background": [0.0, 0.0, 0.0],
-        },
-        separators=(",", ":"),
-    )
+    old_block = json.dumps(_REVISION_549_CONVENTIONS, separators=(",", ":"))
     path = tmp_path / "model.safetensors"
     save_file(arrays, str(path), metadata=_exchange_metadata(render_conventions=old_block))
     back = read_exchange(path)

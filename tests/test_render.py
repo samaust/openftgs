@@ -1073,8 +1073,9 @@ def test_render_constants_agree_with_their_copies() -> None:
     # D-73, Q-35: the conventions files record are the ones render applies (D-72).
     assert conventions["jacobian_clamp_margin"] == r._CLAMP_MARGIN
     assert conventions["screen_extent_max"] == r._EXTENT_MAX
-    assert conventions["screen_extent_rule"] == "opacity_aware"  # E6's √(2 ln(255·σ_eff)) rule
-    assert conventions["rasterize_mode"] == "classic"  # D-6; the reference has no other mode
+    # The extent rule and the rasterize mode have no constant in render to agree with: the
+    # reference backend has one rule and one mode. The io metadata test pins their entries; M5's
+    # gsplat backend, which takes the mode as an argument, can tie the mode to it.
     # Q-31: precull takes PerfConfig.precull's values.
     assert get_args(r._Precull) == get_args(get_type_hints(PerfConfig)["precull"])
 
