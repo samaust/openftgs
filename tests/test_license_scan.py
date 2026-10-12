@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """License scan rules (§2.3 notes; Q-4; PRD #1).
 
-Added tests, not §3 rows: GPL and AGPL fail in any spelling, LGPL and unknown
-licenses pass but are listed for the owner's sign-off, file-level copyleft
+Added tests, not §3 rows: GPL and AGPL fail in any spelling; LGPL, unknown and
+unrecognised licenses pass but are listed for the owner's sign-off; file-level copyleft
 (MPL-2.0) and permissive licenses pass, and albumentations must be MIT.
 """
 
@@ -56,11 +56,16 @@ def test_gpl_and_agpl_fail(license_: str) -> None:
         "LGPL-3.0-or-later",
         "GNU Lesser General Public License v3 (LGPLv3)",
         "GNU Library or Lesser General Public License (LGPL)",
+        "GNU Library General Public License v2 (LGPLv2)",
+        "GNU Lesser General Public License",
+        "Lesser GPL",
+        "Other/Proprietary License",
+        "CC-BY-NC-4.0",
         "UNKNOWN",
         "",
     ],
 )
-def test_lgpl_and_unknown_pass_but_need_signoff(license_: str) -> None:
+def test_lgpl_unknown_and_unrecognised_pass_but_need_signoff(license_: str) -> None:
     result = scan.classify([_row("pkg", license_)])
     assert result.failures == []
     assert [r["Name"] for r in result.signoff] == ["pkg"]
@@ -72,7 +77,9 @@ def test_lgpl_and_unknown_pass_but_need_signoff(license_: str) -> None:
         "MIT",
         "MIT License",
         "BSD-3-Clause",
+        "BSD",
         "BSD License",
+        "ISC",
         "Apache-2.0",
         "Apache Software License",
         "MPL-2.0",

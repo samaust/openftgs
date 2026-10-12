@@ -5,9 +5,9 @@ Runs pip-licenses (or reads its JSON output from a file given as the only
 argument) and classifies every installed distribution:
 
 - GPL or AGPL in any spelling fails the scan;
-- LGPL and unknown licenses pass but are listed for the owner's sign-off;
+- LGPL, unknown and unrecognised licenses pass but are listed for the owner's sign-off;
 - albumentations fails unless it is MIT (§2.3 note);
-- everything else passes, including MPL-2.0 (file-level copyleft, §2.3).
+- recognised permissive licenses and MPL-2.0 (file-level copyleft, §2.3) pass.
 
 Exit code 0 when nothing fails, 1 otherwise.
 """
@@ -22,11 +22,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 _LESSER = re.compile(
-    r"\bLGPL[\w.+-]*|(?:GNU\s+)?(?:Library\s+or\s+)?Lesser\s+General\s+Public\s+License[^;()]*",
+    r"\bLGPL[\w.+-]*|(?:GNU\s+)?(?:Library\s+or\s+Lesser|Library|Lesser)\s+"
+    r"(?:General\s+Public\s+License|GPL)[^;()]*",
     re.IGNORECASE,
 )
 _GPL = re.compile(r"\bA?GPL|General\s+Public\s+License|Affero", re.IGNORECASE)
-_UNKNOWN = {"", "unknown", "none"}
+_PERMISSIVE = re.compile(
+    r"\b(?:MIT|BSD|0BSD|Apache|ISC|PSF|Python\s+Software\s+Foundation|MPL|Mozilla\s+Public"
+    r"|zlib|HPND|Historical\s+Permission|CMU|Unlicense|CC0|Public\s+Domain)",
+    re.IGNORECASE,
+)
 _MIT = {"mit", "mit license"}
 
 
@@ -46,7 +51,7 @@ def classify(rows: list[dict[str, str]]) -> ScanResult:
             result.failures.append(row)
         elif _GPL.search(_LESSER.sub(" ", license_)):
             result.failures.append(row)
-        elif _LESSER.search(license_) or license_.lower() in _UNKNOWN:
+        elif _LESSER.search(license_) or not _PERMISSIVE.search(license_):
             result.signoff.append(row)
     return result
 
@@ -75,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     result = classify(rows)
     print(f"Scanned {len(rows)} distributions.")
     if result.signoff:
-        print("Needs the owner's sign-off (LGPL or unknown license):")
+        print("Needs the owner's sign-off (LGPL, unknown or unrecognised license):")
         print("\n".join(_describe(r) for r in result.signoff))
     if result.failures:
         print("FAILED (GPL or AGPL, or a non-MIT albumentations):")
