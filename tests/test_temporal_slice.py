@@ -15,7 +15,9 @@ import torch._dynamo
 from torch import Tensor
 from torch._dynamo.utils import counters
 
+from openftgs.model import FreeTimeGaussians
 from openftgs.motion import TemporalSlice, temporal_slice
+from openftgs.types import TimeNormalizer
 
 # 11 sizes, so 10 resizes: mostly growing as at growth events, with N = 1 and N = 10⁶.
 SIZES = [1000, 1500, 1, 2300, 4096, 10_000, 50_000, 120_000, 300_000, 700_000, 1_000_000]
@@ -98,6 +100,28 @@ def _compiled_frames() -> int:
     return int(counters["frames"]["ok"])
 
 
+def _stored(n: int, seed: int) -> dict[str, Tensor]:
+    """The nine stored tensors of n random rows on CUDA, SH degree 0 (shN has no bands)."""
+    params = dict(zip(NAMES, _model(n, seed, "cuda"), strict=True))
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    params["sh0"] = torch.randn(n, 1, 3, generator=g, device="cuda")
+    params["shN"] = torch.zeros(n, 0, 3, device="cuda")
+    return params
+
+
+def _model_resize(model: FreeTimeGaussians, n: int, seed: int) -> None:
+    """Resize as at growth events through the model's resize_ (Q-23): new rows go last, and the
+    one shrink keeps a random subset by mask, in order."""
+    n_old = model.num_gaussians
+    if n >= n_old:
+        model.resize_(append=_stored(n - n_old, seed))
+        return
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    keep = torch.zeros(n_old, dtype=torch.bool, device="cuda")
+    keep[torch.randperm(n_old, generator=g, device="cuda")[:n]] = True
+    model.resize_(keep=keep)
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_u28_eager_and_compiled_agree_across_resizes(device: str) -> None:
     """U-28: values ≤ 1e-6 and gradients ≤ 1e-5 relative (Q-15) for N from 1 to 10⁶, resized
@@ -156,3 +180,47 @@ def test__impl_values_match_perf_config() -> None:
 
     hints = typing.get_type_hints(PerfConfig)
     assert typing.get_args(hints["slice_impl"]) == openftgs.motion._IMPLS
+
+
+@pytest.mark.gpu
+def test_u28_through_the_model_across_resizes() -> None:
+    """U-28 (#45): through FreeTimeGaussians.at_time on CUDA, under the default "auto" (the
+    compiled slice, Q-13), on one model resized between calls with resize_ as at growth events,
+    the values agree with the eager slice within 1e-6 and the gradients on the stored tensors
+    within 1e-5 relative (Q-15), with at most 2 recompilations over the 10 resizes (D-50)."""
+    torch._dynamo.reset()
+    counters.clear()
+    model = FreeTimeGaussians(_stored(SIZES[0], 200), sh_degree=0, time=TimeNormalizer(0.0, 1.0))
+    for k, n in enumerate(SIZES):
+        _model_resize(model, n, 200 + k)
+        t = 0.05 + 0.9 * k / len(SIZES)
+        params = [getattr(model, name) for name in NAMES]
+        compiled = model.at_time(t)
+        means, times, log_durations, velocities, log_scales, quats, opacity_logits = params
+        eager = temporal_slice(
+            means,
+            times,
+            log_durations,
+            velocities,
+            log_scales,
+            quats,
+            opacity_logits,
+            t,
+            impl="eager",
+        )
+        g = torch.Generator(device="cuda").manual_seed(n)
+        weights = {
+            f: torch.randn(getattr(eager, f).shape, generator=g, device="cuda") for f in FIELDS
+        }
+        grads = {}
+        for which, out in (("compiled", compiled), ("eager", eager)):
+            loss = sum((getattr(out, f) * weights[f]).sum() for f in FIELDS)
+            assert isinstance(loss, Tensor)
+            grads[which] = torch.autograd.grad(loss, params)
+        for f in FIELDS:
+            _assert_relative_l2(getattr(compiled, f), getattr(eager, f), 1e-6, f"N={n} {f}")
+        for name, a, b in zip(NAMES, grads["compiled"], grads["eager"], strict=True):
+            _assert_relative_l2(a, b, 1e-5, f"N={n} grad {name}")
+    frames = _compiled_frames()
+    assert frames >= 1, "the compiled slice never compiled"
+    assert frames - 1 <= 2, f"{frames - 1} recompilations over {len(SIZES) - 1} resizes"
