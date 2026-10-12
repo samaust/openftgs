@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""render() with two backends, gsplat (CUDA, production) and reference (pure PyTorch, CPU, tests),
-and the temporal index used for rendering.
+"""render() with two backends, gsplat (CUDA, production; from M5) and reference (pure PyTorch, CPU,
+tests), and, from M15, the temporal index used for rendering (D-55).
 
 Spec: E2, E5, E6, D-55. Band: Core model (§2.1).
 """
