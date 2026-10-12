@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""render() with two backends, gsplat (CUDA, production; from M5) and reference (pure PyTorch, CPU,
-tests), and, from M15, the temporal index used for rendering (D-55).
+"""render() with two backends, gsplat 1.5.3 (CUDA, float32, production) and reference (pure
+PyTorch, the readable oracle for tests), and, from M15, the temporal index used for rendering
+(D-55).
 
-Spec: E2, E5, E6, D-55. Band: Core model (§2.1).
+Spec: E2, E5, E6, D-3, D-4, D-6, D-12, D-28, D-31, D-32, D-34, D-55, D-57. Band: Core model
+(§2.1).
 """
 
 import math
@@ -35,6 +37,11 @@ _SH_OFFSET = 0.5  # E2: the SH sum + 0.5, clamped at 0 per channel; D-4
 _BACKGROUND = (0.0, 0.0, 0.0)  # E6: c_bg is black; D-34
 _CHUNK_ELEMENTS = 1 << 22  # pixel–primitive pairs composited at once (bounds memory only)
 
+# gsplat's settings (D-6, D-57); E6's constants above are passed to it as well.
+_RASTERIZE_MODE = "classic"  # D-6: no antialiasing compensation; ftgs-if's rasterize_mode (Q-35)
+_TILE_SIZE = 16  # D-57
+_RADIUS_CLIP = 0.0  # D-57: no primitive is skipped for its size
+
 _Backend = Literal["gsplat", "reference"]
 _TimeUnits = Literal["raw", "normalized"]
 _Precull = Literal["internal", "compact"]  # Q-31: PerfConfig.precull's values (D-32, D-57)
@@ -51,23 +58,26 @@ def render(
     backend: _Backend = "gsplat",
     return_aux: bool = False,
     precull: _Precull = "internal",  # Q-31
+    packed: bool = True,  # Q-36
 ) -> RenderOutput:
     """Render `model` at one time from one or more cameras of the same size (E2, E5, E6).
 
     `timestamp` is a raw τ (`time_units="raw"`) or a normalized t. `sh_degree` limits the SH
     bands (default: the model's degree). `background` is [3] or [C, 3], black by default (D-34).
     `precull="compact"` applies the opacity cull of D-32 by compaction before the backend instead
-    of inside its projection (Q-31); images are unchanged. With `return_aux`, the output also holds
-    the 2D means, whose gradient is retained, and the visibility mask (Q-32).
+    of inside its projection (Q-31); images are unchanged. `packed` selects gsplat's packed mode
+    (D-57, Q-36); the reference backend is always unpacked. With `return_aux`, the output also
+    holds the 2D means, whose gradient is retained, the visibility mask and, in packed mode, the
+    primitive behind each row of the 2D means (Q-32, Q-37, Q-38).
     """
     _check_choice("backend", backend, get_args(_Backend))
     _check_choice("time_units", time_units, get_args(_TimeUnits))
     _check_choice("precull", precull, get_args(_Precull))
+    if not isinstance(packed, bool):  # Q-36
+        raise ValueError(f"packed must be a bool, got {packed!r}")
     cams = _check_cameras(cameras)
-    if backend == "gsplat":  # Q-32: until M5
-        raise NotImplementedError(
-            "the gsplat render backend arrives in milestone M5; use backend='reference'"
-        )
+    if backend == "gsplat":
+        _check_gsplat_model(model)
     t = _normalized_time(model, timestamp, time_units)
     g = model.at_time(t, sh_degree=sh_degree)
     backgrounds = _backgrounds(background, len(cams), g.means_t)
@@ -76,14 +86,22 @@ def render(
         # Q-31, D-57: compaction after the temporal slice, in ascending row order.
         rows = torch.nonzero(g.passes_cull).squeeze(1)
         g = _take_rows(g, rows)
-    image, alpha, means2d, visible = _render_reference(
-        g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
-    )
+    gaussian_ids: Tensor | None = None
+    if backend == "gsplat":
+        image, alpha, means2d, visible, gaussian_ids = _render_gsplat(
+            g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians, packed=packed
+        )
+    else:
+        image, alpha, means2d, visible = _render_reference(
+            g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
+        )
     if not return_aux:
         return RenderOutput(image=image, alpha=alpha)
     if means2d.requires_grad:
         means2d.retain_grad()  # Q-32: the gradient statistics read ∂L/∂μ′ (E10)
-    return RenderOutput(image=image, alpha=alpha, means2d=means2d, visible=visible)
+    return RenderOutput(
+        image=image, alpha=alpha, means2d=means2d, visible=visible, gaussian_ids=gaussian_ids
+    )
 
 
 # The front half, shared by every backend.
@@ -115,6 +133,17 @@ def _check_cameras(cameras: Camera | Sequence[Camera]) -> list[Camera]:
     return cams
 
 
+def _check_gsplat_model(model: FreeTimeGaussians) -> None:
+    # Q-38: gsplat's kernels compute in float32 on a CUDA device; the float64 path of Q-32 is the
+    # reference backend's.
+    param = model.means
+    if param.device.type != "cuda" or param.dtype != torch.float32:
+        raise ValueError(
+            "the gsplat backend renders float32 models on a CUDA device, got "
+            f"{param.dtype} on {param.device}; use backend='reference' for this model"
+        )
+
+
 def _normalized_time(model: FreeTimeGaussians, timestamp: float, time_units: _TimeUnits) -> float:
     # Q-32: a finite real number (not a bool); raw time warns through to_t (Q-9), normalized time
     # here, outside [0, 1] or, with a single timestamp, anywhere but 0.
@@ -141,7 +170,8 @@ def _backgrounds(background: Tensor | None, num_cameras: int, like: Tensor) -> T
     """One background color per camera, [C, 3], in the parameters' dtype and device (D-34)."""
     # Q-32: None (black), [3] for every camera, or [C, 3].
     if background is None:
-        color = torch.tensor(_BACKGROUND, dtype=like.dtype, device=like.device)
+        # Filled on the device, not copied from the host, so a render doesn't synchronize (D-49).
+        color = torch.stack([like.new_full((), value) for value in _BACKGROUND])
     else:
         color = torch.as_tensor(background).to(dtype=like.dtype, device=like.device)
     if tuple(color.shape) == (3,):
@@ -164,9 +194,6 @@ def _scatter_rows(values: Tensor, rows: Tensor | None, num_rows: int) -> Tensor:
     return full.index_copy(0, rows, values)
 
 
-# The reference backend.
-
-
 @dataclass(frozen=True)
 class _CameraTensors:
     """One camera's parameters as tensors in the model parameters' dtype and device."""
@@ -180,17 +207,6 @@ class _CameraTensors:
     center: Tensor  # [3] o = −R_wᵀ t_w (E2, §1.4)
     width: int
     height: int
-
-
-@dataclass(frozen=True)
-class _Projection:
-    """Per-row results of projecting the passed rows into one camera (E2, E6)."""
-
-    means2d: Tensor  # [M, 2] μ′ where visible, 0 elsewhere
-    conics: Tensor  # [M, 3] Σ′⁻¹ as (a, b, c): q = ½(a dx² + c dy²) + b dx dy
-    depths: Tensor  # [M] z_c, detached, for sorting
-    colors: Tensor  # [M, 3] E2
-    visible: Tensor  # [M] bool: both screen radii positive
 
 
 def _camera_tensors(camera: Camera, like: Tensor) -> _CameraTensors:
@@ -209,6 +225,20 @@ def _camera_tensors(camera: Camera, like: Tensor) -> _CameraTensors:
         width=camera.width,
         height=camera.height,
     )
+
+
+# The reference backend.
+
+
+@dataclass(frozen=True)
+class _Projection:
+    """Per-row results of projecting the passed rows into one camera (E2, E6)."""
+
+    means2d: Tensor  # [M, 2] μ′ where visible, 0 elsewhere
+    conics: Tensor  # [M, 3] Σ′⁻¹ as (a, b, c): q = ½(a dx² + c dy²) + b dx dy
+    depths: Tensor  # [M] z_c, detached, for sorting
+    colors: Tensor  # [M, 3] E2
+    visible: Tensor  # [M] bool: both screen radii positive
 
 
 def _matmul(a: Tensor, b: Tensor) -> Tensor:
@@ -366,3 +396,178 @@ def _rasterize(
         images.append((weights[..., None] * colors).sum(dim=-2) + t_final * background)
         alphas.append(1.0 - t_final)
     return torch.cat(images), torch.cat(alphas)
+
+
+# The gsplat backend.
+
+
+def _render_gsplat(
+    g: GaussiansAtTime,
+    cameras: list[Camera],
+    background: Tensor,
+    *,
+    rows: Tensor | None,
+    num_rows: int,
+    packed: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    """Image [C, H, W, 3], alpha [C, H, W, 1], 2D means ([C, N, 2] unpacked, [nnz, 2] packed),
+    visibility [C, N] and, packed, the model row behind each row of the 2D means [nnz], of the
+    per-time arrays `g`, which hold all N rows or the ascending subset `rows` (Q-37, Q-38)."""
+    num_cams, width, height = len(cameras), cameras[0].width, cameras[0].height
+    like = g.means_t
+    if like.shape[0] == 0:
+        # Q-38: gsplat's kernels cannot run on zero rows; this is Q-32's empty render.
+        return _empty_gsplat_render(g, background, width, height, num_rows=num_rows, packed=packed)
+
+    import gsplat
+
+    # Adapted from gsplat 1.5.3, gsplat/rendering.py, rasterization() (lines 407-525, 631-648 and
+    # 746-759), Apache-2.0: its stage functions in its order, for this package's one configuration
+    # (pinhole camera, classic mode, no distortion, one GPU, RGB). Calling the stages directly
+    # keeps Q-32's 2D means in every layout (Q-37); the background and the camera center are this
+    # package's own (Q-38).
+    cams = [_camera_tensors(camera, like) for camera in cameras]
+    viewmats = torch.stack([_view_matrix(cam) for cam in cams])
+    intrinsics = torch.stack([_intrinsics(cam) for cam in cams])
+    centers = torch.stack([cam.center for cam in cams])
+    projection = gsplat.fully_fused_projection(
+        g.means_t,
+        None,
+        g.quats_n,
+        g.scales,
+        viewmats,
+        intrinsics,
+        width,
+        height,
+        eps2d=_EPS2D,
+        near_plane=_NEAR,
+        far_plane=_FAR,
+        radius_clip=_RADIUS_CLIP,
+        packed=packed,
+        sparse_grad=False,
+        calc_compensations=False,  # classic mode (D-6, _RASTERIZE_MODE): no compensation
+        camera_model="pinhole",
+        opacities=g.opacities_t,  # E6, D-32: the opacity cull and the opacity-aware extent
+    )
+    camera_ids: Tensor | None = None
+    local_ids: Tensor | None = None
+    gaussian_ids: Tensor | None = None
+    if packed:
+        _, camera_ids, local_ids, radii, means2d, depths, conics, _ = projection
+        # Every packed row is written and visible (both radii positive), so gsplat's own 2D means
+        # are the anchor (Q-37). Rows come camera-major, ascending within a camera (Q-38).
+        anchor = rasterized = means2d
+        passed_visible = (radii > 0).all(dim=-1)
+        dirs = g.means_t[local_ids] - centers[camera_ids]
+        coeffs = g.sh[local_ids]
+        opacities = g.opacities_t[local_ids]
+        gaussian_ids = local_ids if rows is None else rows[local_ids]
+        visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=like.device)
+        # A value already on the device, so the scatter doesn't synchronize (D-49).
+        visible.index_put_((camera_ids, gaussian_ids), visible.new_ones(()))
+    else:
+        radii, means2d, depths, conics, _ = projection
+        passed_visible = (radii > 0).all(dim=-1)  # E6: both screen radii positive
+        # gsplat leaves the 2D means of culled rows uninitialized; Q-32 wants 0 there, in the
+        # tensor the rasterizer reads (Q-37).
+        means2d = torch.where(passed_visible[..., None], means2d, torch.zeros_like(means2d))
+        if rows is None:
+            anchor = rasterized = means2d
+            visible = passed_visible
+        else:
+            # Q-31, Q-37: the 2D means go back among all N rows, and the rasterizer reads the kept
+            # rows from there, so that [C, N, 2] tensor is the anchor.
+            anchor = means2d.new_zeros((num_cams, num_rows, 2)).index_copy(1, rows, means2d)
+            rasterized = anchor.index_select(1, rows)
+            visible = passed_visible.new_zeros((num_cams, num_rows)).index_copy(
+                1, rows, passed_visible
+            )
+        dirs = g.means_t[None] - centers[:, None]
+        coeffs = g.sh.expand(num_cams, *g.sh.shape)
+        opacities = g.opacities_t.expand(num_cams, -1)
+    # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; at_time has
+    # already cut the bands above the active degree (D-3).
+    degree = math.isqrt(g.sh.shape[1]) - 1
+    colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=passed_visible)
+    colors = torch.clamp_min(colors + _SH_OFFSET, 0.0)
+    tile_width = math.ceil(width / _TILE_SIZE)
+    tile_height = math.ceil(height / _TILE_SIZE)
+    _, isect_ids, flatten_ids = gsplat.isect_tiles(
+        rasterized,
+        radii,
+        depths,
+        _TILE_SIZE,
+        tile_width,
+        tile_height,
+        segmented=False,  # D-57
+        packed=packed,
+        n_images=num_cams,
+        image_ids=camera_ids,
+        gaussian_ids=local_ids,  # gsplat's own ids, local to the rows passed
+    )
+    offsets = gsplat.isect_offset_encode(isect_ids, num_cams, tile_width, tile_height)
+    offsets = offsets.reshape(num_cams, tile_height, tile_width)
+    image, alpha = gsplat.rasterize_to_pixels(
+        rasterized,
+        conics,
+        colors,
+        opacities,
+        width,
+        height,
+        _TILE_SIZE,
+        offsets,
+        flatten_ids,
+        backgrounds=None,
+        packed=packed,
+        absgrad=False,
+    )
+    # Q-38: E6's background, T_final·c_bg = (1 − alpha)·c_bg, composited here in both layouts,
+    # since gsplat 1.5.3 cannot take a per-camera background in packed mode.
+    image = image + (1.0 - alpha) * background[:, None, None, :]
+    return image, alpha, anchor, visible, gaussian_ids
+
+
+def _view_matrix(cam: _CameraTensors) -> Tensor:
+    """gsplat's view matrix [4, 4] (world to camera) from R_w and t_w only (§1.4, Q-32)."""
+    # Filled on the device, not written from the host, so a render doesn't synchronize (D-49).
+    bottom = torch.cat([cam.translation.new_zeros(3), cam.translation.new_ones(1)])[None]
+    return torch.cat([torch.cat([cam.rotation, cam.translation[:, None]], dim=1), bottom])
+
+
+def _intrinsics(cam: _CameraTensors) -> Tensor:
+    """gsplat's K [3, 3] from f_x, f_y, c_x and c_y only (§1.4, Q-32)."""
+    zero, one = torch.zeros_like(cam.fx), torch.ones_like(cam.fx)
+    return torch.stack(
+        [
+            torch.stack([cam.fx, zero, cam.cx]),
+            torch.stack([zero, cam.fy, cam.cy]),
+            torch.stack([zero, zero, one]),
+        ]
+    )
+
+
+def _empty_gsplat_render(
+    g: GaussiansAtTime,
+    background: Tensor,
+    width: int,
+    height: int,
+    *,
+    num_rows: int,
+    packed: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    """Q-32's empty render, in the gsplat backend's layouts (Q-38), for per-time arrays `g` with no
+    rows. It stays on the autograd graph, as the reference's empty render does: the outputs depend
+    with weight zero on the 2D means, which depend with weight zero on every per-time array, so
+    every stored tensor and the 2D means get an exactly zero gradient (U-8, D-57)."""
+    num_cams = background.shape[0]
+    arrays = (g.means_t, g.opacities_t, g.quats_n, g.scales, g.sh)
+    zero = sum((array.sum() for array in arrays), start=g.means_t.new_zeros(())) * 0.0
+    means2d = zero.expand(0, 2) if packed else zero.expand(num_cams, num_rows, 2)
+    through = means2d.sum() * 0.0  # the outputs read the 2D means, as compositing does
+    image = background[:, None, None, :].expand(num_cams, height, width, 3) + through
+    alpha = background.new_zeros((num_cams, height, width, 1)) + through
+    visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=background.device)
+    if not packed:
+        return image, alpha, means2d, visible, None
+    ids = torch.zeros(0, dtype=torch.int64, device=background.device)
+    return image, alpha, means2d, visible, ids

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared builders of random models and cameras for the test suite (forward note on PRD #20).
+"""Shared test scenes for the test suite (forward note on PRD #20): random models and cameras,
+the hand-built render scenes and U-8's scenes that both render backends' tests use, and U-4's
+change of time unit.
 
 Each test file still writes out its own `PARAM_NAMES` from §1.1: that tuple is the tests'
 independent expectation, not a duplicate to share.
@@ -7,14 +9,16 @@ independent expectation, not a duplicate to share.
 
 import math
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians
-from openftgs.types import Camera, TimeNormalizer
+from openftgs.types import Camera, ExchangeModel, TimeNormalizer
 
 UNIT_TIME = TimeNormalizer(0.0, 1.0)
+C0 = 0.28209479177387814  # §1.1
 
 
 def random_params(
@@ -159,3 +163,131 @@ def ring(
         )
         for k in range(count)
     ]
+
+
+# Hand-built render scenes, shared by the render tests of both backends (E2, E6).
+
+
+_ROW_KEYS = {"mean", "time", "log_duration", "velocity", "scale", "quat", "logit", "sh0", "shN"}
+
+
+def model_from_rows(
+    rows: Sequence[dict[str, Any]],
+    *,
+    sh_degree: int = 0,
+    time: TimeNormalizer = UNIT_TIME,
+) -> FreeTimeGaussians:
+    """A model with one primitive per row. Defaults: time center 0.5, ŝ = 20 (σt = 1 within
+    |t − μt| ≤ 1), no velocity, isotropic scale 0.25, identity quaternion, logit 0 (σ = 0.5),
+    sh0 = 0 (color 0.5) and no higher bands. An unknown key raises ValueError."""
+    k = (sh_degree + 1) ** 2 - 1
+    shapes: dict[str, tuple[int, ...]] = {
+        "means": (3,),
+        "times": (),
+        "log_durations": (),
+        "velocities": (3,),
+        "log_scales": (3,),
+        "quats": (4,),
+        "opacity_logits": (),
+        "sh0": (1, 3),
+        "shN": (k, 3),
+    }
+    cols: dict[str, list[Any]] = {name: [] for name in shapes}
+    for row in rows:
+        unknown = set(row) - _ROW_KEYS
+        if unknown:
+            raise ValueError(f"unknown row keys {sorted(unknown)}")
+        scale = row.get("scale", 0.25)
+        scales = [scale] * 3 if isinstance(scale, int | float) else list(scale)
+        cols["means"].append(list(row["mean"]))
+        cols["times"].append(row.get("time", 0.5))
+        cols["log_durations"].append(row.get("log_duration", 20.0))
+        cols["velocities"].append(list(row.get("velocity", (0.0, 0.0, 0.0))))
+        cols["log_scales"].append([math.log(a) for a in scales])
+        cols["quats"].append(list(row.get("quat", (1.0, 0.0, 0.0, 0.0))))
+        cols["opacity_logits"].append(row.get("logit", 0.0))
+        cols["sh0"].append([list(row.get("sh0", (0.0, 0.0, 0.0)))])
+        cols["shN"].append(row.get("shN", [[0.0, 0.0, 0.0]] * k))
+    params = {
+        name: torch.tensor(cols[name], dtype=torch.float32).reshape(len(rows), *shape)
+        for name, shape in shapes.items()
+    }
+    return FreeTimeGaussians(params, sh_degree=sh_degree, time=time)
+
+
+# Camera A: the point (X, Y, 4) lands at (32.5 + 4X, 24.5 + 4Y).
+CAM_A = pinhole(64, 48, fx=16.0, fy=16.0, cx=32.5, cy=24.5)
+
+
+def sh0_for(rgb: Sequence[float]) -> tuple[float, float, float]:
+    """sh0 giving the color rgb at degree 0 (E2: C₀·sh0 + 0.5)."""
+    r, g, b = ((c - 0.5) / C0 for c in rgb)
+    return (r, g, b)
+
+
+def logit_of(p: float) -> float:
+    return math.log(p / (1.0 - p))
+
+
+def sigmoid64(logit: float) -> float:
+    """σ of a logit as stored (float32), evaluated in float64."""
+    return float(torch.sigmoid(torch.tensor(logit, dtype=torch.float32).to(torch.float64)))
+
+
+# U-8's scenes (D-32, D-57), shared by both backends' U-8 tests.
+
+
+def u8_scene(
+    n: int, dtype: torch.dtype, *, kept: int | None = None, tie: bool = False
+) -> FreeTimeGaussians:
+    """n random rows around `ring(3)`, some behind a camera or off the image, with every third row
+    below the opacity cull (logit −9). With `kept`, exactly that many rows pass the cull. With
+    `tie`, rows 4 and 5 sit at the same place, opaque enough to be seen by every camera, with
+    different colors, so they tie in depth."""
+    params = random_params(
+        n,
+        generator=torch.Generator().manual_seed(n),
+        spread=4.5,
+        log_scale=(-2.5, -0.5),
+        logit=(-3.0, 3.0),
+    )
+    params["opacity_logits"][::3] = -9.0
+    if kept is not None:
+        params["opacity_logits"] = torch.tensor([3.0] * kept + [-9.0] * (n - kept))
+    if tie:
+        for row in (4, 5):
+            params["means"][row] = torch.tensor([0.1, 0.2, 0.3])
+            params["velocities"][row] = 0.0
+            params["times"][row] = 0.37
+            params["opacity_logits"][row] = 2.0
+    model = FreeTimeGaussians(params, sh_degree=3, time=UNIT_TIME)
+    return model.double() if dtype == torch.float64 else model
+
+
+U8_CASES: dict[str, tuple[int, int | None, bool]] = {  # n, rows passing the cull, depth tie
+    "no row kept": (1, 0, False),
+    "one row kept": (2, 1, False),
+    "a third culled": (7, None, False),
+    "depth tie": (33, None, True),
+    "depth tie, more rows": (64, None, True),
+}
+
+
+# U-4's change of time unit (E14, §1.4 "Time"), shared by both backends' U-4 tests.
+
+
+def rescaled_time_unit(exchange: ExchangeModel, a: float, b: float) -> ExchangeModel:
+    """The exchange model in the time unit τ′ = aτ + b: time centers aτ + b, durations a·d,
+    velocities v_τ/a (float32, as ftgs-if stores them), τ₀ and τ₁ mapped too."""
+    arrays = dict(exchange.arrays)
+    arrays["time_center"] = a * arrays["time_center"] + b
+    arrays["duration"] = a * arrays["duration"]
+    arrays["velocity"] = (arrays["velocity"].to(torch.float64) / a).to(torch.float32)
+    return ExchangeModel(
+        arrays=arrays,
+        sh_degree=exchange.sh_degree,
+        tau0=a * exchange.tau0 + b,
+        tau1=a * exchange.tau1 + b,
+        time_unit=exchange.time_unit,
+        producer=exchange.producer,
+    )
