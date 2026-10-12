@@ -31,6 +31,7 @@ The two paths agree in value. "same" means zero padding in both, and fused-ssim'
 
 - The perceptual network is passed in as the keyword `perceptual`, built once by the trainer (Q-40).
 - The returned dict holds detached zero-dimensional tensors on the images' device, so computing the loss never synchronizes with the host (§2.4 rule 3, Q-40). The trainer reads them at its logging period.
-- A term whose effective weight is zero is not computed and has no key. That covers λ_perc = 0 ablations and L_reg after `reg_until`, which names the last iteration with L_reg (D-10, Q-41).
+- A term whose λ is zero is not computed and has no key for the whole run, which saves the perceptual pass in λ_perc = 0 ablations (Q-41).
+- After `reg_until`, which names the last iteration with L_reg (D-10), L_reg leaves the total but is still reported under its key, computed without a gradient. The keys therefore stay fixed for a run, and the loss trace D-10 names shows L_reg after a cutoff (Q-41, owner's answer).
 - The iteration index is counted as D-41 counts it.
 - A perceptual network built for another backbone than `LossConfig.perc_net` is rejected (D-9, Q-41).
