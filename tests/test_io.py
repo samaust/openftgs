@@ -471,7 +471,10 @@ def _trainer_state(n: int = 7, sh_degree: int = 3) -> TrainerState:
         frame_dt=1.0 / 299.0,
         params=params,
         optim=optim,
-        stats={"g_sum": torch.rand(n, generator=g), "count": torch.randint(0, 9, (n,))},
+        stats={
+            "g_sum": torch.rand(n, generator=g),
+            "count": torch.randint(0, 9, (n,), generator=g),
+        },
         rng=rng,
         sampler={"epoch": 3, "cursor": 17, "permutation": [4, 0, 2, 1, 3]},
         scene_sha256="ab" * 32,
@@ -759,3 +762,39 @@ def test_unreadable_safetensors_files_are_rejected_with_value_error(tmp_path: Pa
     for reader in (read_init_points, read_exchange):
         with pytest.raises(ValueError):
             reader(path)
+
+
+def test_param_names_copy_matches_the_model() -> None:
+    """Private: io may not import the model (§2.1), so its copy of the nine names is pinned to
+    FreeTimeGaussians.PARAM_NAMES."""
+    import openftgs.io
+    from openftgs.model import FreeTimeGaussians
+
+    assert openftgs.io._PARAM_NAMES == FreeTimeGaussians.PARAM_NAMES
+
+
+def test_checkpoint_safetensors_files_carry_format_and_version(tmp_path: Path) -> None:
+    """§2.2 introduction: "Every file carries format and version" (Q-25: the JSON parts are
+    covered by the manifest's own format, version and hashes)."""
+    out = save_checkpoint(_trainer_state(), tmp_path / "ckpt")
+    for name in ("params", "optim", "stats", "rng"):
+        with safe_open(str(out / f"{name}.safetensors"), framework="pt") as f:
+            meta = f.metadata()
+        assert meta["format"] == "ftgs-checkpoint", name
+        assert meta["version"] == "1", name
+
+
+@pytest.mark.parametrize("case", ["float64 params", "stats of another N", "2-D stats"])
+def test_checkpoint_save_checks_params_and_stats(tmp_path: Path, case: str) -> None:
+    """§2.2 ftgs-checkpoint: params are the nine tensors in float32; g_sum and count are [N]
+    (Q-25)."""
+    state = _trainer_state(n=7)
+    if case == "float64 params":
+        state.params["times"] = state.params["times"].double()
+    elif case == "stats of another N":
+        state.stats["count"] = torch.zeros(6, dtype=torch.int64)
+    elif case == "2-D stats":
+        state.stats["g_sum"] = torch.zeros(7, 1)
+    with pytest.raises(ValueError):
+        save_checkpoint(state, tmp_path / "ckpt")
+    assert list(tmp_path.iterdir()) == []

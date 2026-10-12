@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reading and writing full checkpoints (TrainerState), FTGS-IF exchange files (ExchangeModel) and
-PLY files for viewers. Plain data in and out: this module imports neither openftgs.model nor
+"""Reading and writing full checkpoints (TrainerState), FTGS-IF exchange files (ExchangeModel),
+ftgs-init files (InitPoints) and PLY files for viewers, with the validators of the exchange and
+init formats. Plain data in and out: this module imports neither openftgs.model nor
 openftgs.train.
 
 Spec: §2.2, D-30. Band: Foundation (§2.1).
@@ -14,7 +15,7 @@ import os
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import numpy as np
 import torch
@@ -42,7 +43,7 @@ _VERSION = 1  # the major version this module reads and writes (§2.2)
 # Shared helpers: safetensors files with the §2.2 metadata header.
 
 
-def _fail(where: str, reason: str) -> None:
+def _fail(where: str, reason: str) -> NoReturn:
     # Q-26: every rejection is a plain ValueError.
     raise ValueError(f"{where}: {reason}")
 
@@ -113,6 +114,7 @@ def _check_tensor(
 _INIT = "ftgs-init"
 
 
+# Q-22: the ftgs-init validator, shared by the reader, the writer and the model.
 def validate_init_points(points: InitPoints) -> None:
     """§2.2 ftgs-init validation (Q-22): the table's dtypes and shapes, N ≥ 1, all values finite,
     colors within [0, 1], durations positive. Raises ValueError (Q-26)."""
@@ -137,7 +139,7 @@ def validate_init_points(points: InitPoints) -> None:
     _check_tensor(tensors, "velocities", torch.float32, (n, 3), where, required=False)
     durations = _check_tensor(tensors, "durations", torch.float64, (n,), where, required=False)
     _check_tensor(tensors, "frame_ids", torch.int64, (n,), where, required=False)
-    assert colors is not None
+    assert colors is not None  # required=True
     if not bool(((colors >= 0.0) & (colors <= 1.0)).all()):
         _fail(where, "colors must lie within [0, 1]")
     if durations is not None and not bool((durations > 0.0).all()):
@@ -206,6 +208,7 @@ _RENDER_CONVENTIONS = {
 }
 
 
+# Q-22, Q-24: the ftgs-if validator, shared by the reader, the writer and the model.
 def validate_exchange(model: ExchangeModel) -> None:
     """§2.2 ftgs-if validation (Q-22, Q-24): the table's keys, dtypes and shapes, N ≥ 1, all
     values finite, opacity in (0, 1), durations and scales positive, rotations of norm > 1e-8,
@@ -221,7 +224,6 @@ def validate_exchange(model: ExchangeModel) -> None:
     position = a.get("position")
     if not isinstance(position, Tensor) or position.dim() != 2:
         _fail(where, "position must be an [N, 3] tensor")
-    assert position is not None
     n = int(position.shape[0])
     if n < 1:
         _fail(where, "needs at least one primitive")
@@ -233,8 +235,8 @@ def validate_exchange(model: ExchangeModel) -> None:
     rotation = _check_tensor(a, "rotation", torch.float32, (n, 4), where)
     opacity = _check_tensor(a, "opacity", torch.float32, (n,), where)
     _check_tensor(a, "sh", torch.float32, (n, (degree + 1) ** 2, 3), where)
-    assert duration is not None and scale is not None and rotation is not None
-    assert opacity is not None
+    assert duration is not None and scale is not None  # required=True
+    assert rotation is not None and opacity is not None
     if not bool((duration > 0.0).all()):
         _fail(where, "duration must be positive")
     if not bool((scale > 0.0).all()):
@@ -422,6 +424,14 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
         _fail(where, f"stats must hold tensors only, got {sorted(stats_rest)}")
     _check_json(state.sampler, f"{where} sampler")
     _check_json(state.config, f"{where} config")
+    n = int(state.params["means"].shape[0])
+    for name in _PARAM_NAMES:
+        if state.params[name].dtype != torch.float32:
+            _fail(where, f"params[{name!r}] must be float32 (§2.2), got {state.params[name].dtype}")
+    for name, value in stats_tensors.items():
+        if tuple(value.shape) != (n,):
+            _fail(where, f"stats[{name!r}] must have shape [{n}], got {list(value.shape)}")
+    # Q-25: a save never deletes a directory that isn't a checkpoint.
     if directory.exists() and not (_is_checkpoint(directory) or not any(directory.iterdir())):
         _fail(where, "exists and is not a checkpoint; refusing to replace it")
 
@@ -432,11 +442,15 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
             shutil.rmtree(leftover)
     tmp.mkdir(parents=True)
     try:
-        _write_safetensors({k: state.params[k] for k in _PARAM_NAMES}, tmp / _CKPT_FILES[0], {})
-        _write_safetensors(optim_tensors, tmp / "optim.safetensors", {})
+        # §2.2: every file carries format and version; the JSON parts are covered by the
+        # manifest's (Q-25).
+        header = {"format": _CKPT, "version": str(_VERSION)}
+        params = {k: state.params[k] for k in _PARAM_NAMES}
+        _write_safetensors(params, tmp / "params.safetensors", header)
+        _write_safetensors(optim_tensors, tmp / "optim.safetensors", header)
         (tmp / "optim.json").write_bytes(_json_bytes(optim_rest))
-        _write_safetensors(stats_tensors, tmp / "stats.safetensors", {})
-        _write_safetensors(rng_tensors, tmp / "rng.safetensors", {})
+        _write_safetensors(stats_tensors, tmp / "stats.safetensors", header)
+        _write_safetensors(rng_tensors, tmp / "rng.safetensors", header)
         (tmp / "rng.json").write_bytes(_json_bytes(rng_rest))
         (tmp / "sampler.json").write_bytes(_json_bytes(state.sampler))
         manifest = {
@@ -539,7 +553,7 @@ def write_ply(
 ) -> None:
     """Write per-time arrays as a static 3DGS-viewer PLY (Q-18): binary little-endian float32
     properties x y z, nx ny nz (zero), f_dc_0..2, f_rest_* (channel-major), opacity as a logit,
-    scale_0..2 as logs, rot_0..3. Inputs are activated values: scales > 0, opacities in [0, 1]
+    scale_0..2 as logs, rot_0..3. Inputs are physical values: scales > 0, opacities in [0, 1]
     (clamped to [1e-7, 1 − 1e-7] before the logit), quaternions (w, x, y, z)."""
     where = f"ply {path}"
     n = int(means.shape[0]) if means.dim() == 2 else -1
@@ -551,8 +565,12 @@ def write_ply(
         "opacities": (opacities, (n,)),
         "sh": (sh, (n, k, 3)),
     }
+    if n < 0:
+        _fail(where, f"means must have shape [N, 3], got {list(means.shape)}")
+    if k < 1:
+        _fail(where, f"sh must have shape [N, K, 3] with K ≥ 1, got {list(sh.shape)}")
     for name, (value, shape) in expected.items():
-        if n < 0 or k < 1 or tuple(value.shape) != shape:
+        if tuple(value.shape) != shape:
             _fail(where, f"{name} must have shape {list(shape)}, got {list(value.shape)}")
     f64 = torch.float64
     opacity = opacities.detach().to("cpu", f64).clamp(_OPACITY_EPS, 1.0 - _OPACITY_EPS)

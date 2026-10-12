@@ -486,12 +486,16 @@ def test_e14_unit_conversions_of_durations_and_velocities() -> None:
     time = TimeNormalizer(2.0, 6.0)
     d = torch.tensor([2.0, 0.5], dtype=F64)
     v_tau = torch.tensor([[3.0, -1.0, 0.25]], dtype=torch.float32)
-    torch.testing.assert_close(durations_to_normalized(d, time), d.new_tensor([0.5, 0.125]))
-    torch.testing.assert_close(durations_to_raw(d.new_tensor([0.5, 0.125]), time), d)
+    torch.testing.assert_close(
+        durations_to_normalized(d, time), d.new_tensor([0.5, 0.125]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        durations_to_raw(d.new_tensor([0.5, 0.125]), time), d, rtol=0, atol=0
+    )
     v = velocities_to_normalized(v_tau, time)
     assert v.dtype == torch.float32
-    torch.testing.assert_close(v, v_tau.new_tensor([[12.0, -4.0, 1.0]]))
-    torch.testing.assert_close(velocities_to_raw(v, time), v_tau)
+    torch.testing.assert_close(v, v_tau.new_tensor([[12.0, -4.0, 1.0]]), rtol=0, atol=0)
+    torch.testing.assert_close(velocities_to_raw(v, time), v_tau, rtol=0, atol=0)
 
 
 def test_e14_unit_conversions_use_a_unit_of_one_for_a_single_timestamp() -> None:

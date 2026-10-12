@@ -102,7 +102,7 @@ def reg4d_terms(
     return _opacity_terms(opacity_logits, temporal_opacity(times, log_durations, t))[2]
 
 
-def _time_unit(time: TimeNormalizer) -> float:
+def _span_or_one(time: TimeNormalizer) -> float:
     # Q-19: with a single timestamp (T_τ = 0), durations and velocities convert with a unit of 1.
     span = time.tau1 - time.tau0
     return span if span > 0.0 else 1.0
@@ -111,22 +111,22 @@ def _time_unit(time: TimeNormalizer) -> float:
 # Q-27: E14's unit conversions of primitive quantities (Q-8); time centers use TimeNormalizer.
 def durations_to_normalized(durations: Tensor, time: TimeNormalizer) -> Tensor:
     """s = d/T_τ: durations in raw τ units to normalized time (E14)."""
-    return durations / _time_unit(time)
+    return durations / _span_or_one(time)
 
 
 def durations_to_raw(durations: Tensor, time: TimeNormalizer) -> Tensor:
     """d = s·T_τ: durations in normalized time to raw τ units (E14)."""
-    return durations * _time_unit(time)
+    return durations * _span_or_one(time)
 
 
 def velocities_to_normalized(velocities: Tensor, time: TimeNormalizer) -> Tensor:
     """v = v_τ·T_τ: world units per unit of τ to world units per unit of t (E14)."""
-    return velocities * _time_unit(time)
+    return velocities * _span_or_one(time)
 
 
 def velocities_to_raw(velocities: Tensor, time: TimeNormalizer) -> Tensor:
     """v_τ = v/T_τ: world units per unit of t to world units per unit of τ (E14)."""
-    return velocities / _time_unit(time)
+    return velocities / _span_or_one(time)
 
 
 def _slice_eager(
