@@ -16,6 +16,7 @@ from typing import Any, Literal
 import pytest
 import torch
 from builders import (
+    C0,
     CAM_A,
     U8_CASES,
     UNIT_TIME,
@@ -269,6 +270,46 @@ def test_e2_colors_are_not_clamped_at_one(packed: bool) -> None:
     )
     image = _gsplat(model, CAM_A, 0.5, packed=packed).image.detach().cpu()
     torch.testing.assert_close(image[0, 24, 32], torch.full((3,), 0.999 * 1.6), rtol=0, atol=1e-6)
+
+
+# U-6's band cases on gsplat (E2, E13, D-3; #52)
+
+
+@LAYOUTS
+def test_u6_inactive_bands_contribute_nothing(packed: bool) -> None:
+    """U-6, E13 (GPU): rendered with sh_degree = 1, a degree-3 model equals the degree-1 model
+    holding only its first three higher bands, whatever its bands 2 and 3 hold, and those bands
+    get exactly zero gradient."""
+    cameras = ring(2)
+    model = _cuda(random_model(20, seed=0, sh_degree=3, spread=0.6))
+    params = {name: getattr(model, name).detach() for name in PARAM_NAMES}
+    low = FreeTimeGaussians({**params, "shN": params["shN"][:, :3]}, sh_degree=1, time=model.time)
+    expected = _gsplat(low, cameras, 0.4, packed=packed).image.detach()
+    out = _gsplat(model, cameras, 0.4, sh_degree=1, packed=packed)
+    assert torch.equal(out.image.detach(), expected)
+    (grad,) = torch.autograd.grad(out.image.sum(), model.shN)
+    assert torch.equal(grad[:, 3:], torch.zeros_like(grad[:, 3:]))
+    assert bool(grad[:, :3].abs().sum() > 0)
+    other = FreeTimeGaussians(
+        {**params, "shN": torch.cat([params["shN"][:, :3], -params["shN"][:, 3:]], dim=1)},
+        sh_degree=3,
+        time=model.time,
+    )
+    assert torch.equal(_gsplat(other, cameras, 0.4, sh_degree=1, packed=packed).image, expected)
+
+
+@LAYOUTS
+def test_u6_degree_zero_renders_the_dc_color(packed: bool) -> None:
+    """U-6 (GPU): with sh_degree = 0 a centered pixel of a row with higher-band energy reads
+    σ·(C₀·c₀₀ + 0.5) = 0.5·(C₀·c₀₀ + 0.5)."""
+    sh0 = (0.3, -0.2, 0.9)
+    sh_n = [[0.4, -0.3, 0.2]] * 15
+    model = _cuda(
+        model_from_rows([{"mean": (0.0, 0.0, 4.0), "sh0": sh0, "shN": sh_n}], sh_degree=3)
+    )
+    image = _gsplat(model, CAM_A, 0.5, sh_degree=0, packed=packed).image.detach().cpu()
+    expected = torch.tensor([0.5 * (C0 * c + 0.5) for c in sh0])
+    torch.testing.assert_close(image[0, 24, 32], expected, rtol=0, atol=1e-6)
 
 
 # The backend against gsplat's own rasterization() (D-75, D-76)
