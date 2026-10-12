@@ -11,7 +11,8 @@ description = "Black-box differential harness that compares two implementations 
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Samuel Austin" }]
-requires-python = ">=3.10"
+# Q-1: Python floor.
+requires-python = ">=3.11"
 # Owner decision 2026-10-11 (docs/clean-room/milestones.md, M16): report plots use
 # matplotlib's Agg backend.
 dependencies = ["matplotlib"]
