@@ -35,6 +35,11 @@ _SH_OFFSET = 0.5  # E2: the SH sum + 0.5, clamped at 0 per channel; D-4
 _BACKGROUND = (0.0, 0.0, 0.0)  # E6: c_bg is black; D-34
 _CHUNK_ELEMENTS = 1 << 22  # pixel–primitive pairs composited at once (bounds memory only)
 
+# gsplat's settings (D-6, D-57); E6's constants above are passed to it as well.
+_RASTERIZE_MODE = "classic"  # D-6: no antialiasing compensation; ftgs-if's rasterize_mode (Q-35)
+_TILE_SIZE = 16  # D-57
+_RADIUS_CLIP = 0.0  # D-57: no primitive is skipped for its size
+
 _Backend = Literal["gsplat", "reference"]
 _TimeUnits = Literal["raw", "normalized"]
 _Precull = Literal["internal", "compact"]  # Q-31: PerfConfig.precull's values (D-32, D-57)
@@ -51,23 +56,26 @@ def render(
     backend: _Backend = "gsplat",
     return_aux: bool = False,
     precull: _Precull = "internal",  # Q-31
+    packed: bool = True,  # Q-36
 ) -> RenderOutput:
     """Render `model` at one time from one or more cameras of the same size (E2, E5, E6).
 
     `timestamp` is a raw τ (`time_units="raw"`) or a normalized t. `sh_degree` limits the SH
     bands (default: the model's degree). `background` is [3] or [C, 3], black by default (D-34).
     `precull="compact"` applies the opacity cull of D-32 by compaction before the backend instead
-    of inside its projection (Q-31); images are unchanged. With `return_aux`, the output also holds
-    the 2D means, whose gradient is retained, and the visibility mask (Q-32).
+    of inside its projection (Q-31); images are unchanged. `packed` selects gsplat's packed mode
+    (D-57, Q-36); the reference backend is always unpacked. With `return_aux`, the output also
+    holds the 2D means, whose gradient is retained, the visibility mask and, in packed mode, the
+    primitive behind each row of the 2D means (Q-32, Q-37, Q-38).
     """
     _check_choice("backend", backend, get_args(_Backend))
     _check_choice("time_units", time_units, get_args(_TimeUnits))
     _check_choice("precull", precull, get_args(_Precull))
+    if not isinstance(packed, bool):  # Q-36
+        raise ValueError(f"packed must be a bool, got {packed!r}")
     cams = _check_cameras(cameras)
-    if backend == "gsplat":  # Q-32: until M5
-        raise NotImplementedError(
-            "the gsplat render backend arrives in milestone M5; use backend='reference'"
-        )
+    if backend == "gsplat":
+        _check_gsplat_model(model)
     t = _normalized_time(model, timestamp, time_units)
     g = model.at_time(t, sh_degree=sh_degree)
     backgrounds = _backgrounds(background, len(cams), g.means_t)
@@ -76,14 +84,22 @@ def render(
         # Q-31, D-57: compaction after the temporal slice, in ascending row order.
         rows = torch.nonzero(g.passes_cull).squeeze(1)
         g = _take_rows(g, rows)
-    image, alpha, means2d, visible = _render_reference(
-        g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
-    )
+    gaussian_ids: Tensor | None = None
+    if backend == "gsplat":
+        image, alpha, means2d, visible, gaussian_ids = _render_gsplat(
+            g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians, packed=packed
+        )
+    else:
+        image, alpha, means2d, visible = _render_reference(
+            g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
+        )
     if not return_aux:
         return RenderOutput(image=image, alpha=alpha)
     if means2d.requires_grad:
         means2d.retain_grad()  # Q-32: the gradient statistics read ∂L/∂μ′ (E10)
-    return RenderOutput(image=image, alpha=alpha, means2d=means2d, visible=visible)
+    return RenderOutput(
+        image=image, alpha=alpha, means2d=means2d, visible=visible, gaussian_ids=gaussian_ids
+    )
 
 
 # The front half, shared by every backend.
@@ -113,6 +129,17 @@ def _check_cameras(cameras: Camera | Sequence[Camera]) -> list[Camera]:
     if len({(cam.width, cam.height) for cam in cams}) > 1:
         raise ValueError("all cameras of one render must have the same width and height")
     return cams
+
+
+def _check_gsplat_model(model: FreeTimeGaussians) -> None:
+    # Q-38: gsplat's kernels compute in float32 on a CUDA device; the float64 path of Q-32 is the
+    # reference backend's.
+    param = model.means
+    if param.device.type != "cuda" or param.dtype != torch.float32:
+        raise ValueError(
+            "the gsplat backend renders float32 models on a CUDA device, got "
+            f"{param.dtype} on {param.device}; use backend='reference' for this model"
+        )
 
 
 def _normalized_time(model: FreeTimeGaussians, timestamp: float, time_units: _TimeUnits) -> float:
@@ -366,3 +393,18 @@ def _rasterize(
         images.append((weights[..., None] * colors).sum(dim=-2) + t_final * background)
         alphas.append(1.0 - t_final)
     return torch.cat(images), torch.cat(alphas)
+
+
+# The gsplat backend.
+
+
+def _render_gsplat(
+    g: GaussiansAtTime,
+    cameras: list[Camera],
+    background: Tensor,
+    *,
+    rows: Tensor | None,
+    num_rows: int,
+    packed: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    raise NotImplementedError("the gsplat backend's rendering arrives in the next commit")

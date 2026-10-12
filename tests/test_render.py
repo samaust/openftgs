@@ -8,6 +8,7 @@ come from an independent float64 evaluation of E1 to E6 written in this file. Pi
 as (row v, column u).
 """
 
+import inspect
 import math
 import warnings
 from collections.abc import Sequence
@@ -860,11 +861,13 @@ def test_all_lists_the_public_api() -> None:
         ({"background": torch.zeros(4)}, "background"),
         ({"background": torch.zeros(2, 3)}, "background"),
         ({"sh_degree": 1}, "sh_degree"),
+        ({"packed": "yes"}, "packed"),
+        ({"packed": 1}, "packed"),
     ],
 )
 def test_render_rejects_invalid_arguments(kwargs: dict[str, Any], match: str) -> None:
-    """Q-32: unknown choices, background shapes other than [3] and [C, 3], and an SH degree above
-    the model's (Q-20) raise ValueError."""
+    """Q-32, Q-36: unknown choices, background shapes other than [3] and [C, 3], an SH degree above
+    the model's (Q-20) and a `packed` that is not a bool raise ValueError."""
     with pytest.raises(ValueError, match=match):
         render(_api_model(), CAM_A, 0.5, **{"backend": "reference", **kwargs})
 
@@ -897,10 +900,28 @@ def test_render_rejects_cameras_it_cannot_batch() -> None:
             render(model, cameras, 0.5, backend="reference")
 
 
-def test_gsplat_backend_arrives_in_m5() -> None:
-    """Q-32: until M5, backend="gsplat" (the §2.1 default) raises NotImplementedError."""
-    with pytest.raises(NotImplementedError, match="M5"):
-        render(_api_model(), CAM_A, 0.5)
+@pytest.mark.parametrize("packed", [True, False])
+def test_gsplat_backend_rejects_models_it_cannot_render(packed: bool) -> None:
+    """Q-38: the gsplat backend (the §2.1 default) renders float32 models on a CUDA device only; a
+    CPU model, in float32 or float64, raises ValueError naming the reference backend."""
+    for model in (_api_model(), _api_model().double()):
+        with pytest.raises(ValueError, match="reference"):
+            render(model, CAM_A, 0.5, packed=packed)
+
+
+def test_reference_backend_ignores_packed() -> None:
+    """Q-36: the reference backend is always unpacked, so `packed` changes nothing: means2d is
+    [C, N, 2] and gaussian_ids None either way, and the outputs are bitwise equal."""
+    model = _api_model()
+    out = {
+        packed: _render(model, CAM_A, 0.5, return_aux=True, packed=packed)
+        for packed in (True, False)
+    }
+    for packed in (True, False):
+        assert out[packed].gaussian_ids is None
+        assert out[packed].means2d is not None and out[packed].means2d.shape == (1, 2, 2)
+    for field in ("image", "alpha", "means2d", "visible"):
+        assert torch.equal(getattr(out[True], field), getattr(out[False], field)), field
 
 
 def test_render_warns_outside_the_training_time_range() -> None:
@@ -1011,7 +1032,8 @@ def test_scene_with_every_primitive_culled_renders_the_background(precull: str) 
 def test_render_constants_agree_with_their_copies() -> None:
     """Private: E6's constants appear in render and in the ftgs-if render_conventions (Q-24, and
     D-73's entries under Q-35's keys); the opacity cull that render reads is motion's (D-32); the
-    default background is TrainConfig's (D-34); the precull choices are PerfConfig's (Q-31)."""
+    default background is TrainConfig's (D-34); gsplat's settings are D-57's; the precull choices
+    and the packed default are PerfConfig's (Q-31, Q-36)."""
     import openftgs.io
     import openftgs.motion
     import openftgs.render
@@ -1032,11 +1054,16 @@ def test_render_constants_agree_with_their_copies() -> None:
     # D-73, Q-35: the conventions files record are the ones render applies (D-72).
     assert conventions["jacobian_clamp_margin"] == r._CLAMP_MARGIN
     assert conventions["screen_extent_max"] == r._EXTENT_MAX
-    # The extent rule and the rasterize mode have no constant in render to agree with: the
-    # reference backend has one rule and one mode. The io metadata test pins their entries; M5's
-    # gsplat backend, which takes the mode as an argument, can tie the mode to it.
-    # Q-31: precull takes PerfConfig.precull's values.
+    # D-6, D-73, Q-35: the rasterize mode the gsplat backend runs is the one files record. The
+    # extent rule has no constant: both backends pass the effective opacity to their extent.
+    assert conventions["rasterize_mode"] == r._RASTERIZE_MODE == "classic"
+    # D-57: gsplat's tile size and no radius_clip.
+    assert r._TILE_SIZE == 16 and r._RADIUS_CLIP == 0.0
+    # Q-31: precull takes PerfConfig.precull's values; Q-36: packed defaults to PerfConfig's.
     assert get_args(r._Precull) == get_args(get_type_hints(PerfConfig)["precull"])
+    packed = inspect.signature(render).parameters["packed"]
+    assert packed.kind is inspect.Parameter.KEYWORD_ONLY
+    assert packed.default is PerfConfig().packed is True
 
 
 def test_rasterize_composites_chunks_of_pixel_rows_like_one(
