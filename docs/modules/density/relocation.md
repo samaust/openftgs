@@ -32,7 +32,9 @@ The live set is tested on the stored logit against ô_dead (D-14). Every logit b
 - n is clamped as E11 says for the formula only; every drawn copy is still written;
 - the scale factor uses the unclamped σ_new.
 
-U-13 compares `mcmc_split` with gsplat 1.5.3's `compute_relocation`, a float32 kernel, over live targets whose σ_new stays off the clamp, as the PRD asked; there the two agree far inside U-13's bound. Where σ_new falls below the dead threshold, so that only a_new is kept, the difference grows to just under the bound, from float32 cancellation in the kernel's evaluation of σ_new, not from the float64 path (source log #60, #62).
+U-13 compares `mcmc_split` with gsplat 1.5.3's `compute_relocation`, a float32 kernel, over live targets and every n E11 allows, as U-13's row asks. Away from the clamp the two agree far inside U-13's bound; where σ_new falls below the dead threshold, so that only a_new is kept, the difference grows to just under the bound, from float32 cancellation in the kernel's evaluation of σ_new, not from the float64 path (source log #60, #62, #63). That is where a later move of the gsplat pin would show first.
+
+Note for M16: `mcmc_split` applies only the upper bound of E11's clamp, so the harness adapter's answer to the L2 `relocation_math` query must apply D-14's lower bound to σ_new itself (Q-50).
 
 The clamp has two halves. `mcmc_split` applies the upper bound. The lower bound is D-14's and is applied by the callers to the stored float32 logit, as a floor at ô_dead from the configuration: only a bound on the stored logit guarantees that every relocated row is live, since sigmoid(ô_dead) rounds below the threshold in float32 (Q-50).
 

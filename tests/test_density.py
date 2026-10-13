@@ -562,18 +562,16 @@ def test_u13_property_e11_holds_for_random_targets(rows: list[tuple[float, int, 
 @pytest.mark.gpu
 def test_u13_matches_gsplat_compute_relocation() -> None:
     """U-13: against gsplat 1.5.3's compute_relocation (float32 kernel), within 5e-4 relative,
-    over a grid of live target opacities in [0.005, 0.999] (D-14) and n = 1 … 51, keeping the
-    pairs away from the clamp, whose σ_new = 1 − (1 − σ)^(1/n) stays in [0.005, 1 − 2⁻²³] (PRD
-    #65). gsplat's outputs are unclamped (source log #55), as mcmc_split's are there. Measured
-    on the RTX 4090: 1.7e-5 at worst away from the clamp; where σ_new falls below 0.005 the
-    kernel's float32 cancellation reaches 4.9e-4 (source log #60, #62)."""
+    over a grid of live target opacities in [0.005, 0.999] (D-14) and n = 1 … 51, as the spec's
+    row asks, with no restriction: the grid includes the pairs whose σ_new falls below 0.005,
+    where a_new is still used. gsplat's outputs are unclamped (source log #55), as mcmc_split's
+    are below 1 − 2⁻²³. Measured on the RTX 4090: 4.9e-4 at worst, at σ = 0.005 and n = 36, from
+    float32 cancellation in the kernel's 1 − (1 − σ)^(1/n); 1.7e-5 away from the clamp (source
+    log #60, #62, #63)."""
     from gsplat.relocation import compute_relocation
 
-    sigma = torch.linspace(0.005, 0.999, 400)[:, None].expand(400, 51).reshape(-1)
-    n = torch.arange(1, 52)[None, :].expand(400, 51).reshape(-1)
-    # Off the clamp: (1 − σ)^(1/n) ≤ 0.995, worked in float64 independently of mcmc_split.
-    off_clamp = torch.log1p(-sigma.double()) / n <= math.log(0.995)
-    sigma, n = sigma[off_clamp].contiguous(), n[off_clamp].contiguous()
+    sigma = torch.linspace(0.005, 0.999, 400)[:, None].expand(400, 51).reshape(-1).contiguous()
+    n = torch.arange(1, 52)[None, :].expand(400, 51).reshape(-1).contiguous()
     scales = torch.rand(sigma.shape[0], 3, generator=torch.Generator().manual_seed(0)) + 0.1
     binoms = torch.zeros(51, 51)  # E11's C(i − 1, k), i − 1 and k in 0 … 50
     for m in range(51):
