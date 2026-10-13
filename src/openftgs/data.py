@@ -90,7 +90,7 @@ class MultiViewVideo:
         offsets = self._centers - self._centers.mean(dim=0)
         return float(factor) * float(torch.linalg.vector_norm(offsets, dim=1).max())
 
-    def _record(self, index: int) -> int:
+    def _checked_index(self, index: int) -> int:
         if not 0 <= index < len(self.records):
             raise IndexError(f"image index {index} out of range [0, {len(self.records)})")
         return index
@@ -98,17 +98,17 @@ class MultiViewVideo:
     def load_image(self, index: int) -> Tensor:
         """Image `index` as float32 [H, W, 3] in [0, 1], on the CPU: 8-bit values divided by
         255, alpha dropped (§1.4 "Images", D-34; Q-65)."""
-        record = self.records[self._record(index)]
-        pixels = _read(record.image_path, record, _IMAGE_MODES)
+        record = self.records[self._checked_index(index)]
+        pixels = _read(record.image_path, _size(record), _IMAGE_MODES)
         return torch.from_numpy(pixels[..., :3].astype(np.float32)) / 255.0
 
     def load_mask(self, index: int) -> Tensor | None:
         """The dynamic-region mask of image `index` as float32 [H, W] in [0, 1], or None when
         it has none: 8-bit values divided by 255, bilevel ones 0 or 1 (§2.2, Q-61, Q-65)."""
-        mask_path = self.manifest.masks[self._record(index)]
+        mask_path = self.manifest.masks[self._checked_index(index)]
         if mask_path is None:
             return None
-        pixels = _read(mask_path, self.records[index], _MASK_MODES)
+        pixels = _read(mask_path, _size(self.records[index]), _MASK_MODES)
         if pixels.dtype == np.bool_:
             return torch.from_numpy(pixels.astype(np.float32))
         return torch.from_numpy(pixels.astype(np.float32)) / 255.0
@@ -120,13 +120,34 @@ def _center(record: ImageRecord) -> tuple[float, ...]:
     return tuple((-(w2c[:3, :3].T @ w2c[:3, 3])).tolist())
 
 
-def _read(path: Path, record: ImageRecord, modes: tuple[str, ...]) -> np.ndarray:
-    """The pixels of an image file in one of `modes`, checked against the record's camera
-    size (Q-65)."""
+def _size(record: ImageRecord) -> tuple[int, int]:
+    """The (width, height) of the record's camera, as Pillow gives an image's size."""
+    return record.camera.width, record.camera.height
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_BIT_DEPTH = 24  # the IHDR chunk's bit-depth byte: after the signature, length, type, size
+
+
+def _png_bit_depth(path: Path) -> int | None:
+    """The bit depth per channel of a PNG file (its IHDR chunk), or None for other formats.
+    Pillow opens 16-bit RGB PNGs in the 8-bit mode "RGB", so the mode alone can't tell."""
+    with path.open("rb") as file:
+        head = file.read(_PNG_BIT_DEPTH + 1)
+    if len(head) <= _PNG_BIT_DEPTH or not head.startswith(_PNG_SIGNATURE):
+        return None
+    return head[_PNG_BIT_DEPTH]
+
+
+def _read(path: Path, size: tuple[int, int], modes: tuple[str, ...]) -> np.ndarray:
+    """The pixels of an image file in one of `modes`, 8 bits per channel (1 for bilevel), of
+    the given (width, height) (Q-65)."""
     with Image.open(path) as image:
         if image.mode not in modes:
             raise ValueError(f"{path}: mode must be one of {modes}, got {image.mode!r}")
-        size = (record.camera.width, record.camera.height)
+        depth = _png_bit_depth(path)
+        if depth is not None and depth != (1 if image.mode == "1" else 8):
+            raise ValueError(f"{path}: images must have 8 bits per channel, got {depth}")
         if image.size != size:
             raise ValueError(f"{path}: size must be {size} (width, height), got {image.size}")
         return np.asarray(image)

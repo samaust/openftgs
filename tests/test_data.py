@@ -10,6 +10,8 @@ chosen transitions, whose mean absolute differences are worked by hand.
 """
 
 import json
+import struct
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -141,10 +143,9 @@ def _write_scene(
     images: list[dict[str, Any]],
     *,
     mode: str = "RGB",
-    write: bool = True,
 ) -> Path:
-    """The manifest and, unless `write` is False, one PNG of the camera's size per image (and
-    per mask), with seeded pixel values."""
+    """The manifest and one PNG of the camera's size per image (and per mask), with seeded
+    pixel values."""
     manifest = {
         "format": "ftgs-scene",
         "version": 1,
@@ -155,18 +156,17 @@ def _write_scene(
     }
     path = root / "scene.json"
     path.write_text(json.dumps(manifest))
-    if write:
-        for k, image in enumerate(images):
-            cam = cameras[image["camera"]]
-            w, h = cam["width"], cam["height"]
-            channels = {"RGB": 3, "RGBA": 4}[mode]
-            target = root / image["path"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(_pixels(h, w, channels, k), mode).save(target)
-            if "mask" in image:
-                mask = root / image["mask"]
-                mask.parent.mkdir(parents=True, exist_ok=True)
-                Image.fromarray(_pixels(h, w, 1, 100 + k)[..., 0], "L").save(mask)
+    for k, image in enumerate(images):
+        cam = cameras[image["camera"]]
+        w, h = cam["width"], cam["height"]
+        channels = {"RGB": 3, "RGBA": 4}[mode]
+        target = root / image["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(_pixels(h, w, channels, k), mode).save(target)
+        if "mask" in image:
+            mask = root / image["mask"]
+            mask.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(_pixels(h, w, 1, 100 + k)[..., 0], "L").save(mask)
     return path
 
 
@@ -179,9 +179,9 @@ _RING = {  # four training cameras at distance 2 from their centroid, the origin
 }
 
 
-def _ring_images(frames: int = 3, dt: float = 1.0 / 30.0) -> list[dict[str, Any]]:
-    images = [_image(name, k * dt) for k in range(frames) for name in "abcd"]
-    images += [_image("test", k * dt, "test") for k in range(frames)]
+def _ring_images(frames: int = 3) -> list[dict[str, Any]]:
+    images = [_image(name, k / 30.0) for k in range(frames) for name in "abcd"]
+    images += [_image("test", k / 30.0, "test") for k in range(frames)]
     return images
 
 
@@ -209,7 +209,7 @@ def test_time_normalizer_spans_the_training_timestamps(tmp_path: Path) -> None:
 def test_frame_interval_of_the_training_cameras(tmp_path: Path) -> None:
     """E14, D-46: Δt_f is the median over training cameras of each camera's median gap, in
     normalized time. Four synchronized cameras at frames k/30, k = 0 … 4, span T_τ = 4/30, so
-    Δt_f = 1/4. A test camera with a finer frame rate doesn't count."""
+    Δt_f = 1/4. A test view whose images are closer in time doesn't count."""
     images = [_image(name, k / 30.0) for k in range(5) for name in "abcd"]
     images += [_image("test", k / 120.0, "test") for k in range(17)]
     video = MultiViewVideo.from_manifest(_write_scene(tmp_path, _RING, images))
@@ -237,7 +237,7 @@ def test_frame_interval_of_a_single_timestamp(tmp_path: Path) -> None:
 def test_spatial_scale_of_a_ring(tmp_path: Path) -> None:
     """D-27: S = 1.1 × the largest distance from a training camera center to the centroid of
     the training camera centers. Four cameras at distance 2 from the origin give 2.2; the test
-    camera at distance 100 is excluded, and a pose repeated at every frame counts once."""
+    view at distance 100 is excluded, and a pose repeated at every frame counts once."""
     video = MultiViewVideo.from_manifest(_write_scene(tmp_path, _RING, _ring_images(3)))
     assert video.spatial_scale(1.1) == pytest.approx(2.2, rel=1e-12)
     assert video.spatial_scale(2.0) == pytest.approx(4.0, rel=1e-12)
@@ -291,6 +291,38 @@ def test_load_image_checks_size_and_mode(tmp_path: Path) -> None:
     Image.fromarray(_pixels(3, 4, 1, 0)[..., 0], "L").save(video.records[1].image_path)
     with pytest.raises(ValueError, match="mode"):
         video.load_image(1)
+
+
+def _write_png_16(path: Path, pixels: np.ndarray) -> None:
+    """A 16-bit-per-channel RGB PNG written from the PNG format's chunks, which Pillow can read
+    but not write."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    height, width, _ = pixels.shape
+    header = struct.pack(">IIBBBBB", width, height, 16, 2, 0, 0, 0)  # depth 16, truecolor
+    rows = b"".join(b"\x00" + row.astype(">u2").tobytes() for row in pixels)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_load_image_refuses_16_bit_files(tmp_path: Path) -> None:
+    """Q-65, §1.4 "Images": only 8-bit inputs are defined (divided by 255). Pillow reads a
+    16-bit RGB PNG in its 8-bit mode "RGB", keeping the high byte, so the file's own bit depth
+    is checked (from the two-axis review of #84)."""
+    video = MultiViewVideo.from_manifest(_write_scene(tmp_path, _RING, _ring_images(1)))
+    path = video.records[0].image_path
+    _write_png_16(path, np.full((3, 4, 3), 0x1234, dtype=np.uint16))
+    with Image.open(path) as image:
+        assert image.mode == "RGB"  # the reason for the check
+    with pytest.raises(ValueError, match="8 bits"):
+        video.load_image(0)
 
 
 @pytest.mark.parametrize("index", [-1, 7])
