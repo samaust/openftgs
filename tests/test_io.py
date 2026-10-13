@@ -1141,6 +1141,19 @@ def test_render_request_rejections(tmp_path: Path, path: tuple, value: object, m
         read_render_request(_write_json(tmp_path / "r.json", raw))
 
 
+@pytest.mark.parametrize(
+    ("value", "shown"), [(_DELETE, "None"), (5, "5"), ("ftgs-if", "'ftgs-if'")]
+)
+def test_render_request_names_the_format_it_found(
+    tmp_path: Path, value: object, shown: str
+) -> None:
+    """Q-26: the rejection shows the format as the file holds it, a missing one as None, not as
+    the string 'None' (from the second M9 milestone review)."""
+    raw = _set(_request(), ("format",), value)
+    with pytest.raises(ValueError, match=f"format must be 'ftgs-render-request', got {shown}$"):
+        read_render_request(_write_json(tmp_path / "r.json", raw))
+
+
 @pytest.mark.parametrize("text", ["[1, 2]", "{", '{"format": "ftgs-render-request", "x": NaN}'])
 def test_render_request_rejects_files_that_are_not_requests(tmp_path: Path, text: str) -> None:
     path = tmp_path / "r.json"
@@ -1177,6 +1190,9 @@ def _renders() -> Renders:
     return Renders(rgb=rgb, alpha=alpha)
 
 
+_SHA = hashlib.sha256(b"request").hexdigest()
+
+
 def test_renders_round_trip_with_metadata(tmp_path: Path) -> None:
     """§2.2 ftgs-renders: rgb/<id> float32 [H, W, 3], alpha/<id> float32 [H, W, 1]; metadata
     records the format, version, producer and the request's SHA-256 (Q-56)."""
@@ -1205,10 +1221,23 @@ def test_renders_round_trip_with_metadata(tmp_path: Path) -> None:
 def test_renders_reader_rejects_another_request(tmp_path: Path) -> None:
     """Q-56: reading with a request hash rejects a file recorded for another request."""
     path = tmp_path / "out.safetensors"
-    write_renders(_renders(), path, producer="p", request_sha256="aa")
+    write_renders(_renders(), path, producer="p", request_sha256=_SHA)
     read_renders(path)
     with pytest.raises(ValueError, match="request"):
-        read_renders(path, request_sha256="bb")
+        read_renders(path, request_sha256=hashlib.sha256(b"another request").hexdigest())
+
+
+@pytest.mark.parametrize(
+    "sha", ["aa", _SHA.upper(), _SHA[:-1], _SHA + "0", "g" + _SHA[1:], " " + _SHA[1:]]
+)
+def test_renders_writer_takes_a_sha256_hex_digest(tmp_path: Path, sha: str) -> None:
+    """§2.2: the metadata records the SHA-256 of the request, which read_renders compares with
+    hashlib's hexdigest, so the writer takes 64 lowercase hex digits and nothing else (Q-56,
+    from the second M9 milestone review)."""
+    path = tmp_path / "out.safetensors"
+    with pytest.raises(ValueError, match="SHA-256"):
+        write_renders(_renders(), path, producer="p", request_sha256=sha)
+    assert not path.exists()
 
 
 def test_renders_reader_ignores_other_tensors(tmp_path: Path) -> None:
@@ -1226,6 +1255,7 @@ def test_renders_reader_ignores_other_tensors(tmp_path: Path) -> None:
         ({"a": torch.zeros(6, 8, 3)}, {}, "both"),
         ({"a": torch.zeros(6, 8, 3, dtype=F64)}, {"a": torch.zeros(6, 8, 1)}, "float32"),
         ({"a": torch.zeros(6, 8, 4)}, {"a": torch.zeros(6, 8, 1)}, "shape"),
+        ({"a": torch.zeros(6, 8)}, {"a": torch.zeros(6, 8, 1)}, r"\[H, W, 3\], got \[6, 8\]$"),
         ({"a": torch.zeros(6, 8, 3)}, {"a": torch.zeros(6, 7, 1)}, "shape"),
         ({"a": torch.full((6, 8, 3), math.nan)}, {"a": torch.zeros(6, 8, 1)}, "finite"),
         ({}, {}, "at least one"),
@@ -1235,7 +1265,7 @@ def test_renders_validation(tmp_path: Path, rgb: dict, alpha: dict, match: str) 
     """Q-56: the writer and the reader apply the same checks."""
     path = tmp_path / "out.safetensors"
     with pytest.raises(ValueError, match=match):
-        write_renders(Renders(rgb, alpha), path, producer="p", request_sha256="aa")
+        write_renders(Renders(rgb, alpha), path, producer="p", request_sha256=_SHA)
     assert not path.exists()
     tensors = {f"rgb/{k}": v for k, v in rgb.items()} | {f"alpha/{k}": v for k, v in alpha.items()}
     save_file(
@@ -1276,6 +1306,6 @@ def test_renders_reader_returns_ids_sorted(tmp_path: Path) -> None:
         alpha={k: r.alpha["b"].clone() for k in ("z", "a", "m")},
     )
     path = tmp_path / "out.safetensors"
-    write_renders(renders, path, producer="p", request_sha256="aa")
+    write_renders(renders, path, producer="p", request_sha256=_SHA)
     back = read_renders(path)
     assert list(back.rgb) == list(back.alpha) == ["a", "m", "z"]
