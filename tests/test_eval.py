@@ -3,8 +3,8 @@
 D-67 to D-69; Q-60 to Q-63).
 
 Expected values are worked by hand (PSNR at a known MSE, SSIM_k of constant images in closed
-form, crops built pixel by pixel) or come from torchmetrics' LPIPS, an oracle that shares no
-code with lpips's wrapper here beyond the published weights.
+form, crops built pixel by pixel) or come from torchmetrics' LPIPS, an oracle reached through
+another library's code path to the same published weights (§2.3).
 """
 
 import json
@@ -320,7 +320,13 @@ def test_dynamic_region_needs_a_box_every_metric_accepts(
 
 @pytest.mark.parametrize(
     "mask",
-    [torch.zeros(50, 59), torch.zeros(50, 60, 3), torch.zeros(50, 60, dtype=torch.int64)],
+    [
+        torch.zeros(50, 59),
+        torch.zeros(50, 60, 3),
+        torch.zeros(50, 60, dtype=torch.int64),
+        torch.zeros(50, 60, dtype=torch.uint8),  # 8-bit masks are divided by 255 first (§1.4)
+        torch.zeros(50, 60, device="meta"),
+    ],
 )
 def test_dynamic_region_rejects_a_mask_of_another_shape_or_type(mask: Tensor) -> None:
     image = torch.zeros(50, 60, 3)

@@ -1195,8 +1195,7 @@ def test_renders_round_trip_with_metadata(tmp_path: Path) -> None:
     }
     assert keys == {"rgb/a", "rgb/b", "alpha/a", "alpha/b"}
     back = read_renders(path, request_sha256=sha)
-    assert list(back.rgb) == list(back.alpha)
-    assert set(back.rgb) == {"a", "b"}
+    assert list(back.rgb) == list(back.alpha) == ["a", "b"]
     for k in ("a", "b"):
         assert torch.equal(back.rgb[k], renders.rgb[k])
         assert torch.equal(back.alpha[k], renders.alpha[k])
@@ -1266,3 +1265,17 @@ def test_renders_reader_checks_format_and_major_version(
     save_file({"rgb/a": r.rgb["a"], "alpha/a": r.alpha["a"]}, str(path), metadata=meta)
     with pytest.raises(ValueError, match=match):
         read_renders(path)
+
+
+def test_renders_reader_returns_ids_sorted(tmp_path: Path) -> None:
+    """Q-56: the file keeps no item order, so ids come back sorted, whatever order they were
+    written in."""
+    r = _renders()
+    renders = Renders(
+        rgb={k: r.rgb["b"].clone() for k in ("z", "a", "m")},
+        alpha={k: r.alpha["b"].clone() for k in ("z", "a", "m")},
+    )
+    path = tmp_path / "out.safetensors"
+    write_renders(renders, path, producer="p", request_sha256="aa")
+    back = read_renders(path)
+    assert list(back.rgb) == list(back.alpha) == ["a", "m", "z"]

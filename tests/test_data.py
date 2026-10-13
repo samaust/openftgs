@@ -80,3 +80,12 @@ def test_fastest_frames_needs_frames_of_one_hw3_shape(bad: torch.Tensor) -> None
     frames[5] = bad
     with pytest.raises(ValueError, match="shape"):
         fastest_frames(frames)
+
+
+def test_fastest_frames_needs_frames_of_one_dtype() -> None:
+    """Q-59: uint8 frames are on a 0–255 scale and floating frames on 0–1, so a stream mixing
+    them would weigh their differences unevenly; it is refused, as mixed shapes are."""
+    frames = _frames([0.0] * 12)
+    frames[4] = torch.zeros(4, 6, 3, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="dtype"):
+        fastest_frames(frames)

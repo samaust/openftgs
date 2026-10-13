@@ -779,7 +779,8 @@ def read_renders(path: Path, *, request_sha256: str | None = None) -> Renders:
     rgb = {k.removeprefix("rgb/"): v for k, v in tensors.items() if k.startswith("rgb/")}
     alpha = {k.removeprefix("alpha/"): v for k, v in tensors.items() if k.startswith("alpha/")}
     _check_renders(rgb, alpha, where)
-    return Renders(rgb=rgb, alpha={k: alpha[k] for k in rgb})
+    ids = sorted(rgb)  # Q-56: the file keeps no item order
+    return Renders(rgb={k: rgb[k] for k in ids}, alpha={k: alpha[k] for k in ids})
 
 
 # PLY snapshot for viewers (Q-18): export-only, never read back.

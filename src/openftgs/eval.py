@@ -128,12 +128,15 @@ def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tens
         raise ValueError(
             f"mask must be [{height}, {width}] or [{height}, {width}, 1], got {list(mask.shape)}"
         )
+    if mask.device != pred.device:
+        raise ValueError(f"mask must be on the images' device {pred.device}, got {mask.device}")
+    # Q-61: an 8-bit mask is divided by 255 first, as every 8-bit input is (§1.4 "Images").
     if mask.dtype == torch.bool:
         dynamic = mask
     elif mask.is_floating_point():
         dynamic = mask >= _MASK_THRESHOLD
     else:
-        raise ValueError(f"mask must be bool or floating, got {mask.dtype}")
+        raise ValueError(f"mask must be bool or floating in [0, 1], got {mask.dtype}")
     rows = torch.nonzero(dynamic.any(dim=1)).flatten()
     cols = torch.nonzero(dynamic.any(dim=0)).flatten()
     if rows.numel() == 0:
