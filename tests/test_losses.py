@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""openftgs.losses (E7, E8, E9; D-7 to D-11, D-37, D-38, D-52, D-68; Q-40 to Q-43): U-9, U-10,
-U-11 and the added tests of PRD #53.
+"""openftgs.losses (E7, E8, E9; D-7 to D-11, D-37, D-38, D-52, D-68, D-77, D-78; Q-41, Q-42):
+U-9, U-10, U-11 and the added tests of PRD #53.
 
 Expected values are worked by hand from the spec, come from scikit-image's
 `structural_similarity` or from a brute-force float64 SSIM written in this file from Wang et al.
@@ -497,7 +497,7 @@ def test_regularization_of_an_empty_model_is_zero() -> None:
     assert reg4d_loss(model, 0.5).item() == 0.0
 
 
-# U-10 and U-9: the total loss (E9, D-10, D-37, D-38; Q-40, Q-41)
+# U-10 and U-9: the total loss (E9, D-10, D-37, D-38, D-77; Q-41)
 
 NO_PERC = LossConfig(lambda_perc=0.0)  # E9 at its defaults, without the downloaded network
 T_IT = OptimConfig().iterations  # T_it, the default run length
@@ -595,7 +595,7 @@ def test_u10_regularization_is_independent_of_the_camera() -> None:
 
 
 def test_total_loss_returns_detached_scalars_on_the_image_device() -> None:
-    """Q-40: the terms are detached 0-d tensors on the images' device, and "total" is the
+    """D-77: the terms are detached 0-d tensors on the images' device, and "total" is the
     returned loss's value."""
     model = random_model(10, seed=27)
     pred, gt = _detached_pair(28, dtype=F32)
@@ -617,7 +617,7 @@ def test_total_loss_rejects_an_iteration_below_one(it: object) -> None:
 
 
 def test_total_loss_needs_the_perceptual_network_when_its_weight_is_positive() -> None:
-    """Q-40: λ_perc > 0 with no network passed is a ValueError."""
+    """D-77: λ_perc > 0 with no network passed is a ValueError."""
     model = random_model(4, seed=0)
     pred, gt = _detached_pair(30, dtype=F32)
     with pytest.raises(ValueError):
@@ -699,7 +699,7 @@ def test_u11_l1_plus_regularization_passes_gradcheck_through_the_reference_rende
     clamps and thresholds of E6 (σ′ ≈ 3 px, σ ≤ 0.6, distinct depths, colors away from 0), and
     the target sits 0.1 from the initial render in every pixel and channel, away from L1's kink.
 
-    Q-43: E8's sg[σt] gives L_reg no gradient through μt and ŝ while finite differences see its
+    D-78: E8's sg[σt] gives L_reg no gradient through μt and ŝ while finite differences see its
     value move, so L_reg is evaluated with the substituted opacity logits and μt and ŝ held at
     their base values, which is what the stop-gradient means to first order; L1 sees all nine
     substituted tensors. U-10 pins the exact zeros."""
@@ -726,7 +726,7 @@ def test_u11_l1_plus_regularization_passes_gradcheck_through_the_reference_rende
 
     def fn(*tensors: Tensor) -> Tensor:
         substituted = {f"model.{name}": x for name, x in zip(PARAM_NAMES, tensors, strict=True)}
-        # Q-43: L_reg's μt and ŝ stay at their base values.
+        # D-78: L_reg's μt and ŝ stay at their base values.
         substituted["reg_model.opacity_logits"] = substituted["model.opacity_logits"]
         loss: Tensor = torch.func.functional_call(module, substituted, ())
         return loss
