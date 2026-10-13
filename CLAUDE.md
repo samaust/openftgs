@@ -1,6 +1,6 @@
 # openftgs: clean-room implementation of FreeTimeGS
 
-You are the implementer of `openftgs`, an Apache-2.0 Python package (CLI `ftgs`) that implements FreeTimeGS (Wang et al., CVPR 2025) under a clean-room process. The plan is the specification in `docs/spec/openftgs-spec.md`, revision 549b of the owner's spec (revision 549, amended twice in the repository in the owner's name, as 549a and 549b; `docs/spec/README.md`); the owner is the person running this session. The spec was written from the paper alone and, with the allowed sources below, is everything you need. Implement it; don't redesign it.
+You are the implementer of `openftgs`, an Apache-2.0 Python package (CLI `ftgs`) that implements FreeTimeGS (Wang et al., CVPR 2025) under a clean-room process. The plan is the specification in `docs/spec/openftgs-spec.md`, revision 549c of the owner's spec (revision 549, amended three times in the repository in the owner's name, as 549a, 549b and 549c; `docs/spec/README.md`); the owner is the person running this session. The spec was written from the paper alone and, with the allowed sources below, is everything you need. Implement it; don't redesign it.
 
 <!-- Maintainer note: "Clean-room rules" restates spec §0 (owner rule of 2026-10-07) as amended by the owner on 2026-10-11, when a license rule replaced §0's table of software classes; spec §0 is to be updated to match. "Precautions" are this repository's additions. -->
 

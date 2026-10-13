@@ -187,7 +187,7 @@ def reg4d_loss(model: FreeTimeGaussians, t: float) -> Tensor:
     return terms.mean() if terms.numel() > 0 else terms.sum()
 
 
-# Q-40: the dict holds detached 0-d tensors, so the loss never syncs with the host (§2.4 rule 3),
+# D-77: the dict holds detached 0-d tensors, so the loss never syncs with the host (§2.4 rule 3),
 # and the perceptual network is passed in.
 def total_loss(
     pred: Tensor,
