@@ -1,26 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PSNR, SSIM_k, DSSIM_k, LPIPS-Alex and LPIPS-VGG, and the dynamic-region crop and mask.
+"""PSNR, SSIM_k, DSSIM_k, LPIPS-Alex and LPIPS-VGG, the dynamic-region crop and mask, and the
+metrics report that `ftgs eval` writes.
 
-Spec: E16, App. B.1, D-29, D-52, D-67, D-68. Band: Orchestration (§2.1).
+Spec: E16, App. B.1, D-29, D-52, D-64, D-67, D-68, D-69. Band: Orchestration (§2.1).
 """
 
 import contextlib
 import math
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
 
-from openftgs.losses import ssim
+from openftgs.losses import LPIPSLoss, ssim
 
 __all__ = [
     "METRIC_NAMES",
+    "Evaluator",
+    "ImageMetrics",
     "average_metrics",
     "dssim_k",
     "dynamic_region",
     "lpips_backbone",
+    "metrics_report",
     "psnr",
     "ssim_k",
 ]
@@ -168,3 +173,151 @@ def average_metrics(rows: Sequence[Mapping[str, float]]) -> dict[str, float]:
     if any(set(row) != set(keys) for row in rows):
         raise ValueError("every row must hold the same keys")
     return {key: math.fsum(row[key] for row in rows) / len(rows) for key in keys}
+
+
+class Evaluator:
+    """All eight metrics of METRIC_NAMES for one image pair, with the LPIPS networks built once
+    on `device` (E16, D-68; Q-60). Calling it with a dynamic-region mask also gives the same
+    metrics on `dynamic_region`'s pair, or None when the mask has no usable region (Q-61)."""
+
+    def __init__(self, *, device: str | torch.device = "cuda") -> None:
+        self._device = torch.device(device)
+        self._alex = LPIPSLoss("alex").to(self._device)
+        self._vgg = LPIPSLoss("vgg").to(self._device)
+
+    def __call__(
+        self, pred: Tensor, gt: Tensor, *, mask: Tensor | None = None
+    ) -> tuple[dict[str, float], dict[str, float] | None]:
+        if pred.dim() != 3:
+            raise ValueError(f"Evaluator takes one image pair [H, W, 3], got {list(pred.shape)}")
+        _check_pair(pred, gt)
+        pred, gt = pred.to(self._device), gt.to(self._device)
+        entire = self._metrics(pred, gt)
+        if mask is None:
+            return entire, None
+        region = dynamic_region(pred, gt, mask.to(self._device))
+        return entire, None if region is None else self._metrics(*region)
+
+    def _metrics(self, pred: Tensor, gt: Tensor) -> dict[str, float]:
+        values = {
+            "psnr": psnr(pred, gt),
+            "ssim1": ssim_k(pred, gt, 1),
+            "ssim2": ssim_k(pred, gt, 2),
+            "dssim1": dssim_k(pred, gt, 1),
+            "dssim2": dssim_k(pred, gt, 2),
+        }
+        with _metric_mode():
+            clamped = pred.clamp(0.0, 1.0)  # D-67
+            values["lpips_alex"] = self._alex(clamped, gt)
+            values["lpips_vgg"] = self._vgg(clamped, gt)
+            # D-68, Q-58: the same VGG network on the unmapped [0, 1] images.
+            values["lpips_vgg_raw"] = self._vgg(clamped, gt, map_inputs=False)
+        return {name: float(values[name]) for name in METRIC_NAMES}
+
+
+# Q-60: one test image's results, as metrics_report reads them.
+@dataclass(frozen=True)
+class ImageMetrics:
+    camera: str
+    timestamp: float  # raw τ
+    frame_index: int | None
+    path: str  # the image path of the scene manifest
+    entire: Mapping[str, float]  # the eight METRIC_NAMES values
+    dynamic: Mapping[str, float] | None  # None without a usable dynamic region (Q-61)
+    masked: bool  # the image carries a dynamic-region mask
+
+
+_REPORT = "ftgs-metrics"  # Q-63
+
+
+def _json_value(value: float) -> float | None:
+    # Q-63: JSON without NaN or Infinity (Q-25); a perfect render's PSNR becomes null.
+    return value if math.isfinite(value) else None
+
+
+def _check_values(values: Mapping[str, float], path: str) -> None:
+    if set(values) != set(METRIC_NAMES):
+        raise ValueError(f"{path}: metrics must hold exactly {list(METRIC_NAMES)}")
+
+
+def _means(rows: Sequence[Mapping[str, float]]) -> dict[str, float | None]:
+    if not rows:
+        return dict.fromkeys(METRIC_NAMES)
+    means = average_metrics(rows)
+    return {name: _json_value(means[name]) for name in METRIC_NAMES}
+
+
+def _row(image: ImageMetrics, values: Mapping[str, float] | None) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "camera": image.camera,
+        "timestamp": image.timestamp,
+        "frame_index": image.frame_index,
+        "path": image.path,
+    }
+    for name in METRIC_NAMES:
+        row[name] = None if values is None else _json_value(values[name])
+    return row
+
+
+def metrics_report(
+    images: Sequence[ImageMetrics], *, split: str, metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The body of METRICS.json (§2.1 CLI paragraph; Q-63): per-image rows and per-scene means
+    under `entire`; under `dynamic` when an image is masked, with the manifest's mask source and
+    approximate flag (D-64); under `fastest_10` the means over the Fastest-10 frames when the
+    manifest names them (D-69). `metadata` is the scene manifest's `metadata`. Non-finite values
+    and means over no image are null. The caller adds the header (model, scene, producer)."""
+    if not images:
+        raise ValueError("metrics_report needs at least one image")
+    for image in images:
+        _check_values(image.entire, image.path)
+        if image.dynamic is not None:
+            _check_values(image.dynamic, image.path)
+    masked = [image for image in images if image.masked]
+    report: dict[str, Any] = {
+        "format": _REPORT,
+        "version": 1,
+        "split": split,
+        "metrics": list(METRIC_NAMES),
+        "lpips_backbone": lpips_backbone(metadata.get("source")),
+        "entire": {
+            "scene": _means([image.entire for image in images]),
+            "images": [_row(image, image.entire) for image in images],
+        },
+    }
+    if masked:
+        usable = [image.dynamic for image in masked if image.dynamic is not None]
+        report["dynamic"] = {
+            "mask_source": metadata.get("mask_source"),
+            "masks_approximate": bool(metadata.get("masks_approximate", False)),
+            "count": len(usable),
+            "skipped": len(masked) - len(usable),
+            "scene": _means(usable),
+            "images": [_row(image, image.dynamic) for image in masked],
+        }
+    fastest = metadata.get("fastest_10")
+    if fastest is not None:
+        if (
+            not isinstance(fastest, list | tuple)
+            or len(fastest) != 2
+            or not all(isinstance(n, int) and not isinstance(n, bool) for n in fastest)
+            or fastest[0] >= fastest[1]
+        ):
+            raise ValueError(f"metadata.fastest_10 must be [n0, n1) with n0 < n1, got {fastest!r}")
+        n0, n1 = fastest
+        inside = [
+            image
+            for image in images
+            if image.frame_index is not None and n0 <= image.frame_index < n1
+        ]
+        block: dict[str, Any] = {
+            "range": [n0, n1],
+            "count": len(inside),
+            "entire": _means([image.entire for image in inside]),
+        }
+        if masked:
+            block["dynamic"] = _means(
+                [image.dynamic for image in inside if image.masked and image.dynamic is not None]
+            )
+        report["fastest_10"] = block
+    return report

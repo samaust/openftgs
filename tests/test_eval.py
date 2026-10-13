@@ -7,8 +7,10 @@ form, crops built pixel by pixel) or come from torchmetrics' LPIPS, an oracle th
 code with lpips's wrapper here beyond the published weights.
 """
 
+import json
 import math
 import warnings
+from typing import Any
 
 import pytest
 import torch
@@ -17,10 +19,13 @@ from torch import Tensor
 import openftgs.eval
 from openftgs.eval import (
     METRIC_NAMES,
+    Evaluator,
+    ImageMetrics,
     average_metrics,
     dssim_k,
     dynamic_region,
     lpips_backbone,
+    metrics_report,
     psnr,
     ssim_k,
 )
@@ -44,11 +49,14 @@ def test_public_api() -> None:
     """Q-60: `__all__` is exactly the public API, and the metric names are those §2.1's CLI
     paragraph gives for METRICS.json."""
     assert sorted(openftgs.eval.__all__) == [
+        "Evaluator",
+        "ImageMetrics",
         "METRIC_NAMES",
         "average_metrics",
         "dssim_k",
         "dynamic_region",
         "lpips_backbone",
+        "metrics_report",
         "psnr",
         "ssim_k",
     ]
@@ -318,3 +326,182 @@ def test_dynamic_region_rejects_a_mask_of_another_shape_or_type(mask: Tensor) ->
     image = torch.zeros(50, 60, 3)
     with pytest.raises(ValueError, match="mask"):
         dynamic_region(image, image, mask)
+
+
+# The Evaluator: all eight metrics of an image (E16, D-68; Q-60).
+
+
+@pytest.fixture(scope="module")
+def evaluator() -> Evaluator:
+    """Built once on the CPU (the LPIPS trunk weights are downloaded)."""
+    return Evaluator(device="cpu")
+
+
+def _torchmetrics_lpips(net: str, pred: Tensor, gt: Tensor, *, normalize: bool) -> float:
+    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # torchvision's `pretrained` deprecation
+        metric = LearnedPerceptualImagePatchSimilarity(net_type=net, normalize=normalize)
+    with torch.no_grad():
+        value = metric(pred.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
+    return float(value)
+
+
+@pytest.mark.weights
+def test_u23_lpips_against_torchmetrics(evaluator: Evaluator) -> None:
+    """U-23, D-68: LPIPS-Alex and LPIPS-VGG with inputs mapped to [−1, 1] match torchmetrics'
+    LPIPS with normalize=True, and lpips_vgg_raw (unmapped [0, 1] inputs) matches it with
+    normalize=False, within 1e-4. The render is clamped first (D-67)."""
+    pred, gt = _noisy_pair((48, 64, 3), seed=11, noise=0.15)
+    pred, gt = pred.to(F32), gt.to(F32)
+    raw = pred.clone()
+    raw[:4] += 0.5  # above 1 in places: the metrics see the clamped render
+    pred = raw.clamp(0.0, 1.0)
+    entire, dynamic = evaluator(raw, gt)
+    assert dynamic is None
+    assert abs(entire["lpips_alex"] - _torchmetrics_lpips("alex", pred, gt, normalize=True)) <= 1e-4
+    assert abs(entire["lpips_vgg"] - _torchmetrics_lpips("vgg", pred, gt, normalize=True)) <= 1e-4
+    expected_raw = _torchmetrics_lpips("vgg", pred, gt, normalize=False)
+    assert abs(entire["lpips_vgg_raw"] - expected_raw) <= 1e-4
+    assert abs(entire["lpips_vgg_raw"] - entire["lpips_vgg"]) > 1e-3
+
+
+@pytest.mark.weights
+def test_evaluator_gives_every_metric_of_the_image_and_of_its_region(evaluator: Evaluator) -> None:
+    """Q-60: the eight metrics, in METRIC_NAMES order, agree with the metric functions; with a
+    mask, the dynamic values are the same metrics on dynamic_region's pair (Q-61)."""
+    g = _gen(12)
+    gt = torch.rand(50, 60, 3, generator=g)
+    pred = (gt + 0.1 * torch.randn(50, 60, 3, generator=g)).clamp(0.0, 1.2)
+    entire, dynamic = evaluator(pred, gt, mask=_l_mask())
+    assert list(entire) == list(METRIC_NAMES)
+    assert entire["psnr"] == psnr(pred, gt).item()
+    assert entire["ssim2"] == ssim_k(pred, gt, 2).item()
+    assert entire["dssim1"] == dssim_k(pred, gt, 1).item()
+    region = dynamic_region(pred, gt, _l_mask())
+    assert region is not None and dynamic is not None
+    assert dynamic == evaluator(*region)[0]
+    with pytest.warns(UserWarning, match="dynamic"):
+        _, none = evaluator(pred, gt, mask=torch.zeros(50, 60))
+    assert none is None
+
+
+@pytest.mark.weights
+def test_evaluator_takes_one_image_pair(evaluator: Evaluator) -> None:
+    with pytest.raises(ValueError):
+        evaluator(torch.zeros(2, 40, 40, 3), torch.zeros(2, 40, 40, 3))
+
+
+# The metrics report (§2.1 CLI paragraph, D-64, D-69; Q-63).
+
+
+def _values(base: float) -> dict[str, float]:
+    return {name: base + k for k, name in enumerate(METRIC_NAMES)}
+
+
+def _image(
+    k: int, *, frame: int | None, dynamic: dict[str, float] | None = None, masked: bool = False
+) -> ImageMetrics:
+    return ImageMetrics(
+        camera="cam00",
+        timestamp=k / 30,
+        frame_index=frame,
+        path=f"images/cam00/{k:06d}.png",
+        entire=_values(10.0 * k),
+        dynamic=dynamic,
+        masked=masked,
+    )
+
+
+def test_metrics_report_layout_without_masks() -> None:
+    """Q-63: format and version, the split, the metric names, the backbone from the source
+    (Q-62), and under `entire` the per-scene means and one row per image; no `dynamic` or
+    `fastest_10` block without masks or a range."""
+    images = [_image(0, frame=0), _image(1, frame=1), _image(2, frame=None)]
+    report = metrics_report(images, split="test", metadata={"source": "n3dv/flame_steak"})
+    assert set(report) == {"format", "version", "split", "metrics", "lpips_backbone", "entire"}
+    assert report["format"] == "ftgs-metrics" and report["version"] == 1
+    assert report["split"] == "test"
+    assert report["metrics"] == list(METRIC_NAMES)
+    assert report["lpips_backbone"] == "alex"
+    assert report["entire"]["scene"] == _values(10.0)  # the mean of 0, 10 and 20, plus k
+    rows = report["entire"]["images"]
+    assert [r["path"] for r in rows] == [im.path for im in images]
+    assert rows[1] == {
+        "camera": "cam00",
+        "timestamp": 1 / 30,
+        "frame_index": 1,
+        "path": "images/cam00/000001.png",
+        **_values(10.0),
+    }
+    assert rows[2]["frame_index"] is None
+    json.dumps(report, allow_nan=False)
+
+
+def test_metrics_report_writes_non_finite_values_as_null() -> None:
+    """Q-63: a perfect render's PSNR is +inf (Q-60); JSON gets null, in rows and means."""
+    perfect = ImageMetrics("c", 0.0, 0, "p.png", {**_values(0.0), "psnr": math.inf}, None, False)
+    report = metrics_report([perfect, _image(1, frame=1)], split="test", metadata={})
+    assert report["entire"]["images"][0]["psnr"] is None
+    assert report["entire"]["scene"]["psnr"] is None
+    assert report["entire"]["scene"]["ssim1"] == (1.0 + 11.0) / 2
+    assert report["lpips_backbone"] == "vgg"
+    json.dumps(report, allow_nan=False)
+
+
+def test_metrics_report_dynamic_block() -> None:
+    """§2.1, D-64, Q-63: with masked images, `dynamic` holds the mask source and approximate
+    flag from the manifest metadata, the count of usable regions and of skipped ones, their
+    means, and one row per masked image (null values where no region was usable, Q-61)."""
+    images = [
+        _image(0, frame=0, dynamic=_values(1.0), masked=True),
+        _image(1, frame=1, dynamic=None, masked=True),
+        _image(2, frame=2, dynamic=_values(3.0), masked=True),
+        _image(3, frame=3),  # no mask
+    ]
+    metadata: dict[str, Any] = {"mask_source": "bgmv2", "masks_approximate": True}
+    dynamic = metrics_report(images, split="test", metadata=metadata)["dynamic"]
+    assert dynamic["mask_source"] == "bgmv2"
+    assert dynamic["masks_approximate"] is True
+    assert (dynamic["count"], dynamic["skipped"]) == (2, 1)
+    assert dynamic["scene"] == _values(2.0)
+    assert [r["path"] for r in dynamic["images"]] == [im.path for im in images[:3]]
+    assert all(dynamic["images"][1][name] is None for name in METRIC_NAMES)
+    assert dynamic["images"][2]["psnr"] == 3.0
+    plain = metrics_report(images[1:2], split="test", metadata={})["dynamic"]
+    assert plain["mask_source"] is None and plain["masks_approximate"] is False
+    assert all(plain["scene"][name] is None for name in METRIC_NAMES)
+
+
+def test_metrics_report_fastest_10_block() -> None:
+    """D-69, Q-63: with metadata.fastest_10 = [n0, n0 + 10), the means over the test images
+    whose frame_index lies in the range, for `entire` and, with masks, `dynamic`."""
+    images = [_image(k, frame=k, dynamic=_values(float(k)), masked=True) for k in range(12)] + [
+        _image(99, frame=None)
+    ]
+    report = metrics_report(images, split="test", metadata={"fastest_10": [2, 12]})
+    block = report["fastest_10"]
+    assert block["range"] == [2, 12]
+    assert block["count"] == 10
+    assert block["entire"] == _values(10.0 * 6.5)  # frames 2 … 11
+    assert block["dynamic"] == _values(6.5)
+    plain = metrics_report(images[:3], split="test", metadata={"fastest_10": [5, 15]})
+    assert plain["fastest_10"]["count"] == 0
+    assert all(plain["fastest_10"]["entire"][name] is None for name in METRIC_NAMES)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"metadata": {"fastest_10": [3]}},
+        {"metadata": {"fastest_10": [5, 3]}},
+        {"metadata": {"fastest_10": "2-12"}},
+        {"images": []},
+        {"images": [ImageMetrics("c", 0.0, 0, "p", {"psnr": 1.0}, None, False)]},
+    ],
+)
+def test_metrics_report_rejects_malformed_input(bad: dict[str, Any]) -> None:
+    kwargs: dict[str, Any] = {"images": [_image(0, frame=0)], "metadata": {}} | bad
+    with pytest.raises(ValueError):
+        metrics_report(kwargs["images"], split="test", metadata=kwargs["metadata"])
