@@ -4,7 +4,8 @@ Q-23, Q-25, Q-44 to Q-46): the learning-rate part of U-17, U-31 and the added te
 
 Expected rates come from the §1.3 rate table and from E12 and E13 evaluated in float64 in this
 file; expected Adam updates from Adam's update rule (Kingma and Ba) with the §1.3 settings, and for
-selective Adam from D-53's description (moments decayed, no bias correction).
+selective Adam from D-53's description (moments decayed, no bias correction). "Relative" in U-31
+is the per-tensor relative L2 error (Q-47, owner answer).
 """
 
 import math
@@ -18,7 +19,7 @@ from builders import random_model, random_params
 from openftgs.config import OptimConfig, TrainConfig, config_to_dict
 from openftgs.io import load_checkpoint, save_checkpoint
 from openftgs.model import FreeTimeGaussians
-from openftgs.optim import FTGSOptimizer, build_optimizer
+from openftgs.optim import FTGSOptimizer, _fused_supported, build_optimizer
 from openftgs.types import TimeNormalizer, TrainerState
 
 S = 2.5  # spatial scale (D-27), arbitrary here
@@ -130,7 +131,7 @@ def test_u17_rates_never_increase() -> None:
         previous = rates
 
 
-def test_u17_rates_match_e12_and_e13_at_every_iteration() -> None:
+def test_u17_rates_match_e12_and_e13_at_sampled_iterations() -> None:
     cfg = OptimConfig(iterations=1_000)
     opt = build_optimizer(random_model(4), cfg, spatial_scale=S, frame_dt=DT)
     for it in (1, 2, 17, 500, 999, 1_000):
@@ -181,6 +182,21 @@ def set_grads(model: FreeTimeGaussians, generator: torch.Generator) -> None:
         p.grad = torch.where(g == 0, torch.ones_like(g), g)
 
 
+def iterate(
+    model: FreeTimeGaussians,
+    opt: FTGSOptimizer,
+    its: range,
+    generator: torch.Generator,
+    *,
+    visibility: torch.Tensor | None = None,
+) -> None:
+    """For each iteration: seeded gradients, that iteration's rates, one Adam step."""
+    for it in its:
+        set_grads(model, generator)
+        opt.set_iteration(it)
+        opt.step(visibility=visibility)
+
+
 def test_parameter_groups_at_the_defaults_and_at_sh_degree_0() -> None:
     # §1.3: one group per tensor; U-26: no shN group at L = 0.
     opt = build_optimizer(random_model(4), OptimConfig(), spatial_scale=S, frame_dt=DT)
@@ -195,12 +211,8 @@ def test_d71_single_timestamp_freezes_times_and_velocities(adam: AdamKind) -> No
     model = single_timestamp_model()
     opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=1.0, adam=adam)
     assert set(opt.set_iteration(1)) == set(PARAM_NAMES) - {"times", "velocities"}
-    generator = torch.Generator().manual_seed(5)
     before = {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
-    for it in range(1, 6):
-        set_grads(model, generator)
-        opt.set_iteration(it)
-        opt.step()
+    iterate(model, opt, range(1, 6), torch.Generator().manual_seed(5))
     assert torch.equal(model.times, torch.zeros_like(model.times))
     assert torch.equal(model.velocities, torch.zeros_like(model.velocities))
     for name in set(PARAM_NAMES) - {"times", "velocities"}:
@@ -236,21 +248,15 @@ def test_zero_grad_clears_all_nine_tensors() -> None:
         assert getattr(model, name).grad is None, name
 
 
-def run_steps(
-    model_device: str, adam: AdamKind, steps: int, *, visibility: torch.Tensor | None = None
-) -> tuple[dict[str, torch.Tensor], object]:
-    """`steps` Adam steps of a seeded random model on seeded gradients, at each iteration's
-    rates; returns the final stored tensors (float64, CPU) and the optimizer."""
-    model = random_model(64).to(model_device)
+def final_params(device: str, adam: AdamKind, steps: int) -> dict[str, torch.Tensor]:
+    """The stored tensors (float64, CPU) of a seeded random model after `steps` Adam steps on
+    seeded gradients, at each iteration's rates."""
+    model = random_model(64).to(device)
     opt = build_optimizer(
         model, OptimConfig(iterations=steps), spatial_scale=S, frame_dt=DT, adam=adam
     )
-    generator = torch.Generator().manual_seed(11)
-    for it in range(1, steps + 1):
-        set_grads(model, generator)
-        opt.set_iteration(it)
-        opt.step(visibility=visibility)
-    return {name: getattr(model, name).detach().double().cpu() for name in PARAM_NAMES}, opt
+    iterate(model, opt, range(1, steps + 1), torch.Generator().manual_seed(11))
+    return {name: getattr(model, name).detach().double().cpu() for name in PARAM_NAMES}
 
 
 def as_float32(x: float) -> float:
@@ -258,26 +264,26 @@ def as_float32(x: float) -> float:
     return float(torch.tensor(x, dtype=torch.float32))
 
 
-def assert_relative(actual: torch.Tensor, expected: torch.Tensor, rel: float) -> None:
-    """U-31's "relative" (Q-47): |actual − expected| ≤ rel·(|expected| + max|expected|)
-    elementwise, so elements near 0 are measured against the tensor's scale."""
-    floor = rel * float(expected.abs().max()) if expected.numel() else 0.0
-    torch.testing.assert_close(actual, expected, rtol=rel, atol=floor)
+def assert_relative_l2(actual: torch.Tensor, expected: torch.Tensor, rel: float) -> None:
+    """U-31's "relative" (Q-47, owner answer): ‖actual − expected‖₂ ≤ rel·‖expected‖₂ per
+    tensor."""
+    error = float(torch.linalg.vector_norm(actual - expected))
+    assert error <= rel * float(torch.linalg.vector_norm(expected)), error
 
 
 def test_u31_fused_and_foreach_agree_over_100_steps_cpu() -> None:
-    fused, _ = run_steps("cpu", "fused", 100)
-    foreach, _ = run_steps("cpu", "foreach", 100)
+    fused = final_params("cpu", "fused", 100)
+    foreach = final_params("cpu", "foreach", 100)
     for name in PARAM_NAMES:
-        assert_relative(fused[name], foreach[name], 1e-6)
+        assert_relative_l2(fused[name], foreach[name], 1e-6)
 
 
 @pytest.mark.gpu
 def test_u31_fused_and_foreach_agree_over_100_steps_cuda() -> None:
-    fused, _ = run_steps("cuda", "fused", 100)
-    foreach, _ = run_steps("cuda", "foreach", 100)
+    fused = final_params("cuda", "fused", 100)
+    foreach = final_params("cuda", "foreach", 100)
     for name in PARAM_NAMES:
-        assert_relative(fused[name], foreach[name], 1e-6)
+        assert_relative_l2(fused[name], foreach[name], 1e-6)
 
 
 def stepped(
@@ -286,15 +292,11 @@ def stepped(
     """A model and its optimizer after `steps` steps on seeded gradients, so moments are set."""
     model = random_model(n).to(device)
     opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=DT, adam=adam)
-    generator = torch.Generator().manual_seed(7)
-    for it in range(1, steps + 1):
-        set_grads(model, generator)
-        opt.set_iteration(it)
-        opt.step()
+    iterate(model, opt, range(1, steps + 1), torch.Generator().manual_seed(7))
     return model, opt
 
 
-def test_reset_rows_zeroes_moments_of_listed_rows_and_keeps_steps() -> None:
+def test_reset_rows_zeroes_moments_of_listed_rows_and_keeps_step_counters() -> None:
     # D-16: zero exp_avg and exp_avg_sq of the rows; keep each step counter. Q-44: int64 indices
     # in any order, repeats allowed (relocation draws targets with replacement).
     _, opt = stepped()
@@ -512,11 +514,7 @@ def test_u31_selective_adam_leaves_invisible_rows_and_moments_unchanged() -> Non
     )
     before_state = opt.state_dict()
     before = {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
-    generator = torch.Generator().manual_seed(13)
-    for it in range(1, 101):
-        set_grads(model, generator)
-        opt.set_iteration(it)
-        opt.step(visibility=visibility)
+    iterate(model, opt, range(1, 101), torch.Generator().manual_seed(13), visibility=visibility)
     after_state = opt.state_dict()
     hidden = ~visibility
     for name in PARAM_NAMES:
@@ -533,7 +531,8 @@ def test_u31_selective_adam_with_all_rows_visible_is_adam_without_bias_correctio
     # D-53: with every row visible, selective Adam is Adam without bias correction:
     # m ← β₁m + (1 − β₁)g, v ← β₂v + (1 − β₂)g², p ← p − η·m/(√v + ε), here in float64.
     # Q-47: the reference takes β₁, β₂, ε and η as the float32 values gsplat's kernel receives;
-    # float32(0.999) alone moves 1 − β₂ by about 1.3e-5 relative, more than U-31's tolerance.
+    # float32(0.999) alone moves 1 − β₂ by about 1.3e-5 relative, more than U-31's tolerance
+    # (owner answer).
     n, steps = 64, 100
     cfg = OptimConfig(iterations=steps)
     model = random_model(n).to("cuda")
@@ -555,7 +554,7 @@ def test_u31_selective_adam_with_all_rows_visible_is_adam_without_bias_correctio
             p64[name] = p64[name] - eta * m[name] / (v[name].sqrt() + eps)
         opt.step(visibility=visibility)
     for name in PARAM_NAMES:
-        assert_relative(getattr(model, name).detach().double().cpu(), p64[name], 1e-6)
+        assert_relative_l2(getattr(model, name).detach().double().cpu(), p64[name], 1e-6)
 
 
 def test_selective_adam_needs_cuda() -> None:
@@ -590,3 +589,31 @@ def test_selective_adam_requires_a_bool_visibility_mask() -> None:
 def test_build_optimizer_rejects_an_unknown_adam_kind() -> None:
     with pytest.raises(ValueError):
         build_optimizer(random_model(4), OptimConfig(), spatial_scale=S, frame_dt=DT, adam="sgd")  # type: ignore[arg-type]
+
+
+def test_fused_supported_probes_each_device_and_dtype() -> None:
+    # Q-45: torch checks fused support only at a step that creates the state, so the fallback
+    # probes; the meta device has no fused kernel.
+    assert _fused_supported([torch.zeros(2), torch.zeros(3, dtype=torch.float64)])
+    assert not _fused_supported([torch.zeros(2), torch.zeros(2, device="meta")])
+
+
+def test_fused_adam_on_cpu_needs_no_fallback(recwarn: pytest.WarningsRecorder) -> None:
+    build_optimizer(random_model(4), OptimConfig(), spatial_scale=S, frame_dt=DT, adam="fused")
+    assert not [w for w in recwarn if "foreach" in str(w.message)]
+
+
+@pytest.mark.gpu
+def test_fused_supported_false_falls_back_to_foreach_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Q-45: where the probe refuses fused Adam, build warns and uses foreach, whose step counters
+    # live on the CPU (fused ones live on the parameter's device).
+    fused = build_optimizer(random_model(4).to("cuda"), OptimConfig(), spatial_scale=S, frame_dt=DT)
+    assert fused.state_dict()["means"]["step"].device.type == "cuda"
+    monkeypatch.setattr("openftgs.optim._fused_supported", lambda params: False)
+    with pytest.warns(UserWarning, match="foreach"):
+        opt = build_optimizer(
+            random_model(4).to("cuda"), OptimConfig(), spatial_scale=S, frame_dt=DT
+        )
+    assert opt.state_dict()["means"]["step"].device.type == "cpu"

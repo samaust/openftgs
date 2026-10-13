@@ -189,7 +189,7 @@ L_render + λ_reg·L_reg(t), the quantity backpropagated at every iteration. E9
 _Avoid_: objective, overall loss, training loss
 
 **Parameter group**:
-The optimizer's unit for one stored tensor, holding its learning rate; a stored tensor without one takes no updates (`shN` at L = 0, `times` and `velocities` with a single timestamp). §1.3 Optimizer and learning rates, D-71, U-26
+The optimizer's unit for one stored tensor, holding its learning rate and Adam settings; one per stored tensor that takes updates. §1.3 Optimizer and learning rates, D-71
 _Avoid_: param group, optimizer group
 
 **Learning-rate schedule**:
@@ -209,7 +209,7 @@ Adam's per-tensor count of the steps it has taken, which sets the bias correctio
 _Avoid_: step (unqualified), iteration (that is it), Adam iteration
 
 **Moment reset**:
-Zeroing the Adam moments of chosen rows while keeping each tensor's step counter, done to every relocation target and every overwritten row. D-16
+Zeroing the Adam moments of chosen rows while keeping each tensor's step counter, done to every target and every moved copy at a relocation. D-16
 _Avoid_: optimizer reset, state reset, opacity reset (a different operation, in the "w/o periodic relocation" ablation)
 
 **Selective Adam**:

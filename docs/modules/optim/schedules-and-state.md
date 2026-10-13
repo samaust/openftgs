@@ -1,6 +1,6 @@
 # Learning-rate schedules and optimizer state in `openftgs.optim`
 
-How `openftgs.optim` meets its §2.1 row for E12 and E13: the parameter groups, the learning-rate schedules, the three Adam kinds of D-53, the moment reset and resize that growth and relocation call, and the optimizer's share of the checkpoint (§2.2). The two keyword parameters §2.1 lacks are the owner's answers recorded in `docs/clean-room/questions.md` (Q-44); the behaviour at the edges and the state layout are provisional rows (Q-45, Q-46).
+How `openftgs.optim` meets its §2.1 row for E12 and E13: the parameter groups, the learning-rate schedules, the three Adam kinds of D-53, the moment reset and resize that growth and relocation call, and the optimizer's share of the checkpoint (§2.2). The two keyword parameters §2.1 lacks are the owner's answers recorded in `docs/clean-room/questions.md` (Q-44); the behaviour at the edges and the state layout are provisional rows (Q-45, Q-46), and how U-31 measures its tolerances is the owner's answer in Q-47.
 
 ## Parameter groups
 
@@ -13,15 +13,15 @@ How `openftgs.optim` meets its §2.1 row for E12 and E13: the parameter groups, 
 
 ## Learning-rate schedules
 
-The base rates are the §1.5 values from `OptimConfig`, with the position rate scaled by S and the velocity rate by S/Δt_f (D-19, D-27), held as Python floats. `set_iteration` turns the iteration into training progress as D-41 defines it and evaluates each schedule in the form its equation is written: E13's exponential form for `means` and `times` (D-20), E12's product form for `velocities`, constants for the rest. It writes plain floats into the groups, so neither it nor `step` synchronizes with the host (§2.4 rule 3, D-49). It accepts only the iterations D-41 counts, and with a one-iteration run training progress is 0 (Q-45). `build_optimizer` applies the first iteration's rates. The active SH degree, also in E13, is the trainer's (M10).
+The base rates are the §1.5 values from `OptimConfig`, scaled as §1.3's rate table says (D-19, D-27) and held as Python floats. `set_iteration` turns the iteration into training progress as D-41 defines it and evaluates each schedule in the form its equation is written: E13's exponential form for `means` and `times` (D-20), E12's product form for `velocities`, constants for the rest. It writes plain floats into the groups, so neither it nor `step` synchronizes with the host (§2.4 rule 3, D-49). It accepts only the iterations D-41 counts, and with a one-iteration run training progress is 0 (Q-45). `build_optimizer` applies the first iteration's rates. The active SH degree, also in E13, is the trainer's (M10).
 
 ## The three Adam kinds
 
 D-53 names the kinds, which `PerfConfig.adam` selects and the trainer passes to `build_optimizer` (Q-44):
 
-- **fused**, the default: PyTorch's fused Adam. If PyTorch refuses it for the parameters' device or dtype, the optimizer warns and uses foreach (Q-45).
+- **fused**, the default: PyTorch's fused Adam. PyTorch checks whether it supports a device and dtype only at the step that creates the Adam state, which the optimizer creates itself, so the build probes each device and dtype with a one-element step; where the probe fails, the optimizer warns and uses foreach (Q-45).
 - **foreach**: PyTorch's multi-tensor Adam.
-- **selective**: gsplat's Selective Adam, an approximate option. It needs CUDA, and `step` takes the visible rows as a bool mask (Q-44). gsplat's kernel never advances the step counter, so the optimizer advances it itself and the counter always counts the steps taken; a resume under another kind then applies the right bias correction (Q-45).
+- **selective**: gsplat's Selective Adam, an approximate option. It needs CUDA, and `step` takes the visible rows as a bool mask (Q-44). gsplat's kernel never advances the step counter, so the optimizer advances it itself and the counter always counts the steps taken; a resume under another kind then applies the right bias correction (Q-45). The kernel takes its hyperparameters as float32, which is why U-31's float64 reference is fed the float32 values (Q-47).
 
 ## State, moment reset and resize
 
@@ -30,7 +30,7 @@ The Adam moments and step counters are created when the optimizer is built, zero
 - **Moment reset.** `reset_rows` zeroes the Adam moments of the rows it is given, as indices that may repeat (relocation draws targets with replacement), and keeps each step counter (D-16).
 - **Resize.** The model replaces its parameters when it resizes, so the optimizer follows it: the caller resizes the model first, then calls the optimizer's `resize_` with the same keep mask (Q-23) and the number of appended rows. The kept rows' moments stay in order, new rows start with zero moments (D-45), each group is rebound to the model's new parameter, and the step counters are kept. A row count that doesn't match the model is rejected before anything changes (Q-44).
 
-Validation reads only dtypes, shapes and devices, never values, so none of these calls synchronizes.
+Validation reads only dtypes, shapes and devices, never values, so `set_iteration`, `step`, `zero_grad` and a moment reset never synchronize (§2.4 rule 3). A resize with a keep mask does: gathering the kept rows needs their count on the host. It runs only at events, where D-49 allows the selection of kept rows to synchronize.
 
 ## The checkpoint's optimizer files
 
