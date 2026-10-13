@@ -1,6 +1,6 @@
 # Learning-rate schedules and optimizer state in `openftgs.optim`
 
-How `openftgs.optim` meets its §2.1 row for E12 and E13: the parameter groups, the learning-rate schedules, the three Adam kinds of D-53, the moment reset and resize that growth and relocation call, and the optimizer's share of the checkpoint (§2.2). The two keyword parameters §2.1 lacks are the owner's answers recorded in `docs/clean-room/questions.md` (Q-44); the behaviour at the edges and the state layout are provisional rows (Q-45, Q-46), and how U-31 measures its tolerances is the owner's answer in Q-47.
+How `openftgs.optim` meets its §2.1 row for E12 and E13: the parameter groups, the learning-rate schedules, the three Adam kinds of D-53, the moment reset and resize that growth and relocation call, and the optimizer's share of the checkpoint (§2.2). The two keyword parameters §2.1 lacks are the owner's answers recorded in `docs/clean-room/questions.md` (Q-44); the behaviour at the edges and the state layout are rows the owner confirmed (Q-45, Q-46), and how U-31 measures its tolerances is the owner's answer in Q-47.
 
 ## Parameter groups
 
