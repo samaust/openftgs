@@ -343,6 +343,18 @@ class FreeTimeGaussians(torch.nn.Module):
     def _set_params(self, params: Mapping[str, Tensor]) -> None:
         """Check the §1.1 validity rules, then register the nine tensors as parameters, sharing
         their storage."""
+        self._check_params(params)
+        for name in self.PARAM_NAMES:
+            setattr(self, name, torch.nn.Parameter(params[name].detach()))
+
+    # Q-55: public, so that a writer that works in place (relocation) can check §1.1's rules.
+    def validate(self) -> None:
+        """Check the §1.1 validity rules on the current parameters; ValueError if one fails.
+        Reads values, so it synchronizes on a GPU (events allow it, §2.4 rule 3)."""
+        self._check_params({name: getattr(self, name).detach() for name in self.PARAM_NAMES})
+
+    def _check_params(self, params: Mapping[str, Tensor]) -> None:
+        """The §1.1 validity rules, shared by the constructor, resize_ and validate (Q-55)."""
         if set(params) != set(self.PARAM_NAMES):
             _fail(f"params must hold exactly {self.PARAM_NAMES}, got {sorted(params)}")
         n = int(params["means"].shape[0]) if params["means"].dim() == 2 else -1
@@ -377,8 +389,6 @@ class FreeTimeGaussians(torch.nn.Module):
             bool(params["times"].any()) or bool(params["velocities"].any())
         ):
             _fail("with a single timestamp (T_τ = 0), times and velocities must be 0 (§1.4)")
-        for name in self.PARAM_NAMES:
-            setattr(self, name, torch.nn.Parameter(params[name].detach()))
 
     @property
     def num_gaussians(self) -> int:

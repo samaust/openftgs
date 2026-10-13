@@ -1003,3 +1003,48 @@ def test_canonical_rotation_has_no_negative_zeros() -> None:
     rotation = model.to_exchange().arrays["rotation"]
     assert torch.equal(rotation, torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 4))
     assert not bool(torch.signbit(rotation).any())
+
+
+# validate (§1.1 validity rules after an in-place write; Q-55)
+
+
+def test_validate_passes_on_a_valid_model() -> None:
+    """Q-55: validate() returns quietly on a model that meets §1.1's validity rules, and changes
+    nothing."""
+    model = _model(n=5)
+    before = _rows(model)
+    model.validate()
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
+
+
+@pytest.mark.parametrize(
+    ("name", "row", "value"),
+    [
+        ("means", 2, math.nan),
+        ("log_scales", 0, math.inf),
+        ("sh0", 4, -math.inf),
+        ("quats", 1, 0.0),
+    ],
+)
+def test_validate_rejects_parameters_written_in_place(name: str, row: int, value: float) -> None:
+    """§1.1 validity rules, checked after every relocation (Q-55): a non-finite value written in
+    place, or a quaternion whose norm is no longer > 1e-8, is a ValueError (Q-26)."""
+    model = _model(n=5)
+    with torch.no_grad():
+        getattr(model, name)[row] = value
+    with pytest.raises(ValueError):
+        model.validate()
+
+
+def test_validate_checks_the_single_timestamp_rule() -> None:
+    """D-71: with T_τ = 0, a time center written in place away from 0 fails validate() (Q-55)."""
+    params = _params(n=3, sh_degree=0, seed=7)
+    params["times"] = torch.zeros(3)
+    params["velocities"] = torch.zeros(3, 3)
+    model = FreeTimeGaussians(params, sh_degree=0, time=TimeNormalizer(4.0, 4.0))
+    model.validate()
+    with torch.no_grad():
+        model.times[1] = 0.25
+    with pytest.raises(ValueError, match="T_τ = 0"):
+        model.validate()
