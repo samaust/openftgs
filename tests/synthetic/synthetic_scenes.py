@@ -471,7 +471,8 @@ def train(
 
 def assert_rows_matched(logs: Sequence[StepLog], n: int) -> None:
     """Q-80: one-to-one matching by row holds, since N never changed and no relocation event
-    found a dead row to move."""
+    moved a row. A report of 0 dead rows also covers relocation's no-op when every row is dead
+    (§1.3), which the scenes' recovery criteria would fail anyway."""
     assert all(log.num_gaussians == n for log in logs)
     assert all(log.relocation is None or log.relocation.dead == 0 for log in logs)
 
