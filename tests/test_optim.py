@@ -8,6 +8,7 @@ selective Adam from D-53's description (moments decayed, no bias correction). "R
 is the per-tensor relative L2 error (Q-47, owner answer).
 """
 
+import copy
 import math
 from pathlib import Path
 from typing import Literal
@@ -617,3 +618,41 @@ def test_fused_supported_false_falls_back_to_foreach_with_a_warning(
             random_model(4).to("cuda"), OptimConfig(), spatial_scale=S, frame_dt=DT
         )
     assert opt.state_dict()["means"]["step"].device.type == "cpu"
+
+
+@pytest.mark.gpu
+def test_selective_state_resumes_under_fused_adam_with_its_step_count() -> None:
+    # Q-45: under selective Adam the optimizer counts the steps taken, so a resume under fused
+    # Adam applies the bias correction for that count: its next step is Adam's update (§1.3,
+    # Kingma and Ba) with t = k + 1 on the loaded moments, here in float64.
+    n, k = 64, 5
+    cfg = OptimConfig()
+    model = random_model(n).to("cuda")
+    selective = build_optimizer(model, cfg, spatial_scale=S, frame_dt=DT, adam="selective")
+    visibility = torch.ones(n, dtype=torch.bool, device="cuda")
+    iterate(
+        model, selective, range(1, k + 1), torch.Generator().manual_seed(19), visibility=visibility
+    )
+    saved = selective.state_dict()
+
+    resumed = copy.deepcopy(model)
+    fused = build_optimizer(resumed, cfg, spatial_scale=S, frame_dt=DT, adam="fused")
+    fused.load_state_dict(saved)
+    loaded = fused.state_dict()
+    beta1, beta2 = cfg.betas
+    set_grads(resumed, torch.Generator().manual_seed(23))
+    rates = fused.set_iteration(k + 1)
+    expected = {}
+    for name in PARAM_NAMES:
+        assert float(loaded[name]["step"]) == k
+        assert loaded[name]["step"].device.type == "cuda"  # fused keeps it on the device
+        g = getattr(resumed, name).grad.double().cpu()
+        m = beta1 * saved[name]["exp_avg"].double().cpu() + (1 - beta1) * g
+        v = beta2 * saved[name]["exp_avg_sq"].double().cpu() + (1 - beta2) * g * g
+        m_hat, v_hat = m / (1 - beta1 ** (k + 1)), v / (1 - beta2 ** (k + 1))
+        p = getattr(resumed, name).detach().double().cpu()
+        expected[name] = p - rates[name] * m_hat / (v_hat.sqrt() + cfg.eps)
+    fused.step()
+    for name in PARAM_NAMES:
+        assert_relative_l2(getattr(resumed, name).detach().double().cpu(), expected[name], 1e-6)
+        assert float(fused.state_dict()[name]["step"]) == k + 1
