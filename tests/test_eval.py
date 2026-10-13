@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """E16's metrics in openftgs.eval: U-23 and the added tests of PRD #74 (D-29, D-40, D-52, D-64,
-D-67 to D-69; Q-60 to Q-63).
+D-67 to D-69; Q-60 to Q-63), and the evaluation of a model on a scene's images (Q-68).
 
 Expected values are worked by hand (PSNR at a known MSE, SSIM_k of constant images in closed
 form, crops built pixel by pixel) or come from torchmetrics' LPIPS, an oracle reached through
@@ -10,14 +10,17 @@ another library's code path to the same published weights (§2.3).
 import json
 import math
 import warnings
+from pathlib import Path
 from typing import Any, Literal
 
 import pytest
 import torch
+from builders import random_model, ring, write_scene
 from torch import Tensor
 
 import openftgs.eval
 import openftgs.losses
+from openftgs.data import MultiViewVideo
 from openftgs.eval import (
     METRIC_NAMES,
     Evaluator,
@@ -25,11 +28,14 @@ from openftgs.eval import (
     average_metrics,
     dssim_k,
     dynamic_region,
+    evaluate_images,
     lpips_backbone,
     metrics_report,
     psnr,
     ssim_k,
 )
+from openftgs.render import render_request
+from openftgs.types import RenderItem, RenderRequest, TimeNormalizer
 
 F32 = torch.float32
 F64 = torch.float64
@@ -56,6 +62,7 @@ def test_public_api() -> None:
         "average_metrics",
         "dssim_k",
         "dynamic_region",
+        "evaluate_images",
         "lpips_backbone",
         "metrics_report",
         "psnr",
@@ -618,3 +625,56 @@ def test_evaluator_runs_lpips_without_tf32_and_restores_the_flag(
     finally:
         torch.backends.cudnn.allow_tf32 = before
     assert sorted(seen) == [(False, False), (False, True), (False, True)]
+
+
+# Evaluating a model on a scene's images (Q-68).
+
+
+def _scene_for_evaluation(root: Path) -> MultiViewVideo:
+    """Three 64×48 ring cameras over τ ∈ [0, 0.2]: ring00 trains; ring01 and ring02 are test
+    views, two of them sharing τ = 0.1, with masks whose left half is dynamic (32 px wide, so
+    every metric is defined on the region, Q-61)."""
+    cams = ring(3, width_px=64, height_px=48, focal=60.0)
+    gt = random_model(12, seed=0, sh_degree=1, time=TimeNormalizer(0.0, 0.2), spread=0.5)
+    views = [(cams[0], tau, "train") for tau in (0.0, 0.1, 0.2)]
+    views += [(cams[1], 0.0, "test"), (cams[2], 0.1, "test"), (cams[1], 0.1, "test")]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, views, mask_tests=True))
+
+
+@pytest.mark.weights
+def test_evaluate_images_are_the_evaluator_on_render_request_images(
+    tmp_path: Path, evaluator: Evaluator
+) -> None:
+    """Q-68: each test image's metrics are the Evaluator's on render_request's image of that
+    record, with the image's mask; results come in manifest order, with the record's camera,
+    raw timestamp, frame index and path relative to the manifest."""
+    video = _scene_for_evaluation(tmp_path)
+    model = random_model(12, seed=1, sh_degree=1, time=video.time, spread=0.5)
+    results = evaluate_images(model, video, evaluator, backend="reference")
+    tests = [i for i, record in enumerate(video.records) if record.split == "test"]
+    assert [(m.camera, m.timestamp, m.frame_index, m.path) for m in results] == [
+        ("ring01", 0.0, 3, "images/ring01/000003.png"),
+        ("ring02", 0.1, 4, "images/ring02/000004.png"),
+        ("ring01", 0.1, 5, "images/ring01/000005.png"),
+    ]
+    items = tuple(
+        RenderItem(str(i), video.records[i].timestamp, video.records[i].camera) for i in tests
+    )
+    renders = render_request(model, RenderRequest(items, time_unit="s"), backend="reference")
+    for metrics, i in zip(results, tests, strict=True):
+        mask = video.load_mask(i)
+        entire, dynamic = evaluator(renders.rgb[str(i)], video.load_image(i), mask=mask)
+        assert metrics.masked and dynamic is not None
+        assert metrics.entire == entire and metrics.dynamic == dynamic
+
+
+@pytest.mark.weights
+def test_evaluate_images_of_the_training_split(tmp_path: Path, evaluator: Evaluator) -> None:
+    """Q-68: any data split; an empty one is a ValueError."""
+    video = _scene_for_evaluation(tmp_path)
+    model = random_model(12, seed=1, sh_degree=1, time=video.time, spread=0.5)
+    results = evaluate_images(model, video, evaluator, split="train", backend="reference")
+    assert [m.timestamp for m in results] == [0.0, 0.1, 0.2]
+    assert not any(m.masked for m in results)
+    with pytest.raises(ValueError, match="split"):
+        evaluate_images(model, video, evaluator, split="val", backend="reference")

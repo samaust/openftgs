@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PSNR, SSIM_k, DSSIM_k, LPIPS-Alex and LPIPS-VGG, the dynamic-region crop and mask, and the
-metrics report that `ftgs eval` writes.
+"""PSNR, SSIM_k, DSSIM_k, LPIPS-Alex and LPIPS-VGG, the dynamic-region crop and mask, the
+evaluation of a model on a scene's images, and the metrics report that `ftgs eval` writes.
 
-Spec: E16, App. B.1, D-29, D-52, D-64, D-67, D-68, D-69. Band: Orchestration (§2.1).
+Spec: E16, App. B.1, D-29, D-52, D-55, D-64, D-67, D-68, D-69. Band: Orchestration (§2.1).
 """
 
 import contextlib
@@ -15,7 +15,11 @@ from typing import Any, Literal
 import torch
 from torch import Tensor
 
+from openftgs.data import MultiViewVideo
 from openftgs.losses import LPIPSLoss, ssim
+from openftgs.model import FreeTimeGaussians
+from openftgs.render import render_request
+from openftgs.types import RenderItem, RenderRequest
 
 __all__ = [
     "METRIC_NAMES",
@@ -24,6 +28,7 @@ __all__ = [
     "average_metrics",
     "dssim_k",
     "dynamic_region",
+    "evaluate_images",
     "lpips_backbone",
     "metrics_report",
     "psnr",
@@ -236,6 +241,49 @@ class ImageMetrics:
     entire: Mapping[str, float]  # the eight METRIC_NAMES values
     dynamic: Mapping[str, float] | None  # None without a usable dynamic region (Q-61)
     masked: bool  # the image carries a dynamic-region mask
+
+
+# Q-68: the images of one data split, rendered through render_request (Q-57's shared path).
+def evaluate_images(
+    model: FreeTimeGaussians,
+    dataset: MultiViewVideo,
+    evaluator: Evaluator,
+    *,
+    split: str = "test",
+    backend: Literal["gsplat", "reference"] = "gsplat",
+    background: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> list[ImageMetrics]:
+    """The metrics of every image of one data split (E16, D-67): each record rendered at its
+    raw timestamp with the model's full SH degree and `background`, through `render_request`
+    one timestamp at a time, so cameras that share a time render together (D-55) and one
+    time's renders are held at once, then evaluated by `evaluator` with the image's mask.
+    Results come in the manifest's order."""
+    indices = [i for i, record in enumerate(dataset.records) if record.split == split]
+    if not indices:
+        raise ValueError(f"the data split {split!r} holds no images")
+    groups: dict[float, list[int]] = {}
+    for i in indices:
+        groups.setdefault(dataset.records[i].timestamp, []).append(i)
+    root = dataset.manifest.path.parent
+    results: dict[int, ImageMetrics] = {}
+    for timestamp, group in groups.items():
+        items = tuple(RenderItem(str(i), timestamp, dataset.records[i].camera) for i in group)
+        request = RenderRequest(items, time_unit=dataset.manifest.time_unit, background=background)
+        renders = render_request(model, request, backend=backend)
+        for i in group:
+            record = dataset.records[i]
+            mask = dataset.load_mask(i)
+            entire, dynamic = evaluator(renders.rgb[str(i)], dataset.load_image(i), mask=mask)
+            results[i] = ImageMetrics(
+                camera=record.camera.name,
+                timestamp=record.timestamp,
+                frame_index=record.frame_index,
+                path=record.image_path.relative_to(root).as_posix(),
+                entire=entire,
+                dynamic=dynamic,
+                masked=mask is not None,
+            )
+    return [results[i] for i in indices]
 
 
 _REPORT = "ftgs-metrics"  # Q-63

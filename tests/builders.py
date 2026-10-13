@@ -1,20 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared test scenes for the test suite (forward note on PRD #20): random models and cameras,
-the hand-built render scenes and U-8's scenes that both render backends' tests use, and U-4's
-change of time unit.
+the hand-built render scenes and U-8's scenes that both render backends' tests use, U-4's
+change of time unit, and scenes written to disk as a scene manifest with its images, with the
+shortened calendars of §3.2 (PRD #84, shared with M11).
 
 Each test file still writes out its own `PARAM_NAMES` from §1.1: that tuple is the tests'
 independent expectation, not a duplicate to share.
 """
 
+import dataclasses
+import json
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image
 from torch import Tensor
 
+from openftgs.config import TrainConfig
 from openftgs.model import FreeTimeGaussians
+from openftgs.render import render
 from openftgs.types import Camera, ExchangeModel, TimeNormalizer
 
 UNIT_TIME = TimeNormalizer(0.0, 1.0)
@@ -290,4 +297,96 @@ def rescaled_time_unit(exchange: ExchangeModel, a: float, b: float) -> ExchangeM
         tau1=a * exchange.tau1 + b,
         time_unit=exchange.time_unit,
         producer=exchange.producer,
+    )
+
+
+# Scenes on disk (§2.2 scene manifest) and the shortened calendars of §3.2.
+
+
+def _camera_json(camera: Camera) -> dict[str, Any]:
+    return {
+        "width": camera.width,
+        "height": camera.height,
+        "model": "pinhole",
+        "K": camera.K.tolist(),
+        "world_to_camera": camera.world_to_camera.tolist(),
+    }
+
+
+def write_scene(
+    root: Path,
+    model: FreeTimeGaussians,
+    views: Sequence[tuple[Camera, float, str]],
+    *,
+    mask_tests: bool = False,
+    time_unit: str = "s",
+    metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """A scene manifest and its images in `root`, returning the manifest's path. Each view, a
+    (camera, raw τ, data split) triple, is rendered from `model` with the reference backend at
+    that τ, clamped to [0, 1] and rounded to an 8-bit RGB PNG. Cameras are keyed by name, so the
+    views of one camera share it. With `mask_tests`, each test image gets an 8-bit mask whose
+    left half is dynamic."""
+    root.mkdir(parents=True, exist_ok=True)
+    cameras: dict[str, dict[str, Any]] = {}
+    images: list[dict[str, Any]] = []
+    for k, (camera, tau, split) in enumerate(views):
+        cameras.setdefault(camera.name, _camera_json(camera))
+        with torch.no_grad():
+            rgb = render(model, camera, tau, backend="reference").image[0]
+        pixels = (rgb.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).numpy()
+        entry: dict[str, Any] = {
+            "camera": camera.name,
+            "timestamp": tau,
+            "frame_index": k,
+            "path": f"images/{camera.name}/{k:06d}.png",
+            "split": split,
+        }
+        target = root / entry["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(pixels, "RGB").save(target)
+        if mask_tests and split == "test":
+            mask = torch.zeros(camera.height, camera.width, dtype=torch.uint8)
+            mask[:, : camera.width // 2] = 255
+            entry["mask"] = f"masks/{camera.name}/{k:06d}.png"
+            (root / entry["mask"]).parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(mask.numpy(), "L").save(root / entry["mask"])
+        images.append(entry)
+    manifest = {
+        "format": "ftgs-scene",
+        "version": 1,
+        "time_unit": time_unit,
+        "cameras": cameras,
+        "images": images,
+        "metadata": dict(metadata or {"source": "synthetic"}),
+    }
+    path = root / "scene.json"
+    path.write_text(json.dumps(manifest, indent=1))
+    return path
+
+
+def shortened_config(iterations: int, base: TrainConfig | None = None) -> TrainConfig:
+    """§3.2 shared setup: `base` (default TrainConfig()) with T_it = `iterations` and every
+    iteration count of its calendar (the growth and relocation windows, the event period and
+    the SH interval, given for T_it = 30,000) multiplied by T_it/30,000 and rounded, half up
+    (Q-75), with a minimum of 1."""
+    cfg = TrainConfig() if base is None else base
+
+    def scaled(count: int) -> int:
+        return max(1, math.floor(count * iterations / 30_000 + 0.5))  # Q-75
+
+    return dataclasses.replace(
+        cfg,
+        growth=dataclasses.replace(
+            cfg.growth, start=scaled(cfg.growth.start), stop=scaled(cfg.growth.stop)
+        ),
+        reloc=dataclasses.replace(
+            cfg.reloc,
+            every=scaled(cfg.reloc.every),
+            start=scaled(cfg.reloc.start),
+            stop=scaled(cfg.reloc.stop),
+        ),
+        optim=dataclasses.replace(
+            cfg.optim, iterations=iterations, sh_interval=scaled(cfg.optim.sh_interval)
+        ),
     )
