@@ -319,23 +319,58 @@ def _gt_clutter(seed: int, gt: ExchangeModel) -> ExchangeModel:
     return exchange(arrays, tau0=gt.tau0, tau1=gt.tau1, degree=0)
 
 
+CLUSTER_SIZE = 3  # Q-83: each S-2 object and two companions
+CLUSTER_OFFSET = 1.5  # Q-83: companions this many of the object's largest scales away
+CLUSTER_SCALE = 0.8  # Q-83: a companion's scales, as a fraction of the object's
+
+
+def _gt_s6(seed: int, gt: ExchangeModel) -> ExchangeModel:
+    """S-6's under-fitted ground truth (Q-83): each of S-2's 8 objects followed by two companions
+    that share its motion, time, duration, rotation and opacity, offset in a uniform random
+    direction by CLUSTER_OFFSET × its largest scale, with CLUSTER_SCALE × its scales and a
+    random color. At focal length 56 px and radius 0.93 a scale of 0.035 is about 2 px, so a
+    cluster spans a few pixels that one primitive can't fit: a capacity deficit relocation can
+    fill."""
+    g = torch.Generator().manual_seed(seed)
+    a = gt.arrays
+    drawn: list[dict[str, Tensor]] = []
+    for i in range(a["position"].shape[0]):
+        base = {k: v[i].to(F64) for k, v in a.items()}
+        drawn.append(base)
+        for _ in range(CLUSTER_SIZE - 1):
+            d = torch.randn(3, generator=g, dtype=F64)
+            d = d / torch.linalg.vector_norm(d)
+            companion = dict(base)
+            companion["position"] = base["position"] + d * CLUSTER_OFFSET * float(
+                base["scale"].max()
+            )
+            companion["scale"] = base["scale"] * CLUSTER_SCALE
+            companion["sh"] = sh_of(_uniform(g, 0.2, 0.9, 3))[0]
+            drawn.append(companion)
+    arrays = {k: torch.stack([row[k] for row in drawn]) for k in drawn[0]}
+    return exchange(arrays, tau0=gt.tau0, tau1=gt.tau1, degree=0)
+
+
 GROUND_TRUTH_FILES = {
     "s1": "s1_gt.safetensors",
     "s2": "s2_gt.safetensors",
     "s3": "s3_gt.safetensors",
     "s5": "s5_gt.safetensors",
+    "s6": "s6_gt.safetensors",
 }
 
 
 def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, ExchangeModel]:
-    """The ground truth of S-1, S-2, S-3 and S-5 from the committed seeds: S-5's is S-2's 8
-    Gaussians (its first rows) followed by 2,000 small ones (Q-78); S-6 to S-8 reuse S-2's."""
+    """The ground truth of S-1, S-2, S-3, S-5 and S-6 from the committed seeds: S-5's is S-2's 8
+    Gaussians (its first rows) followed by 2,000 small ones (Q-78); S-6's is S-2's objects as
+    clusters of three (Q-83); S-7 and S-8 reuse S-2's."""
     s2 = _gt_s2(seeds["s2"]["ground_truth"])
     return {
         "s1": _gt_s1(seeds["s1"]["ground_truth"]),
         "s2": s2,
         "s3": _gt_s3(seeds["s3"]["ground_truth"]),
         "s5": concatenated(s2, _gt_clutter(seeds["s5"]["clutter"], s2)),
+        "s6": _gt_s6(seeds["s6"]["ground_truth"], s2),
     }
 
 

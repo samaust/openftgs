@@ -4,8 +4,10 @@
 Each scene trains from an initial model derived from committed ground truth and checks what was
 recovered against §3.2's pass criteria, on the CPU with the reference backend and on the GPU with
 gsplat (S-5 on the GPU only, Q-78). The setup choices §3.2 leaves open are Q-77 to Q-79, the
-measures Q-80. Every test records its measured values with `record_property`, for the
-Calibration data table of docs/clean-room/questions.md; no criterion is loosened there.
+measures Q-80; S-1, S-5 and S-6 depart from §3.2's rows where the owner decided (Q-81, Q-78,
+Q-83), and S-5's PSNR criterion stays verbatim under a strict xfail (Q-78). Every test records
+its measured values with `record_property`, for the Calibration data table of
+docs/clean-room/questions.md; no criterion is loosened there.
 """
 
 import dataclasses
@@ -358,33 +360,99 @@ def test_s3_recovers_time_centers_and_durations(
     assert held_out >= 33.0
 
 
-@pytest.mark.gpu
-def test_s5_regularization_keeps_fewer_primitives_opaque(
-    tmp_path: Path, record_property: Record
-) -> None:
-    """S-5 (GPU only, Q-78): S-2 plus 2,000 small random Gaussians in the ground truth, every row
-    initialized at its true point with opacity 0.1 (D-5, Q-78, Q-79; S-2's 8 objects as in S-2,
-    with v = 0), trained with λ_reg = 0 and 10⁻², growth "gradient" (N_max = 10,000): at the end
-    the share of primitives with σ > 0.9 is lower with regularization, and the final held-out
-    PSNR is not lower by more than 0.5 dB."""
+@dataclasses.dataclass(frozen=True)
+class _S5Runs:
+    opaque: dict[str, int]  # rows with σ > 0.9 at the end, per run
+    opaque_true: dict[str, int]  # of those, rows whose ground truth has σ > 0.9 (by row index)
+    truth_opaque: int  # ground-truth rows with σ > 0.9
+    rows: int
+    reg_term_last: float  # the regularized run's L_reg at its last iteration
+    reg_term_reported: bool  # every iteration of the regularized run reported L_reg
+    psnr: dict[str, float]
+
+
+@functools.cache
+def _s5_runs() -> _S5Runs:
+    """S-5's two runs on the GPU (Q-78): the ground truth's 2,008 rows each start at their true
+    point with opacity 0.1, growth "none" so rows stay one per ground-truth Gaussian, relocation
+    at its default, λ_reg = 0 and 10⁻²."""
     device = "cuda"
-    gt, video, taus = _s2_scene(tmp_path, device, "s5")
-    objects = _s2_init(rows(gt, slice(0, 8)), load_seeds()["s2"]["init_frames"], taus)
-    init = concatenated(objects, with_degree(rows(gt, slice(8, None)), 3))
-    init = replaced(init, opacity=torch.full_like(init.arrays["opacity"], 0.1))
-    growth = GrowthConfig(n_max=10_000)  # mode "gradient" (Q-78)
-    results: dict[str, float] = {}
-    for name, lambda_reg in (("no_reg", 0.0), ("reg", 1e-2)):
-        loss = LossConfig(lambda_reg=lambda_reg)
-        cfg = synthetic_config(S2_ITERATIONS, TrainConfig(loss=loss, growth=growth))
-        trainer, _ = _train(cfg, video, init, device)
-        opacity = physical(trainer.model)["opacity"]
-        results[f"{name}_opaque_share"] = float((opacity > 0.9).to(torch.float64).mean())
-        results[f"{name}_count"] = float(opacity.shape[0])
-        results[f"{name}_held_out_psnr"] = _held_out_psnr(trainer, video)
-    _record(record_property, f"s5_{device}", results)
-    assert results["reg_opaque_share"] < results["no_reg_opaque_share"]
-    assert results["reg_held_out_psnr"] >= results["no_reg_held_out_psnr"] - 0.5
+    with tempfile.TemporaryDirectory() as root:
+        gt, video, taus = _s2_scene(Path(root), device, "s5")
+        objects = _s2_init(rows(gt, slice(0, 8)), load_seeds()["s2"]["init_frames"], taus)
+        init = concatenated(objects, with_degree(rows(gt, slice(8, None)), 3))
+        init = replaced(init, opacity=torch.full_like(init.arrays["opacity"], 0.1))
+        truth_high = gt.arrays["opacity"] > 0.9
+        opaque: dict[str, int] = {}
+        opaque_true: dict[str, int] = {}
+        psnr: dict[str, float] = {}
+        reported = False
+        last = 0.0
+        for name, lambda_reg in (("no_reg", 0.0), ("reg", 1e-2)):
+            loss = LossConfig(lambda_reg=lambda_reg)
+            base = TrainConfig(loss=loss, growth=GrowthConfig(mode="none"))  # Q-78
+            trainer, logs = _train(synthetic_config(S2_ITERATIONS, base), video, init, device)
+            high = physical(trainer.model)["opacity"] > 0.9
+            opaque[name] = int(high.sum())
+            opaque_true[name] = int((high & truth_high).sum())
+            psnr[name] = _held_out_psnr(trainer, video)
+            if lambda_reg > 0.0:
+                reported = all("reg" in log.losses for log in logs)
+                last = float(logs[-1].losses["reg"]) if reported else 0.0
+        return _S5Runs(
+            opaque=opaque,
+            opaque_true=opaque_true,
+            truth_opaque=int(truth_high.sum()),
+            rows=int(gt.arrays["opacity"].shape[0]),
+            reg_term_last=last,
+            reg_term_reported=reported,
+            psnr=psnr,
+        )
+
+
+@pytest.mark.gpu
+def test_s5_regularization_keeps_fewer_primitives_opaque(record_property: Record) -> None:
+    """S-5 (GPU only, Q-78): S-2 plus 2,000 small random Gaussians in the ground truth, every row
+    initialized at its true point with opacity 0.1 (D-5, Q-79), growth "none" (Q-78), trained
+    with λ_reg = 0 and 10⁻²: at the end the share of primitives with σ > 0.9 is lower with
+    regularization (the same N in both runs, one row per ground-truth Gaussian). The regularized
+    run reports a nonzero L_reg at every iteration, so E8 entered its loss."""
+    runs = _s5_runs()
+    _record(
+        record_property,
+        "s5_cuda",
+        {
+            "no_reg_opaque": float(runs.opaque["no_reg"]),
+            "reg_opaque": float(runs.opaque["reg"]),
+            "no_reg_opaque_true": float(runs.opaque_true["no_reg"]),
+            "reg_opaque_true": float(runs.opaque_true["reg"]),
+            "truth_opaque": float(runs.truth_opaque),
+            "rows": float(runs.rows),
+            "reg_term_last": runs.reg_term_last,
+        },
+    )
+    assert runs.reg_term_reported and runs.reg_term_last > 0.0
+    assert runs.opaque["reg"] / runs.rows < runs.opaque["no_reg"] / runs.rows
+
+
+@pytest.mark.gpu
+@pytest.mark.xfail(  # Q-78
+    strict=True,
+    raises=AssertionError,
+    reason="Q-78: with growth off, E8 costs about 7 dB on sub-pixel opaque Gaussians under Adam "
+    "(σ slides down the σ·c direction, Q-81); recorded in the Calibration data table, pending "
+    "a spec decision",
+)
+def test_s5_regularization_costs_at_most_half_a_db(record_property: Record) -> None:
+    """S-5: final PSNR with regularization not lower than without by more than 0.5 dB. Kept as
+    §3.2 states it under a strict xfail (Q-78), so the cost is recorded and a pass is loud."""
+    runs = _s5_runs()
+    _record(
+        record_property,
+        "s5_cuda",
+        {"no_reg_held_out_psnr": runs.psnr["no_reg"], "reg_held_out_psnr": runs.psnr["reg"]},
+    )
+    assert runs.psnr["reg"] >= runs.psnr["no_reg"] - 0.5
 
 
 # D-14: a row is dead when its float32 opacity logit lies below the float32 logit of 0.005.
@@ -403,12 +471,16 @@ class _S6Runs:
 
 @functools.cache
 def _s6_runs(device: str) -> _S6Runs:
-    """S-6's two runs on `device` (relocation on and off, Q-78), shared by its two tests."""
+    """S-6's two runs on `device` (relocation on and off), shared by its two tests: the
+    clustered ground truth (Q-83), initialized as S-2 (one live row per object, at its center)
+    plus 8 dead rows (N = 16, Q-78)."""
     with tempfile.TemporaryDirectory() as root:
-        gt, video, taus = _s2_scene(Path(root), device)
+        _, video, taus = _s2_scene(Path(root), device, "s6")
+        objects = ground_truth("s2")
         seeds = load_seeds()
-        dead = dead_rows(seeds["s6"]["dead"], gt, 8, frame_taus())
-        init = concatenated(_s2_init(gt, seeds["s2"]["init_frames"], taus), with_degree(dead, 3))
+        dead = dead_rows(seeds["s6"]["dead"], objects, 8, frame_taus())
+        live = _s2_init(objects, seeds["s2"]["init_frames"], taus)
+        init = concatenated(live, with_degree(dead, 3))
         events: list[StepLog] = []
         dead_after: list[int] = []
 
@@ -442,9 +514,10 @@ def _s6_runs(device: str) -> _S6Runs:
 def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(
     device: str, record_property: Record
 ) -> None:
-    """S-6: S-2's initialization plus as many dead primitives (σ = 10⁻³) away from the objects,
-    N = 16 (Q-78), relocation on, growth off. N stays constant; the first relocation event moves
-    all 8 dead rows (Q-82); right after each event no row is dead (Q-78)."""
+    """S-6: S-2's objects as clusters of three Gaussians (Q-83), S-2's initialization plus as
+    many dead primitives (σ = 10⁻³) away from the objects, N = 16 (Q-78), relocation on, growth
+    off. N stays constant; the first relocation event moves all 8 dead rows; right after each
+    event no row is dead (Q-78)."""
     runs = _s6_runs(device)
     _record(
         record_property,
@@ -462,15 +535,10 @@ def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.xfail(  # Q-82
-    strict=True,
-    raises=AssertionError,
-    reason="Q-82: unattainable under E10 and E11 for S-2's one-Gaussian objects; the measured "
-    "gain is recorded in the Calibration data table, pending a spec decision",
-)
 def test_s6_relocation_gains_one_db(device: str, record_property: Record) -> None:
-    """S-6: PSNR with relocation ≥ PSNR without + 1 dB (calibrated). Kept as §3.2 states it
-    under a strict xfail (Q-82), so the measurement is recorded and a pass is loud."""
+    """S-6: PSNR with relocation ≥ PSNR without + 1 dB (calibrated; the measured gain goes to
+    the Calibration data table), on the clustered ground truth whose clusters one live row
+    can't fit (Q-83)."""
     runs = _s6_runs(device)
     gain = runs.psnr_on - runs.psnr_off
     _record(
