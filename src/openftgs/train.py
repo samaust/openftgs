@@ -301,6 +301,24 @@ def _check_perf(perf: PerfConfig) -> None:
         raise NotImplementedError(f"frame_cache={perf.frame_cache!r} (D-51) comes with M12")
 
 
+def _stored_tensors(model: FreeTimeGaussians) -> dict[str, Tensor]:
+    """The model's nine stored tensors (§1.1), by name."""
+    return {name: getattr(model, name) for name in FreeTimeGaussians.PARAM_NAMES}
+
+
+def _copy_of(model: FreeTimeGaussians) -> FreeTimeGaussians:
+    """Q-69 (owner answer, #97): a copy of a passed model, made as the model copies the tensors
+    it is given, so the caller's object is never modified or moved; it keeps the model's SH
+    degree, time normalizer and time unit (Q-17). Q-76: the constructor checks §1.1, so a model
+    that breaks the validity rules is refused here."""
+    return FreeTimeGaussians(
+        _stored_tensors(model),
+        sh_degree=model.sh_degree,
+        time=model.time,
+        time_unit=model.time_unit,
+    )
+
+
 def _cpu(tree: Any) -> Any:
     """A copy of a tree of dicts with every tensor detached and cloned to the CPU."""
     if isinstance(tree, Tensor):
@@ -348,7 +366,7 @@ class Trainer:
         self._configure(cfg, dataset, device)
         time_unit = dataset.manifest.time_unit
         if isinstance(init, FreeTimeGaussians):
-            # Q-69: a model passed in is trained in place; it must belong to this run.
+            # Q-69: a model passed in must belong to this run; the trainer trains a copy.
             if init.sh_degree != cfg.sh_degree:
                 raise ValueError(f"the model's SH degree {init.sh_degree} isn't {cfg.sh_degree}")
             if init.time != dataset.time:
@@ -359,7 +377,7 @@ class Trainer:
                 raise ValueError(
                     f"the model's N = {init.num_gaussians} exceeds N_max = {cfg.growth.n_max}"
                 )
-            model = init
+            model = _copy_of(init)
         elif isinstance(init, InitPoints):
             # §1.3 steps 7–9 (D-24, D-74; Q-16), with the run's own initialization generator.
             model = FreeTimeGaussians.from_init_points(
@@ -465,6 +483,14 @@ class Trainer:
         self._window_count = 0
 
     # -- training -------------------------------------------------------------------------------
+
+    # Q-69 (owner answer, #97): read-only; load_state_dict replaces the model it returns.
+    @property
+    def model(self) -> FreeTimeGaussians:
+        """The model the trainer is training: the same object across training iterations and
+        events, which resize it in place; `load_state_dict` and `from_checkpoint` replace it with
+        the model of the loaded state."""
+        return self._run.model
 
     @property
     def iteration(self) -> int:
@@ -663,7 +689,7 @@ class Trainer:
             time=run.time,
             spatial_scale=run.spatial_scale,
             frame_dt=run.frame_dt,
-            params=_cpu({n: getattr(run.model, n) for n in FreeTimeGaussians.PARAM_NAMES}),
+            params=_cpu(_stored_tensors(run.model)),
             optim=_cpu(run.optimizer.state_dict()),
             stats=_cpu(run.stats.state_dict()),
             rng=_cpu(
