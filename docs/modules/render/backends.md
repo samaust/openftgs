@@ -75,6 +75,12 @@ The pinned gsplat cannot take a per-camera background in packed mode, so the bac
 
 A render synchronizes where gsplat reads back the number of tile intersections and, in packed mode, the number of visible pairs; with compaction, `render()`'s own selection of kept rows synchronizes too (D-57). The backend adds nothing else (§2.4 rule 3): its view matrices, the packed visibility scatter and the default background are filled on the device, never written from the host, and a GPU test checks that every synchronization torch's debug mode reports comes from gsplat. Cameras or a background held on the host are copied to the device in every render, which synchronizes, so a caller that renders repeatedly, like the trainer, keeps them on the device.
 
+## Rendering a request
+
+`render_request` answers a render request (§2.2, D-55, Q-57). Items that share a timestamp and an image size render in one `render()` call, since `render()` refuses cameras of different sizes (Q-32), and a private chunk size bounds the cameras per call without changing any image. The request's background and SH degree pass through. Its time unit must be the model's (Q-17). The whole request runs under inference mode, and the outputs are moved to the CPU in request order, so a large request doesn't hold every image on the GPU.
+
+Each call still runs the temporal slice for its time. The temporal index of D-55, and with it "activations computed once per model" (§2.4), go inside this function in M15, so its callers (the trainer's evaluation, `ftgs render`, `ftgs eval`) won't change.
+
 ## Where the backends differ
 
 Both backends implement E6 with the same culls and constants, so their images differ only by float32 rounding: gsplat's kernels are built with fast math and order their arithmetic differently. U-7 and U-12 hold the two together within the spec's tolerances. Rounding matters more at E6's discontinuities, where a last-bit difference can put a term on opposite sides of a threshold in the two backends (Q-39):
