@@ -41,8 +41,8 @@ from render_margins import (
 from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians
-from openftgs.render import render
-from openftgs.types import Camera, RenderOutput, TimeNormalizer
+from openftgs.render import render, render_request
+from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, TimeNormalizer
 
 pytestmark = pytest.mark.gpu
 
@@ -1038,3 +1038,31 @@ def test_render_synchronizes_only_inside_gsplat(packed: bool) -> None:
             if "synchronizing CUDA operation" in str(record.message)
         }
         assert all("/gsplat/" in site for site in sites), sites
+
+
+def test_render_request_on_gsplat_equals_render_per_item() -> None:
+    """§2.2, D-55, Q-57: on gsplat, cameras rendered together in one call give each item's own
+    render, within 1e-6; the outputs come back on the CPU."""
+    model = _cuda(random_model(60, seed=31, spread=0.8))
+    cams = ring(5, width_px=32, height_px=24)
+    items = tuple(
+        RenderItem(
+            f"i{k}",
+            0.4 if k < 4 else 0.6,
+            Camera(cam.K, cam.world_to_camera, cam.width, cam.height, f"i{k}"),
+        )
+        for k, cam in enumerate(cams)
+    )
+    request = RenderRequest(items=items, time_unit="s", background=(0.1, 0.2, 0.3))
+    out = render_request(model, request, backend="gsplat")
+    for item in items:
+        single = render(
+            model,
+            item.camera,
+            item.timestamp,
+            background=torch.tensor(request.background),
+            backend="gsplat",
+        )
+        assert out.rgb[item.id].device.type == "cpu"
+        torch.testing.assert_close(out.rgb[item.id], single.image[0].cpu(), rtol=0.0, atol=1e-6)
+        torch.testing.assert_close(out.alpha[item.id], single.alpha[0].cpu(), rtol=0.0, atol=1e-6)

@@ -40,8 +40,8 @@ from torch import Tensor
 
 from openftgs.io import read_exchange, write_exchange
 from openftgs.model import FreeTimeGaussians
-from openftgs.render import render
-from openftgs.types import Camera, RenderOutput, TimeNormalizer
+from openftgs.render import render, render_request
+from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, TimeNormalizer
 
 F32 = torch.float32
 F64 = torch.float64
@@ -796,10 +796,10 @@ def _api_model() -> FreeTimeGaussians:
 
 
 def test_all_lists_the_public_api() -> None:
-    """§2.1: render is the module's only public name."""
+    """§2.1: render is the module's public name, with render_request (Q-57)."""
     import openftgs.render
 
-    assert openftgs.render.__all__ == ["render"]
+    assert openftgs.render.__all__ == ["render", "render_request"]
 
 
 @pytest.mark.parametrize(
@@ -1029,3 +1029,128 @@ def test_rasterize_composites_chunks_of_pixel_rows_like_one(
     chunked = _render(model, ring(2), 0.4)
     assert torch.equal(chunked.image, whole.image)
     assert torch.equal(chunked.alpha, whole.alpha)
+
+
+# render_request: answering a render request (§2.2, D-55; Q-57).
+
+
+def _item(item_id: str, timestamp: float, camera: Camera) -> RenderItem:
+    renamed = Camera(camera.K, camera.world_to_camera, camera.width, camera.height, item_id)
+    return RenderItem(item_id, timestamp, renamed)
+
+
+def _mixed_request(**kwargs: Any) -> RenderRequest:
+    """Seven items: three cameras of one size at τ = 0.25, two of another size at τ = 0.25,
+    one at τ = 0.7, and one more at τ = 0.25 listed last."""
+    big = ring(4, width_px=24, height_px=16)
+    small = ring(2, radius=5.0, width_px=10, height_px=12)
+    items = (
+        _item("a", 0.25, big[0]),
+        _item("b", 0.25, small[0]),
+        _item("c", 0.25, big[1]),
+        _item("d", 0.7, big[2]),
+        _item("e", 0.25, small[1]),
+        _item("f", 0.25, big[2]),
+        _item("g", 0.25, big[3]),
+    )
+    return RenderRequest(items=items, time_unit="s", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("background", "sh_degree"), [((0.0, 0.0, 0.0), None), ((0.2, 0.4, 1.0), 1)]
+)
+def test_render_request_equals_render_per_item(
+    background: tuple[float, float, float], sh_degree: int | None
+) -> None:
+    """§2.2: "Python callers use render() directly with the same semantics": every item equals
+    render() of its camera alone at its raw timestamp, with the request's background and SH
+    degree, bitwise on the reference backend (D-55: batching leaves images unchanged)."""
+    model = random_model(40, seed=21, spread=0.8)
+    request = _mixed_request(background=background, sh_degree=sh_degree)
+    out = render_request(model, request, backend="reference")
+    assert list(out.rgb) == list(out.alpha) == [item.id for item in request.items]
+    for item in request.items:
+        single = render(
+            model,
+            item.camera,
+            item.timestamp,
+            sh_degree=sh_degree,
+            background=torch.tensor(background),
+            backend="reference",
+        )
+        rgb, alpha = out.rgb[item.id], out.alpha[item.id]
+        assert rgb.shape == (item.camera.height, item.camera.width, 3)
+        assert alpha.shape == (item.camera.height, item.camera.width, 1)
+        assert torch.equal(rgb, single.image[0]), item.id
+        assert torch.equal(alpha, single.alpha[0]), item.id
+
+
+def test_render_request_renders_each_time_and_size_in_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-55, Q-57: cameras that share a timestamp and an image size render in one call; the
+    seven items of the mixed request form three groups: (0.25, 24×16) with four cameras,
+    (0.25, 10×12) with two and (0.7, 24×16) with one."""
+    import openftgs.render
+
+    calls: list[tuple[float, list[str]]] = []
+    original = openftgs.render.render
+
+    def spy(model: FreeTimeGaussians, cameras: Any, timestamp: float, **kw: Any) -> RenderOutput:
+        calls.append((timestamp, [c.name for c in cameras]))
+        return original(model, cameras, timestamp, **kw)
+
+    monkeypatch.setattr(openftgs.render, "render", spy)
+    render_request(random_model(5, seed=1), _mixed_request(), backend="reference")
+    assert calls == [(0.25, ["a", "c", "f", "g"]), (0.25, ["b", "e"]), (0.7, ["d"])]
+
+
+def test_render_request_outputs_are_cpu_inference_tensors_not_clamped() -> None:
+    """§2.2: rgb is stored without clamping to 1; §2.4: rendering runs in inference mode;
+    Q-57: the outputs are on the CPU."""
+    bright = model_from_rows(
+        [{"mean": (0.0, 0.0, 4.0), "scale": 1.0, "logit": 10.0, "sh0": sh0_for((1.6, 1.6, 1.6))}]
+    )
+    camera = pinhole(8, 6, fx=10.0, fy=10.0, cx=4.0, cy=3.0)
+    request = RenderRequest(items=(_item("x", 0.5, camera),), time_unit="s")
+    out = render_request(bright, request, backend="reference")
+    rgb, alpha = out.rgb["x"], out.alpha["x"]
+    assert float(rgb.max()) > 1.0
+    for value in (rgb, alpha):
+        assert value.device.type == "cpu"
+        assert value.dtype == F32
+        assert torch.is_inference(value)
+        assert not value.requires_grad
+
+
+def test_render_request_needs_the_model_time_unit() -> None:
+    """Q-17, Q-57: a request whose time unit isn't the model's is refused, since its
+    timestamps would be read in the wrong unit."""
+    request = RenderRequest(items=_mixed_request().items, time_unit="ms")
+    with pytest.raises(ValueError, match="time_unit"):
+        render_request(random_model(3, seed=2), request, backend="reference")
+
+
+def test_render_request_warns_outside_the_training_span() -> None:
+    """§1.4 "Time": rendering accepts any τ and warns outside [τ₀, τ₁] (Q-9)."""
+    camera = pinhole(8, 6, fx=10.0, fy=10.0, cx=4.0, cy=3.0)
+    request = RenderRequest(items=(_item("x", 1.5, camera),), time_unit="s")
+    with pytest.warns(UserWarning):
+        render_request(random_model(3, seed=2), request, backend="reference")
+
+
+def test_render_request_chunks_large_groups_without_changing_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private: the chunk size of `render_request` bounds memory only (Q-57); with two cameras
+    per call, the four-camera group still gives every item's own render, bitwise."""
+    import openftgs.render
+
+    model = random_model(30, seed=4, spread=0.8)
+    request = _mixed_request()
+    expected = render_request(model, request, backend="reference")
+    monkeypatch.setattr(openftgs.render, "_CAMERAS_PER_CALL", 2)
+    chunked = render_request(model, request, backend="reference")
+    for item in request.items:
+        assert torch.equal(chunked.rgb[item.id], expected.rgb[item.id])
+        assert torch.equal(chunked.alpha[item.id], expected.alpha[item.id])
