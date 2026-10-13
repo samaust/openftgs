@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The trainer in openftgs.train: the calendar part of U-17, U-21, U-24, the smoke runs of U-26,
-S-10, and the added tests of PRD #84 (§1.3, §2.2, D-17, D-18, D-26, D-27, D-45, D-46, D-71;
-Q-69 to Q-75).
+S-10, the added tests of PRD #84 (§1.3, §2.2, D-17, D-18, D-26, D-27, D-45, D-46, D-71;
+Q-69 to Q-75), and #97's tests of the model the trainer trains (Q-69 as answered, Q-76).
 
 Expected values come from the §1.3 calendar table and its rules, from rates and scales worked
 by hand for scenes whose cameras and timestamps are chosen so the answer is known, and, for the
@@ -311,6 +311,9 @@ U24 = dataclasses.replace(
     perf=dataclasses.replace(U21.perf, log_every=20),
 )
 
+# U-21's calendar cut to 120 iterations: one event, at 100, which grows and relocates.
+ONE_EVENT = dataclasses.replace(U21, optim=dataclasses.replace(U21.optim, iterations=120))
+
 
 def _u21_model(video: MultiViewVideo) -> FreeTimeGaussians:
     return random_model(
@@ -544,32 +547,54 @@ def _params_of(model: FreeTimeGaussians) -> dict[str, torch.Tensor]:
 
 def test_a_passed_model_is_never_modified(tmp_path: Path) -> None:
     """Q-69 (owner answer, #97): the trainer trains a copy of a passed model, so the caller's
-    object keeps its tensors, its device and its slice_impl through construction, training
-    iterations with events, and a refused construction."""
+    object keeps its tensors, its device and its slice_impl after construction, after training
+    iterations with events, and after a construction refused once the copy is in place
+    (selective Adam on the CPU, Q-45); the copy takes PerfConfig.slice_impl (Q-66)."""
     video = _scene(tmp_path)
     model = _u21_model(video)
+    model.slice_impl = "compiled"  # not the default, so a reset would show
     before = _params_of(model)
-    cfg = dataclasses.replace(
-        U21,
-        optim=dataclasses.replace(U21.optim, iterations=120),  # one event, at 100
-        perf=dataclasses.replace(U21.perf, slice_impl="eager"),
-    )
-    logs = _run(Trainer(cfg, video, model, device="cpu"))
-    assert _events_did_work(logs)
-    with pytest.raises(ValueError, match="SH degree"):
-        Trainer(_no_perceptual(sh_degree=2), video, model, device="cpu")
-    _assert_same(_params_of(model), before)
-    assert model.means.device.type == "cpu" and model.slice_impl == "auto"
+
+    def unchanged() -> None:
+        _assert_same(_params_of(model), before)
+        assert model.means.device.type == "cpu" and model.slice_impl == "compiled"
+
+    cfg = dataclasses.replace(ONE_EVENT, perf=dataclasses.replace(U21.perf, slice_impl="eager"))
+    trainer = Trainer(cfg, video, model, device="cpu")
+    unchanged()
+    assert trainer.model.slice_impl == "eager"
+    assert _events_did_work(_run(trainer))
+    unchanged()
+    selective = dataclasses.replace(cfg, perf=dataclasses.replace(cfg.perf, adam="selective"))
+    with pytest.raises(ValueError, match="selective"):
+        Trainer(selective, video, model, device="cpu")
+    unchanged()
+
+
+def test_the_copy_keeps_the_time_unit(tmp_path: Path) -> None:
+    """Q-69 (owner answer, #97), Q-17: the copy keeps the passed model's time unit, which must
+    be the scene's; the trainer state records it."""
+    scene = _scene(tmp_path)
+    manifest = json.loads(scene.manifest.path.read_text())
+    manifest["time_unit"] = "frame"
+    path = scene.manifest.path.with_name("frames.json")
+    path.write_text(json.dumps(manifest))
+    video = MultiViewVideo.from_manifest(path)
+    model = _u21_model(video)
+    model.time_unit = "frame"
+    trainer = Trainer(_no_perceptual(sh_degree=1), video, model, device="cpu")
+    assert trainer.model.time_unit == "frame" and trainer.state_dict().time_unit == "frame"
 
 
 def test_two_trainers_from_one_model_give_identical_runs(tmp_path: Path) -> None:
-    """Q-69 (owner answer, #97), U-24's property: two trainers built from the same model
-    object, with events, give bitwise-identical step logs and final states, since neither
-    trains the object itself."""
+    """Q-69 (owner answer, #97), U-24's property: a trainer built from a model object after
+    another trainer ran from it gives the same step logs and final state, bitwise, with events,
+    since the first one didn't train the object itself."""
     video = _scene(tmp_path)
     model = _u21_model(video)
-    a, b = Trainer(U24, video, model, device="cpu"), Trainer(U24, video, model, device="cpu")
+    a = Trainer(U24, video, model, device="cpu")
     logs_a = _run(a)
+    b = Trainer(U24, video, model, device="cpu")
     logs_b = _run(b)
     assert _events_did_work(logs_a)
     _assert_logs_equal(logs_a, logs_b)
@@ -578,12 +603,11 @@ def test_two_trainers_from_one_model_give_identical_runs(tmp_path: Path) -> None
 
 def test_trainer_model_is_the_model_being_trained(tmp_path: Path) -> None:
     """Q-69 (owner answer, #97): `Trainer.model` is the model the trainer trains: its stored
-    tensors are the state's parameters; events resize it in place, so it stays the same object;
+    tensors are the state's; events resize it in place, so it stays the same object;
     `load_state_dict` and `from_checkpoint` replace it with the loaded state's model; it is
     read-only."""
     video = _scene(tmp_path / "scene")
-    cfg = dataclasses.replace(U21, optim=dataclasses.replace(U21.optim, iterations=120))
-    trainer = Trainer(cfg, video, _u21_model(video), device="cpu")
+    trainer = Trainer(ONE_EVENT, video, _u21_model(video), device="cpu")
     model = trainer.model
     _assert_same(_params_of(model), trainer.state_dict().params)
     assert _events_did_work(_run(trainer))
