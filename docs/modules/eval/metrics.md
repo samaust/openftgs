@@ -20,7 +20,7 @@ The box is the bounding box of every dynamic pixel, as D-67 defines it, so a sin
 
 ## Averaging and the backbone
 
-Each metric is computed per test image, averaged over a scene's test images, then over scenes, never pooled (D-67). `average_metrics` serves both levels. `lpips_backbone` picks the backbone that the paper reports for a dataset (D-29). It reads it from the scene manifest's `metadata.source`: Neural3DV is AlexNet, and every other dataset, including synthetic scenes, is VGG (Q-62). The report carries all three LPIPS values in either case; the backbone only says which one the paper's tables compare to.
+Each metric is computed per test image, averaged over a scene's test images, then over scenes, never pooled (D-67). `average_metrics` serves both levels. `lpips_backbone` picks the backbone that the paper reports for a dataset (D-29). It reads it from the scene manifest's `metadata.source`: Neural3DV is AlexNet, and every other dataset, including synthetic scenes, is VGG (Q-62). The report carries all three LPIPS values in either case; the backbone only says which one the paper's tables compare to. The match is exact and case-sensitive, so M12's Neural3DV converter writes the source as "n3dv/<scene>", as in §2.2's example (Q-62).
 
 ## The metrics report
 
