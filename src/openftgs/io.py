@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reading and writing full checkpoints (TrainerState), FTGS-IF exchange files (ExchangeModel),
-ftgs-init files (InitPoints) and PLY files for viewers, with the validators of the exchange and
-init formats. Plain data in and out: this module imports neither openftgs.model nor
-openftgs.train.
+ftgs-init files (InitPoints), render requests (RenderRequest) and their renders (Renders), and
+PLY files for viewers, with the validators of the exchange and init formats. Plain data in and
+out: this module imports neither openftgs.model nor openftgs.train.
 
-Spec: §2.2, D-30, D-73. Band: Foundation (§2.1).
+Spec: §2.2, D-30, D-34, D-73. Band: Foundation (§2.1).
 """
 
 import hashlib
@@ -25,18 +25,30 @@ from safetensors.torch import save_file
 from torch import Tensor
 
 from openftgs.config import config_from_dict
-from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer, TrainerState
+from openftgs.types import (
+    Camera,
+    ExchangeModel,
+    InitPoints,
+    RenderItem,
+    RenderRequest,
+    Renders,
+    TimeNormalizer,
+    TrainerState,
+)
 
 __all__ = [
     "load_checkpoint",
     "read_exchange",
     "read_init_points",
+    "read_render_request",
+    "read_renders",
     "save_checkpoint",
     "validate_exchange",
     "validate_init_points",
     "write_exchange",
     "write_init_points",
     "write_ply",
+    "write_renders",
 ]
 
 _VERSION = 1  # the major version this module reads and writes (§2.2)
@@ -599,6 +611,176 @@ def load_checkpoint(directory: Path) -> TrainerState:
     if n > n_max:
         _fail(where, f"N = {n} exceeds N_max = {n_max}")
     return state
+
+
+# ftgs-render-request (JSON) and ftgs-renders (safetensors), §2.2: rendering at any camera and
+# time.
+
+_REQUEST = "ftgs-render-request"
+_RENDERS = "ftgs-renders"
+_ORTHONORMAL_TOLERANCE = 1e-5  # Q-56: max |RᵀR − I| of a request camera's rotation
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _finite_number(value: Any, what: str, where: str) -> float:
+    if not _is_number(value) or not math.isfinite(value):
+        _fail(where, f"{what} must be a finite number, got {value!r}")
+    return float(value)
+
+
+def _positive_int(value: Any, what: str, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _fail(where, f"{what} must be an int >= 1, got {value!r}")
+    return value
+
+
+def _matrix(value: Any, rows: int, cols: int, what: str, where: str) -> list[list[float]]:
+    if (
+        not isinstance(value, list)
+        or len(value) != rows
+        or any(not isinstance(row, list) or len(row) != cols for row in value)
+    ):
+        _fail(where, f"{what} must be a {rows}x{cols} list of rows")
+    return [[_finite_number(x, what, where) for x in row] for row in value]
+
+
+# Q-56: one parser for the cameras of the JSON formats; render() reads only fx, fy, cx, cy and
+# the world-to-camera rotation and translation (Q-32), so anything it would drop is refused here.
+def _parse_camera(value: Any, name: str, where: str) -> Camera:
+    if not isinstance(value, dict):
+        _fail(where, "camera must be an object")
+    width = _positive_int(value.get("width"), "camera width", where)
+    height = _positive_int(value.get("height"), "camera height", where)
+    k = _matrix(value.get("K"), 3, 3, "K", where)
+    fx, fy = k[0][0], k[1][1]
+    if not (fx > 0.0 and fy > 0.0):
+        _fail(where, f"K must have fx > 0 and fy > 0, got {fx!r} and {fy!r}")
+    if k[0][1] != 0.0 or k[1][0] != 0.0 or k[2] != [0.0, 0.0, 1.0]:
+        _fail(where, "K must be [[fx, 0, cx], [0, fy, cy], [0, 0, 1]] (no skew)")
+    w2c = _matrix(value.get("world_to_camera"), 4, 4, "world_to_camera", where)
+    if w2c[3] != [0.0, 0.0, 0.0, 1.0]:
+        _fail(where, "world_to_camera must have the last row (0, 0, 0, 1)")
+    rotation = torch.tensor([row[:3] for row in w2c[:3]], dtype=torch.float64)
+    error = (rotation.T @ rotation - torch.eye(3, dtype=torch.float64)).abs().max()
+    if float(error) > _ORTHONORMAL_TOLERANCE or float(torch.linalg.det(rotation)) <= 0.0:
+        _fail(where, "world_to_camera's rotation must be orthonormal with determinant +1")
+    return Camera(
+        K=torch.tensor(k, dtype=torch.float32),
+        world_to_camera=torch.tensor(w2c, dtype=torch.float32),
+        width=width,
+        height=height,
+        name=name,
+    )
+
+
+def _parse_item(value: Any, where: str) -> RenderItem:
+    if not isinstance(value, dict):
+        _fail(where, "every item must be an object")
+    item_id = value.get("id")
+    if not isinstance(item_id, str) or not item_id:
+        _fail(where, f"item id must be a non-empty string, got {item_id!r}")
+    where = f"{where}, item {item_id!r}"
+    timestamp = _finite_number(value.get("timestamp"), "timestamp", where)
+    return RenderItem(item_id, timestamp, _parse_camera(value.get("camera"), item_id, where))
+
+
+def read_render_request(path: Path) -> RenderRequest:
+    """Read and validate a ftgs-render-request file (§2.2; Q-56). `background` defaults to
+    black (D-34) and `sh_degree` to null, the model's degree; unknown keys are ignored."""
+    where = f"render request {path}"
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise ValueError(f"{where}: not a readable JSON file: {err}") from None
+    if not isinstance(raw, dict):
+        _fail(where, "the file must hold an object")
+    version = raw.get("version")
+    if isinstance(version, bool) or not isinstance(version, int | str):
+        _fail(where, f"version must be an int or a string, got {version!r}")
+    _check_header({"format": str(raw.get("format")), "version": str(version)}, _REQUEST, where)
+    time_unit = raw.get("time_unit")
+    if not isinstance(time_unit, str) or not time_unit:
+        _fail(where, f"time_unit must be a non-empty string, got {time_unit!r}")
+    background = raw.get("background", [0.0, 0.0, 0.0])
+    if not isinstance(background, list) or len(background) != 3:
+        _fail(where, "background must be a list of three numbers")
+    color = tuple(_finite_number(c, "background", where) for c in background)
+    if not all(0.0 <= c <= 1.0 for c in color):  # Q-11's range for TrainConfig.background
+        _fail(where, f"background components must lie within [0, 1], got {list(color)}")
+    sh_degree = raw.get("sh_degree")
+    if sh_degree is not None and (
+        isinstance(sh_degree, bool)
+        or not isinstance(sh_degree, int)
+        or sh_degree not in _SH_DEGREES
+    ):
+        _fail(where, f"sh_degree must be null or one of {_SH_DEGREES}, got {sh_degree!r}")
+    items = raw.get("items")
+    if not isinstance(items, list) or not items:
+        _fail(where, "items must be a non-empty list")
+    parsed = tuple(_parse_item(item, where) for item in items)
+    ids = [item.id for item in parsed]
+    if len(set(ids)) != len(ids):
+        duplicated = sorted({i for i in ids if ids.count(i) > 1})
+        _fail(where, f"item ids must be unique, repeated: {duplicated}")
+    return RenderRequest(
+        items=parsed,
+        time_unit=time_unit,
+        background=(color[0], color[1], color[2]),
+        sh_degree=sh_degree,
+    )
+
+
+def _check_renders(rgb: Mapping[str, Tensor], alpha: Mapping[str, Tensor], where: str) -> None:
+    if set(rgb) != set(alpha):
+        unpaired = sorted(set(rgb) ^ set(alpha))
+        _fail(where, f"every id needs both rgb and alpha, unpaired: {unpaired}")
+    if not rgb:
+        _fail(where, "needs at least one render")
+    for item_id, image in rgb.items():
+        if not item_id:
+            _fail(where, "render ids must be non-empty")
+        h, w = (int(image.shape[0]), int(image.shape[1])) if image.dim() == 3 else (-1, -1)
+        _check_tensor(rgb, item_id, torch.float32, (h, w, 3), f"{where}, rgb")
+        _check_tensor(alpha, item_id, torch.float32, (h, w, 1), f"{where}, alpha")
+
+
+def write_renders(renders: Renders, path: Path, *, producer: str, request_sha256: str) -> None:
+    """Write a ftgs-renders v1 file (§2.2; Q-56): `rgb/<id>` [H, W, 3] and `alpha/<id>`
+    [H, W, 1], float32, rgb not clamped to 1, with the producer and the SHA-256 of the request
+    file's bytes as metadata."""
+    _check_renders(renders.rgb, renders.alpha, f"renders {path}")
+    tensors = {f"rgb/{k}": v for k, v in renders.rgb.items()}
+    tensors.update({f"alpha/{k}": renders.alpha[k] for k in renders.rgb})
+    meta = {
+        "format": _RENDERS,
+        "version": str(_VERSION),
+        "producer": producer,
+        "request_sha256": request_sha256,
+    }
+    _write_safetensors(tensors, Path(path), meta)
+
+
+def read_renders(path: Path, *, request_sha256: str | None = None) -> Renders:
+    """Read and validate a ftgs-renders file (§2.2; Q-56). With `request_sha256`, a file
+    recorded for another request is rejected. Tensors other than rgb/… and alpha/… are
+    ignored. The file keeps no item order, so the ids come back sorted: match them to the
+    request by id."""
+    tensors, meta = _read_safetensors(Path(path))
+    where = f"renders {path}"
+    _check_header(meta, _RENDERS, where)
+    if request_sha256 is not None and meta.get("request_sha256") != request_sha256:
+        _fail(
+            where,
+            f"made for the request {meta.get('request_sha256')!r}, expected {request_sha256!r}",
+        )
+    rgb = {k.removeprefix("rgb/"): v for k, v in tensors.items() if k.startswith("rgb/")}
+    alpha = {k.removeprefix("alpha/"): v for k, v in tensors.items() if k.startswith("alpha/")}
+    _check_renders(rgb, alpha, where)
+    ids = sorted(rgb)  # Q-56: the file keeps no item order
+    return Renders(rgb={k: rgb[k] for k in ids}, alpha={k: alpha[k] for k in ids})
 
 
 # PLY snapshot for viewers (Q-18): export-only, never read back.

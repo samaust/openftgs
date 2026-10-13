@@ -24,3 +24,9 @@ A save is atomic: the files go into a temporary sibling directory, which replace
 ## PLY snapshot
 
 `write_ply` writes per-time arrays, as physical values, in the layout 3DGS viewers read, with logit opacities and log scales (Q-18). It is export-only: no reader exists, and no other part of the package consumes it.
+
+## Render requests and renders
+
+`read_render_request` reads a `ftgs-render-request` file into the `RenderRequest` of `openftgs.types`, and `write_renders` and `read_renders` write and read its `ftgs-renders` answer as `Renders` (§2.2, Q-56). The required and optional keys, and the rules for item ids and cameras, are Q-56's. The cameras are checked more strictly than `render()` checks its own: `render()` reads only the focal lengths, the principal point and the world-to-camera rotation and translation (Q-32), so a skewed K or a malformed last row would otherwise be dropped without a word. One private camera parser does the reading, so the scene-manifest reader (M10) can share it.
+
+A renders file records the producer and the SHA-256 of the request file's bytes as read, which the caller computes; reading with a hash rejects a file made for another request, as `read_init_points` rejects another time unit (Q-22). There is no request writer: the harness writes its own requests, and the tests write the JSON by hand.

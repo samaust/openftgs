@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The file formats of §2.2 in openftgs.io: ftgs-init, ftgs-if, ftgs-checkpoint, and the PLY
-snapshot (D-30, D-73; U-22 and U-26 file parts; Q-17, Q-18, Q-22, Q-24 to Q-26, Q-35).
+"""The file formats of §2.2 in openftgs.io: ftgs-init, ftgs-if, ftgs-checkpoint, the render
+request and renders, and the PLY snapshot (D-30, D-73; U-22 and U-26 file parts; Q-17, Q-18,
+Q-22, Q-24 to Q-26, Q-35, Q-56).
 
 Expected values come from the §2.2 tables (keys, dtypes, shapes, validation rules) and from
 values worked by hand; files with invalid content are written with safetensors directly, so the
@@ -25,13 +26,16 @@ from openftgs.io import (
     load_checkpoint,
     read_exchange,
     read_init_points,
+    read_render_request,
+    read_renders,
     save_checkpoint,
     validate_exchange,
     validate_init_points,
     write_exchange,
     write_init_points,
+    write_renders,
 )
-from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer, TrainerState
+from openftgs.types import ExchangeModel, InitPoints, Renders, TimeNormalizer, TrainerState
 
 F32 = torch.float32
 F64 = torch.float64
@@ -1002,3 +1006,276 @@ def test_readers_reject_non_canonical_version_strings(tmp_path: Path, version: s
     save_file(_init_tensors(), str(path), metadata=_init_metadata(version=version))
     with pytest.raises(ValueError, match="version"):
         read_init_points(path)
+
+
+# ftgs-render-request and ftgs-renders (§2.2; Q-56).
+
+
+def _request_camera(width: int = 8, height: int = 6) -> dict:
+    # A rotation of 90° about z and a translation, written exactly in JSON.
+    return {
+        "width": width,
+        "height": height,
+        "K": [[10.0, 0.0, 4.0], [0.0, 12.0, 3.0], [0.0, 0.0, 1.0]],
+        "world_to_camera": [
+            [0.0, -1.0, 0.0, 0.5],
+            [1.0, 0.0, 0.0, -0.25],
+            [0.0, 0.0, 1.0, 3.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    }
+
+
+def _request(**overrides: object) -> dict:
+    request: dict = {
+        "format": "ftgs-render-request",
+        "version": 1,
+        "time_unit": "s",
+        "background": [0.25, 0.5, 1.0],
+        "sh_degree": 2,
+        "items": [
+            {"id": "r0000", "timestamp": 1.2345, "camera": _request_camera()},
+            {"id": "r0001", "timestamp": 0.0, "camera": _request_camera(5, 4)},
+        ],
+    }
+    request.update(overrides)
+    return request
+
+
+def _write_json(path: Path, value: object) -> Path:
+    path.write_text(json.dumps(value))
+    return path
+
+
+def test_render_request_reads_items_in_order(tmp_path: Path) -> None:
+    """§2.2 render request: items in file order, each a camera and a raw timestamp; the
+    background and SH degree as given; camera tensors float32 (§2.1 Camera), named by id."""
+    request = read_render_request(_write_json(tmp_path / "r.json", _request()))
+    assert request.time_unit == "s"
+    assert request.background == (0.25, 0.5, 1.0)
+    assert request.sh_degree == 2
+    assert [item.id for item in request.items] == ["r0000", "r0001"]
+    first = request.items[0]
+    assert first.timestamp == 1.2345
+    assert first.camera.name == "r0000"
+    assert (first.camera.width, first.camera.height) == (8, 6)
+    assert first.camera.K.dtype == F32 and first.camera.world_to_camera.dtype == F32
+    assert torch.equal(first.camera.K, torch.tensor(_request_camera()["K"]))
+    assert torch.equal(
+        first.camera.world_to_camera, torch.tensor(_request_camera()["world_to_camera"])
+    )
+    assert (request.items[1].camera.width, request.items[1].camera.height) == (5, 4)
+
+
+def test_render_request_defaults_and_unknown_keys(tmp_path: Path) -> None:
+    """§2.2: background defaults to black (D-34) and sh_degree to null, the model's degree
+    (Q-56); readers ignore unknown optional keys, at the top level and in items."""
+    raw = _request(extra={"a": 1})
+    del raw["background"], raw["sh_degree"]
+    raw["items"][0]["note"] = "x"
+    raw["items"][0]["camera"]["model"] = "pinhole"
+    request = read_render_request(_write_json(tmp_path / "r.json", raw))
+    assert request.background == (0.0, 0.0, 0.0)
+    assert request.sh_degree is None
+    assert len(request.items) == 2
+    raw["sh_degree"] = None
+    raw["version"] = "1.3"
+    assert read_render_request(_write_json(tmp_path / "s.json", raw)).sh_degree is None
+
+
+def _set(raw: dict, path: tuple, value: object) -> dict:
+    target = raw
+    for key in path[:-1]:
+        target = target[key]
+    if value is _DELETE:
+        del target[path[-1]]
+    else:
+        target[path[-1]] = value
+    return raw
+
+
+_DELETE = object()
+_CAM = ("items", 0, "camera")
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("format",), "ftgs-renders", "format"),
+        (("version",), 2, "version"),
+        (("version",), "2.0", "version"),
+        (("version",), True, "version"),
+        (("version",), 1.0, "version"),
+        (("time_unit",), _DELETE, "time_unit"),
+        (("time_unit",), 5, "time_unit"),
+        (("items",), [], "items"),
+        (("items",), _DELETE, "items"),
+        (("items", 1, "id"), "r0000", "unique"),
+        (("items", 0, "id"), "", "id"),
+        (("items", 0, "id"), 7, "id"),
+        (("items", 0, "timestamp"), True, "timestamp"),
+        (("items", 0, "timestamp"), "1.0", "timestamp"),
+        (("items", 0, "timestamp"), _DELETE, "timestamp"),
+        ((*_CAM, "width"), True, "width"),
+        ((*_CAM, "width"), 0, "width"),
+        ((*_CAM, "height"), 2.0, "height"),
+        ((*_CAM, "K", 0, 1), 0.5, "skew"),
+        ((*_CAM, "K", 0, 0), 0.0, "fx"),
+        ((*_CAM, "K", 1, 1), -12.0, "fy"),
+        ((*_CAM, "K", 2), [0.0, 0.0, 2.0], "skew"),
+        ((*_CAM, "K", 1), [0.0, 12.0], "K"),
+        ((*_CAM, "world_to_camera", 3), [0.0, 0.0, 1.0, 1.0], "last row"),
+        ((*_CAM, "world_to_camera", 0, 0), 0.01, "orthonormal"),
+        ((*_CAM, "world_to_camera", 2, 2), -1.0, "orthonormal"),  # a reflection
+        ((*_CAM, "world_to_camera", 0, 3), "x", "finite"),
+        (("sh_degree",), 4, "sh_degree"),
+        (("sh_degree",), True, "sh_degree"),
+        (("background",), [0.0, 0.0, 1.5], "background"),
+        (("background",), [0.0, 0.0], "background"),
+    ],
+)
+def test_render_request_rejections(tmp_path: Path, path: tuple, value: object, match: str) -> None:
+    """§2.2 render request, validated as Q-56 states; every failure is a ValueError (Q-26)."""
+    raw = _set(_request(), path, value)
+    with pytest.raises(ValueError, match=match):
+        read_render_request(_write_json(tmp_path / "r.json", raw))
+
+
+@pytest.mark.parametrize("text", ["[1, 2]", "{", '{"format": "ftgs-render-request", "x": NaN}'])
+def test_render_request_rejects_files_that_are_not_requests(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "r.json"
+    path.write_text(text)
+    with pytest.raises(ValueError):
+        read_render_request(path)
+
+
+def test_render_request_rejects_non_finite_numbers(tmp_path: Path) -> None:
+    """Q-56: JSON's NaN and Infinity extensions are refused wherever a number is read."""
+    path = tmp_path / "r.json"
+    text = json.dumps(_request()).replace("1.2345", "NaN")
+    path.write_text(text)
+    with pytest.raises(ValueError, match="finite"):
+        read_render_request(path)
+
+
+def test_render_request_accepts_a_rotation_within_the_tolerance(tmp_path: Path) -> None:
+    """Q-56: R orthonormal within 1e-5, so float32-rounded rotations written to JSON pass."""
+    c, s = math.cos(0.3), math.sin(0.3)
+    w2c = [[c, -s, 0.0, 0.0], [s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 2.0], [0.0, 0.0, 0.0, 1.0]]
+    rounded = torch.tensor(w2c, dtype=F32).tolist()
+    raw = _set(_request(), (*_CAM, "world_to_camera"), rounded)
+    read_render_request(_write_json(tmp_path / "r.json", raw))
+
+
+def _renders() -> Renders:
+    g = _gen(3)
+    rgb = {
+        "a": torch.rand(6, 8, 3, generator=g) * 1.5,  # §2.2: not clamped to 1
+        "b": torch.rand(4, 5, 3, generator=g),
+    }
+    alpha = {"a": torch.rand(6, 8, 1, generator=g), "b": torch.rand(4, 5, 1, generator=g)}
+    return Renders(rgb=rgb, alpha=alpha)
+
+
+def test_renders_round_trip_with_metadata(tmp_path: Path) -> None:
+    """§2.2 ftgs-renders: rgb/<id> float32 [H, W, 3], alpha/<id> float32 [H, W, 1]; metadata
+    records the format, version, producer and the request's SHA-256 (Q-56)."""
+    renders = _renders()
+    path = tmp_path / "out.safetensors"
+    sha = hashlib.sha256(b"request").hexdigest()
+    write_renders(renders, path, producer="openftgs test", request_sha256=sha)
+    with safe_open(str(path), framework="pt") as f:
+        meta = f.metadata()
+        keys = set(f.keys())
+    assert meta == {
+        "format": "ftgs-renders",
+        "version": "1",
+        "producer": "openftgs test",
+        "request_sha256": sha,
+    }
+    assert keys == {"rgb/a", "rgb/b", "alpha/a", "alpha/b"}
+    back = read_renders(path, request_sha256=sha)
+    assert list(back.rgb) == list(back.alpha) == ["a", "b"]
+    for k in ("a", "b"):
+        assert torch.equal(back.rgb[k], renders.rgb[k])
+        assert torch.equal(back.alpha[k], renders.alpha[k])
+    assert float(back.rgb["a"].max()) > 1.0
+
+
+def test_renders_reader_rejects_another_request(tmp_path: Path) -> None:
+    """Q-56: reading with a request hash rejects a file recorded for another request."""
+    path = tmp_path / "out.safetensors"
+    write_renders(_renders(), path, producer="p", request_sha256="aa")
+    read_renders(path)
+    with pytest.raises(ValueError, match="request"):
+        read_renders(path, request_sha256="bb")
+
+
+def test_renders_reader_ignores_other_tensors(tmp_path: Path) -> None:
+    """§2.2 introduction: unknown optional content is ignored."""
+    r = _renders()
+    tensors = {"rgb/a": r.rgb["a"], "alpha/a": r.alpha["a"], "depth/a": torch.zeros(6, 8, 1)}
+    path = tmp_path / "out.safetensors"
+    save_file(tensors, str(path), metadata={"format": "ftgs-renders", "version": "1"})
+    assert set(read_renders(path).rgb) == {"a"}
+
+
+@pytest.mark.parametrize(
+    ("rgb", "alpha", "match"),
+    [
+        ({"a": torch.zeros(6, 8, 3)}, {}, "both"),
+        ({"a": torch.zeros(6, 8, 3, dtype=F64)}, {"a": torch.zeros(6, 8, 1)}, "float32"),
+        ({"a": torch.zeros(6, 8, 4)}, {"a": torch.zeros(6, 8, 1)}, "shape"),
+        ({"a": torch.zeros(6, 8, 3)}, {"a": torch.zeros(6, 7, 1)}, "shape"),
+        ({"a": torch.full((6, 8, 3), math.nan)}, {"a": torch.zeros(6, 8, 1)}, "finite"),
+        ({}, {}, "at least one"),
+    ],
+)
+def test_renders_validation(tmp_path: Path, rgb: dict, alpha: dict, match: str) -> None:
+    """Q-56: the writer and the reader apply the same checks."""
+    path = tmp_path / "out.safetensors"
+    with pytest.raises(ValueError, match=match):
+        write_renders(Renders(rgb, alpha), path, producer="p", request_sha256="aa")
+    assert not path.exists()
+    tensors = {f"rgb/{k}": v for k, v in rgb.items()} | {f"alpha/{k}": v for k, v in alpha.items()}
+    save_file(
+        tensors or {"x": torch.zeros(1)},
+        str(path),
+        metadata={"format": "ftgs-renders", "version": "1"},
+    )
+    with pytest.raises(ValueError, match=match):
+        read_renders(path)
+
+
+@pytest.mark.parametrize(
+    ("meta", "match"),
+    [
+        ({"format": "ftgs-if", "version": "1"}, "format"),
+        ({"format": "ftgs-renders", "version": "2"}, "version"),
+        ({"format": "ftgs-renders"}, "version"),
+    ],
+)
+def test_renders_reader_checks_format_and_major_version(
+    tmp_path: Path, meta: dict[str, str], match: str
+) -> None:
+    """§2.2 introduction: every file carries format and version; readers reject an unknown
+    major version."""
+    r = _renders()
+    path = tmp_path / "out.safetensors"
+    save_file({"rgb/a": r.rgb["a"], "alpha/a": r.alpha["a"]}, str(path), metadata=meta)
+    with pytest.raises(ValueError, match=match):
+        read_renders(path)
+
+
+def test_renders_reader_returns_ids_sorted(tmp_path: Path) -> None:
+    """Q-56: the file keeps no item order, so ids come back sorted, whatever order they were
+    written in."""
+    r = _renders()
+    renders = Renders(
+        rgb={k: r.rgb["b"].clone() for k in ("z", "a", "m")},
+        alpha={k: r.alpha["b"].clone() for k in ("z", "a", "m")},
+    )
+    path = tmp_path / "out.safetensors"
+    write_renders(renders, path, producer="p", request_sha256="aa")
+    back = read_renders(path)
+    assert list(back.rgb) == list(back.alpha) == ["a", "m", "z"]

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """render() with two backends, gsplat 1.5.3 (CUDA, float32, production) and reference (pure
-PyTorch, the readable oracle for tests), and, from M15, the temporal index used for rendering
-(D-55).
+PyTorch, the readable oracle for tests); render_request(), which answers a render request with
+cameras batched per time; and, from M15, the temporal index used for rendering (D-55).
 
 Spec: E2, E5, E6, D-3, D-4, D-6, D-12, D-28, D-31, D-32, D-34, D-55, D-57. Band: Core model
 (§2.1).
@@ -19,9 +19,9 @@ from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
 from openftgs.sh import sh_basis
-from openftgs.types import Camera, RenderOutput
+from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders
 
-__all__ = ["render"]
+__all__ = ["render", "render_request"]
 
 # E6's normative constants (gsplat 1.5.3 in classic mode) and E2's color offset.
 _PIXEL_CENTER = 0.5  # E6: pixel (u, v) is sampled at (u + ½, v + ½); §1.4; D-28
@@ -104,6 +104,49 @@ def render(
     return RenderOutput(
         image=image, alpha=alpha, means2d=means2d, visible=visible, gaussian_ids=gaussian_ids
     )
+
+
+def render_request(
+    model: FreeTimeGaussians, request: RenderRequest, *, backend: _Backend = "gsplat"
+) -> Renders:
+    """Answer a render request (§2.2, Q-57): one image and alpha per item, at the item's raw
+    timestamp, with the request's background and SH degree, keyed by item id in request order.
+
+    Items that share a timestamp and an image size render in one `render()` call (D-55); the
+    temporal index comes in M15. Item ids must be unique; outputs are keyed by them, whatever
+    the cameras' names. Runs in inference mode; outputs are CPU inference tensors.
+    """
+    # Q-57, Q-17: the timestamps are raw τ in the request's unit, which must be the model's.
+    if request.time_unit != model.time_unit:
+        raise ValueError(
+            f"the request's time_unit {request.time_unit!r} differs from the model's "
+            f"{model.time_unit!r}"
+        )
+    ids = [item.id for item in request.items]
+    if len(set(ids)) != len(ids):  # Q-56: unique ids, also in a request built in Python
+        raise ValueError("render request item ids must be unique")
+    groups: dict[tuple[float, int, int], list[RenderItem]] = {}
+    for item in request.items:
+        key = (item.timestamp, item.camera.width, item.camera.height)
+        groups.setdefault(key, []).append(item)
+    background = torch.tensor(request.background, dtype=torch.float32)
+    rgb: dict[str, Tensor] = {}
+    alpha: dict[str, Tensor] = {}
+    with torch.inference_mode():
+        for (timestamp, _, _), group in groups.items():
+            # D-55: cameras that share a time (and, for render(), a size) render in one call.
+            out = render(
+                model,
+                [item.camera for item in group],
+                timestamp,
+                sh_degree=request.sh_degree,
+                background=background,
+                backend=backend,
+            )
+            for k, item in enumerate(group):
+                rgb[item.id] = out.image[k].cpu()
+                alpha[item.id] = out.alpha[k].cpu()
+    return Renders(rgb={i: rgb[i] for i in ids}, alpha={i: alpha[i] for i in ids})
 
 
 # The front half, shared by every backend.

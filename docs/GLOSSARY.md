@@ -474,6 +474,10 @@ _Avoid_: raw LPIPS, unnormalized LPIPS
 Any metric computed after cropping render and ground truth to the dynamic-region mask's bounding box and blacking out pixels outside the mask in both; reported under `dynamic` beside the full-frame `entire` values. D-67
 _Avoid_: masked metric, foreground metric, dynamic PSNR (unqualified)
 
+**Metrics report**:
+The METRICS.json file `ftgs eval` writes, holding the E16 metrics per test image and per scene under `entire`, under `dynamic` when the scene has dynamic-region masks, and under `fastest_10` when the manifest names the Fastest-10 frames. E16, D-67, D-69
+_Avoid_: metrics file, results JSON, eval report
+
 ### Differential harness
 
 **Harness**:
