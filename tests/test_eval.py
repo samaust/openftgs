@@ -10,13 +10,14 @@ another library's code path to the same published weights (§2.3).
 import json
 import math
 import warnings
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
 from torch import Tensor
 
 import openftgs.eval
+import openftgs.losses
 from openftgs.eval import (
     METRIC_NAMES,
     Evaluator,
@@ -225,7 +226,7 @@ def test_metrics_run_without_tf32_and_restore_the_flag(monkeypatch: pytest.Monke
     """D-52, §2.4 Precision: evaluation clears cuDNN's TF32 flag for its forward pass and
     restores it afterwards (Q-60)."""
     seen: list[bool] = []
-    original = openftgs.eval.ssim
+    original = openftgs.losses.ssim  # the function eval imports
 
     def spy(*args: object, **kwargs: object) -> Tensor:
         seen.append(torch.backends.cudnn.allow_tf32)
@@ -358,7 +359,9 @@ def evaluator() -> Evaluator:
     return Evaluator(device="cpu")
 
 
-def _torchmetrics_lpips(net: str, pred: Tensor, gt: Tensor, *, normalize: bool) -> float:
+def _torchmetrics_lpips(
+    net: Literal["alex", "vgg"], pred: Tensor, gt: Tensor, *, normalize: bool
+) -> float:
     from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
     with warnings.catch_warnings():

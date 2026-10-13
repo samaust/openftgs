@@ -13,6 +13,7 @@ import json
 import math
 import random
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -1011,7 +1012,7 @@ def test_readers_reject_non_canonical_version_strings(tmp_path: Path, version: s
 # ftgs-render-request and ftgs-renders (§2.2; Q-56).
 
 
-def _request_camera(width: int = 8, height: int = 6) -> dict:
+def _request_camera(width: int = 8, height: int = 6) -> dict[str, Any]:
     # A rotation of 90° about z and a translation, written exactly in JSON.
     return {
         "width": width,
@@ -1026,8 +1027,8 @@ def _request_camera(width: int = 8, height: int = 6) -> dict:
     }
 
 
-def _request(**overrides: object) -> dict:
-    request: dict = {
+def _request(**overrides: object) -> dict[str, Any]:
+    request: dict[str, Any] = {
         "format": "ftgs-render-request",
         "version": 1,
         "time_unit": "s",
@@ -1083,8 +1084,8 @@ def test_render_request_defaults_and_unknown_keys(tmp_path: Path) -> None:
     assert read_render_request(_write_json(tmp_path / "s.json", raw)).sh_degree is None
 
 
-def _set(raw: dict, path: tuple, value: object) -> dict:
-    target = raw
+def _set(raw: dict[str, Any], path: tuple[str | int, ...], value: object) -> dict[str, Any]:
+    target: Any = raw  # dicts and lists along the path
     for key in path[:-1]:
         target = target[key]
     if value is _DELETE:
@@ -1134,7 +1135,9 @@ _CAM = ("items", 0, "camera")
         (("background",), [0.0, 0.0], "background"),
     ],
 )
-def test_render_request_rejections(tmp_path: Path, path: tuple, value: object, match: str) -> None:
+def test_render_request_rejections(
+    tmp_path: Path, path: tuple[str | int, ...], value: object, match: str
+) -> None:
     """§2.2 render request, validated as Q-56 states; every failure is a ValueError (Q-26)."""
     raw = _set(_request(), path, value)
     with pytest.raises(ValueError, match=match):
@@ -1261,7 +1264,9 @@ def test_renders_reader_ignores_other_tensors(tmp_path: Path) -> None:
         ({}, {}, "at least one"),
     ],
 )
-def test_renders_validation(tmp_path: Path, rgb: dict, alpha: dict, match: str) -> None:
+def test_renders_validation(
+    tmp_path: Path, rgb: dict[str, Tensor], alpha: dict[str, Tensor], match: str
+) -> None:
     """Q-56: the writer and the reader apply the same checks."""
     path = tmp_path / "out.safetensors"
     with pytest.raises(ValueError, match=match):
