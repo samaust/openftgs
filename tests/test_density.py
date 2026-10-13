@@ -1261,3 +1261,90 @@ def test_reset_opacity_clamps_every_opacity_to_at_most_one_hundredth() -> None:
             else:
                 assert torch.equal(after[name][key], moments[name][key])
         assert torch.equal(after[name]["step"], moments[name]["step"])
+
+
+# The device paths on CUDA (GPU)
+
+
+def _cuda_event(generator_device: str) -> tuple[dict[str, torch.Tensor], list[object]]:
+    """A growth ("gradient"), a relocation and a growth ("score") on a CUDA model, with the
+    random draws from a generator on `generator_device`; returns the final rows (on the CPU) and
+    the three reports."""
+    logits = [0.5 + 0.01 * k if k % 4 else LOGIT_DEAD for k in range(400)]
+    model, _ = _relocation_scene(logits, seed=21)
+    with torch.no_grad():
+        model.log_scales[::3] = math.log(2.0)  # largest scale > 0.01·S: these candidates split
+    model = model.to("cuda")
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=0.1)
+    stats = GradStats(400, device="cuda")
+    g = torch.rand(400, generator=torch.Generator().manual_seed(22)) * 4e-4
+    stats.load_state_dict({"g_sum": g, "count": torch.ones(400, dtype=torch.int32)})
+    gen = torch.Generator(device=generator_device).manual_seed(23)
+    reports: list[object] = [
+        grow(
+            model, opt, stats, GrowthConfig(), spatial_scale=S, reloc=RelocConfig(), generator=gen
+        ),
+        relocate(model, opt, stats, RelocConfig(), generator=gen),
+    ]
+    assert bool((model.opacity_logits.detach() >= O_DEAD).all())  # every row live after it
+    reports.append(
+        grow(
+            model,
+            opt,
+            stats,
+            GrowthConfig(mode="score"),
+            spatial_scale=S,
+            reloc=RelocConfig(),
+            generator=gen,
+        )
+    )
+    assert model.means.device.type == "cuda" and stats.g_sum.device.type == "cuda"
+    return {name: getattr(model, name).detach().cpu() for name in PARAM_NAMES}, reports
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("generator_device", ["cuda", "cpu"])
+def test_relocate_and_grow_run_on_cuda_and_repeat_with_the_same_seed(generator_device: str) -> None:
+    """§1.3 Growth and Relocation on a CUDA model, with the trainer's generator on the GPU or the
+    CPU (draws run on the generator's device; Q-51): N grows by the reports' counts, every row is
+    live after the relocation, and the same seed gives bitwise the same model."""
+    first, reports = _cuda_event(generator_device)
+    second, again = _cuda_event(generator_device)
+    assert reports == again
+    growth, relocation, score = reports
+    assert isinstance(growth, GrowthReport) and isinstance(score, GrowthReport)
+    assert isinstance(relocation, RelocationReport) and relocation.dead > 0
+    assert growth.cloned > 0 and growth.split > 0
+    assert score.num_gaussians == growth.num_gaussians + score.sampled
+    for name in PARAM_NAMES:
+        assert torch.equal(first[name], second[name]), name
+
+
+@pytest.mark.gpu
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+def test_score_e11_and_opacity_reset_make_no_host_synchronization() -> None:
+    """D-49, docs/modules/density/relocation.md: sampling_score, mcmc_split (after its first call
+    on the device) and reset_opacity make no host synchronization (torch's sync debug mode)."""
+    model, _ = _relocation_scene([0.5 - 0.02 * k for k in range(300)], seed=31)
+    model = model.to("cuda")
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=0.1)
+    stats = GradStats(300, device="cuda")
+    stats.load_state_dict(
+        {
+            "g_sum": torch.rand(300, generator=torch.Generator().manual_seed(32)),
+            "count": torch.ones(300, dtype=torch.int32),
+        }
+    )
+    sigma = torch.rand(64, device="cuda", dtype=F64) * 0.9 + 0.05
+    scales = torch.rand(64, 3, device="cuda", dtype=F64) + 0.1
+    n = torch.randint(1, 60, (64,), device="cuda")
+    mcmc_split(sigma, scales, n)  # builds the coefficient table on the device
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        rho = sampling_score(model, stats, RelocConfig())
+        new_sigma, _ = mcmc_split(sigma, scales, n)
+        reset_opacity(model, opt)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    assert rho.shape == (300,) and new_sigma.shape == (64,)
