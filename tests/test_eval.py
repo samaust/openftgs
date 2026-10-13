@@ -496,7 +496,10 @@ def test_metrics_report_fastest_10_block() -> None:
     [
         {"metadata": {"fastest_10": [3]}},
         {"metadata": {"fastest_10": [5, 3]}},
+        {"metadata": {"fastest_10": [0, 50]}},  # §2.2: [n0, n0 + 10)
         {"metadata": {"fastest_10": "2-12"}},
+        {"metadata": {"masks_approximate": "false"}},
+        {"images": [ImageMetrics("c", 0.0, 0, "p", _values(0.0), _values(0.0), False)]},
         {"images": []},
         {"images": [ImageMetrics("c", 0.0, 0, "p", {"psnr": 1.0}, None, False)]},
     ],
@@ -505,3 +508,61 @@ def test_metrics_report_rejects_malformed_input(bad: dict[str, Any]) -> None:
     kwargs: dict[str, Any] = {"images": [_image(0, frame=0)], "metadata": {}} | bad
     with pytest.raises(ValueError):
         metrics_report(kwargs["images"], split="test", metadata=kwargs["metadata"])
+
+
+def test_u23_report_scene_means_are_means_of_per_image_values() -> None:
+    """U-23, D-67: the report's scene PSNR is the mean of the per-image values (30 dB for
+    images at 20 and 40 dB), not the PSNR of a pooled MSE (22.97 dB)."""
+    gt = torch.full((2, 8, 8, 3), 0.5, dtype=F64)
+    pred = gt.clone()
+    pred[0] += 0.1
+    pred[1] += 0.01
+    values = psnr(pred, gt)
+    images = [
+        ImageMetrics(
+            "c", float(k), k, f"{k}.png", {**_values(0.0), "psnr": float(values[k])}, None, False
+        )
+        for k in range(2)
+    ]
+    scene = metrics_report(images, split="test", metadata={})["entire"]["scene"]
+    assert abs(scene["psnr"] - 30.0) <= 1e-6
+
+
+def test_dynamic_region_clamps_the_render_only() -> None:
+    """D-67, Q-60, Q-61: renders are clamped to [0, 1]; the ground truth is used as given."""
+    pred = torch.full((40, 40, 3), 1.5)
+    gt = torch.full((40, 40, 3), 1.25)
+    region = dynamic_region(pred, gt, torch.ones(40, 40, dtype=torch.bool))
+    assert region is not None
+    assert float(region[0].max()) == 1.0
+    assert float(region[1].max()) == 1.25
+
+
+@pytest.mark.parametrize(
+    ("pred", "gt"),
+    [
+        (torch.zeros(16, 16, 3), torch.zeros(16, 16, 3, dtype=F64)),
+        (torch.zeros(16, 16, 3, device="meta"), torch.zeros(16, 16, 3)),
+    ],
+)
+def test_metrics_need_one_dtype_and_device(pred: Tensor, gt: Tensor) -> None:
+    """Q-60: images share one floating dtype and one device (Q-41)."""
+    with pytest.raises(ValueError):
+        psnr(pred, gt)
+
+
+@pytest.mark.parametrize("source", [5, ["n3dv"], b"n3dv"])
+def test_lpips_backbone_needs_a_string_source(source: object) -> None:
+    """Q-62: metadata.source is a string or absent."""
+    with pytest.raises(ValueError, match="source"):
+        lpips_backbone(source)  # type: ignore[arg-type]
+
+
+@pytest.mark.weights
+def test_evaluator_reports_float32_metrics_for_float64_images(evaluator: Evaluator) -> None:
+    """D-52, Q-60: reported metrics are plain float32: the Evaluator takes any floating pair
+    and computes every metric on its float32 copy."""
+    pred, gt = _noisy_pair((40, 48, 3), seed=13)
+    from64, _ = evaluator(pred, gt)
+    from32, _ = evaluator(pred.to(F32), gt.to(F32))
+    assert from64 == from32

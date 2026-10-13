@@ -61,7 +61,8 @@ def _metric_mode() -> Iterator[None]:
         torch.backends.cudnn.allow_tf32 = before
 
 
-# Q-60: images are [..., H, W, 3] of one shape and floating dtype (Q-41); one value per image.
+# Q-60: images are [..., H, W, 3] of one shape, floating dtype and device (Q-41); one value
+# per image.
 def _check_pair(pred: Tensor, gt: Tensor) -> None:
     if pred.shape != gt.shape:
         raise ValueError(
@@ -69,8 +70,10 @@ def _check_pair(pred: Tensor, gt: Tensor) -> None:
         )
     if pred.dim() < 3 or pred.shape[-1] != 3:
         raise ValueError(f"images must be [..., H, W, 3], got {list(pred.shape)}")
-    if not (pred.is_floating_point() and gt.is_floating_point()):
-        raise ValueError(f"images must be floating, got {pred.dtype} and {gt.dtype}")
+    if not pred.is_floating_point() or pred.dtype != gt.dtype:
+        raise ValueError(f"images must share one floating dtype, got {pred.dtype} and {gt.dtype}")
+    if pred.device != gt.device:
+        raise ValueError(f"images must be on one device, got {pred.device} and {gt.device}")
 
 
 def _check_k(k: int) -> None:
@@ -110,10 +113,11 @@ def dssim_k(pred: Tensor, gt: Tensor, k: int) -> Tensor:
 
 
 def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tensor] | None:
-    """The pair a dynamic-region metric compares (App. B.1, D-67): both images clamped, set to
-    black outside the mask and cropped to the mask's bounding box. `mask` is [H, W] or [H, W, 1],
-    bool or floating, binarized at 0.5 (≥ 0.5 is dynamic). None, with a warning, for an empty
-    mask or a box narrower than 31 px on a side, which some metric can't evaluate (Q-61)."""
+    """The pair a dynamic-region metric compares (App. B.1, D-67): the render clamped to
+    [0, 1], then both images set to black outside the mask and cropped to the mask's bounding
+    box. `mask` is [H, W] or [H, W, 1], bool or floating, binarized at 0.5 (≥ 0.5 is dynamic).
+    None, with a warning, for an empty mask or a box narrower than 31 px on a side, which some
+    metric can't evaluate (Q-61)."""
     if pred.dim() != 3:
         raise ValueError(f"dynamic_region takes one image pair [H, W, 3], got {list(pred.shape)}")
     _check_pair(pred, gt)
@@ -156,9 +160,12 @@ def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tens
     return pred_crop, gt_crop
 
 
+# Q-62: the dataset is read from metadata.source.
 def lpips_backbone(source: str | None) -> Literal["alex", "vgg"]:
     """The LPIPS backbone the paper reports for a dataset (D-29): AlexNet for Neural3DV, VGG
-    otherwise, read from the scene manifest's `metadata.source` (Q-62)."""
+    otherwise, read from the scene manifest's `metadata.source`."""
+    if source is not None and not isinstance(source, str):
+        raise ValueError(f"metadata.source must be a string, got {source!r}")
     if source is not None and (source == "n3dv" or source.startswith("n3dv/")):
         return "alex"
     return "vgg"
@@ -191,7 +198,9 @@ class Evaluator:
         if pred.dim() != 3:
             raise ValueError(f"Evaluator takes one image pair [H, W, 3], got {list(pred.shape)}")
         _check_pair(pred, gt)
-        pred, gt = pred.to(self._device), gt.to(self._device)
+        # D-52: reported metrics are plain float32, the networks' dtype (Q-60).
+        pred = pred.to(self._device, torch.float32)
+        gt = gt.to(self._device, torch.float32)
         entire = self._metrics(pred, gt)
         if mask is None:
             return entire, None
@@ -199,14 +208,11 @@ class Evaluator:
         return entire, None if region is None else self._metrics(*region)
 
     def _metrics(self, pred: Tensor, gt: Tensor) -> dict[str, float]:
-        values = {
-            "psnr": psnr(pred, gt),
-            "ssim1": ssim_k(pred, gt, 1),
-            "ssim2": ssim_k(pred, gt, 2),
-            "dssim1": dssim_k(pred, gt, 1),
-            "dssim2": dssim_k(pred, gt, 2),
-        }
+        ssim1, ssim2 = ssim_k(pred, gt, 1), ssim_k(pred, gt, 2)
+        values = {"psnr": psnr(pred, gt), "ssim1": ssim1, "ssim2": ssim2}
         with _metric_mode():
+            values["dssim1"] = (1.0 - ssim1) / 2.0  # as dssim_k, from the same SSIM
+            values["dssim2"] = (1.0 - ssim2) / 2.0
             clamped = pred.clamp(0.0, 1.0)  # D-67
             values["lpips_alex"] = self._alex(clamped, gt)
             values["lpips_vgg"] = self._vgg(clamped, gt)
@@ -228,6 +234,7 @@ class ImageMetrics:
 
 
 _REPORT = "ftgs-metrics"  # Q-63
+_FASTEST_COUNT = 10  # §2.2: metadata.fastest_10 holds [n0, n0 + 10) (D-69)
 
 
 def _json_value(value: float) -> float | None:
@@ -272,7 +279,12 @@ def metrics_report(
     for image in images:
         _check_values(image.entire, image.path)
         if image.dynamic is not None:
+            if not image.masked:
+                raise ValueError(f"{image.path}: dynamic metrics need a masked image")
             _check_values(image.dynamic, image.path)
+    approximate = metadata.get("masks_approximate", False)
+    if not isinstance(approximate, bool):  # D-64
+        raise ValueError(f"metadata.masks_approximate must be a bool, got {approximate!r}")
     masked = [image for image in images if image.masked]
     report: dict[str, Any] = {
         "format": _REPORT,
@@ -289,7 +301,7 @@ def metrics_report(
         usable = [image.dynamic for image in masked if image.dynamic is not None]
         report["dynamic"] = {
             "mask_source": metadata.get("mask_source"),
-            "masks_approximate": bool(metadata.get("masks_approximate", False)),
+            "masks_approximate": approximate,
             "count": len(usable),
             "skipped": len(masked) - len(usable),
             "scene": _means(usable),
@@ -301,9 +313,9 @@ def metrics_report(
             not isinstance(fastest, list | tuple)
             or len(fastest) != 2
             or not all(isinstance(n, int) and not isinstance(n, bool) for n in fastest)
-            or fastest[0] >= fastest[1]
+            or fastest[1] - fastest[0] != _FASTEST_COUNT
         ):
-            raise ValueError(f"metadata.fastest_10 must be [n0, n1) with n0 < n1, got {fastest!r}")
+            raise ValueError(f"metadata.fastest_10 must be [n0, n0 + 10), got {fastest!r}")
         n0, n1 = fastest
         inside = [
             image

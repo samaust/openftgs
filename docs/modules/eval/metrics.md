@@ -1,6 +1,6 @@
 # Metrics in `openftgs.eval`
 
-How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's. `eval` imports only `losses` and `types`. It never renders: renders come from `render.render_request` (Q-57), so the metrics stay pure tensor functions that run on the CPU.
+How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's. `eval` imports only `losses`. It never renders: renders come from `render.render_request` (Q-57), so the metrics stay pure tensor functions that run on the CPU.
 
 ## The metrics
 
@@ -10,11 +10,11 @@ Every metric takes images in the layout of the losses (Q-41) and returns one val
 - **SSIM_k** is the loss's SSIM with data range k, called once per image through the public `losses.ssim`, so the metric and the loss share one definition (E7, E16, D-67). k is 1 or 2. **DSSIM_k** is derived from it (D-29, D-40).
 - **LPIPS-Alex** and **LPIPS-VGG** run the loss's `LPIPSLoss` wrapper, one network per backbone, built once by `Evaluator`. **lpips_vgg_raw** runs the same VGG network with `map_inputs=False` (D-68, Q-58).
 
-Evaluation is a forward pass with plain float32 convolutions (D-52): every metric runs under inference mode with cuDNN's TF32 flag cleared, and the flag is restored afterwards. On CUDA float32, SSIM₁ may take the fused-ssim path, which agrees with the fallback in value (Q-42).
+Evaluation is a forward pass with plain float32 convolutions (D-52): every metric runs under inference mode with cuDNN's TF32 flag cleared, and the flag is restored afterwards. `Evaluator` computes on a float32 copy of the pair, the LPIPS networks' dtype, and derives DSSIM_k from the SSIM_k it has just computed (Q-60). On CUDA float32, SSIM₁ may take the fused-ssim path, which agrees with the fallback in value (Q-42).
 
 ## The dynamic region
 
-`dynamic_region` turns a render, its ground truth and the test image's mask into the pair that the dynamic-region metrics compare (App. B.1, D-67). The mask is binarized at 0.5, a pixel counting as dynamic at 0.5 and above. Both images are clamped and filled with black outside the mask, then cropped to the mask's bounding box, the same box for both (Q-61).
+`dynamic_region` turns a render, its ground truth and the test image's mask into the pair that the dynamic-region metrics compare (App. B.1, D-67). The mask is binarized at 0.5, a pixel counting as dynamic at 0.5 and above. The render is clamped, as for every metric; then both images are filled with black outside the mask and cropped to the mask's bounding box, the same box for both (Q-61).
 
 A mask with no dynamic pixel, or a box too small for every metric to be defined, gives no pair and a warning, and the report counts that image as skipped (Q-61). The minimum side comes from the largest window of the metrics, LPIPS-Alex's.
 
