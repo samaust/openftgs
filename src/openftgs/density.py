@@ -14,17 +14,33 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from openftgs.config import RelocConfig
+from openftgs.config import GrowthConfig, RelocConfig
 from openftgs.model import FreeTimeGaussians, rotation_matrix
 from openftgs.optim import FTGSOptimizer
 
 __all__ = [  # Q-48
     "GradStats",
+    "GrowthReport",
     "RelocationReport",
+    "grow",
     "mcmc_split",
     "relocate",
     "sampling_score",
 ]
+
+_SPLIT_DIVISOR = 1.6  # E17: children's scales a/1.6
+
+
+@dataclass(frozen=True)
+class GrowthReport:
+    """What a growth event did (Q-48): candidates cloned and split ("gradient" mode), rows
+    appended by E11 ("score" mode), candidates left out by the cap N_max (D-44), and N after."""
+
+    cloned: int
+    split: int
+    sampled: int
+    capped: int
+    num_gaussians: int
 
 
 @dataclass(frozen=True)
@@ -385,3 +401,140 @@ def relocate(
     model.validate()  # §1.1: checked after every relocation
     stats.reset()  # §1.3 step 7 (Q-51, owner answer)
     return RelocationReport(dead=n_dead, targets=int(targets.shape[0]))
+
+
+def _check_spatial_scale(spatial_scale: object) -> float:
+    if isinstance(spatial_scale, bool) or not isinstance(spatial_scale, int | float):
+        _fail(f"spatial_scale must be a number, got {spatial_scale!r}")
+    if not (math.isfinite(spatial_scale) and spatial_scale > 0.0):
+        _fail(f"spatial_scale must be finite and > 0, got {spatial_scale!r}")
+    return float(spatial_scale)
+
+
+def _resize_all(
+    model: FreeTimeGaussians,
+    optimizer: FTGSOptimizer,
+    stats: GradStats,
+    *,
+    keep: Tensor | None,
+    append: Mapping[str, Tensor] | None,
+    parents: Tensor | None,
+) -> None:
+    """Model, optimizer and statistics resized together, with one keep mask (§1.3 Growth step 4;
+    Q-23, Q-44): new rows get zero moments and their parents' statistics (D-45)."""
+    model.resize_(keep=keep, append=append)
+    optimizer.resize_(keep=keep, n_append=0 if parents is None else int(parents.shape[0]))
+    stats.resize_(keep=keep, append_from=parents)
+
+
+# Q-52: candidates, the cap, the clone/split boundary, the order of new rows and of the draws.
+def _grow_by_gradient(
+    model: FreeTimeGaussians,
+    optimizer: FTGSOptimizer,
+    stats: GradStats,
+    cfg: GrowthConfig,
+    spatial_scale: float,
+    generator: torch.Generator,
+) -> GrowthReport:
+    n = model.num_gaussians
+    g = stats.mean()
+    rows = torch.nonzero(g > cfg.grad_threshold).squeeze(1)  # §1.3 Growth step 1, in float32
+    n_candidates = int(rows.shape[0])
+    room = max(cfg.n_max - n, 0)  # a clone and a split each add one row
+    capped = max(n_candidates - room, 0)
+    if capped:
+        # D-44: the largest g that fit, ties to the lower row (a stable sort of rows in order).
+        best = torch.sort(g[rows], descending=True, stable=True).indices[:room]
+        rows = torch.sort(rows[best]).values
+    if rows.numel() == 0:
+        return GrowthReport(cloned=0, split=0, sampled=0, capped=capped, num_gaussians=n)
+    with torch.no_grad():
+        params = {name: getattr(model, name).detach() for name in FreeTimeGaussians.PARAM_NAMES}
+        log_scales = params["log_scales"][rows]
+        # §1.3 Growth step 3: a clone when the largest scale is ≤ split_scale·S (in float32).
+        large = torch.exp(log_scales).amax(dim=-1) > cfg.split_scale * spatial_scale
+        clone_rows, split_rows = rows[~large], rows[large]
+        n_split = int(split_rows.shape[0])
+        new_rows = [{name: p.index_select(0, clone_rows) for name, p in params.items()}]
+        keep = None
+        if n_split:
+            parent = {name: p.index_select(0, split_rows) for name, p in params.items()}
+            # E17: μ + R(q)·diag(a)·z_k for k = 1, 2, from one draw, first children first.
+            z = torch.randn((2, n_split, 3), generator=generator, device=generator.device)
+            rs = rotation_matrix(parent["quats"]) * torch.exp(parent["log_scales"])[:, None, :]
+            offsets = (rs[None] @ z.to(rs.device)[..., None]).squeeze(-1)
+            child_log_scales = (parent["log_scales"].double() - math.log(_SPLIT_DIVISOR)).float()
+            for k in range(2):
+                new_rows.append(
+                    {
+                        **parent,
+                        "means": parent["means"] + offsets[k],
+                        "log_scales": child_log_scales,
+                    }
+                )
+            keep = torch.ones(n, dtype=torch.bool, device=rows.device).index_fill_(
+                0, split_rows, False
+            )
+        append = {name: torch.cat([r[name] for r in new_rows]) for name in params}
+    parents = torch.cat([clone_rows, split_rows, split_rows])
+    _resize_all(model, optimizer, stats, keep=keep, append=append, parents=parents)
+    return GrowthReport(
+        cloned=int(clone_rows.shape[0]),
+        split=n_split,
+        sampled=0,
+        capped=capped,
+        num_gaussians=model.num_gaussians,
+    )
+
+
+def grow(
+    model: FreeTimeGaussians,
+    optimizer: FTGSOptimizer,
+    stats: GradStats,
+    cfg: GrowthConfig,
+    *,
+    spatial_scale: float,
+    reloc: RelocConfig,
+    generator: torch.Generator,
+) -> GrowthReport:
+    """One growth event in the configured count-control mode (§1.3 Growth and Count-control
+    modes, E17, D-18, D-42 to D-45): "gradient" clones and splits the candidates, "score" appends
+    rows drawn ∝ ρ and initialized by E11, "none" does nothing. Model, optimizer and statistics
+    are resized together. Synchronizes with the host: an event does anyway (§2.4 rule 3)."""
+    _check_stats(model, stats)
+    _check_generator(generator)
+    scale = _check_spatial_scale(spatial_scale)
+    if cfg.mode == "none":
+        return GrowthReport(
+            cloned=0, split=0, sampled=0, capped=0, num_gaussians=model.num_gaussians
+        )
+    if cfg.mode == "score":
+        return _grow_by_score(model, optimizer, stats, cfg, reloc, generator)
+    return _grow_by_gradient(model, optimizer, stats, cfg, scale, generator)
+
+
+# Q-52: the score mode draws from the live set only, applies E11 like relocation, zeroes the
+# targets' moments (D-16) and appends the copies with their targets' statistics (D-45).
+def _grow_by_score(
+    model: FreeTimeGaussians,
+    optimizer: FTGSOptimizer,
+    stats: GradStats,
+    cfg: GrowthConfig,
+    reloc: RelocConfig,
+    generator: torch.Generator,
+) -> GrowthReport:
+    n = model.num_gaussians
+    # §1.3 Count-control modes: max(0, min(N_max, ⌊(1 + rate)·N⌋) − N) new rows.
+    n_add = max(0, min(cfg.n_max, math.floor((1.0 + cfg.score_rate) * n)) - n)
+    live = model.opacity_logits.detach() >= _logit_bound(reloc.dead_opacity)  # D-14
+    if n_add == 0 or not bool(live.any()):
+        return GrowthReport(cloned=0, split=0, sampled=0, capped=0, num_gaussians=n)
+    model.validate()  # Q-55: a non-finite model raises before the draw
+    scores = torch.where(live, sampling_score(model, stats, reloc), 0.0)
+    draws = _draw_targets(scores, n_add, generator)
+    targets, copies = _move(model, draws, reloc, generator)
+    optimizer.reset_rows(targets)
+    _resize_all(model, optimizer, stats, keep=None, append=copies, parents=draws)
+    return GrowthReport(
+        cloned=0, split=0, sampled=n_add, capped=0, num_gaussians=model.num_gaussians
+    )

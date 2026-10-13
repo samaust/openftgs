@@ -28,10 +28,12 @@ from builders import (
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from openftgs.config import OptimConfig, RelocConfig
+from openftgs.config import GrowthConfig, OptimConfig, RelocConfig
 from openftgs.density import (
     GradStats,
+    GrowthReport,
     RelocationReport,
+    grow,
     mcmc_split,
     relocate,
     sampling_score,
@@ -609,9 +611,10 @@ def _rows_of(model: FreeTimeGaussians) -> dict[str, torch.Tensor]:
     return {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
 
 
-def _target_of(model: FreeTimeGaussians, rows: torch.Tensor) -> torch.Tensor:
-    """The original row each given row's time center names (row k has μt = k/N)."""
-    n = model.num_gaussians
+def _target_of(model: FreeTimeGaussians, rows: torch.Tensor, n: int | None = None) -> torch.Tensor:
+    """The original row each given row's time center names (row k of the scene's N rows has
+    μt = k/N; N is the model's row count unless given)."""
+    n = model.num_gaussians if n is None else n
     return torch.round(model.times.detach()[rows] * n).to(torch.int64)
 
 
@@ -893,3 +896,290 @@ def test_u13_render_is_nearly_unchanged_by_relocating_stacked_copies() -> None:
     after = render(model, CAM_A, 0.5, time_units="normalized", backend="reference").image.detach()
     psnr = -10.0 * math.log10(float(((after - before) ** 2).mean()))
     assert psnr >= 30.0, psnr
+
+
+# U-25 · growth (E17, D-18, D-42 to D-45; Q-52)
+
+S = 100.0  # spatial scale: the clone/split boundary 0.01·S is 1.0 (D-27, §1.3 Growth)
+
+
+def _stats_from(g: list[float]) -> GradStats:
+    """Statistics whose accumulated gradient g is exactly the given float32 values (count 1)."""
+    stats = GradStats(len(g))
+    n = len(g)
+    stats.load_state_dict(
+        {"g_sum": torch.tensor(g, dtype=F32), "count": torch.ones(n, dtype=torch.int32)}
+    )
+    return stats
+
+
+def _growth_scene(
+    log_scales: list[list[float]], *, seed: int = 0
+) -> tuple[FreeTimeGaussians, FTGSOptimizer]:
+    """`_relocation_scene` with live rows and the given log-scales (set after the Adam step)."""
+    model, opt = _relocation_scene([1.0] * len(log_scales), seed=seed)
+    with torch.no_grad():
+        model.log_scales.copy_(torch.tensor(log_scales, dtype=F32))
+    return model, opt
+
+
+SMALL = [-3.0, -3.0, -3.0]  # largest scale e⁻³ ≤ 0.01·S: a clone
+LARGE = [0.5, -1.0, -2.0]  # largest scale e^0.5 > 0.01·S: a split
+
+
+def test_u25_candidates_are_exactly_the_rows_whose_g_exceeds_tau_pos() -> None:
+    """U-25, §1.3 Growth step 1: the candidates are exactly the primitives with g > 0.0002
+    (τ_pos): g equal to float32(0.0002) doesn't grow, the next float32 up does. Clones copy all
+    nine tensors and go last in ascending parent row (exact)."""
+    tau = float(torch.tensor(2e-4, dtype=F32))
+    above = float(torch.nextafter(torch.tensor(tau), torch.tensor(1.0)))
+    g = [tau, above, 0.0, 5e-3, 1e-4, tau]
+    model, opt = _growth_scene([SMALL] * 6)
+    before = _rows_of(model)
+    report = grow(
+        model,
+        opt,
+        _stats_from(g),
+        GrowthConfig(),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator(),
+    )
+    assert report == GrowthReport(cloned=2, split=0, sampled=0, capped=0, num_gaussians=8)
+    after = _rows_of(model)
+    for name in PARAM_NAMES:
+        assert torch.equal(after[name][:6], before[name])
+        assert torch.equal(after[name][6:], before[name][torch.tensor([1, 3])]), name
+
+
+def test_u25_clone_split_boundary_is_at_one_hundredth_of_s() -> None:
+    """U-25, §1.3 Growth step 3: a candidate whose largest scale is ≤ 0.01·S is cloned, a larger
+    one split. With S = 100, â = 0 gives a = 1, exactly the boundary: a clone; â = 2⁻²² gives
+    a = 1 + 2⁻²² in float32: a split."""
+    nudge = 2.0**-22
+    assert float(torch.exp(torch.tensor(nudge, dtype=F32))) == 1.0 + nudge
+    model, opt = _growth_scene([[0.0, -1.0, -1.0], [-1.0, nudge, -1.0]])
+    report = grow(
+        model,
+        opt,
+        _stats_from([1.0, 1.0]),
+        GrowthConfig(),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator(),
+    )
+    assert (report.cloned, report.split) == (1, 1)
+
+
+def test_u25_split_children_replace_their_parent() -> None:
+    """U-25, E17, D-43: a split's two children have scales a/1.6 (stored as the float32 nearest
+    â − ln 1.6) and copy the parent's other tensors except the position, bitwise; the parent is
+    removed. Kept rows keep their order; new rows go last: clones, then first children, then
+    second children, each in ascending parent row (Q-52)."""
+    model, opt = _growth_scene([LARGE, SMALL, SMALL, LARGE, LARGE, SMALL])
+    before = _rows_of(model)
+    report = grow(
+        model,
+        opt,
+        _stats_from([1.0, 1.0, 0.0, 1.0, 0.0, 1.0]),
+        GrowthConfig(),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator().manual_seed(2),
+    )
+    # Candidates 0, 1, 3, 5: rows 0 and 3 split, rows 1 and 5 clone; rows 2 and 4 stay.
+    assert report == GrowthReport(cloned=2, split=2, sampled=0, capped=0, num_gaussians=10)
+    after = _rows_of(model)
+    order = [1, 2, 4, 5, 1, 5, 0, 3, 0, 3]  # kept, clones, first children, second children
+    for name in PARAM_NAMES:
+        if name in ("means", "log_scales"):
+            continue
+        assert torch.equal(after[name], before[name][torch.tensor(order)]), name
+    for name in ("means", "log_scales"):
+        assert torch.equal(after[name][:6], before[name][torch.tensor(order[:6])]), name
+    expected = (before["log_scales"][torch.tensor([0, 3])].double() - math.log(1.6)).float()
+    assert torch.equal(after["log_scales"][6:8], expected)
+    assert torch.equal(after["log_scales"][8:10], expected)
+    assert not torch.equal(after["means"][6:8], after["means"][8:10])
+
+
+def test_u25_split_offsets_have_the_parents_covariance() -> None:
+    """U-25, E17: the offsets of 10⁶ children (Q-54: 10⁶ draws, owner answer) of 5·10⁵ identical
+    parents match the parent's Gaussian R(q)·diag(a)·z, a being the parent's scales, in mean and
+    covariance within 1%."""
+    parents = 500_000
+    quat, scales = [0.7, -0.4, 0.5, 0.3], [1.6, 0.3, 0.05]  # largest > 0.01·S: splits
+    model, opt = _growth_scene([[math.log(a) for a in scales]] * parents)
+    with torch.no_grad():
+        model.means.copy_(torch.tensor([1.0, -2.0, 0.5]).expand(parents, 3))
+        model.quats.copy_(torch.tensor(quat).expand(parents, 4))
+    grow(
+        model,
+        opt,
+        _stats_from([1.0] * parents),
+        GrowthConfig(),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator().manual_seed(12),
+    )
+    assert model.num_gaussians == 2 * parents
+    offsets = model.means.detach() - torch.tensor([1.0, -2.0, 0.5])
+    norm = math.sqrt(sum(c * c for c in quat))
+    assert_standard_normal(_whitened(offsets, [c / norm for c in quat], scales))
+
+
+def test_u25_new_rows_have_zero_moments_and_inherit_their_parents_statistics() -> None:
+    """U-25, §1.3 Growth step 4, D-45: new rows start with zero Adam moments and inherit their
+    parent's g_sum and count, so the relocation later in the same event scores them; kept rows
+    keep their moments and statistics, in order; step counters are kept."""
+    model, opt = _growth_scene([LARGE, SMALL, SMALL, SMALL])
+    moments = opt.state_dict()
+    stats = GradStats(4)
+    stats.load_state_dict(
+        {
+            "g_sum": torch.tensor([3.0, 0.0, 0.5, 1.0e-4]),
+            "count": torch.tensor([2, 0, 1, 3], dtype=torch.int32),
+        }
+    )
+    grow(
+        model,
+        opt,
+        stats,
+        GrowthConfig(),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator(),
+    )
+    # Candidates: row 0 (g = 1.5, split) and row 2 (g = 0.5, clone): kept 1, 2, 3; then 2, 0, 0.
+    assert torch.equal(stats.g_sum, torch.tensor([0.0, 0.5, 1.0e-4, 0.5, 3.0, 3.0]))
+    assert torch.equal(stats.count, torch.tensor([0, 1, 3, 1, 2, 2], dtype=torch.int32))
+    after = opt.state_dict()
+    for name in after:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(after[name][key][:3], moments[name][key][1:])
+            assert torch.equal(after[name][key][3:], torch.zeros_like(after[name][key][3:]))
+        assert torch.equal(after[name]["step"], moments[name]["step"])
+
+
+def test_u25_with_a_full_cap_the_largest_g_grow_ties_to_the_lower_row() -> None:
+    """U-25, D-44: when N plus the candidates would exceed N_max, only the candidates with the
+    largest g that fit grow, ties going to the lower row index; the report counts the rest."""
+    g = [3.0, 5.0, 1.0, 5.0, 3.0, 0.0]
+    model, opt = _growth_scene([SMALL] * 6)
+    before = _rows_of(model)
+    report = grow(
+        model,
+        opt,
+        _stats_from(g),
+        GrowthConfig(n_max=9),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator(),
+    )
+    # Room for 3 of 5 candidates: rows 1 and 3 (g = 5), then row 0 (g = 3, before row 4).
+    assert report == GrowthReport(cloned=3, split=0, sampled=0, capped=2, num_gaussians=9)
+    assert torch.equal(model.times.detach()[6:], before["times"][torch.tensor([0, 1, 3])])
+
+
+def test_u25_n_never_decreases_and_a_full_model_does_not_grow() -> None:
+    """U-25, §1.1, D-42: growth only adds; with N = N_max no candidate grows and nothing
+    changes."""
+    model, opt = _growth_scene([SMALL, LARGE, SMALL])
+    before = _rows_of(model)
+    report = grow(
+        model,
+        opt,
+        _stats_from([1.0, 1.0, 1.0]),
+        GrowthConfig(n_max=3),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator(),
+    )
+    assert report == GrowthReport(cloned=0, split=0, sampled=0, capped=3, num_gaussians=3)
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
+
+
+def test_count_control_none_changes_nothing() -> None:
+    """§1.3 Count-control modes: with growth = "none", N stays as initialized; grow touches
+    nothing and draws nothing."""
+    model, opt = _growth_scene([LARGE, SMALL])
+    before = _rows_of(model)
+    gen = torch.Generator().manual_seed(1)
+    state = gen.get_state()
+    report = grow(
+        model,
+        opt,
+        _stats_from([1.0, 1.0]),
+        GrowthConfig(mode="none"),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=gen,
+    )
+    assert report == GrowthReport(cloned=0, split=0, sampled=0, capped=0, num_gaussians=2)
+    assert torch.equal(gen.get_state(), state)
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
+
+
+def test_count_control_score_appends_five_percent_up_to_n_max() -> None:
+    """§1.3 Count-control modes: growth = "score" appends max(0, min(N_max, ⌊1.05·N⌋) − N)
+    rows at each event, so the count ends at N_max and then stays."""
+    model, opt = _relocation_scene([1.0] * 100)
+    stats = GradStats(100)
+    cfg = GrowthConfig(mode="score", n_max=108)
+    gen = torch.Generator().manual_seed(3)
+    sizes = []
+    for _ in range(3):
+        report = grow(model, opt, stats, cfg, spatial_scale=S, reloc=RelocConfig(), generator=gen)
+        sizes.append((report.sampled, report.num_gaussians))
+    assert sizes == [(5, 105), (3, 108), (0, 108)]
+    assert model.num_gaussians == 108 and stats.num_gaussians == 108
+
+
+def test_count_control_score_moves_copies_from_live_targets_by_e11() -> None:
+    """§1.3 Count-control modes, E11, D-16, D-45 (Q-52): the score mode's rows are drawn ∝ ρ from
+    the live set only (dead rows, here with the largest g, are never drawn), each target gets
+    E11 with n = 1 + its draws and zeroed Adam moments, and each new row is its target's updated
+    row, positioned from its Gaussian, with its target's statistics."""
+    n_live, n_dead = 60, 40
+    logits = [0.2 + 0.03 * k for k in range(n_live)] + [LOGIT_DEAD] * n_dead
+    model, opt = _relocation_scene(logits)
+    before = _rows_of(model)
+    sums = [0.01 * (k % 7) for k in range(n_live)] + [100.0] * n_dead
+    stats = _stats_with(sums, [1] * (n_live + n_dead))
+    g_before = stats.mean()
+    report = grow(
+        model,
+        opt,
+        stats,
+        GrowthConfig(mode="score"),
+        spatial_scale=S,
+        reloc=RelocConfig(),
+        generator=torch.Generator().manual_seed(4),
+    )
+    assert report == GrowthReport(cloned=0, split=0, sampled=5, capped=0, num_gaussians=105)
+    new_rows = torch.arange(100, 105)
+    sources = _target_of(model, new_rows, n_live + n_dead)
+    assert bool((sources < n_live).all())
+    after = _rows_of(model)
+    for name in PARAM_NAMES:
+        if name != "means":
+            assert torch.equal(after[name][new_rows], after[name][sources]), name
+    assert torch.equal(stats.mean()[new_rows], g_before[sources])
+    moments = opt.state_dict()
+    targets, draws = torch.unique(sources, return_counts=True)
+    for target, count in zip(targets.tolist(), draws.tolist(), strict=True):
+        sigma = float(torch.sigmoid(before["opacity_logits"][target].double()))
+        s_new, _ = e11_oracle(sigma, 1 + count, 1.0)
+        expected = max(float(torch.logit(torch.tensor(s_new, dtype=F64)).float()), O_DEAD)
+        assert float(after["opacity_logits"][target]) == expected
+        for name in moments:
+            assert torch.equal(
+                moments[name]["exp_avg"][target], torch.zeros_like(moments[name]["exp_avg"][target])
+            )
+    untouched = torch.ones(105, dtype=torch.bool)
+    untouched[targets] = False
+    untouched[100:] = False
+    for name in PARAM_NAMES:
+        assert torch.equal(after[name][:100][untouched[:100]], before[name][untouched[:100]])
