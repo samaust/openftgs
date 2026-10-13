@@ -4,7 +4,7 @@ ftgs-init files (InitPoints), render requests (RenderRequest) and their renders 
 PLY files for viewers, with the validators of the exchange and init formats. Plain data in and
 out: this module imports neither openftgs.model nor openftgs.train.
 
-Spec: §2.2, D-30, D-73. Band: Foundation (§2.1).
+Spec: §2.2, D-30, D-34, D-73. Band: Foundation (§2.1).
 """
 
 import hashlib
@@ -766,7 +766,8 @@ def write_renders(renders: Renders, path: Path, *, producer: str, request_sha256
 def read_renders(path: Path, *, request_sha256: str | None = None) -> Renders:
     """Read and validate a ftgs-renders file (§2.2; Q-56). With `request_sha256`, a file
     recorded for another request is rejected. Tensors other than rgb/… and alpha/… are
-    ignored."""
+    ignored. The file keeps no item order, so the ids come back sorted: match them to the
+    request by id."""
     tensors, meta = _read_safetensors(Path(path))
     where = f"renders {path}"
     _check_header(meta, _RENDERS, where)

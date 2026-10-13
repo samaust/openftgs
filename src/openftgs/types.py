@@ -174,6 +174,7 @@ class RenderRequest:
 
 @dataclass(frozen=True)
 class Renders:
+    # Keyed by item id: in request order from render_request, sorted from read_renders (Q-56).
     rgb: dict[str, Tensor]  # id → [H, W, 3] float32, not clamped to 1
     alpha: dict[str, Tensor]  # id → [H, W, 1] float32
 

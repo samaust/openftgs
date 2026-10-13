@@ -1246,3 +1246,23 @@ def test_renders_validation(tmp_path: Path, rgb: dict, alpha: dict, match: str) 
     )
     with pytest.raises(ValueError, match=match):
         read_renders(path)
+
+
+@pytest.mark.parametrize(
+    ("meta", "match"),
+    [
+        ({"format": "ftgs-if", "version": "1"}, "format"),
+        ({"format": "ftgs-renders", "version": "2"}, "version"),
+        ({"format": "ftgs-renders"}, "version"),
+    ],
+)
+def test_renders_reader_checks_format_and_major_version(
+    tmp_path: Path, meta: dict[str, str], match: str
+) -> None:
+    """§2.2 introduction: every file carries format and version; readers reject an unknown
+    major version."""
+    r = _renders()
+    path = tmp_path / "out.safetensors"
+    save_file({"rgb/a": r.rgb["a"], "alpha/a": r.alpha["a"]}, str(path), metadata=meta)
+    with pytest.raises(ValueError, match=match):
+        read_renders(path)
