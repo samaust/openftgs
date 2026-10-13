@@ -13,7 +13,7 @@ import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from PIL import Image
@@ -319,20 +319,21 @@ def write_scene(
     images: Sequence[tuple[Camera, float, str]],
     *,
     mask_tests: bool = False,
+    backend: Literal["reference", "gsplat"] = "reference",
 ) -> Path:
     """A scene manifest and its images in `root`, returning the manifest's path. Each image, a
-    (camera, raw τ, data split) triple, is rendered from `model` with the reference backend at
-    that τ, clamped to [0, 1] and rounded to an 8-bit RGB PNG. Cameras are keyed by name, so the
-    images of one camera share it. With `mask_tests`, each test image gets an 8-bit mask whose
-    left half is dynamic."""
+    (camera, raw τ, data split) triple, is rendered from `model` with `backend` on the model's
+    device at that τ, clamped to [0, 1] and rounded to an 8-bit RGB PNG. Cameras are keyed by
+    name, so the images of one camera share it. With `mask_tests`, each test image gets an 8-bit
+    mask whose left half is dynamic."""
     root.mkdir(parents=True, exist_ok=True)
     cameras: dict[str, dict[str, Any]] = {}
     entries: list[dict[str, Any]] = []
     for k, (camera, tau, split) in enumerate(images):
         cameras.setdefault(camera.name, _camera_json(camera))
         with torch.no_grad():
-            rgb = render(model, camera, tau, backend="reference").image[0]
-        pixels = (rgb.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).numpy()
+            rgb = render(model, camera, tau, backend=backend).image[0]
+        pixels = (rgb.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy()
         entry: dict[str, Any] = {
             "camera": camera.name,
             "timestamp": tau,
