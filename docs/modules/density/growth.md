@@ -33,7 +33,7 @@ The ablation's constants have no config field; they are fixed private constants 
 
 ## Notes for M10
 
-- When the opacity reset fires, over the whole run or only within the growth window as 3DGS and gsplat do, is the trainer's calendar decision.
+- When the opacity reset fires, over the whole run or only within the growth window as 3DGS and gsplat do, is the trainer's calendar decision. Its period and `prune`'s iteration 3,000 come from the same gsplat default, so the trainer takes the period from one place and the two can't drift apart (Q-53, owner answer).
 - The relocation generator may live on the CPU or on the model's device; draws run on the generator's device. A generator on the model's device keeps the draws there.
 - With relocation off, the trainer resets the gradient statistics itself after each event (Q-51).
 - A `ValueError` from `FreeTimeGaussians.validate()` at an event means the run diverged; its mapping to the CLI's exit code 3 belongs to M10 and M14.
