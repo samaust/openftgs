@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The file formats of §2.2 in openftgs.io: ftgs-init, ftgs-if, ftgs-checkpoint, the render
-request and renders, and the PLY snapshot (D-30, D-73; U-22 and U-26 file parts; Q-17, Q-18,
-Q-22, Q-24 to Q-26, Q-35, Q-56).
+request and renders, the scene manifest, and the PLY snapshot (D-30, D-73; U-22 and U-26 file
+parts; Q-17, Q-18, Q-22, Q-24 to Q-26, Q-35, Q-56, Q-64).
 
 Expected values come from the §2.2 tables (keys, dtypes, shapes, validation rules) and from
 values worked by hand; files with invalid content are written with safetensors directly, so the
@@ -29,6 +29,7 @@ from openftgs.io import (
     read_init_points,
     read_render_request,
     read_renders,
+    read_scene_manifest,
     save_checkpoint,
     validate_exchange,
     validate_init_points,
@@ -1314,3 +1315,205 @@ def test_renders_reader_returns_ids_sorted(tmp_path: Path) -> None:
     write_renders(renders, path, producer="p", request_sha256=_SHA)
     back = read_renders(path)
     assert list(back.rgb) == list(back.alpha) == ["a", "m", "z"]
+
+
+# ftgs-scene (§2.2; Q-64).
+
+
+def _scene_camera(width: int = 8, height: int = 6) -> dict[str, Any]:
+    # A rotation of 90° about z and a translation, written exactly in JSON.
+    return {
+        "width": width,
+        "height": height,
+        "model": "pinhole",
+        "K": [[10.0, 0.0, 4.0], [0.0, 12.0, 3.0], [0.0, 0.0, 1.0]],
+        "world_to_camera": [
+            [0.0, -1.0, 0.0, 0.5],
+            [1.0, 0.0, 0.0, -0.25],
+            [0.0, 0.0, 1.0, 3.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    }
+
+
+_MOVED = [
+    [1.0, 0.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0, 2.0],
+    [0.0, 0.0, 1.0, 4.0],
+    [0.0, 0.0, 0.0, 1.0],
+]
+
+
+def _scene(**overrides: object) -> dict[str, Any]:
+    scene: dict[str, Any] = {
+        "format": "ftgs-scene",
+        "version": 1,
+        "time_unit": "s",
+        "cameras": {"cam00": _scene_camera(), "cam01": _scene_camera(5, 4)},
+        "images": [
+            {
+                "camera": "cam00",
+                "timestamp": 0.0,
+                "frame_index": 0,
+                "path": "images/cam00/000000.png",
+                "split": "train",
+            },
+            {
+                "camera": "cam01",
+                "timestamp": 0.1,
+                "frame_index": 3,
+                "path": "images/cam01/000000.png",
+                "split": "test",
+                "mask": "masks/cam01/000000.png",
+            },
+            {
+                "camera": "cam00",
+                "timestamp": 1.0 / 30.0,
+                "path": "images/cam00/000001.png",
+                "split": "train",
+                "world_to_camera": _MOVED,
+            },
+        ],
+        "metadata": {"source": "n3dv/test", "resize": 0.5},
+    }
+    scene.update(overrides)
+    return scene
+
+
+def test_scene_manifest_reads_records_in_file_order(tmp_path: Path) -> None:
+    """§2.2 scene manifest (Q-64): records in file order with raw float64 timestamps, splits,
+    frame indices and paths resolved against the manifest's directory; cameras as in §2.1 with
+    float32 tensors and the camera's name; the test image's mask; the metadata, the time unit
+    and the SHA-256 of the file's bytes as read."""
+    path = _write_json(tmp_path / "scene.json", _scene())
+    manifest = read_scene_manifest(path)
+    assert manifest.path == path
+    assert manifest.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert manifest.time_unit == "s"
+    assert manifest.metadata == {"source": "n3dv/test", "resize": 0.5}
+    first, second, third = manifest.records
+    assert [r.split for r in manifest.records] == ["train", "test", "train"]
+    assert [r.timestamp for r in manifest.records] == [0.0, 0.1, 1.0 / 30.0]
+    assert [r.frame_index for r in manifest.records] == [0, 3, None]
+    assert first.image_path == tmp_path / "images/cam00/000000.png"
+    assert manifest.masks == (None, tmp_path / "masks/cam01/000000.png", None)
+    assert first.camera.name == "cam00" and second.camera.name == "cam01"
+    assert (second.camera.width, second.camera.height) == (5, 4)
+    assert first.camera.K.dtype == F32 and first.camera.world_to_camera.dtype == F32
+    assert torch.equal(first.camera.K, torch.tensor(_scene_camera()["K"]))
+    assert torch.equal(
+        first.camera.world_to_camera, torch.tensor(_scene_camera()["world_to_camera"])
+    )
+    # §2.2: an image entry may override world_to_camera; the record gets its own camera.
+    assert third.camera.name == "cam00"
+    assert torch.equal(third.camera.world_to_camera, torch.tensor(_MOVED))
+    assert torch.equal(third.camera.K, first.camera.K)
+
+
+def test_scene_manifest_defaults_and_unknown_keys(tmp_path: Path) -> None:
+    """§2.2: readers ignore unknown optional keys; an absent camera model is pinhole, absent
+    metadata is empty, a null frame index is None and a "major.minor" version is read (Q-64)."""
+    raw = _scene(extra=[1, 2], version="1.4")
+    del raw["metadata"], raw["cameras"]["cam00"]["model"]
+    raw["images"][0]["frame_index"] = None
+    raw["images"][0]["note"] = "x"
+    manifest = read_scene_manifest(_write_json(tmp_path / "scene.json", raw))
+    assert manifest.metadata == {}
+    assert manifest.records[0].frame_index is None
+    assert len(manifest.records) == 3
+
+
+def test_scene_manifest_images_share_their_camera(tmp_path: Path) -> None:
+    """Q-64: images without an override share their camera's object; an override of K alone
+    keeps the camera's pose."""
+    raw = _scene()
+    raw["images"].append(
+        {
+            "camera": "cam00",
+            "timestamp": 0.5,
+            "path": "b.png",
+            "split": "train",
+            "K": [[20.0, 0.0, 4.0], [0.0, 20.0, 3.0], [0.0, 0.0, 1.0]],
+        }
+    )
+    raw["images"].append({"camera": "cam00", "timestamp": 0.6, "path": "c.png", "split": "train"})
+    records = read_scene_manifest(_write_json(tmp_path / "scene.json", raw)).records
+    assert records[4].camera is records[0].camera
+    assert records[3].camera is not records[0].camera
+    assert records[3].camera.K[0, 0] == 20.0
+    assert torch.equal(records[3].camera.world_to_camera, records[0].camera.world_to_camera)
+
+
+_IMG = ("images", 0)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("format",), "ftgs-render-request", "format"),
+        (("format",), _DELETE, "format"),
+        (("version",), 2, "version"),
+        (("version",), True, "version"),
+        (("time_unit",), "", "time_unit"),
+        (("time_unit",), _DELETE, "time_unit"),
+        (("cameras",), [], "cameras"),
+        (("cameras", "cam00"), 3, "camera"),
+        (("cameras", "cam00", "model"), "opencv", "pinhole"),
+        (("cameras", "cam00", "width"), 0, "width"),
+        (("cameras", "cam00", "K", 0, 1), 0.5, "skew"),
+        (("cameras", "cam00", "world_to_camera", 3), [0.0, 0.0, 1.0, 1.0], "last row"),
+        (("cameras", "cam00", "world_to_camera", 0, 0), 0.01, "orthonormal"),
+        (("images",), [], "images"),
+        (("images",), _DELETE, "images"),
+        (("images", 0), "x", "object"),
+        ((*_IMG, "camera"), "cam09", "camera"),
+        ((*_IMG, "camera"), _DELETE, "camera"),
+        ((*_IMG, "timestamp"), True, "timestamp"),
+        ((*_IMG, "timestamp"), "0", "timestamp"),
+        ((*_IMG, "timestamp"), _DELETE, "timestamp"),
+        ((*_IMG, "path"), "", "path"),
+        ((*_IMG, "path"), "/abs/x.png", "relative"),
+        ((*_IMG, "path"), _DELETE, "path"),
+        ((*_IMG, "split"), "val", "split"),
+        ((*_IMG, "split"), _DELETE, "split"),
+        ((*_IMG, "frame_index"), 1.0, "frame_index"),
+        ((*_IMG, "frame_index"), True, "frame_index"),
+        ((*_IMG, "mask"), "m.png", "mask"),
+        (("images", 1, "mask"), "", "mask"),
+        ((*_IMG, "world_to_camera"), [[1.0]], "world_to_camera"),
+        ((*_IMG, "K"), [[0.0, 0.0, 4.0], [0.0, 12.0, 3.0], [0.0, 0.0, 1.0]], "fx"),
+        (("metadata",), [1], "metadata"),
+    ],
+)
+def test_scene_manifest_rejections(
+    tmp_path: Path, path: tuple[str | int, ...], value: object, match: str
+) -> None:
+    """§2.2 scene manifest, validated as Q-64 states (cameras as Q-56's); every failure is a
+    ValueError (Q-26)."""
+    raw = _set(_scene(), path, value)
+    with pytest.raises(ValueError, match=match):
+        read_scene_manifest(_write_json(tmp_path / "scene.json", raw))
+
+
+def test_scene_manifest_needs_a_training_image(tmp_path: Path) -> None:
+    """Q-64: training reads the train split, so a manifest without one is refused."""
+    raw = _scene()
+    raw["images"] = [raw["images"][1]]
+    with pytest.raises(ValueError, match="training image"):
+        read_scene_manifest(_write_json(tmp_path / "scene.json", raw))
+
+
+@pytest.mark.parametrize("text", ["[1, 2]", "{", ""])
+def test_scene_manifest_rejects_files_that_are_not_manifests(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(text)
+    with pytest.raises(ValueError):
+        read_scene_manifest(path)
+
+
+def test_scene_manifest_rejects_non_finite_timestamps(tmp_path: Path) -> None:
+    """Q-56's rule for numbers: JSON's NaN extension is refused."""
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps(_scene()).replace('"timestamp": 0.1', '"timestamp": NaN'))
+    with pytest.raises(ValueError, match="finite"):
+        read_scene_manifest(path)
