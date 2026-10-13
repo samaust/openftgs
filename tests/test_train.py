@@ -9,16 +9,28 @@ resume and determinism tests, from a second run of the same configuration: the p
 and U-24 state.
 """
 
+import dataclasses
+import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 import torch
-from builders import UNIT_TIME, pinhole, random_model, ring, write_scene
+from builders import (
+    UNIT_TIME,
+    logit_of,
+    model_from_rows,
+    pinhole,
+    random_model,
+    ring,
+    shortened_config,
+    write_scene,
+)
 
 from openftgs.config import (
     GrowthConfig,
+    InitConfig,
     LossConfig,
     OptimConfig,
     PerfConfig,
@@ -26,8 +38,12 @@ from openftgs.config import (
     TrainConfig,
 )
 from openftgs.data import MultiViewVideo
+from openftgs.eval import METRIC_NAMES
+from openftgs.io import load_checkpoint, save_checkpoint
+from openftgs.model import FreeTimeGaussians
+from openftgs.render import render
 from openftgs.train import StepLog, Trainer, calendar_entry
-from openftgs.types import Camera, InitPoints, TimeNormalizer
+from openftgs.types import Camera, InitPoints, TimeNormalizer, TrainerState
 
 F64 = torch.float64
 TAU1 = 4.0 / 30.0  # five frames at 30 FPS
@@ -256,3 +272,448 @@ def test_options_of_later_milestones_are_refused(tmp_path: Path, perf: PerfConfi
     video = _scene(tmp_path)
     with pytest.raises(NotImplementedError):
         Trainer(_no_perceptual(perf=perf), video, _init_points(), device="cpu")
+
+
+# Checkpoints and exact resume (U-21), determinism (U-24), stability (S-10).
+
+# U-21's test calendar: events every 50 iterations from 100, growth up to 200, relocation up to
+# 250, so events fall on both sides of a resume at 150. A low gradient threshold makes every
+# event grow, and a dead threshold of 0.2 leaves dead rows at every event (Q-11 ranges hold).
+U21 = TrainConfig(
+    sh_degree=1,
+    loss=LossConfig(lambda_perc=0.0),
+    growth=GrowthConfig(start=100, stop=200, grad_threshold=1e-7, n_max=400),
+    reloc=RelocConfig(every=50, start=100, stop=250, dead_opacity=0.2),
+    optim=OptimConfig(iterations=300, sh_interval=50),
+    perf=PerfConfig(log_every=50),
+)
+
+
+def _u21_trainer(video: MultiViewVideo, cfg: TrainConfig = U21) -> Trainer:
+    model = random_model(
+        40,
+        seed=2,
+        sh_degree=1,
+        time=video.time,
+        spread=0.6,
+        log_scale=(-2.5, -1.5),
+        logit=(-3.0, 2.0),
+    )
+    return Trainer(cfg, video, model, device="cpu")
+
+
+def _assert_same(a: object, b: object, path: str = "state") -> None:
+    """Bitwise equality of nested dicts, lists and tensors."""
+    if isinstance(a, torch.Tensor):
+        assert isinstance(b, torch.Tensor) and a.dtype == b.dtype, path
+        assert torch.equal(a, b), path
+    elif isinstance(a, dict):
+        assert isinstance(b, dict) and set(a) == set(b), path
+        for key in a:
+            _assert_same(a[key], b[key], f"{path}.{key}")
+    elif isinstance(a, list | tuple):
+        assert isinstance(b, list | tuple) and len(a) == len(b), path
+        for k, (x, y) in enumerate(zip(a, b, strict=True)):
+            _assert_same(x, y, f"{path}[{k}]")
+    else:
+        assert a == b, f"{path}: {a!r} != {b!r}"
+
+
+def _assert_states_equal(a: TrainerState, b: TrainerState, *, global_rng: bool = True) -> None:
+    for name in ("iteration", "config", "time", "spatial_scale", "frame_dt", "params", "optim"):
+        _assert_same(getattr(a, name), getattr(b, name), name)
+    for name in ("stats", "sampler", "scene_sha256", "time_unit"):
+        _assert_same(getattr(a, name), getattr(b, name), name)
+    roles = set(a.rng) if global_rng else {"sampler", "relocation"}
+    _assert_same({k: a.rng[k] for k in roles}, {k: b.rng[k] for k in roles}, "rng")
+
+
+def _assert_logs_equal(a: Sequence[StepLog], b: Sequence[StepLog]) -> None:
+    assert len(a) == len(b)
+    for x, y in zip(a, b, strict=True):
+        assert (x.iteration, x.image_index, x.timestamp, x.t, x.sh_degree) == (
+            y.iteration,
+            y.image_index,
+            y.timestamp,
+            y.t,
+            y.sh_degree,
+        )
+        assert x.rates == y.rates and x.mean_losses == y.mean_losses, x.iteration
+        assert (x.num_gaussians, x.growth, x.relocation, x.pruned, x.opacity_reset) == (
+            y.num_gaussians,
+            y.growth,
+            y.relocation,
+            y.pruned,
+            y.opacity_reset,
+        ), x.iteration
+        _assert_same(x.losses, y.losses, f"losses at {x.iteration}")
+
+
+def _events_did_work(logs: Sequence[StepLog]) -> bool:
+    grew = any(log.growth is not None and log.growth.cloned + log.growth.split > 0 for log in logs)
+    moved = any(log.relocation is not None and log.relocation.dead > 0 for log in logs)
+    return grew and moved
+
+
+def test_u21_checkpoint_round_trip_keeps_every_part_of_the_state(tmp_path: Path) -> None:
+    """U-21: every tensor, Adam moment, step counter, generator state, sampler state and
+    statistic survives a save and a load bitwise, and a trainer resumed from the checkpoint
+    holds the same state (§2.2; Q-25, Q-72)."""
+    video = _scene(tmp_path / "scene")
+    trainer = _u21_trainer(video)
+    _run(trainer, 120)  # after an event, in the middle of an epoch
+    state = trainer.state_dict()
+    save_checkpoint(state, tmp_path / "ckpt")
+    _assert_states_equal(state, load_checkpoint(tmp_path / "ckpt"))
+    resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu")
+    assert resumed.iteration == 120
+    _assert_states_equal(state, resumed.state_dict())
+
+
+def test_u21_resumed_run_is_bitwise_equal_to_the_straight_run(tmp_path: Path) -> None:
+    """U-21 (reference backend, CPU): 300 iterations straight against 150, a resume through a
+    checkpoint directory, and 150 more give the same images, rates, loss terms, event reports
+    and final state, bitwise. Events grow and relocate rows on both sides of the resume."""
+    video = _scene(tmp_path / "scene")
+    straight_trainer = _u21_trainer(video)
+    straight = _run(straight_trainer)
+    first = _u21_trainer(video)
+    before = _run(first, 150)
+    save_checkpoint(first.state_dict(), tmp_path / "ckpt")
+    resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu")
+    after = _run(resumed)
+    assert _events_did_work(before) and _events_did_work(after)
+    _assert_logs_equal(straight, before + after)
+    _assert_states_equal(straight_trainer.state_dict(), resumed.state_dict(), global_rng=False)
+
+
+def test_u24_two_seeded_runs_are_bitwise_identical(tmp_path: Path) -> None:
+    """U-24: two 100-iteration runs from one configuration and seed, with events, give the same
+    step logs and final state, bitwise; neither seeds the global generators (Q-72)."""
+    video = _scene(tmp_path)
+    cfg = dataclasses.replace(
+        U21,
+        growth=dataclasses.replace(U21.growth, start=20, stop=60),
+        reloc=dataclasses.replace(U21.reloc, every=20, start=20, stop=80),
+        optim=dataclasses.replace(U21.optim, iterations=100, sh_interval=20),
+        perf=dataclasses.replace(U21.perf, log_every=20),
+    )
+    a, b = _u21_trainer(video, cfg), _u21_trainer(video, cfg)
+    logs_a, logs_b = _run(a), _run(b)
+    assert _events_did_work(logs_a)
+    _assert_logs_equal(logs_a, logs_b)
+    _assert_states_equal(a.state_dict(), b.state_dict(), global_rng=False)
+
+
+def test_s10_tiny_scene_trains_stably_and_resumes(tmp_path: Path) -> None:
+    """S-10: 200 iterations on the CPU, on §3.2's shortened calendar (Q-75): the mean loss of
+    the last 20 iterations is below that of the first 20, nothing is NaN, and a checkpoint at
+    100 resumes to 200. N never decreases and stops growing after the growth window (§1.1,
+    D-18, U-25)."""
+    video = _scene(tmp_path / "scene")
+    base = _no_perceptual(init=InitConfig(points_per_frame=10), growth=GrowthConfig(n_max=150))
+    cfg = shortened_config(200, base)
+    trainer = Trainer(cfg, video, _init_points(), device="cpu")
+    logs = _run(trainer, 100)
+    save_checkpoint(trainer.state_dict(), tmp_path / "ckpt")
+    resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu")
+    logs += _run(resumed)
+    totals = [float(log.losses["total"]) for log in logs]
+    assert [log.iteration for log in logs] == list(range(1, 201))
+    assert all(math.isfinite(value) for value in totals)
+    assert sum(totals[-20:]) < sum(totals[:20])
+    counts = [log.num_gaussians for log in logs]
+    assert counts == sorted(counts)
+    after = [log for log in logs if log.iteration > cfg.growth.stop]
+    assert all(log.growth is None and log.num_gaussians == counts[-1] for log in after)
+
+
+# Events (§1.3 step 7, D-45; Q-51, Q-71).
+
+_EVERY_ITERATION = dict(
+    growth=GrowthConfig(start=1, stop=1, grad_threshold=1e-12, split_scale=10.0),
+    reloc=RelocConfig(every=1, start=1, stop=1),
+    optim=OptimConfig(iterations=2),
+)
+
+
+def _one_live_row(video: MultiViewVideo, dead: int = 10) -> FreeTimeGaussians:
+    """One live primitive at the origin, in every camera's view, and `dead` primitives at
+    σ = 0.001 far above the scene, in no camera's view, so they are never growth candidates."""
+    rows = [{"mean": (0.0, 0.0, 0.0), "scale": 0.2, "logit": 1.0, "sh0": (0.5, 0.5, 0.5)}]
+    rows += [{"mean": (0.1 * k, 0.0, 40.0), "logit": logit_of(0.001)} for k in range(dead)]
+    return model_from_rows(rows, sh_degree=3, time=video.time)
+
+
+def test_growth_runs_before_relocation_in_an_event(tmp_path: Path) -> None:
+    """§1.3 step 7, D-45, U-25: growth runs before relocation in an event, so the relocation of
+    the same event can draw the rows growth added. The live row is cloned (its scale is below
+    the split boundary), and relocation's ten draws fall on both copies: two targets, which only
+    growth-then-relocation allows."""
+    video = _scene(tmp_path)
+    trainer = Trainer(_no_perceptual(**_EVERY_ITERATION), video, _one_live_row(video), device="cpu")
+    log = trainer.step()
+    assert log.growth is not None and (log.growth.cloned, log.growth.split) == (1, 0)
+    assert log.relocation is not None
+    assert (log.relocation.dead, log.relocation.targets) == (10, 2)
+    assert log.num_gaussians == 12
+
+
+def test_trainer_resets_the_statistics_when_relocation_is_off(tmp_path: Path) -> None:
+    """D-45, Q-51: an event ends with the statistics reset; relocation resets them itself, and
+    with relocation off the trainer does."""
+    video = _scene(tmp_path)
+    cfg = _no_perceptual(**{**_EVERY_ITERATION, "reloc": RelocConfig(enabled=False, every=1)})
+    trainer = Trainer(cfg, video, _one_live_row(video), device="cpu")
+    log = trainer.step()
+    assert log.growth is not None and log.growth.cloned == 1 and log.relocation is None
+    stats = trainer.state_dict().stats
+    assert not stats["g_sum"].any() and not stats["count"].any()
+
+
+def test_divergence_raises_floating_point_error(tmp_path: Path) -> None:
+    """Q-69: a model that fails §1.1's validity rules at a log read is a diverged run,
+    reported as FloatingPointError (exit code 3 in M14), not as an input error. The model passed
+    in is the one the trainer trains, so a NaN written into it is seen."""
+    video = _scene(tmp_path)
+    model = random_model(20, sh_degree=3, time=video.time, spread=0.6)
+    trainer = Trainer(_no_perceptual(perf=PerfConfig(log_every=1)), video, model, device="cpu")
+    assert trainer.step().mean_losses is not None
+    with torch.no_grad():
+        model.means[0, 0] = float("nan")
+    with pytest.raises(FloatingPointError, match="iteration 2"):
+        trainer.step()
+
+
+# train(), callbacks and global flags (Q-69, Q-73).
+
+
+def test_train_calls_callbacks_in_order_and_stops_when_one_asks(tmp_path: Path) -> None:
+    """Q-69: every callback runs after each step, in order; one returning True stops training
+    after that step. `until` lies in [iteration, T_it]; past T_it the run is complete."""
+    video = _scene(tmp_path)
+    trainer = Trainer(
+        _no_perceptual(optim=OptimConfig(iterations=20)), video, _init_points(), device="cpu"
+    )
+    calls: list[tuple[str, int]] = []
+
+    def first(_: Trainer, log: StepLog) -> None:
+        calls.append(("first", log.iteration))
+
+    def stop_at_5(_: Trainer, log: StepLog) -> bool:
+        calls.append(("second", log.iteration))
+        return log.iteration == 5
+
+    trainer.train(callbacks=[first, stop_at_5])
+    assert trainer.iteration == 5
+    assert calls == [(name, it) for it in range(1, 6) for name in ("first", "second")]
+    trainer.train(until=8)
+    assert trainer.iteration == 8
+    for until in (7, 21, True, 9.0):
+        with pytest.raises(ValueError, match="until"):
+            trainer.train(until=until)  # type: ignore[arg-type]
+    trainer.train()
+    assert trainer.iteration == 20
+    with pytest.raises(ValueError, match="complete"):
+        trainer.step()
+
+
+def test_a_step_leaves_the_global_torch_flags_as_they_were(tmp_path: Path) -> None:
+    """Q-73: deterministic mode and the TF32 setting apply during a step only."""
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    algorithms = torch.are_deterministic_algorithms_enabled()
+    try:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = True, False, True
+        perf = PerfConfig(deterministic=True, perc_precision="ieee")
+        trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
+        trainer.step()
+        assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (True, False, True)
+        assert torch.are_deterministic_algorithms_enabled() == algorithms
+    finally:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+
+
+# Resuming another run's state (§2.2; Q-46, Q-69, Q-70, Q-72).
+
+
+def test_a_resume_refuses_a_changed_scene_manifest_unless_forced(tmp_path: Path) -> None:
+    """§2.2, Q-70: a checkpoint of another scene manifest is refused; forced, the resume keeps
+    the run's S and Δt_f, so its learning rates continue those of the straight run (Q-46's
+    note), although the moved camera changes the dataset's S."""
+    video = _scene(tmp_path / "scene")
+    cfg = _no_perceptual(optim=OptimConfig(iterations=30))
+    straight = _run(Trainer(cfg, video, _init_points(), device="cpu"))
+    first = Trainer(cfg, video, _init_points(), device="cpu")
+    _run(first, 20)
+    save_checkpoint(first.state_dict(), tmp_path / "ckpt")
+    manifest = json.loads(video.manifest.path.read_text())
+    manifest["cameras"]["ring00"]["world_to_camera"][2][3] += 10.0  # back along its axis
+    changed_path = tmp_path / "scene" / "changed.json"
+    changed_path.write_text(json.dumps(manifest))
+    changed = MultiViewVideo.from_manifest(changed_path)
+    assert changed.spatial_scale(1.1) != video.spatial_scale(1.1)
+    with pytest.raises(ValueError, match="force"):
+        Trainer.from_checkpoint(tmp_path / "ckpt", changed, device="cpu")
+    resumed = Trainer.from_checkpoint(tmp_path / "ckpt", changed, device="cpu", force=True)
+    after = _run(resumed)
+    assert [log.rates for log in after] == [log.rates for log in straight[20:]]
+    assert [log.image_index for log in after] == [log.image_index for log in straight[20:]]
+
+
+def test_load_state_dict_refuses_another_run_and_changes_nothing(tmp_path: Path) -> None:
+    """Q-69: a state of another configuration, or whose sampler doesn't fit the dataset, is a
+    ValueError, and the trainer keeps its own state."""
+    video = _scene(tmp_path)
+    trainer = _u21_trainer(video)
+    _run(trainer, 10)
+    before = trainer.state_dict()
+    other = _u21_trainer(video, dataclasses.replace(U21, seed=5)).state_dict()
+    with pytest.raises(ValueError, match="configuration"):
+        trainer.load_state_dict(other)
+    broken = dataclasses.replace(before, sampler={**before.sampler, "permutation": [0, 1, 2]})
+    with pytest.raises(ValueError, match="permutation"):
+        trainer.load_state_dict(broken)
+    _assert_states_equal(trainer.state_dict(), before, global_rng=False)
+
+
+# On the GPU: gsplat (U-21's GPU variant; D-57, Q-36, Q-73).
+
+
+def _psnr(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float(10.0 * torch.log10(1.0 / ((a - b) ** 2).mean()))
+
+
+@pytest.mark.gpu
+def test_u21_on_gsplat_without_events(tmp_path: Path) -> None:
+    """U-21 on the GPU, with no event in the window: 300 iterations straight against 150, a
+    resume and 150 more give the same image order and rates, every stored tensor within 1e-4
+    relative L2 error, and renders at least 50 dB apart (gsplat's backward pass reorders its
+    sums, §2.2)."""
+    video = _scene(tmp_path / "scene")
+    cfg = dataclasses.replace(
+        U21,
+        growth=dataclasses.replace(U21.growth, mode="none"),
+        reloc=dataclasses.replace(U21.reloc, enabled=False),
+    )
+
+    def trainer() -> Trainer:
+        model = random_model(40, seed=2, sh_degree=1, time=video.time, spread=0.6)
+        return Trainer(cfg, video, model, device="cuda")
+
+    straight_trainer = trainer()
+    straight = _run(straight_trainer)
+    first = trainer()
+    before = _run(first, 150)
+    save_checkpoint(first.state_dict(), tmp_path / "ckpt")
+    resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cuda")
+    after = _run(resumed)
+    assert all(log.growth is None and log.relocation is None for log in straight)
+    assert [(log.image_index, log.rates) for log in straight] == [
+        (log.image_index, log.rates) for log in before + after
+    ]
+    a, b = straight_trainer.state_dict().params, resumed.state_dict().params
+    for name in a:
+        error = torch.linalg.vector_norm(a[name] - b[name]) / torch.linalg.vector_norm(a[name])
+        assert float(error) <= 1e-4, name
+    test = next(r for r in video.records if r.split == "test")
+    images = []
+    for state in (a, b):
+        model = FreeTimeGaussians(state, sh_degree=1, time=video.time).cuda()
+        with torch.no_grad():
+            images.append(render(model, test.camera, test.timestamp).image)
+    assert _psnr(images[0], images[1]) >= 50.0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("packed", [True, False])
+def test_gpu_runs_in_both_layouts(tmp_path: Path, packed: bool) -> None:
+    """D-57, Q-36: training on gsplat in packed and unpacked mode, with events, stays finite."""
+    video = _scene(tmp_path)
+    base = _no_perceptual(
+        init=InitConfig(points_per_frame=10),
+        growth=GrowthConfig(n_max=200),
+        perf=PerfConfig(packed=packed, log_every=10),
+    )
+    trainer = Trainer(shortened_config(60, base), video, _init_points(), device="cuda")
+    logs = _run(trainer)
+    assert all(math.isfinite(float(log.losses["total"])) for log in logs)
+    assert any(log.relocation is not None for log in logs)
+
+
+@pytest.mark.gpu
+def test_gpu_deterministic_run(tmp_path: Path) -> None:
+    """Q-73: deterministic mode trains on gsplat and restores the flags afterwards."""
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic)
+    perf = PerfConfig(deterministic=True)
+    trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cuda")
+    logs = _run(trainer, 10)
+    assert all(math.isfinite(float(log.losses["total"])) for log in logs)
+    assert (cudnn.benchmark, cudnn.deterministic) == saved
+
+
+# With the LPIPS networks (weights; D-77, Q-74).
+
+
+@pytest.mark.weights
+def test_training_with_the_perceptual_loss(tmp_path: Path) -> None:
+    """D-77: with λ_perc > 0 the trainer builds the perceptual network once and passes it to
+    total_loss, whose "perceptual" term is reported."""
+    trainer = Trainer(TrainConfig(), _scene(tmp_path), _init_points(), device="cpu")
+    logs = _run(trainer, 3)
+    assert all(math.isfinite(float(log.losses["perceptual"])) for log in logs)
+
+
+def _evaluation_scene(root: Path) -> MultiViewVideo:
+    """64×48 cameras, so the masks' left halves (32 px) are usable dynamic regions (Q-61)."""
+    cams = ring(3, radius=4.0, elevation=1.0, width_px=64, height_px=48, focal=60.0)
+    gt = random_model(24, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
+    views = [(cam, k / 30.0, "train") for k in range(5) for cam in cams[:2]]
+    views += [(cams[2], k / 30.0, "test") for k in (0, 2, 4)]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, views, mask_tests=True))
+
+
+@pytest.mark.weights
+def test_evaluate_returns_scene_means_and_writes_the_metrics_report(tmp_path: Path) -> None:
+    """Q-74: the scene means of METRIC_NAMES for the entire images and, with masks, under
+    "dynamic/<name>"; with out_dir, METRICS.json in Q-63's layout with the trainer's header."""
+    video = _evaluation_scene(tmp_path / "scene")
+    trainer = Trainer(_no_perceptual(), video, _init_points(), device="cpu")
+    _run(trainer, 5)
+    result = trainer.evaluate(out_dir=tmp_path / "out")
+    assert set(result) == set(METRIC_NAMES) | {f"dynamic/{name}" for name in METRIC_NAMES}
+    report = json.loads((tmp_path / "out" / "METRICS.json").read_text())
+    assert report["format"] == "ftgs-metrics" and report["split"] == "test"
+    assert report["model"] == {"iteration": 5}
+    assert report["manifest"] == {
+        "path": str(video.manifest.path),
+        "sha256": video.manifest.sha256,
+    }
+    assert report["producer"].startswith("openftgs")
+    for name in METRIC_NAMES:
+        assert report["entire"]["scene"][name] == pytest.approx(result[name], rel=1e-12)
+        assert report["dynamic"]["scene"][name] == pytest.approx(
+            result[f"dynamic/{name}"], rel=1e-12
+        )
+    assert len(report["entire"]["images"]) == 3
+
+
+@pytest.mark.weights
+def test_an_evaluation_between_steps_leaves_the_run_unchanged(tmp_path: Path) -> None:
+    """Q-74: evaluate draws from no generator and trains nothing, so a run with an evaluation
+    after its fifth step equals one without, bitwise."""
+    video = _evaluation_scene(tmp_path / "scene")
+    cfg = _no_perceptual(optim=OptimConfig(iterations=10))
+    plain = Trainer(cfg, video, _init_points(), device="cpu")
+    plain_logs = _run(plain)
+    evaluated = Trainer(cfg, video, _init_points(), device="cpu")
+
+    def evaluate_at_5(trainer: Trainer, log: StepLog) -> None:
+        if log.iteration == 5:
+            trainer.evaluate()
+
+    logs: list[StepLog] = []
+    evaluated.train(callbacks=[lambda _, log: logs.append(log), evaluate_at_5])
+    _assert_logs_equal(plain_logs, logs)
+    _assert_states_equal(plain.state_dict(), evaluated.state_dict(), global_rng=False)
