@@ -9,6 +9,7 @@ the window of largest motion is known by construction: frames that stay constant
 chosen transitions, whose mean absolute differences are worked by hand.
 """
 
+import dataclasses
 import json
 import struct
 import zlib
@@ -361,6 +362,21 @@ def test_load_mask_checks_size_and_mode(tmp_path: Path) -> None:
     Image.fromarray(_pixels(3, 4, 3, 0), "RGB").save(tmp_path / "masks/test.png")
     with pytest.raises(ValueError, match="mode"):
         video.load_mask(4)
+
+
+def test_a_manifest_without_training_images_is_refused(tmp_path: Path) -> None:
+    """Q-65: training reads the train split (§1.4 "Time": τ₀ and τ₁ come from it), so a
+    hand-built manifest without a training image is a ValueError naming the problem;
+    read_scene_manifest refuses such a file already (Q-64; from the second M10 review)."""
+    manifest = read_scene_manifest(_write_scene(tmp_path, _RING, _ring_images(1)))
+    tests = [k for k, record in enumerate(manifest.records) if record.split == "test"]
+    only_tests = dataclasses.replace(
+        manifest,
+        records=tuple(manifest.records[k] for k in tests),
+        masks=tuple(manifest.masks[k] for k in tests),
+    )
+    with pytest.raises(ValueError, match="training image"):
+        MultiViewVideo(only_tests)
 
 
 def test_missing_files_are_refused_at_construction(tmp_path: Path) -> None:
