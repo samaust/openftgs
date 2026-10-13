@@ -4,7 +4,7 @@ How `openftgs.optim` meets its §2.1 row for E12 and E13: the parameter groups, 
 
 ## Parameter groups
 
-`build_optimizer` makes one parameter group per stored tensor (§1.3 "Optimizer and learning rates"), each named after its tensor, inside one torch optimizer. Two cases leave a stored tensor without a group, so it takes no updates:
+`build_optimizer` makes one parameter group per stored tensor (§1.3 "Optimizer and learning rates"), each named after its tensor, inside one torch optimizer. The optimizer keeps the model it was built for and shows it as the read-only property `model`, which `openftgs.density` checks before it resets moments or resizes (Q-48). Two cases leave a stored tensor without a group, so it takes no updates:
 
 - `shN` at SH degree 0, where the tensor has no columns (U-26);
 - `times` and `velocities` with a single timestamp, which the model's time normalizer shows as τ₀ = τ₁ (D-71). Of D-71's two options, "no parameter group" was chosen, as for `shN` (Q-45).
@@ -27,9 +27,9 @@ D-53 names the kinds, which `PerfConfig.adam` selects and the trainer passes to 
 
 The Adam moments and step counters are created when the optimizer is built, zero, where PyTorch would put them (the step counter on the parameter's device for fused Adam, on the CPU otherwise). PyTorch then uses them as its own, and a moment reset, a resize or a checkpoint works before the first step (Q-45).
 
-- **Moment reset.** `reset_rows` zeroes the Adam moments of the rows it is given, as indices that may repeat (relocation draws targets with replacement), and keeps each step counter (D-16).
+- **Moment reset.** `reset_rows` zeroes the Adam moments of the rows it is given, as indices that may repeat (relocation draws targets with replacement), and keeps each step counter (D-16). By default it zeroes every parameter group; `names` limits it to the named groups, which the ablation's opacity reset uses for the opacity logits alone (Q-53). An unknown name, or a name without a parameter group, is rejected.
 
-  Note for M8: `reset_rows` doesn't check that its indices lie within the rows (Q-44), so an index out of range from a bug in relocation would surface on CUDA as a device-side assert, not a `ValueError`. M8's PRD should therefore include a test that every target and moved copy relocation passes to `reset_rows` lies in [0, N).
+  `reset_rows` doesn't check that its indices lie within the rows (Q-44), so an index out of range from a bug in a caller would surface on CUDA as a device-side assert, not a `ValueError`. On the CPU such an index raises an `IndexError`, so M8's U-14 tests, which check that relocation zeroes the moments of exactly its targets and moved copies, also cover the range of the rows it passes.
 - **Resize.** The model replaces its parameters when it resizes, so the optimizer follows it: the caller resizes the model first, then calls the optimizer's `resize_` with the same keep mask (Q-23) and the number of appended rows. The kept rows' moments stay in order, new rows start with zero moments (D-45), each group is rebound to the model's new parameter, and the step counters are kept. A row count that doesn't match the model is rejected before anything changes (Q-44).
 
 Validation reads only dtypes, shapes and devices, never values, so `set_iteration`, `step`, `zero_grad` and a moment reset never synchronize (§2.4 rule 3). A resize with a keep mask does: gathering the kept rows needs their count on the host. It runs only at growth events, which synchronize anyway (§2.4 rule 3). A moment reset reads no values either, so keeping its indices within the rows is the caller's precondition (Q-44).
