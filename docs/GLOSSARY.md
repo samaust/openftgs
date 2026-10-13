@@ -188,6 +188,34 @@ _Avoid_: temporal regularization, opacity regularization, early-stage regularize
 L_render + λ_reg·L_reg(t), the quantity backpropagated at every iteration. E9
 _Avoid_: objective, overall loss, training loss
 
+**Parameter group**:
+The optimizer's unit for one stored tensor, holding its learning rate and Adam settings; one per stored tensor that takes updates. §1.3 Optimizer and learning rates, D-71
+_Avoid_: param group, optimizer group
+
+**Learning-rate schedule**:
+The rule giving a parameter group's learning rate at each iteration: exponential (E13), annealed (E12) or constant. §1.3 Optimizer and learning rates, E12, E13
+_Avoid_: lr schedule, decay, scheduler (a torch class this package doesn't use)
+
+**Base rates η₀, η₁**:
+A parameter group's learning rates at it = 1 and it = T_it, scaled by S and Δt_f where §1.3 says so; the endpoints its learning-rate schedule runs between. §1.3 Optimizer and learning rates, E12, E13, D-19
+_Avoid_: lr_init, lr_final, initial and final learning rate, learning rate (unqualified, where an endpoint is meant)
+
+**Adam moments**:
+The per-row running averages of a stored tensor's gradient and squared gradient (`exp_avg`, `exp_avg_sq`); zero for rows added by growth and after a moment reset. §1.3 Optimizer and learning rates, §2.2 ftgs-checkpoint, D-45
+_Avoid_: optimizer state (it also holds step counters and rates), momentum, moment buffers
+
+**Step counter**:
+Adam's per-tensor count of the steps it has taken, which sets the bias correction; kept through moment resets and resizes. §2.2 ftgs-checkpoint, D-16
+_Avoid_: step (unqualified), iteration (that is it), Adam iteration
+
+**Moment reset**:
+Zeroing the Adam moments of chosen rows while keeping each tensor's step counter, done to every target and every moved copy at a relocation. D-16
+_Avoid_: optimizer reset, state reset, opacity reset (a different operation, in the "w/o periodic relocation" ablation)
+
+**Selective Adam**:
+gsplat's opt-in Adam kernel that updates only the rows visible in the current image and omits Adam's bias correction; an approximate optimization. D-53, §2.4
+_Avoid_: sparse Adam, masked Adam, SelectiveAdam (gsplat's class name) in prose
+
 **Velocity annealing**:
 The log-linear decay of the velocity learning rate from ηv,0 to ηv,1 over training progress, read as a product rather than the paper's printed sum. E12, D-19
 _Avoid_: λt, velocity schedule, velocity decay
