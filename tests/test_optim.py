@@ -8,16 +8,18 @@ selective Adam from D-53's description (moments decayed, no bias correction).
 """
 
 import math
+from pathlib import Path
 from typing import Literal
 
 import pytest
 import torch
 from builders import random_model, random_params
 
-from openftgs.config import OptimConfig
+from openftgs.config import OptimConfig, TrainConfig, config_to_dict
+from openftgs.io import load_checkpoint, save_checkpoint
 from openftgs.model import FreeTimeGaussians
-from openftgs.optim import build_optimizer
-from openftgs.types import TimeNormalizer
+from openftgs.optim import FTGSOptimizer, build_optimizer
+from openftgs.types import TimeNormalizer, TrainerState
 
 S = 2.5  # spatial scale (D-27), arbitrary here
 DT = 1.0 / 299.0  # Δt_f of a 300-frame sequence (§1.3)
@@ -251,9 +253,14 @@ def run_steps(
     return {name: getattr(model, name).detach().double().cpu() for name in PARAM_NAMES}, opt
 
 
+def as_float32(x: float) -> float:
+    """x rounded to the nearest float32, as a Python float."""
+    return float(torch.tensor(x, dtype=torch.float32))
+
+
 def assert_relative(actual: torch.Tensor, expected: torch.Tensor, rel: float) -> None:
-    """|actual − expected| ≤ rel·|expected| elementwise, with a floor of rel·max|expected| for
-    elements near 0."""
+    """U-31's "relative" (Q-47): |actual − expected| ≤ rel·(|expected| + max|expected|)
+    elementwise, so elements near 0 are measured against the tensor's scale."""
     floor = rel * float(expected.abs().max()) if expected.numel() else 0.0
     torch.testing.assert_close(actual, expected, rtol=rel, atol=floor)
 
@@ -271,3 +278,315 @@ def test_u31_fused_and_foreach_agree_over_100_steps_cuda() -> None:
     foreach, _ = run_steps("cuda", "foreach", 100)
     for name in PARAM_NAMES:
         assert_relative(fused[name], foreach[name], 1e-6)
+
+
+def stepped(
+    adam: AdamKind = "fused", n: int = 8, steps: int = 3, device: str = "cpu"
+) -> tuple[FreeTimeGaussians, FTGSOptimizer]:
+    """A model and its optimizer after `steps` steps on seeded gradients, so moments are set."""
+    model = random_model(n).to(device)
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=DT, adam=adam)
+    generator = torch.Generator().manual_seed(7)
+    for it in range(1, steps + 1):
+        set_grads(model, generator)
+        opt.set_iteration(it)
+        opt.step()
+    return model, opt
+
+
+def test_reset_rows_zeroes_moments_of_listed_rows_and_keeps_steps() -> None:
+    # D-16: zero exp_avg and exp_avg_sq of the rows; keep each step counter. Q-44: int64 indices
+    # in any order, repeats allowed (relocation draws targets with replacement).
+    _, opt = stepped()
+    before = opt.state_dict()
+    rows = torch.tensor([5, 1, 5, 2])
+    opt.reset_rows(rows)
+    after = opt.state_dict()
+    reset = torch.zeros(8, dtype=torch.bool)
+    reset[rows] = True
+    for name in PARAM_NAMES:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert not torch.equal(
+                before[name][key][reset], torch.zeros_like(before[name][key][reset])
+            )
+            assert torch.equal(after[name][key][reset], torch.zeros_like(after[name][key][reset]))
+            assert torch.equal(after[name][key][~reset], before[name][key][~reset]), (name, key)
+        assert torch.equal(after[name]["step"], before[name]["step"])
+        assert float(after[name]["step"]) == 3.0
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        torch.zeros(8, dtype=torch.bool),
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([[1]]),
+    ],
+)
+def test_reset_rows_rejects_masks_and_other_selectors(rows: torch.Tensor) -> None:
+    _, opt = stepped()
+    with pytest.raises(ValueError):
+        opt.reset_rows(rows)
+
+
+def test_resize_keeps_moments_in_order_and_appends_zero_rows() -> None:
+    # §1.3 Growth step 4, D-45: kept rows keep their order, new rows go last with zero moments;
+    # step counters are kept. Q-23: keep is a bool mask; Q-44: called after the model's resize_.
+    model, opt = stepped()
+    before = opt.state_dict()
+    keep = torch.tensor([True, False, True, True, False, True, True, True])
+    append = {name: getattr(model, name).detach()[:3].clone() for name in PARAM_NAMES}
+    model.resize_(keep=keep, append=append)
+    opt.resize_(keep=keep, n_append=3)
+    after = opt.state_dict()
+    for name in PARAM_NAMES:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert after[name][key].shape == getattr(model, name).shape
+            assert torch.equal(after[name][key][:6], before[name][key][keep]), (name, key)
+            assert torch.equal(after[name][key][6:], torch.zeros_like(after[name][key][6:]))
+        assert torch.equal(after[name]["step"], before[name]["step"])
+    # Steps after the resize update the model's new tensors.
+    old = {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
+    set_grads(model, torch.Generator().manual_seed(9))
+    opt.set_iteration(4)
+    opt.step()
+    for name in PARAM_NAMES:
+        assert not torch.equal(getattr(model, name), old[name]), name
+    assert float(opt.state_dict()["means"]["step"]) == 4.0
+
+
+def test_resize_before_the_first_step() -> None:
+    # Q-45: state exists from build, so growth can resize before any step.
+    model = random_model(4)
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=DT)
+    append = {name: getattr(model, name).detach()[:2].clone() for name in PARAM_NAMES}
+    model.resize_(append=append)
+    opt.resize_(n_append=2)
+    state = opt.state_dict()
+    assert state["means"]["exp_avg"].shape == (6, 3)
+    assert float(state["means"]["step"]) == 0.0
+
+
+def test_resize_rejects_a_mismatch_with_the_model_and_changes_nothing() -> None:
+    model, opt = stepped()
+    before = opt.state_dict()
+    append = {name: getattr(model, name).detach()[:3].clone() for name in PARAM_NAMES}
+    model.resize_(append=append)
+    with pytest.raises(ValueError):
+        opt.resize_(n_append=2)  # the model gained 3 rows
+    with pytest.raises(ValueError):
+        opt.resize_(keep=torch.ones(8, dtype=torch.int64), n_append=3)  # not a bool mask
+    with pytest.raises(ValueError):
+        opt.resize_(n_append=-1)
+    after = opt.state_dict()
+    for name in PARAM_NAMES:
+        for key in ("exp_avg", "exp_avg_sq", "step"):
+            assert torch.equal(after[name][key], before[name][key])
+
+
+def train_to(model: FreeTimeGaussians, opt: FTGSOptimizer, start: int, stop: int) -> None:
+    """Iterations start … stop, each with gradients seeded by its iteration index."""
+    for it in range(start, stop + 1):
+        set_grads(model, torch.Generator().manual_seed(1_000 + it))
+        opt.set_iteration(it)
+        opt.step()
+        opt.zero_grad()
+
+
+def checkpoint_state(model: FreeTimeGaussians, opt: FTGSOptimizer, it: int) -> TrainerState:
+    n = model.num_gaussians
+    return TrainerState(
+        iteration=it,
+        config=config_to_dict(TrainConfig()),
+        time=model.time,
+        spatial_scale=S,
+        frame_dt=DT,
+        params={name: getattr(model, name).detach().clone() for name in PARAM_NAMES},
+        optim=opt.state_dict(),
+        stats={"g_sum": torch.zeros(n), "count": torch.zeros(n, dtype=torch.int64)},
+        rng={},
+        sampler={},
+    )
+
+
+@pytest.mark.parametrize(
+    ("saved", "resumed"),
+    [("fused", "fused"), ("foreach", "foreach"), ("fused", "foreach"), ("foreach", "fused")],
+)
+def test_checkpoint_round_trip_resumes_bitwise(
+    tmp_path: Path, saved: AdamKind, resumed: AdamKind
+) -> None:
+    # §2.2 contract: resuming at k and training to m gives the parameters of an uninterrupted
+    # run, bitwise on CPU. Q-46: state saved under one Adam kind loads under another (the kinds
+    # agree to rounding, U-31, so across kinds only the saved state is compared).
+    k, m = 5, 9
+    straight = random_model(16)
+    opt = build_optimizer(straight, OptimConfig(), spatial_scale=S, frame_dt=DT, adam=resumed)
+    train_to(straight, opt, 1, m)
+
+    first = random_model(16)
+    opt = build_optimizer(first, OptimConfig(), spatial_scale=S, frame_dt=DT, adam=saved)
+    train_to(first, opt, 1, k)
+    saved_state = opt.state_dict()
+    save_checkpoint(checkpoint_state(first, opt, k), tmp_path / "ckpt")
+    state = load_checkpoint(tmp_path / "ckpt")
+    model = FreeTimeGaussians(state.params, sh_degree=3, time=state.time)
+    resumed_opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=DT, adam=resumed)
+    resumed_opt.load_state_dict(state.optim)
+    reloaded = resumed_opt.state_dict()
+    for name in PARAM_NAMES:
+        for key in ("exp_avg", "exp_avg_sq", "step"):
+            assert torch.equal(reloaded[name][key], saved_state[name][key]), (name, key)
+        assert reloaded[name]["lr"] == saved_state[name]["lr"]
+    train_to(model, resumed_opt, k + 1, m)
+    if saved == resumed:
+        for name in PARAM_NAMES:
+            assert torch.equal(getattr(model, name), getattr(straight, name)), name
+
+
+def test_state_dict_layout_matches_the_checkpoint_files() -> None:
+    # §2.2: optim.safetensors holds exp_avg, exp_avg_sq and step per tensor; optim.json the base
+    # rates, schedule parameters, β₁, β₂ and ε (Q-46 names the keys).
+    cfg = OptimConfig()
+    _, opt = stepped()
+    state = opt.state_dict()
+    assert set(state) == set(PARAM_NAMES)
+    rates = base_rates(cfg)
+    schedules = {"means": "exponential", "times": "exponential", "velocities": "annealed"}
+    for name in PARAM_NAMES:
+        entry = state[name]
+        assert set(entry) == {
+            "exp_avg",
+            "exp_avg_sq",
+            "step",
+            "lr",
+            "schedule",
+            "iterations",
+            "betas",
+            "eps",
+        }
+        assert entry["step"].shape == () and entry["step"].dtype == torch.float32
+        assert entry["lr"] == pytest.approx(list(rates[name]), rel=1e-15)
+        assert entry["schedule"] == schedules.get(name, "constant")
+        assert entry["iterations"] == cfg.iterations
+        assert entry["betas"] == [0.9, 0.999] and entry["eps"] == 1e-15
+
+
+def test_load_state_dict_rejects_a_different_optimizer_and_changes_nothing() -> None:
+    _, opt = stepped()
+    good = opt.state_dict()
+    other = build_optimizer(
+        random_model(8), OptimConfig(), spatial_scale=2 * S, frame_dt=DT
+    )  # other base rates for means and velocities
+    with pytest.raises(ValueError):
+        other.load_state_dict(good)
+    missing = {name: v for name, v in good.items() if name != "shN"}
+    with pytest.raises(ValueError):
+        opt.load_state_dict(missing)
+    wrong_shape = dict(good, means=dict(good["means"], exp_avg=torch.zeros(9, 3)))
+    with pytest.raises(ValueError):
+        opt.load_state_dict(wrong_shape)
+    wrong_eps = dict(good, quats=dict(good["quats"], eps=1e-8))
+    with pytest.raises(ValueError):
+        opt.load_state_dict(wrong_eps)
+    assert all(
+        torch.equal(opt.state_dict()[n][k], good[n][k])
+        for n in PARAM_NAMES
+        for k in ("exp_avg", "exp_avg_sq", "step")
+    )
+
+
+@pytest.mark.gpu
+def test_u31_selective_adam_leaves_invisible_rows_and_moments_unchanged() -> None:
+    # D-53: selective Adam updates only the visible rows; invisible rows and their moments are
+    # unchanged bitwise.
+    n = 64
+    visibility = torch.arange(n, device="cuda") % 3 != 0
+    model = random_model(n).to("cuda")
+    opt = build_optimizer(
+        model, OptimConfig(iterations=100), spatial_scale=S, frame_dt=DT, adam="selective"
+    )
+    _, warm = stepped("foreach", n=n, steps=1, device="cuda")  # nonzero moments to start from
+    opt.load_state_dict(
+        {name: dict(entry, iterations=100) for name, entry in warm.state_dict().items()}
+    )
+    before_state = opt.state_dict()
+    before = {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
+    generator = torch.Generator().manual_seed(13)
+    for it in range(1, 101):
+        set_grads(model, generator)
+        opt.set_iteration(it)
+        opt.step(visibility=visibility)
+    after_state = opt.state_dict()
+    hidden = ~visibility
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name)[hidden], before[name][hidden]), name
+        assert not torch.equal(getattr(model, name)[visibility], before[name][visibility]), name
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(after_state[name][key][hidden], before_state[name][key][hidden])
+        # Q-45: the step counter counts the steps taken.
+        assert float(after_state[name]["step"]) == float(before_state[name]["step"]) + 100
+
+
+@pytest.mark.gpu
+def test_u31_selective_adam_with_all_rows_visible_is_adam_without_bias_correction() -> None:
+    # D-53: with every row visible, selective Adam is Adam without bias correction:
+    # m ← β₁m + (1 − β₁)g, v ← β₂v + (1 − β₂)g², p ← p − η·m/(√v + ε), here in float64.
+    # Q-47: the reference takes β₁, β₂, ε and η as the float32 values gsplat's kernel receives;
+    # float32(0.999) alone moves 1 − β₂ by about 1.3e-5 relative, more than U-31's tolerance.
+    n, steps = 64, 100
+    cfg = OptimConfig(iterations=steps)
+    model = random_model(n).to("cuda")
+    opt = build_optimizer(model, cfg, spatial_scale=S, frame_dt=DT, adam="selective")
+    beta1, beta2, eps = (as_float32(x) for x in (*cfg.betas, cfg.eps))
+    p64 = {name: getattr(model, name).detach().double().cpu() for name in PARAM_NAMES}
+    m = {name: torch.zeros_like(p) for name, p in p64.items()}
+    v = {name: torch.zeros_like(p) for name, p in p64.items()}
+    visibility = torch.ones(n, dtype=torch.bool, device="cuda")
+    generator = torch.Generator().manual_seed(17)
+    for it in range(1, steps + 1):
+        set_grads(model, generator)
+        rates = opt.set_iteration(it)
+        for name in PARAM_NAMES:
+            g = getattr(model, name).grad.double().cpu()
+            m[name] = beta1 * m[name] + (1 - beta1) * g
+            v[name] = beta2 * v[name] + (1 - beta2) * g * g
+            eta = as_float32(rates[name])
+            p64[name] = p64[name] - eta * m[name] / (v[name].sqrt() + eps)
+        opt.step(visibility=visibility)
+    for name in PARAM_NAMES:
+        assert_relative(getattr(model, name).detach().double().cpu(), p64[name], 1e-6)
+
+
+def test_selective_adam_needs_cuda() -> None:
+    with pytest.raises(ValueError):
+        build_optimizer(
+            random_model(4), OptimConfig(), spatial_scale=S, frame_dt=DT, adam="selective"
+        )
+
+
+def test_visibility_is_only_for_selective_adam() -> None:
+    # Q-44: never silently ignored.
+    _, opt = stepped()
+    with pytest.raises(ValueError):
+        opt.step(visibility=torch.ones(8, dtype=torch.bool))
+
+
+@pytest.mark.gpu
+def test_selective_adam_requires_a_bool_visibility_mask() -> None:
+    model = random_model(8).to("cuda")
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=DT, adam="selective")
+    set_grads(model, torch.Generator().manual_seed(1))
+    for visibility in (
+        None,
+        torch.ones(8, device="cuda"),
+        torch.ones(7, dtype=torch.bool, device="cuda"),
+        torch.ones(8, dtype=torch.bool),
+    ):
+        with pytest.raises(ValueError):
+            opt.step(visibility=visibility)
+
+
+def test_build_optimizer_rejects_an_unknown_adam_kind() -> None:
+    with pytest.raises(ValueError):
+        build_optimizer(random_model(4), OptimConfig(), spatial_scale=S, frame_dt=DT, adam="sgd")  # type: ignore[arg-type]
