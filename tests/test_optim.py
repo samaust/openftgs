@@ -332,6 +332,52 @@ def test_reset_rows_rejects_masks_and_other_selectors(rows: torch.Tensor) -> Non
         opt.reset_rows(rows)
 
 
+def test_reset_rows_with_names_zeroes_only_those_groups() -> None:
+    # Q-53 (owner answer): names limits the moment reset to the named groups, as the ablation's
+    # opacity reset needs for opacity_logits; every step counter is kept (D-16).
+    _, opt = stepped()
+    before = opt.state_dict()
+    rows = torch.arange(8)
+    opt.reset_rows(rows, names=("opacity_logits", "sh0"))
+    after = opt.state_dict()
+    for name in PARAM_NAMES:
+        for key in ("exp_avg", "exp_avg_sq"):
+            if name in ("opacity_logits", "sh0"):
+                assert torch.equal(after[name][key], torch.zeros_like(after[name][key]))
+            else:
+                assert torch.equal(after[name][key], before[name][key]), (name, key)
+        assert torch.equal(after[name]["step"], before[name]["step"])
+
+
+def test_reset_rows_with_names_none_resets_every_group() -> None:
+    # Q-53: names=None keeps the behaviour of reset_rows(rows), every group (Q-44).
+    _, opt = stepped()
+    opt.reset_rows(torch.tensor([3]), names=None)
+    after = opt.state_dict()
+    for name in PARAM_NAMES:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(after[name][key][3], torch.zeros_like(after[name][key][3]))
+
+
+@pytest.mark.parametrize(
+    "names",
+    [("opacity",), ("shN",), "opacity_logits", ("opacity_logits", 3)],
+)
+def test_reset_rows_rejects_unknown_or_groupless_names_and_changes_nothing(names: object) -> None:
+    # Q-53: a name that isn't a stored tensor with a parameter group (shN has none at L = 0),
+    # or names given as a bare string, is a ValueError, raised before any moment changes.
+    model = random_model(8, sh_degree=0)
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=DT)
+    iterate(model, opt, range(1, 3), torch.Generator().manual_seed(7))
+    before = opt.state_dict()
+    with pytest.raises(ValueError):
+        opt.reset_rows(torch.arange(8), names=names)  # type: ignore[arg-type]
+    after = opt.state_dict()
+    for name in before:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(after[name][key], before[name][key])
+
+
 def test_resize_keeps_moments_in_order_and_appends_zero_rows() -> None:
     # §1.3 Growth step 4, D-45: kept rows keep their order, new rows go last with zero moments;
     # step counters are kept. Q-23: keep is a bool mask; Q-44: called after the model's resize_.

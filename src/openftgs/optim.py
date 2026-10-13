@@ -241,13 +241,24 @@ class FTGSOptimizer:
     # targets with replacement); bool masks are refused, as Q-23 keeps them for row selection.
     # The range is the caller's precondition: checking values would synchronize (§2.4 rule 3),
     # and an index outside it fails inside index_fill_ (on CUDA, as a device-side assert).
-    def reset_rows(self, rows: Tensor) -> None:
-        """Zero the Adam moments of `rows` in every group and keep the step counters (D-16)."""
+    # Q-53 (owner answer): names, a keyword-only addition, limits the reset to those groups.
+    def reset_rows(self, rows: Tensor, *, names: Sequence[str] | None = None) -> None:
+        """Zero the Adam moments of `rows` in every group, or in the groups of the tensors named
+        in `names`, and keep the step counters (D-16)."""
         if rows.dtype != torch.int64 or rows.dim() != 1:
             _fail(f"rows must be int64 indices of shape [k], got {rows.dtype} {list(rows.shape)}")
         if rows.device != self._device:
             _fail(f"rows must be on the model's device {self._device}, got {rows.device}")
-        for _, _, state in self._groups():
+        grouped = [schedule.name for schedule in self._schedules]
+        if names is not None:
+            if isinstance(names, str) or not all(isinstance(n, str) for n in names):
+                _fail(f"names must be a sequence of tensor names, got {names!r}")
+            unknown = sorted(set(names) - set(grouped))
+            if unknown:
+                _fail(f"names must name tensors with a parameter group {grouped}, got {unknown}")
+        for schedule, _, state in self._groups():
+            if names is not None and schedule.name not in names:
+                continue
             for key in _MOMENTS:
                 state[key].index_fill_(0, rows, 0.0)
 
