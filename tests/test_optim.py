@@ -416,6 +416,17 @@ def test_resize_before_the_first_step() -> None:
     assert float(state["means"]["step"]) == 0.0
 
 
+def test_optimizer_model_is_the_model_it_was_built_for() -> None:
+    # Q-48 (owner answer): a read-only property naming the model the optimizer was built for, so
+    # density can check the pairing; it stays that model through a resize.
+    model = random_model(4)
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=S, frame_dt=DT)
+    assert opt.model is model
+    model.resize_(keep=torch.tensor([True, False, True, True]))
+    opt.resize_(keep=torch.tensor([True, False, True, True]))
+    assert opt.model is model
+
+
 def test_resize_rejects_a_mismatch_with_the_model_and_changes_nothing() -> None:
     model, opt = stepped()
     before = opt.state_dict()

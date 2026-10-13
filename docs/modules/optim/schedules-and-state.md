@@ -4,7 +4,7 @@ How `openftgs.optim` meets its §2.1 row for E12 and E13: the parameter groups, 
 
 ## Parameter groups
 
-`build_optimizer` makes one parameter group per stored tensor (§1.3 "Optimizer and learning rates"), each named after its tensor, inside one torch optimizer. Two cases leave a stored tensor without a group, so it takes no updates:
+`build_optimizer` makes one parameter group per stored tensor (§1.3 "Optimizer and learning rates"), each named after its tensor, inside one torch optimizer. The optimizer keeps the model it was built for and shows it as the read-only property `model`, which `openftgs.density` checks before it resets moments or resizes (Q-48). Two cases leave a stored tensor without a group, so it takes no updates:
 
 - `shN` at SH degree 0, where the tensor has no columns (U-26);
 - `times` and `velocities` with a single timestamp, which the model's time normalizer shows as τ₀ = τ₁ (D-71). Of D-71's two options, "no parameter group" was chosen, as for `shN` (Q-45).

@@ -1392,3 +1392,43 @@ def test_grow_and_relocate_reject_invalid_arguments(case: str) -> None:
         with pytest.raises(ValueError):
             relocate(model, opt, stats, RelocConfig(), generator=gen)
     assert model.num_gaussians == 2
+
+
+@pytest.mark.parametrize("operation", ["relocate", "grow", "prune", "reset_opacity"])
+def test_an_optimizer_built_for_another_model_is_rejected_before_anything_changes(
+    operation: str,
+) -> None:
+    """Q-48 (owner answer): relocate, grow, prune and reset_opacity check that the optimizer is
+    the model's own (FTGSOptimizer.model), even when another model has the same rows, and raise
+    ValueError before the model, either optimizer or the statistics change."""
+    logits = [1.0, LOGIT_DEAD, 0.5, LOGIT_DEAD]
+    model, _ = _relocation_scene(logits, seed=40)
+    with torch.no_grad():
+        model.log_scales[0] = math.log(20.0)  # a split candidate and a large primitive
+    _, other_opt = _relocation_scene(logits, seed=41)
+    before, moments = _rows_of(model), other_opt.state_dict()
+    stats = _stats_from([1.0, 1.0, 1.0, 1.0])
+    gen = torch.Generator().manual_seed(42)
+    with pytest.raises(ValueError, match="optimizer"):
+        if operation == "relocate":
+            relocate(model, other_opt, stats, RelocConfig(), generator=gen)
+        elif operation == "grow":
+            grow(
+                model,
+                other_opt,
+                stats,
+                GrowthConfig(),
+                spatial_scale=S,
+                reloc=RelocConfig(),
+                generator=gen,
+            )
+        elif operation == "prune":
+            prune(model, other_opt, stats, ABLATION, spatial_scale=S, iteration=5000)
+        else:
+            reset_opacity(model, other_opt)
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
+    for name, state in other_opt.state_dict().items():
+        for key in ("exp_avg", "exp_avg_sq", "step"):
+            assert torch.equal(state[key], moments[name][key])
+    assert torch.equal(stats.count, torch.ones(4, dtype=torch.int32))

@@ -81,6 +81,13 @@ def _check_stats(model: FreeTimeGaussians, stats: "GradStats") -> None:
         _fail(f"the statistics are on {stats.g_sum.device}, the model on {model.means.device}")
 
 
+# Q-48 (owner answer): an identity check, so another model's optimizer is caught even when it
+# has as many rows, before anything changes; it reads no tensor values (D-49).
+def _check_optimizer(model: FreeTimeGaussians, optimizer: FTGSOptimizer) -> None:
+    if not isinstance(optimizer, FTGSOptimizer) or optimizer.model is not model:
+        _fail("the optimizer must be the model's own, built for it by build_optimizer")
+
+
 class GradStats:
     """The gradient statistics g_sum and count of E10, one entry per primitive (Q-48)."""
 
@@ -384,10 +391,11 @@ def relocate(
     generator: torch.Generator,
 ) -> RelocationReport:
     """Move every dead primitive onto a live target (§1.3 Relocation, E11, D-14 to D-16), then
-    reset the gradient statistics. `optimizer` must be the model's (built for it by
-    `build_optimizer`; Q-48). `cfg.enabled` is the trainer's switch and isn't read here.
-    Synchronizes with the host: an event does anyway (§2.4 rule 3)."""
+    reset the gradient statistics. `optimizer` must be the model's own (Q-48). `cfg.enabled` is
+    the trainer's switch and isn't read here. Synchronizes with the host: an event does anyway
+    (§2.4 rule 3)."""
     _check_stats(model, stats)
+    _check_optimizer(model, optimizer)
     _check_generator(generator)
     model.validate()
     dead = ~_live(model, cfg)
@@ -506,9 +514,10 @@ def grow(
     """One growth event in the configured count-control mode (§1.3 Growth and Count-control
     modes, E17, D-18, D-42 to D-45): "gradient" clones and splits the candidates, "score" appends
     rows drawn ∝ ρ and initialized by E11, "none" does nothing. Model, optimizer and statistics
-    are resized together; `optimizer` must be the model's (Q-48). Synchronizes with the host: an
-    event does anyway (§2.4 rule 3)."""
+    are resized together; `optimizer` must be the model's own (Q-48). Synchronizes with the host:
+    an event does anyway (§2.4 rule 3)."""
     _check_stats(model, stats)
+    _check_optimizer(model, optimizer)
     _check_generator(generator)
     scale = _check_spatial_scale(spatial_scale)
     if cfg.mode == "none":
@@ -569,8 +578,9 @@ def prune(
     opacity is below `cfg.prune_opacity` (tested on the stored logit, as D-14 tests the dead
     set) and, after iteration 3,000, those whose largest scale exceeds 0.1·S. Model, optimizer
     and statistics are resized together. Returns the number removed; with no pruning opacity
-    configured, does nothing."""
+    configured, does nothing. `optimizer` must be the model's own (Q-48)."""
     _check_stats(model, stats)
+    _check_optimizer(model, optimizer)
     scale = _check_spatial_scale(spatial_scale)
     if not _is_int(iteration) or iteration < 1:
         _fail(f"iteration must be an int ≥ 1, got {iteration!r}")
@@ -590,7 +600,9 @@ def prune(
 def reset_opacity(model: FreeTimeGaussians, optimizer: FTGSOptimizer) -> None:
     """The ablation's opacity reset (§1.3 Count-control modes): σ ← min(σ, 0.01), on the stored
     logit, and the Adam moments of the opacity logits zeroed for every row, keeping the step
-    counters (Q-53, owner answer). No host synchronization."""
+    counters (Q-53, owner answer). `optimizer` must be the model's own (Q-48). No host
+    synchronization."""
+    _check_optimizer(model, optimizer)
     with torch.no_grad():
         model.opacity_logits.clamp_(max=_logit_bound(_RESET_OPACITY))
     rows = torch.arange(model.num_gaussians, device=model.means.device)

@@ -128,6 +128,12 @@ class FTGSOptimizer:
 
     # -- construction ---------------------------------------------------------------------------
 
+    # Q-48 (owner answer): public, so that density can check it was given the model's optimizer.
+    @property
+    def model(self) -> FreeTimeGaussians:
+        """The model this optimizer was built for, whose stored tensors its groups update."""
+        return self._model
+
     @property
     def _device(self) -> torch.device:
         return self._model.means.device

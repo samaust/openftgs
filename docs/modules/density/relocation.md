@@ -54,7 +54,7 @@ The clamp has two halves. `mcmc_split` applies the upper bound. The lower bound 
 
 First measurements (CPU, the seeds the tests use): U-14's 10⁶ position draws are off the target's Gaussian by at most 0.09% in the whitened mean and 0.25% in the whitened covariance, well inside Q-54's bound; U-13's render before and after relocating stacked copies differs by 40.4 dB.
 
-Writing in place keeps the parameters' identity, so the optimizer keeps its references and step counters; relocation never changes N. The optimizer must be the model's own, built for it by `build_optimizer`: `FTGSOptimizer` has no public row count to check against, so the pairing is the caller's precondition (Q-48), and the trainer (M10) holds the three together. The random draws come in a fixed order (the multinomial, then the normal draw), so a resumed run can repeat them (U-21, M10). `relocate` doesn't read `RelocConfig.enabled`: that is the trainer's switch for calling it.
+Writing in place keeps the parameters' identity, so the optimizer keeps its references and step counters; relocation never changes N. The optimizer must be the model's own, built for it by `build_optimizer`: `relocate`, `grow`, `prune` and `reset_opacity` check `FTGSOptimizer.model` by identity and raise before anything changes, so another model's optimizer is caught even when it has as many rows (Q-48, owner answer). The check reads no tensor values. The random draws come in a fixed order (the multinomial, then the normal draw), so a resumed run can repeat them (U-21, M10). `relocate` doesn't read `RelocConfig.enabled`: that is the trainer's switch for calling it.
 
 ## Host synchronization
 
