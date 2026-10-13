@@ -2,18 +2,51 @@
 """Trainer: the iteration loop, the sampler, the schedules, and the evaluation and checkpoint
 hooks.
 
-Spec: §1.3. Band: Orchestration (§2.1).
+Spec: §1.3, §2.2 (Full checkpoint), §2.4 rule 3, D-26, D-45. Band: Orchestration (§2.1).
 """
 
+import contextlib
+import hashlib
+import importlib.metadata
+import json
+import math
+import random
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
-from openftgs.config import TrainConfig
-from openftgs.density import OPACITY_RESET_EVERY
+import numpy as np
+import torch
+from torch import Tensor
 
-__all__ = ["CalendarEntry", "calendar_entry"]
+from openftgs.config import PerfConfig, TrainConfig, config_from_dict, config_to_dict
+from openftgs.data import MultiViewVideo
+from openftgs.density import (
+    OPACITY_RESET_EVERY,
+    GradStats,
+    GrowthReport,
+    RelocationReport,
+    grow,
+    prune,
+    relocate,
+    reset_opacity,
+)
+from openftgs.eval import Evaluator, average_metrics, evaluate_images, metrics_report
+from openftgs.io import load_checkpoint
+from openftgs.losses import LPIPSLoss, total_loss
+from openftgs.model import FreeTimeGaussians
+from openftgs.optim import FTGSOptimizer, build_optimizer
+from openftgs.render import render
+from openftgs.types import InitPoints, TimeNormalizer, TrainerState
+
+__all__ = ["Callback", "CalendarEntry", "StepLog", "Trainer", "calendar_entry"]  # Q-69
 
 
-# Q-71: what the calendar (§1.3 Iteration calendar) holds for one iteration.
+# The calendar (§1.3 Iteration calendar).
+
+
+# Q-71: what the calendar holds for one iteration.
 @dataclass(frozen=True)
 class CalendarEntry:
     sh_degree: int  # L_active (E13)
@@ -46,3 +79,593 @@ def calendar_entry(cfg: TrainConfig, it: int) -> CalendarEntry:
         # Q-71 (owner answer): inside the growth window only; Q-67: the period from density.
         reset_opacity=ablation and in_growth and it % OPACITY_RESET_EVERY == 0,
     )
+
+
+# What a training iteration reports (Q-69).
+
+
+@dataclass(frozen=True)
+class StepLog:
+    iteration: int  # the iteration just completed
+    image_index: int  # into the dataset's records
+    timestamp: float  # the image's raw τ
+    t: float  # its normalized time (E14)
+    sh_degree: int  # L_active (E13)
+    rates: dict[str, float]  # the learning rates of this iteration (E12, E13)
+    losses: dict[str, Tensor]  # total_loss's detached 0-d terms, on the device, unread (D-77)
+    num_gaussians: int  # N after the iteration
+    growth: GrowthReport | None = None
+    relocation: RelocationReport | None = None
+    pruned: int | None = None
+    opacity_reset: bool = False
+    # Each term's mean over the iterations since the last read, read when the iteration is a
+    # multiple of PerfConfig.log_every (§2.4 rule 3); None otherwise.
+    mean_losses: dict[str, float] | None = None
+
+
+Callback = Callable[["Trainer", StepLog], bool | None]  # Q-69: True stops train()
+
+
+# Generators and the sampler (D-26; Q-72).
+
+
+def _seeded(seed: int, role: str) -> torch.Generator:
+    """A CPU generator for one role, seeded from TrainConfig.seed (Q-72)."""
+    digest = hashlib.sha256(f"openftgs/{role}/{seed}".encode()).digest()
+    return torch.Generator().manual_seed(int.from_bytes(digest[:8], "little"))
+
+
+def _generator(state: object, role: str) -> torch.Generator:
+    if not isinstance(state, Tensor) or state.dtype != torch.uint8:
+        raise ValueError(f"rng[{role!r}] must be a uint8 generator state")
+    generator = torch.Generator()
+    try:
+        generator.set_state(state)
+    except RuntimeError as err:
+        raise ValueError(f"rng[{role!r}] is not a CPU generator state: {err}") from None
+    return generator
+
+
+class _Sampler:
+    """D-26: the seeded permutation of the training images, redrawn each epoch, as dataset
+    record indices; the next permutation is drawn when the current one runs out (Q-72)."""
+
+    def __init__(
+        self,
+        indices: Sequence[int],
+        generator: torch.Generator,
+        state: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._indices = list(indices)
+        self.generator = generator
+        if state is None:
+            self.epoch, self.cursor, self.permutation = 0, 0, self._draw()
+            return
+        epoch, cursor, permutation = (state.get(k) for k in ("epoch", "cursor", "permutation"))
+        if not isinstance(permutation, list) or sorted(permutation) != sorted(self._indices):
+            raise ValueError(
+                "the sampler's permutation must permute this dataset's training images"
+            )
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in permutation):
+            raise ValueError("the sampler's permutation must hold record indices")
+        for name, value, high in (("epoch", epoch, None), ("cursor", cursor, len(permutation))):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"the sampler's {name} must be an int >= 0, got {value!r}")
+            if high is not None and value > high:
+                raise ValueError(f"the sampler's {name} must not exceed {high}, got {value!r}")
+        assert isinstance(epoch, int) and isinstance(cursor, int)
+        self.epoch, self.cursor, self.permutation = epoch, cursor, list(permutation)
+
+    def _draw(self) -> list[int]:
+        order = torch.randperm(len(self._indices), generator=self.generator).tolist()
+        return [self._indices[k] for k in order]
+
+    def next(self) -> int:
+        if self.cursor == len(self.permutation):
+            self.epoch, self.cursor, self.permutation = self.epoch + 1, 0, self._draw()
+        index = self.permutation[self.cursor]
+        self.cursor += 1
+        return index
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"epoch": self.epoch, "cursor": self.cursor, "permutation": list(self.permutation)}
+
+
+def _global_rng() -> dict[str, Any]:
+    """The global generators, recorded for code outside the trainer (Q-72); CUDA states only
+    when CUDA is already initialized, so a CPU run never initializes it."""
+    cuda: dict[str, Tensor] = {}
+    if torch.cuda.is_initialized():  # type: ignore[no-untyped-call]
+        cuda = {str(i): state for i, state in enumerate(torch.cuda.get_rng_state_all())}
+    version, internal, gauss = random.getstate()
+    numpy_state = np.random.get_state(legacy=False)
+    assert isinstance(numpy_state, dict)
+    return {
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": cuda,
+        "python": [version, list(internal), gauss],
+        "numpy": {
+            "bit_generator": numpy_state["bit_generator"],
+            "state": {
+                "key": numpy_state["state"]["key"].tolist(),
+                "pos": int(numpy_state["state"]["pos"]),
+            },
+            "has_gauss": int(numpy_state["has_gauss"]),
+            "gauss": float(numpy_state["gauss"]),
+        },
+    }
+
+
+def _restore_global_rng(rng: Mapping[str, Any]) -> None:
+    """Q-72: the inverse of _global_rng; CUDA states only for initialized devices that exist."""
+    torch.set_rng_state(rng["torch_cpu"])
+    if torch.cuda.is_initialized():  # type: ignore[no-untyped-call]
+        for index, state in rng.get("torch_cuda", {}).items():
+            if int(index) < torch.cuda.device_count():
+                torch.cuda.set_rng_state(state, device=int(index))
+    version, internal, gauss = rng["python"]
+    random.setstate((version, tuple(internal), gauss))
+    numpy_state = rng["numpy"]
+    np.random.set_state(
+        {
+            "bit_generator": numpy_state["bit_generator"],
+            "state": {
+                "key": np.array(numpy_state["state"]["key"], dtype=np.uint32),
+                "pos": numpy_state["state"]["pos"],
+            },
+            "has_gauss": numpy_state["has_gauss"],
+            "gauss": numpy_state["gauss"],
+        }
+    )
+
+
+def _check_global_rng(rng: Mapping[str, Any]) -> None:
+    for key in ("torch_cpu", "python", "numpy"):
+        if key not in rng:
+            raise ValueError(f"rng must hold {key!r}")
+    if not isinstance(rng["torch_cpu"], Tensor) or rng["torch_cpu"].dtype != torch.uint8:
+        raise ValueError("rng['torch_cpu'] must be a uint8 generator state")
+    if not isinstance(rng.get("torch_cuda", {}), Mapping):
+        raise ValueError("rng['torch_cuda'] must map device indices to states")
+
+
+# Global PyTorch flags around a step (Q-73).
+
+
+@contextlib.contextmanager
+def _perf_flags(perf: PerfConfig) -> Iterator[None]:
+    """Q-73: PerfConfig's process-global flags for one step, restored afterwards."""
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    algorithms = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    try:
+        cudnn.allow_tf32 = perf.perc_precision == "tf32"  # D-52
+        if perf.deterministic:
+            # §2.4 Settings: autotuning off, deterministic kernels where PyTorch has them.
+            # fused-ssim stays: its backward writes each gradient element once (source log #73).
+            cudnn.benchmark = False
+            cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        yield
+    finally:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+        torch.use_deterministic_algorithms(algorithms[0], warn_only=algorithms[1])
+
+
+def _check_perf(perf: PerfConfig) -> None:
+    """Q-73: options later milestones build fail now rather than being ignored."""
+    if perf.perc_precision == "bf16":
+        raise NotImplementedError("perc_precision='bf16' (D-52) comes with M15")
+    if perf.images_per_step != 1:
+        raise NotImplementedError("images_per_step > 1 (D-54) comes with M15")
+    if perf.frame_cache in ("gpu", "mmap"):
+        raise NotImplementedError(f"frame_cache={perf.frame_cache!r} (D-51) comes with M12")
+
+
+def _cpu(tree: Any) -> Any:
+    """A copy of a tree of dicts with every tensor detached and cloned to the CPU."""
+    if isinstance(tree, Tensor):
+        return tree.detach().to("cpu", copy=True)
+    if isinstance(tree, Mapping):
+        return {key: _cpu(value) for key, value in tree.items()}
+    return tree
+
+
+def _producer() -> str:
+    try:
+        return f"openftgs {importlib.metadata.version('openftgs')}"
+    except importlib.metadata.PackageNotFoundError:
+        return "openftgs"
+
+
+@dataclass
+class _Run:
+    """Everything a training run changes, built in full before it replaces the old one."""
+
+    model: FreeTimeGaussians
+    optimizer: FTGSOptimizer
+    stats: GradStats
+    sampler: _Sampler
+    relocation: torch.Generator  # every event draw (D-15; Q-72)
+    time: TimeNormalizer  # the run's τ₀, τ₁
+    spatial_scale: float  # S (D-27)
+    frame_dt: float  # Δt_f (E14)
+    iteration: int
+
+
+class Trainer:
+    """The training loop of §1.3 on a multi-view video: one image per training iteration, the
+    events of the calendar, and the trainer state a checkpoint holds (§2.2). The seed is
+    `cfg.seed`; the device selects the backend: gsplat on CUDA, the reference elsewhere (Q-69)."""
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        dataset: MultiViewVideo,
+        init: InitPoints | FreeTimeGaussians,
+        *,
+        device: str = "cuda",
+    ) -> None:
+        self._configure(cfg, dataset, device)
+        time_unit = dataset.manifest.time_unit
+        if isinstance(init, FreeTimeGaussians):
+            # Q-69: a model passed in is trained in place; it must belong to this run.
+            if init.sh_degree != cfg.sh_degree:
+                raise ValueError(f"the model's SH degree {init.sh_degree} isn't {cfg.sh_degree}")
+            if init.time != dataset.time:
+                raise ValueError(f"the model's time {init.time} isn't the dataset's {dataset.time}")
+            if init.time_unit != time_unit:
+                raise ValueError(f"the model's time unit {init.time_unit!r} isn't {time_unit!r}")
+            if init.num_gaussians > cfg.growth.n_max:
+                raise ValueError(
+                    f"the model's N = {init.num_gaussians} exceeds N_max = {cfg.growth.n_max}"
+                )
+            model = init
+        elif isinstance(init, InitPoints):
+            # §1.3 steps 7–9 (D-24, D-74; Q-16), with the run's own initialization generator.
+            model = FreeTimeGaussians.from_init_points(
+                init,
+                dataset.time,
+                cfg.init,
+                frame_dt=dataset.frame_dt,
+                generator=_seeded(cfg.seed, "init"),
+                sh_degree=cfg.sh_degree,
+                n_max=cfg.growth.n_max,
+            )
+            model.time_unit = time_unit
+        else:
+            raise ValueError(f"init must be InitPoints or a model, got {type(init).__name__}")
+        spatial_scale = dataset.spatial_scale(cfg.scene_scale_factor)  # D-27
+        model = self._place(model)
+        self._install(
+            _Run(
+                model=model,
+                optimizer=self._optimizer_for(model, spatial_scale, dataset.frame_dt),
+                stats=GradStats(model.num_gaussians, device=self._device),
+                sampler=_Sampler(self._training, _seeded(cfg.seed, "sampler")),
+                relocation=_seeded(cfg.seed, "relocation"),
+                time=dataset.time,
+                spatial_scale=spatial_scale,
+                frame_dt=dataset.frame_dt,
+                iteration=0,
+            )
+        )
+
+    # Q-70 (owner answer): force resumes despite a changed scene manifest.
+    @classmethod
+    def from_checkpoint(
+        cls,
+        directory: Path,
+        dataset: MultiViewVideo,
+        *,
+        device: str = "cuda",
+        force: bool = False,
+    ) -> "Trainer":
+        """Resume the run saved in a ftgs-checkpoint directory (io.load_checkpoint, then
+        load_state_dict). A checkpoint of another scene manifest is refused unless forced; a
+        forced resume keeps the run's τ₀, τ₁, S and Δt_f (§2.2; Q-70)."""
+        state = load_checkpoint(Path(directory))
+        if state.scene_sha256 != dataset.manifest.sha256 and not force:
+            raise ValueError(
+                f"checkpoint {directory} was made from the scene manifest {state.scene_sha256}, "
+                f"not {dataset.manifest.sha256}; pass force=True to resume anyway"
+            )
+        trainer = cls.__new__(cls)
+        trainer._configure(config_from_dict(state.config), dataset, device)
+        trainer.load_state_dict(state)
+        return trainer
+
+    def _configure(self, cfg: TrainConfig, dataset: MultiViewVideo, device: str) -> None:
+        _check_perf(cfg.perf)
+        self._cfg = cfg
+        self._dataset = dataset
+        self._device = torch.device(device)
+        # Q-69, D-76: gsplat renders on CUDA; the reference backend everywhere else.
+        self._backend: Literal["gsplat", "reference"] = (
+            "gsplat" if self._device.type == "cuda" else "reference"
+        )
+        self._training = [i for i, r in enumerate(dataset.records) if r.split == "train"]
+        self._background = torch.tensor(cfg.background, dtype=torch.float32, device=self._device)
+        # D-77: one perceptual network, built only when its weight is positive.
+        self._perceptual: LPIPSLoss | None = None
+        if cfg.loss.lambda_perc > 0.0:
+            self._perceptual = LPIPSLoss(cfg.loss.perc_net).to(self._device)
+        self._evaluator: Evaluator | None = None
+
+    def _place(self, model: FreeTimeGaussians) -> FreeTimeGaussians:
+        model.slice_impl = self._cfg.perf.slice_impl  # Q-66
+        return model.to(self._device)
+
+    def _optimizer_for(
+        self, model: FreeTimeGaussians, spatial_scale: float, frame_dt: float
+    ) -> FTGSOptimizer:
+        return build_optimizer(
+            model,
+            self._cfg.optim,
+            spatial_scale=spatial_scale,
+            frame_dt=frame_dt,
+            adam=self._cfg.perf.adam,  # Q-44
+        )
+
+    def _install(self, run: _Run) -> None:
+        self._run = run
+        self._window: dict[str, Tensor] = {}  # loss sums since the last read (§2.4 rule 3)
+        self._window_count = 0
+
+    # -- training -------------------------------------------------------------------------------
+
+    @property
+    def iteration(self) -> int:
+        """Completed optimizer steps."""
+        return self._run.iteration
+
+    def step(self) -> StepLog:
+        """One training iteration (§1.3 steps 1–7) at it = iteration + 1."""
+        run, cfg = self._run, self._cfg
+        it = run.iteration + 1
+        if it > cfg.optim.iterations:
+            raise ValueError(f"the run is complete at iteration {run.iteration}")
+        entry = calendar_entry(cfg, it)
+        with _perf_flags(cfg.perf), torch.enable_grad():
+            # Steps 1–2: the next image of the sampler, its normalized time and L_active.
+            index = run.sampler.next()
+            record = self._dataset.records[index]
+            gt = self._dataset.load_image(index).to(self._device)
+            t = float(run.time.to_t(record.timestamp))
+            # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
+            out = render(
+                run.model,
+                record.camera,
+                t,
+                time_units="normalized",
+                sh_degree=entry.sh_degree,
+                background=self._background,
+                backend=self._backend,
+                return_aux=True,
+                precull=cfg.perf.precull,  # Q-31
+                packed=cfg.perf.packed,  # Q-36
+            )
+            # Step 4: E9.
+            loss, terms = total_loss(
+                out.image, gt[None], run.model, t, it, cfg.loss, perceptual=self._perceptual
+            )
+            # Step 5: backpropagate, then the gradient statistics (E10, D-12).
+            torch.autograd.backward(loss)
+            assert out.means2d is not None and out.visible is not None  # return_aux
+            grad = out.means2d.grad
+            if grad is not None:  # a check for None, not a synchronization
+                width, height = record.camera.width, record.camera.height
+                if out.gaussian_ids is not None:  # packed mode (Q-36)
+                    run.stats.update(
+                        grad, width=width, height=height, gaussian_ids=out.gaussian_ids
+                    )
+                else:
+                    run.stats.update(grad, width=width, height=height, visible=out.visible)
+            # Step 6: this iteration's rates and one Adam step.
+            rates = run.optimizer.set_iteration(it)
+            if cfg.perf.adam == "selective":
+                run.optimizer.step(visibility=out.visible.any(dim=0))
+            else:
+                run.optimizer.step()
+            run.optimizer.zero_grad()
+            # Step 7: the event.
+            growth, relocation, pruned = self._event(entry, it)
+        run.iteration = it
+        return StepLog(
+            iteration=it,
+            image_index=index,
+            timestamp=record.timestamp,
+            t=t,
+            sh_degree=entry.sh_degree,
+            rates=rates,
+            losses=terms,
+            num_gaussians=run.model.num_gaussians,
+            growth=growth,
+            relocation=relocation,
+            pruned=pruned,
+            opacity_reset=entry.reset_opacity,
+            mean_losses=self._log(terms, it),
+        )
+
+    def _check_finite(self, it: int) -> None:
+        """Q-69: a model that fails §1.1's validity rules means the run diverged."""
+        try:
+            self._run.model.validate()
+        except ValueError as err:
+            raise FloatingPointError(f"training diverged by iteration {it}: {err}") from err
+
+    def _event(
+        self, entry: CalendarEntry, it: int
+    ) -> tuple[GrowthReport | None, RelocationReport | None, int | None]:
+        """§1.3 step 7 in its order (D-45; Q-71): growth, relocation, the ablation's pruning
+        and opacity reset, then the statistics reset, which relocation does itself (Q-51)."""
+        if not (entry.event or entry.reset_opacity):
+            return None, None, None
+        run, cfg = self._run, self._cfg
+        self._check_finite(it)
+        growth = relocation = pruned = None
+        if entry.grow:
+            growth = grow(
+                run.model,
+                run.optimizer,
+                run.stats,
+                cfg.growth,
+                spatial_scale=run.spatial_scale,
+                reloc=cfg.reloc,
+                generator=run.relocation,
+            )
+        if entry.relocate:
+            relocation = relocate(
+                run.model, run.optimizer, run.stats, cfg.reloc, generator=run.relocation
+            )
+        if entry.prune:
+            pruned = prune(
+                run.model,
+                run.optimizer,
+                run.stats,
+                cfg.reloc,
+                spatial_scale=run.spatial_scale,
+                iteration=it,
+            )
+        if entry.reset_opacity:
+            reset_opacity(run.model, run.optimizer)
+        if entry.event and not entry.relocate:
+            run.stats.reset()  # Q-51: with relocation off, the trainer resets them
+        return growth, relocation, pruned
+
+    def _log(self, terms: Mapping[str, Tensor], it: int) -> dict[str, float] | None:
+        """§2.4 rule 3: loss terms add up on the device and are read every log_every
+        iterations, with the validity check; a non-finite mean means divergence (Q-69)."""
+        for name, value in terms.items():
+            self._window[name] = value if name not in self._window else self._window[name] + value
+        self._window_count += 1
+        if it % self._cfg.perf.log_every != 0:
+            return None
+        means = {name: float(total) / self._window_count for name, total in self._window.items()}
+        self._window, self._window_count = {}, 0
+        if not all(math.isfinite(value) for value in means.values()):
+            raise FloatingPointError(f"training diverged by iteration {it}: mean losses {means}")
+        self._check_finite(it)
+        return means
+
+    def train(self, until: int | None = None, callbacks: Sequence[Callback] = ()) -> None:
+        """Step until `until` (default T_it), calling every callback after each step; a
+        callback that returns True stops training after that step (Q-69)."""
+        iterations = self._cfg.optim.iterations
+        target = iterations if until is None else until
+        if (
+            isinstance(target, bool)
+            or not isinstance(target, int)
+            or not self._run.iteration <= target <= iterations
+        ):
+            raise ValueError(
+                f"until must be an int in [{self._run.iteration}, {iterations}], got {until!r}"
+            )
+        while self._run.iteration < target:
+            log = self.step()
+            stops = [bool(callback(self, log)) for callback in callbacks]
+            if any(stops):
+                return
+
+    # -- evaluation -----------------------------------------------------------------------------
+
+    def evaluate(self, split: str = "test", *, out_dir: Path | None = None) -> dict[str, float]:
+        """The E16 metrics of a data split's images: the scene means of the entire images, and
+        under "dynamic/<name>" those of the dynamic regions when there are any. With `out_dir`,
+        METRICS.json is written there (Q-63, Q-74)."""
+        if self._evaluator is None:
+            self._evaluator = Evaluator(device=self._device)
+        images = evaluate_images(
+            self._run.model,
+            self._dataset,
+            self._evaluator,
+            split=split,
+            backend=self._backend,
+            background=self._cfg.background,
+        )
+        result = average_metrics([image.entire for image in images])
+        dynamic = [image.dynamic for image in images if image.dynamic is not None]
+        if dynamic:
+            result |= {f"dynamic/{k}": v for k, v in average_metrics(dynamic).items()}
+        if out_dir is not None:
+            manifest = self._dataset.manifest
+            report = {
+                "producer": _producer(),
+                "model": {"iteration": self._run.iteration},
+                "manifest": {"path": str(manifest.path), "sha256": manifest.sha256},
+                **metrics_report(images, split=split, metadata=manifest.metadata),
+            }
+            directory = Path(out_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            text = json.dumps(report, allow_nan=False, indent=1)
+            (directory / "METRICS.json").write_text(text, encoding="utf-8")
+        return result
+
+    # -- state ----------------------------------------------------------------------------------
+
+    def state_dict(self) -> TrainerState:
+        """The trainer state of §2.2's checkpoint, with every tensor a CPU copy (Q-69, Q-72)."""
+        run = self._run
+        return TrainerState(
+            iteration=run.iteration,
+            config=config_to_dict(self._cfg),
+            time=run.time,
+            spatial_scale=run.spatial_scale,
+            frame_dt=run.frame_dt,
+            params=_cpu({n: getattr(run.model, n) for n in FreeTimeGaussians.PARAM_NAMES}),
+            optim=_cpu(run.optimizer.state_dict()),
+            stats=_cpu(run.stats.state_dict()),
+            rng=_cpu(
+                {
+                    "sampler": run.sampler.generator.get_state(),
+                    "relocation": run.relocation.get_state(),
+                    **_global_rng(),
+                }
+            ),
+            sampler=run.sampler.state_dict(),
+            scene_sha256=self._dataset.manifest.sha256,
+            time_unit=run.model.time_unit,
+        )
+
+    def load_state_dict(self, state: TrainerState) -> None:
+        """Continue the run `state` holds: its configuration must be this trainer's; its
+        τ₀, τ₁, S and Δt_f are adopted. Everything is built before anything is replaced, so a
+        rejected state leaves the trainer as it was (Q-69, Q-72)."""
+        cfg = self._cfg
+        if config_from_dict(state.config) != cfg:
+            raise ValueError("the state's configuration differs from the trainer's")
+        time_unit = self._dataset.manifest.time_unit
+        if state.time_unit != time_unit:
+            raise ValueError(f"the state's time unit {state.time_unit!r} isn't {time_unit!r}")
+        iteration = state.iteration
+        if isinstance(iteration, bool) or not 0 <= iteration <= cfg.optim.iterations:
+            raise ValueError(f"the state's iteration {iteration!r} is outside the run")
+        if int(state.params["means"].shape[0]) > cfg.growth.n_max:
+            raise ValueError(f"the state's N exceeds N_max = {cfg.growth.n_max}")
+        model = FreeTimeGaussians(
+            state.params, sh_degree=cfg.sh_degree, time=state.time, time_unit=state.time_unit
+        )
+        model = self._place(model)
+        optimizer = self._optimizer_for(model, state.spatial_scale, state.frame_dt)  # Q-46
+        optimizer.load_state_dict(state.optim)
+        stats = GradStats(model.num_gaussians, device=self._device)
+        stats.load_state_dict(state.stats)
+        rng = state.rng
+        _check_global_rng(rng)
+        sampler = _Sampler(self._training, _generator(rng.get("sampler"), "sampler"), state.sampler)
+        run = _Run(
+            model=model,
+            optimizer=optimizer,
+            stats=stats,
+            sampler=sampler,
+            relocation=_generator(rng.get("relocation"), "relocation"),
+            time=state.time,
+            spatial_scale=state.spatial_scale,
+            frame_dt=state.frame_dt,
+            iteration=iteration,
+        )
+        self._install(run)
+        _restore_global_rng(rng)
