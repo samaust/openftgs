@@ -31,6 +31,7 @@ from hypothesis import strategies as st
 
 from openftgs.config import GrowthConfig, OptimConfig, RelocConfig
 from openftgs.density import (
+    OPACITY_RESET_EVERY,
     GradStats,
     GrowthReport,
     RelocationReport,
@@ -1263,6 +1264,16 @@ def test_prune_removes_large_primitives_only_after_iteration_3000() -> None:
         model, opt = _growth_scene([SMALL, [math.log(12.0), 0.0, 0.0], SMALL])
         removed = prune(model, opt, GradStats(3), ABLATION, spatial_scale=S, iteration=iteration)
         assert model.num_gaussians == expected and removed == 3 - expected
+
+
+def test_opacity_reset_period_is_the_iteration_bound_of_pruning() -> None:
+    """§1.3 ablation, Q-53's note, Q-67: the opacity reset's period, every 3,000 iterations, is
+    public, and it is the bound after which large primitives are pruned too."""
+    assert OPACITY_RESET_EVERY == 3000
+    for iteration, expected in ((OPACITY_RESET_EVERY, 3), (OPACITY_RESET_EVERY + 1, 2)):
+        model, opt = _growth_scene([SMALL, [math.log(12.0), 0.0, 0.0], SMALL])
+        prune(model, opt, GradStats(3), ABLATION, spatial_scale=S, iteration=iteration)
+        assert model.num_gaussians == expected
 
 
 def test_prune_without_a_pruning_opacity_changes_nothing() -> None:

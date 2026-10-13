@@ -17,7 +17,8 @@ from openftgs.config import GrowthConfig, RelocConfig
 from openftgs.model import FreeTimeGaussians, rotation_matrix
 from openftgs.optim import FTGSOptimizer
 
-__all__ = [  # Q-48
+__all__ = [  # Q-48; Q-67
+    "OPACITY_RESET_EVERY",
     "GradStats",
     "GrowthReport",
     "RelocationReport",
@@ -573,8 +574,11 @@ def _grow_by_score(
 
 # Q-53: the "w/o periodic relocation" ablation's thresholds and reset value, fixed constants with
 # no config field (D-72) [L: 3DGS §5.2; thresholds from gsplat 1.5.3 DefaultStrategy].
-_PRUNE_SCALE = 0.1  # × S: larger primitives are pruned after _PRUNE_SCALE_AFTER
-_PRUNE_SCALE_AFTER = 3000  # iterations; the test is iteration > 3000, as gsplat's step > 3000
+# Q-67: the opacity reset's period, public so the trainer's calendar takes it from here; it is
+# also the iteration after which large primitives are pruned (iteration > 3000, as gsplat's
+# step > reset_every).
+OPACITY_RESET_EVERY = 3000
+_PRUNE_SCALE = 0.1  # × S: larger primitives are pruned after OPACITY_RESET_EVERY
 _RESET_OPACITY = 0.01  # the opacity reset's bound on σ
 
 
@@ -601,7 +605,7 @@ def prune(
         return 0
     with torch.no_grad():
         remove = model.opacity_logits.detach() < _logit_bound(cfg.prune_opacity)
-        if iteration > _PRUNE_SCALE_AFTER:
+        if iteration > OPACITY_RESET_EVERY:
             largest = torch.exp(model.log_scales.detach()).amax(dim=-1)
             remove |= largest > _PRUNE_SCALE * scale
     n_removed = int(remove.sum())
