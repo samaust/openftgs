@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dataclasses for the package's public data: the frozen Camera, ImageRecord, InitPoints,
 TimeNormalizer and ExchangeModel, RenderOutput, and TrainerState, the plain data a checkpoint
-holds; and the frame interval Δt_f of E14.
+holds; the render request and its renders (Q-56); and the frame interval Δt_f of E14.
 
 Spec: §1.4, §2.2, E14. Band: Foundation (§2.1).
 """
@@ -23,7 +23,10 @@ __all__ = [
     "ExchangeModel",
     "ImageRecord",
     "InitPoints",
+    "RenderItem",
     "RenderOutput",
+    "RenderRequest",
+    "Renders",
     "TimeNormalizer",
     "TrainerState",
     "frame_interval",
@@ -151,6 +154,28 @@ class TrainerState:  # plain tensors and dicts; a §2.2 checkpoint holds exactly
     sampler: dict[str, Any]  # epoch, cursor, permutation
     scene_sha256: str | None = None  # Q-17: SHA-256 of the scene manifest, for resume
     time_unit: str = "s"  # Q-17: the scene manifest's time_unit
+
+
+# Q-56: the contents of a ftgs-render-request file and of its ftgs-renders answer (§2.2).
+@dataclass(frozen=True)
+class RenderItem:
+    id: str
+    timestamp: float  # raw τ in the request's time unit (float64)
+    camera: Camera  # named after the item id
+
+
+@dataclass(frozen=True)
+class RenderRequest:
+    items: tuple[RenderItem, ...]
+    time_unit: str
+    background: tuple[float, float, float] = (0.0, 0.0, 0.0)  # D-34
+    sh_degree: int | None = None  # None: the model's full degree
+
+
+@dataclass(frozen=True)
+class Renders:
+    rgb: dict[str, Tensor]  # id → [H, W, 3] float32, not clamped to 1
+    alpha: dict[str, Tensor]  # id → [H, W, 1] float32
 
 
 def frame_interval(camera_timestamps: Mapping[str, Sequence[float]], time: TimeNormalizer) -> float:
