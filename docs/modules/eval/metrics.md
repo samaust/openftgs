@@ -35,3 +35,7 @@ M14's `ftgs eval` adds the header and writes the file without NaN or Infinity, a
 ## The Fastest-10 frames
 
 The selection itself is not in `eval`. D-69 has the converter store the range in the manifest, and the converter is in `data`, which may not import `eval`, so the selection is `openftgs.data.fastest_frames` (Q-59). It streams the test camera's frames and returns the start of the window. M12's converter scores the test camera's frames as it stores them, after undistortion and resizing, so the range can be recomputed from the files (D-69), and maps the start to the manifest's `frame_index` values, by which the report selects the test images (Q-59, Q-63).
+
+## Evaluating a model on a scene
+
+`evaluate_images` evaluates a model on the images of one data split of a multi-view video, for `Trainer.evaluate` now and `ftgs eval` in M14 (Q-68). It renders through `render.render_request`, one request per timestamp, so cameras that share a time render in one call (D-55) and only one time's renders are held at once; it never calls the render backends itself. Each image is evaluated by the `Evaluator` the caller passes, which holds the LPIPS networks, with the test image's mask when it has one. The results come back as `ImageMetrics` in the manifest's order, each with its path relative to the manifest, as the metrics report lists them.

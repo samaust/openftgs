@@ -29,12 +29,14 @@ The "w/o periodic relocation" ablation replaces relocation with pruning and an o
 - `prune` removes the primitives below the pruning opacity, tested on the stored logit as the dead set is (D-14), and, past the iteration §1.3 names, those whose largest scale exceeds the ablation's bound scaled by S, with the thresholds and the strict iteration test of gsplat 1.5.3's default strategy (source log #56). The model, the optimizer and the statistics are resized together. With no pruning opacity configured, it changes nothing.
 - `reset_opacity` clamps every opacity logit at the logit of the reset value and zeroes the Adam moments of the opacity logits for every row, keeping the step counters, through `reset_rows(..., names=("opacity_logits",))` (owner answer, Q-53), as gsplat's opacity reset does (source log #57).
 
-The ablation's constants have no config field; they are fixed private constants and change only by a logged code change (D-72).
+The ablation's constants have no config field; they are fixed constants and change only by a logged code change (D-72). The iteration bound of the scale test is public, as `OPACITY_RESET_EVERY`, because it is also the opacity reset's period (Q-67); the others are private.
 
-## Notes for M10
+## How the trainer calls growth and the ablation
 
-- When the opacity reset fires, over the whole run or only within the growth window as 3DGS and gsplat do, is the trainer's calendar decision. Its period and `prune`'s iteration 3,000 come from the same gsplat default, so the trainer takes the period from one place and the two can't drift apart (Q-53, owner answer).
-- The relocation generator may live on the CPU or on the model's device; draws run on the generator's device. A generator on the model's device keeps the draws there.
+The trainer (M10, `docs/modules/train/trainer.md`) calls these functions on its calendar:
+
+- The ablation's opacity reset fires at every multiple of `OPACITY_RESET_EVERY` inside the growth window, and pruning at every growth event (owner answer, Q-71). `OPACITY_RESET_EVERY` is public, so the reset period and `prune`'s iteration bound share one value (Q-53, Q-67).
+- The relocation generator lives on the CPU; draws run on the generator's device and move to the model's (Q-72).
 - With relocation off, the trainer resets the gradient statistics itself after each event (Q-51).
-- A `ValueError` from `FreeTimeGaussians.validate()` at an event means the run diverged; its mapping to the CLI's exit code 3 belongs to M10 and M14.
+- A failure of `FreeTimeGaussians.validate()` before an event means the run diverged, which the trainer reports as `FloatingPointError` (Q-69).
 - U-25's "stops growing after 15,000" and "growth runs before relocation in an event" are calendar properties, pinned by the trainer's tests.
