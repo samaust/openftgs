@@ -2,10 +2,10 @@
 """Reading and writing full checkpoints (TrainerState), FTGS-IF exchange files (ExchangeModel),
 ftgs-init files (InitPoints), render requests (RenderRequest) and their renders (Renders), scene
 manifests (SceneManifest), and PLY files for viewers, with the validators of the exchange and
-init formats. Plain data in and
-out: this module imports neither openftgs.model nor openftgs.train.
+init formats. Plain data in and out: this module imports neither openftgs.model nor
+openftgs.train.
 
-Spec: §2.2, D-30, D-34, D-73. Band: Foundation (§2.1).
+Spec: §2.2, D-30, D-34, D-73; Q-64. Band: Foundation (§2.1).
 """
 
 import hashlib
