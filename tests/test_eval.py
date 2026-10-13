@@ -572,3 +572,31 @@ def test_evaluator_reports_float32_metrics_for_float64_images(evaluator: Evaluat
     from64, _ = evaluator(pred, gt)
     from32, _ = evaluator(pred.to(F32), gt.to(F32))
     assert from64 == from32
+
+
+@pytest.mark.weights
+def test_evaluator_runs_lpips_without_tf32_and_restores_the_flag(
+    evaluator: Evaluator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-52, §2.4 Precision: cuDNN's TF32 flag is cleared for every LPIPS pass of the Evaluator
+    (LPIPS-Alex, LPIPS-VGG and lpips_vgg_raw), the convolutions the flag would reach, and
+    restored afterwards (Q-60)."""
+    from openftgs.losses import LPIPSLoss
+
+    seen: list[tuple[bool, bool]] = []
+    original = LPIPSLoss.forward
+
+    def spy(self: LPIPSLoss, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
+        seen.append((torch.backends.cudnn.allow_tf32, map_inputs))
+        return original(self, pred, gt, map_inputs=map_inputs)
+
+    monkeypatch.setattr(LPIPSLoss, "forward", spy)
+    pred, gt = _noisy_pair((40, 48, 3), seed=14)
+    before = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+        evaluator(pred, gt)
+        assert torch.backends.cudnn.allow_tf32 is True
+    finally:
+        torch.backends.cudnn.allow_tf32 = before
+    assert sorted(seen) == [(False, False), (False, True), (False, True)]
