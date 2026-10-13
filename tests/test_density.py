@@ -35,7 +35,9 @@ from openftgs.density import (
     RelocationReport,
     grow,
     mcmc_split,
+    prune,
     relocate,
+    reset_opacity,
     sampling_score,
 )
 from openftgs.model import FreeTimeGaussians
@@ -1183,3 +1185,79 @@ def test_count_control_score_moves_copies_from_live_targets_by_e11() -> None:
     untouched[100:] = False
     for name in PARAM_NAMES:
         assert torch.equal(after[name][:100][untouched[:100]], before[name][untouched[:100]])
+
+
+# The "w/o periodic relocation" ablation: pruning and the opacity reset (§1.3; Q-53)
+
+ABLATION = RelocConfig(enabled=False, prune_opacity=0.005)
+
+
+def test_prune_removes_low_opacity_rows_on_the_float32_logit() -> None:
+    """§1.3 ablation, Q-53: pruning removes the primitives whose base opacity is below 0.005,
+    tested on the stored logit as D-14 tests the dead set: ô = float32(logit 0.005) stays, one
+    float32 step below goes. The model, the optimizer and the statistics are resized together,
+    kept rows in order; the count removed is returned."""
+    below = float(torch.nextafter(torch.tensor(O_DEAD), torch.tensor(-math.inf)))
+    model, opt = _relocation_scene([1.0, O_DEAD, below, -8.0, 0.5])
+    before, moments = _rows_of(model), opt.state_dict()
+    stats = _stats_with([1.0, 2.0, 3.0, 4.0, 5.0], [1, 1, 1, 1, 1])
+    removed = prune(model, opt, stats, ABLATION, spatial_scale=S, iteration=500)
+    assert removed == 2
+    kept = torch.tensor([0, 1, 4])
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name][kept])
+    for name, state in opt.state_dict().items():
+        assert torch.equal(state["exp_avg"], moments[name]["exp_avg"][kept])
+    assert torch.equal(stats.g_sum, torch.tensor([1.0, 2.0, 5.0]))
+
+
+def test_prune_removes_large_primitives_only_after_iteration_3000() -> None:
+    """§1.3 ablation, Q-53: after iteration 3,000 (strictly, as gsplat's default strategy tests
+    it), primitives whose largest scale exceeds 0.1·S are pruned too (here 0.1·S = 10)."""
+    for iteration, expected in ((3000, 3), (3001, 2)):
+        model, opt = _growth_scene([SMALL, [math.log(12.0), 0.0, 0.0], SMALL])
+        removed = prune(model, opt, GradStats(3), ABLATION, spatial_scale=S, iteration=iteration)
+        assert model.num_gaussians == expected and removed == 3 - expected
+
+
+def test_prune_without_a_pruning_opacity_changes_nothing() -> None:
+    """RelocConfig.prune_opacity = None (the default): no pruning, nothing changes."""
+    model, opt = _growth_scene([SMALL, [math.log(12.0), 0.0, 0.0]])
+    with torch.no_grad():
+        model.opacity_logits[0] = -9.0
+    before = _rows_of(model)
+    assert prune(model, opt, GradStats(2), RelocConfig(), spatial_scale=S, iteration=5000) == 0
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
+
+
+@pytest.mark.parametrize("iteration", [0, -1, True, 1.5])
+def test_prune_rejects_an_invalid_iteration(iteration: object) -> None:
+    model, opt = _growth_scene([SMALL])
+    with pytest.raises(ValueError):
+        prune(model, opt, GradStats(1), ABLATION, spatial_scale=S, iteration=iteration)  # type: ignore[arg-type]
+
+
+def test_reset_opacity_clamps_every_opacity_to_at_most_one_hundredth() -> None:
+    """§1.3 ablation, Q-53 (owner answer): the opacity reset sets σ to min(σ, 0.01), on the
+    stored logit as float32(logit 0.01), and zeroes the Adam moments of opacity_logits for every
+    row; the other tensors, their moments and every step counter are unchanged."""
+    bound = float(torch.tensor(math.log(0.01) - math.log1p(-0.01), dtype=F32))
+    logits = [2.0, bound, -6.0, 0.0, -4.0]
+    model, opt = _relocation_scene(logits)
+    before, moments = _rows_of(model), opt.state_dict()
+    reset_opacity(model, opt)
+    # logit 0.01 ≈ −4.595, so −4.0 is above the bound and −6.0 below it.
+    expected = torch.tensor([bound, bound, -6.0, bound, bound], dtype=F32)
+    assert torch.equal(model.opacity_logits.detach(), expected)
+    for name in PARAM_NAMES:
+        if name != "opacity_logits":
+            assert torch.equal(getattr(model, name).detach(), before[name])
+    after = opt.state_dict()
+    for name in after:
+        for key in ("exp_avg", "exp_avg_sq"):
+            if name == "opacity_logits":
+                assert torch.equal(after[name][key], torch.zeros_like(after[name][key]))
+            else:
+                assert torch.equal(after[name][key], moments[name][key])
+        assert torch.equal(after[name]["step"], moments[name]["step"])

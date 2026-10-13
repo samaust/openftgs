@@ -24,7 +24,9 @@ __all__ = [  # Q-48
     "RelocationReport",
     "grow",
     "mcmc_split",
+    "prune",
     "relocate",
+    "reset_opacity",
     "sampling_score",
 ]
 
@@ -538,3 +540,51 @@ def _grow_by_score(
     return GrowthReport(
         cloned=0, split=0, sampled=n_add, capped=0, num_gaussians=model.num_gaussians
     )
+
+
+# Q-53: the "w/o periodic relocation" ablation's thresholds and reset value, fixed constants with
+# no config field (D-72) [L: 3DGS §5.2; thresholds from gsplat 1.5.3 DefaultStrategy].
+_PRUNE_SCALE = 0.1  # × S: larger primitives are pruned after _PRUNE_SCALE_AFTER
+_PRUNE_SCALE_AFTER = 3000  # iterations; the test is iteration > 3000, as gsplat's step > 3000
+_RESET_OPACITY = 0.01  # the opacity reset's bound on σ
+
+
+def prune(
+    model: FreeTimeGaussians,
+    optimizer: FTGSOptimizer,
+    stats: GradStats,
+    cfg: RelocConfig,
+    *,
+    spatial_scale: float,
+    iteration: int,
+) -> int:
+    """The ablation's pruning (§1.3 Count-control modes): remove the primitives whose base
+    opacity is below `cfg.prune_opacity` (tested on the stored logit, as D-14 tests the dead
+    set) and, after iteration 3,000, those whose largest scale exceeds 0.1·S. Model, optimizer
+    and statistics are resized together. Returns the number removed; with no pruning opacity
+    configured, does nothing."""
+    _check_stats(model, stats)
+    scale = _check_spatial_scale(spatial_scale)
+    if not _is_int(iteration) or iteration < 1:
+        _fail(f"iteration must be an int ≥ 1, got {iteration!r}")
+    if cfg.prune_opacity is None:
+        return 0
+    with torch.no_grad():
+        remove = model.opacity_logits.detach() < _logit_bound(cfg.prune_opacity)
+        if iteration > _PRUNE_SCALE_AFTER:
+            largest = torch.exp(model.log_scales.detach()).amax(dim=-1)
+            remove |= largest > _PRUNE_SCALE * scale
+    n_removed = int(remove.sum())
+    if n_removed:
+        _resize_all(model, optimizer, stats, keep=~remove, append=None, parents=None)
+    return n_removed
+
+
+def reset_opacity(model: FreeTimeGaussians, optimizer: FTGSOptimizer) -> None:
+    """The ablation's opacity reset (§1.3 Count-control modes): σ ← min(σ, 0.01), on the stored
+    logit, and the Adam moments of the opacity logits zeroed for every row, keeping the step
+    counters (Q-53, owner answer). No host synchronization."""
+    with torch.no_grad():
+        model.opacity_logits.clamp_(max=_logit_bound(_RESET_OPACITY))
+    rows = torch.arange(model.num_gaussians, device=model.means.device)
+    optimizer.reset_rows(rows, names=("opacity_logits",))
