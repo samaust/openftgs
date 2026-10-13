@@ -24,7 +24,7 @@ The backend follows the device: gsplat on a CUDA device, which D-76 requires of 
 
 A step returns a `StepLog`. Its loss terms are the detached tensors `total_loss` returns, on the device and unread, so a step makes no host synchronization outside gsplat's render, the events and the log reads (§2.4 rule 3, D-49). The trainer adds the terms into device-side sums and reads their means once every `PerfConfig.log_every` iterations; the same read checks the model's validity. After a resume the first window covers only the iterations since the resume; logs never feed back into training.
 
-Each record's camera is copied to the device once and kept there, so a render reads no camera from the host. The copy of each training iteration's image to the device still synchronizes, until the frame cache and prefetcher of D-51 (M12).
+Every training record's camera is copied to the device when the trainer is built, so a training iteration's render reads no camera from the host. The copy of each training iteration's image to the device still synchronizes, until the frame cache and prefetcher of D-51 (M12).
 
 ## Divergence
 

@@ -431,20 +431,18 @@ class Trainer:
         if cfg.loss.lambda_perc > 0.0:
             self._perceptual = LPIPSLoss(cfg.loss.perc_net).to(self._device)
         self._evaluator: Evaluator | None = None
-        self._cameras: dict[int, Camera] = {}  # the records' cameras on the device, by id
-
-    def _camera(self, camera: Camera) -> Camera:
-        """§2.4 rule 3: a record's camera with its tensors on the device, copied once, so a
-        training iteration's render copies nothing from the host for it."""
-        placed = self._cameras.get(id(camera))
-        if placed is None:
-            placed = dataclasses.replace(
-                camera,
-                K=camera.K.to(self._device),
-                world_to_camera=camera.world_to_camera.to(self._device),
-            )
-            self._cameras[id(camera)] = placed
-        return placed
+        # §2.4 rule 3: every training record's camera is copied to the device here, once, so a
+        # training iteration's render copies no camera from the host; records share camera
+        # objects, so they are keyed by identity (Camera's == compares tensors).
+        self._cameras: dict[int, Camera] = {}
+        for index in self._training:
+            camera = dataset.records[index].camera
+            if id(camera) not in self._cameras:
+                self._cameras[id(camera)] = dataclasses.replace(
+                    camera,
+                    K=camera.K.to(self._device),
+                    world_to_camera=camera.world_to_camera.to(self._device),
+                )
 
     def _place(self, model: FreeTimeGaussians) -> FreeTimeGaussians:
         model.slice_impl = self._cfg.perf.slice_impl  # Q-66
@@ -489,7 +487,7 @@ class Trainer:
             # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
             out = render(
                 run.model,
-                self._camera(record.camera),
+                self._cameras[id(record.camera)],
                 t,
                 time_units="normalized",
                 sh_degree=entry.sh_degree,
