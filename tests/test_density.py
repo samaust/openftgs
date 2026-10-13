@@ -425,6 +425,29 @@ def e11_oracle(sigma: float, n: int, a: float) -> tuple[float, float]:
     return float(s_new), float(_DEC.divide(_DEC.multiply(decimal.Decimal(a), s), denom))
 
 
+def e11_from_logit(logit: float, n: int) -> tuple[float, float]:
+    """E11 for a target given by its stored opacity logit, in 50-digit decimal: σ = e^ô/(1 + e^ô)
+    and 1 − σ = 1/(1 + e^ô) are formed exactly from the logit, so a saturated target keeps its
+    precision. Returns float32's view of the stored logit of the unclamped σ_new, logit(σ_new),
+    and the scale factor a_new/a, with n clamped to [1, 51]."""
+    n = min(max(n, 1), 51)
+    one = decimal.Decimal(1)
+    e = _DEC.exp(decimal.Decimal(logit))
+    s, one_minus_s = _DEC.divide(e, _DEC.add(one, e)), _DEC.divide(one, _DEC.add(one, e))
+    one_minus_new = _DEC.power(one_minus_s, _DEC.divide(one, n))  # (1 − σ)^(1/n)
+    s_new = _DEC.subtract(one, one_minus_new)
+    denom = decimal.Decimal(0)
+    for i in range(1, n + 1):
+        for k in range(i):
+            term = _DEC.divide(
+                _DEC.multiply(math.comb(i - 1, k) * (-1) ** k, _DEC.power(s_new, k + 1)),
+                _DEC.sqrt(decimal.Decimal(k + 1)),
+            )
+            denom = _DEC.add(denom, term)
+    new_logit = _DEC.ln(_DEC.divide(s_new, one_minus_new))
+    return float(new_logit), float(_DEC.divide(s, denom))
+
+
 def opacity_after_copies(sigma_new: float, n: int) -> float:
     """1 − (1 − σ_new)^n in 50-digit decimal: the opacity n stacked copies reach (E11)."""
     one = decimal.Decimal(1)
@@ -817,6 +840,22 @@ def test_a_target_drawn_more_than_50_times_uses_n_51() -> None:
     expected_scales = torch.log(torch.stack([a * e11_oracle(sigma, 51, 1.0)[1]] * 61)).float()
     assert torch.equal(model.log_scales.detach(), expected_scales)
     assert torch.equal(_target_of(model, torch.arange(61)), torch.zeros(61, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("logit", [30.0, 40.0])
+def test_relocation_keeps_e11_exact_for_a_saturated_target(logit: float) -> None:
+    """E11 (Q-50, owner answer after the second M8 milestone review, F-1): a target whose stored
+    logit is so large that its float64 σ rounds to 1 (above about 36.7) or nearly so still gets
+    E11's σ_new, because log(1 − σ) is formed from the logit. One target and 50 dead primitives
+    (n = 51): every row's logit is the float32 logit of E11's σ_new (σ_new ≈ 0.44 for ô = 30
+    and 0.54 for ô = 40), and its log-scale float32(log(a·a_new/a)), against a 50-digit decimal
+    oracle that starts from the logit."""
+    model, opt = _relocation_scene([logit] + [LOGIT_DEAD] * 50)
+    a = torch.exp(model.log_scales.detach()[0].double())
+    relocate(model, opt, GradStats(51), RelocConfig(), generator=torch.Generator().manual_seed(0))
+    expected_logit, factor = e11_from_logit(logit, 51)
+    assert torch.equal(model.opacity_logits.detach(), torch.full((51,), expected_logit))
+    assert torch.equal(model.log_scales.detach(), torch.log(a * factor).float().expand(51, 3))
 
 
 def test_u13_clamp_active_case_through_relocate() -> None:

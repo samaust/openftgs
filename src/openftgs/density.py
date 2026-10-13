@@ -306,17 +306,25 @@ def mcmc_split(opacity: Tensor, scales: Tensor, n: Tensor) -> tuple[Tensor, Tens
         _fail(f"n must be an integer tensor of shape [{k}]")
     if scales.device != opacity.device or n.device != opacity.device:
         _fail("opacity, scales and n must be on one device")
+    sigma = opacity.to(torch.float64)
+    new_opacity, new_scales = _e11(sigma, torch.log1p(-sigma), scales.to(torch.float64), n)
+    return new_opacity.to(opacity.dtype), new_scales.to(opacity.dtype)
+
+
+# Q-50: E11 in float64 from σ and log(1 − σ), so that relocation can form log(1 − σ) from the
+# stored logit and keep E11 exact where the float64 σ of a saturated logit rounds to 1.
+def _e11(sigma: Tensor, log1m_sigma: Tensor, scales: Tensor, n: Tensor) -> tuple[Tensor, Tensor]:
+    """σ_new = 1 − (1 − σ)^(1/n), clamped to at most 1 − 2⁻²³, and a_new from the unclamped σ_new
+    (E11), all float64; n is clamped to [1, 51] for the formula."""
     f64 = torch.float64
-    sigma = opacity.to(f64)
     copies = n.clamp(1, _N_COPIES_MAX).to(torch.int64)
     # 1 − (1 − σ)^(1/n), in a form that stays accurate for small σ.
-    sigma_new = -torch.expm1(torch.log1p(-sigma) / copies.to(f64))
+    sigma_new = -torch.expm1(log1m_sigma / copies.to(f64))
     exponents = torch.arange(1, _N_COPIES_MAX + 1, dtype=f64, device=sigma.device)
     powers = sigma_new[:, None] ** exponents  # σ_new^(k+1)
     denominator = (_e11_table(sigma.device)[copies - 1] * powers).sum(dim=1)
-    new_scales = scales.to(f64) * (sigma / denominator)[:, None]
-    new_opacity = sigma_new.clamp(max=_OPACITY_MAX)
-    return new_opacity.to(opacity.dtype), new_scales.to(opacity.dtype)
+    new_scales = scales * (sigma / denominator)[:, None]
+    return sigma_new.clamp(max=_OPACITY_MAX), new_scales
 
 
 def _check_generator(generator: object) -> None:
@@ -360,9 +368,14 @@ def _relocation_move(
         means = model.means.index_select(0, draws)
         rs = rotation_matrix(model.quats.index_select(0, draws))
         rs = rs * torch.exp(log_scales.index_select(0, draws))[:, None, :]  # R·diag(a)
-        sigma = torch.sigmoid(logits[targets].double())
-        new_sigma, new_scales = mcmc_split(
-            sigma, torch.exp(log_scales[targets].double()), 1 + counts[targets]
+        # Q-50: σ_j and log(1 − σ_j) = −log(1 + e^ô_j) from the stored logit, in float64.
+        target_logits = logits[targets].double()
+        log1m_sigma = -torch.logaddexp(torch.zeros_like(target_logits), target_logits)
+        new_sigma, new_scales = _e11(
+            torch.sigmoid(target_logits),
+            log1m_sigma,
+            torch.exp(log_scales[targets].double()),
+            1 + counts[targets],
         )
         # D-14: the lower bound of E11's clamp, on the stored float32 logit (Q-50).
         new_logits = torch.logit(new_sigma).float().clamp_min(_logit_bound(cfg.dead_opacity))

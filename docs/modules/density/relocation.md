@@ -34,6 +34,8 @@ The live set is tested on the stored logit against ô_dead (D-14). Every logit b
 - n is clamped as E11 says for the formula only; every drawn copy is still written;
 - the scale factor uses the unclamped σ_new.
 
+`mcmc_split` takes opacities, so it forms log(1 − σ) from σ. Relocation and the score mode call the same private float64 core with log(1 − σ) formed from the stored logit instead, as the negative of log(1 + e^ô): where a saturated logit's float64 σ rounds to 1, or nearly so, E11 then still gets the target's opacity to full precision, and σ_new stays E11's for every float32 logit (Q-50, after the second M8 milestone review).
+
 U-13 compares `mcmc_split` with gsplat 1.5.3's `compute_relocation`, a float32 kernel, over live targets and every n E11 allows, as U-13's row asks. Away from the clamp the two agree far inside U-13's bound; where σ_new falls below the dead threshold, so that only a_new is kept, the difference grows to just under the bound, from float32 cancellation in the kernel's evaluation of σ_new, not from the float64 path (source log #60, #62, #63). That is where a later move of the gsplat pin would show first.
 
 Note for M16: `mcmc_split` applies only the upper bound of E11's clamp, so the harness adapter's answer to the L2 `relocation_math` query must apply D-14's lower bound to σ_new itself (Q-50).
@@ -48,7 +50,7 @@ The clamp has two halves. `mcmc_split` applies the upper bound. The lower bound 
 2. It forms the dead set. If the dead set or the live set is empty, it only resets the statistics.
 3. It scores the live set; the live scores must be finite with a positive sum (with λ_o = 0, which Q-11 allows, they can all be 0), else `ValueError`.
 4. It draws one target per dead primitive with replacement, on the generator's own device, and moves the draws to the model's device. The dead rows, in ascending order, take the draws in draw order.
-5. It applies E11 once per target, from the float64 sigmoid of the stored logit and the exponential of the stored log-scales.
+5. It applies E11 once per target, from the float64 sigmoid of the stored logit, log(1 − σ) formed from that logit, and the exponential of the stored log-scales.
 6. It gathers each target's position, orientation and scales before anything is written, then writes in place under `no_grad`: the targets' new logit and log-scales, then all nine tensors to the moved copies, then the moved copies' positions, drawn from the target's Gaussian with its scales from before the move (E11 writes diag(a_j), as E17 uses the parent's scales). The draws come from one normal draw after the multinomial. With `copy_position = "stack"` the moved copies keep the target's position.
 7. It resets the Adam moments of the targets and the moved copies, or of the targets only when `reset_moved_moments` is off (D-16), through `FTGSOptimizer.reset_rows`.
 8. It checks the validity rules again, as §1.1 asks after every relocation.
