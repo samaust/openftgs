@@ -293,6 +293,8 @@ def test_options_of_later_milestones_are_refused(tmp_path: Path, perf: PerfConfi
 # U-21's test calendar: events every 50 iterations from 100, growth up to 200, relocation up to
 # 250, so events fall on both sides of a resume at 150. A low gradient threshold makes every
 # event grow, and a dead threshold of 0.2 leaves dead rows at every event (Q-11 ranges hold).
+# U-21's scene has 12 training images (four frames), so 150 and 125 fall in mid-epoch.
+U21_FRAMES = 4
 U21 = TrainConfig(
     sh_degree=1,
     loss=LossConfig(lambda_perc=0.0),
@@ -357,7 +359,11 @@ def _assert_states_equal(a: TrainerState, b: TrainerState, *, global_rng: bool =
     _assert_same({k: a.rng[k] for k in roles}, {k: b.rng[k] for k in roles}, "rng")
 
 
-def _assert_logs_equal(a: Sequence[StepLog], b: Sequence[StepLog]) -> None:
+def _assert_logs_equal(
+    a: Sequence[StepLog], b: Sequence[StepLog], *, mean_losses: bool = True
+) -> None:
+    """Bitwise-equal step logs; `mean_losses=False` leaves out the log window's means, which a
+    resume restarts (§2.2's contract covers images, rates, draws and parameters, not logs)."""
     assert len(a) == len(b)
     for x, y in zip(a, b, strict=True):
         assert (x.iteration, x.image_index, x.timestamp, x.t, x.sh_degree) == (
@@ -367,7 +373,8 @@ def _assert_logs_equal(a: Sequence[StepLog], b: Sequence[StepLog]) -> None:
             y.t,
             y.sh_degree,
         )
-        assert x.rates == y.rates and x.mean_losses == y.mean_losses, x.iteration
+        assert x.rates == y.rates, x.iteration
+        assert not mean_losses or x.mean_losses == y.mean_losses, x.iteration
         assert (x.num_gaussians, x.growth, x.relocation, x.pruned, x.opacity_reset) == (
             y.num_gaussians,
             y.growth,
@@ -388,31 +395,37 @@ def test_u21_checkpoint_round_trip_keeps_every_part_of_the_state(tmp_path: Path)
     """U-21: every tensor, Adam moment, step counter, generator state, sampler state and
     statistic survives a save and a load bitwise, and a trainer resumed from the checkpoint
     holds the same state (§2.2; Q-25, Q-72)."""
-    video = _scene(tmp_path / "scene")
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
     trainer = _u21_trainer(video)
-    _run(trainer, 120)  # after an event, in the middle of an epoch
+    _run(trainer, 125)  # after an event, in the middle of an epoch
     state = trainer.state_dict()
+    assert 0 < state.sampler["cursor"] < len(state.sampler["permutation"])
     save_checkpoint(state, tmp_path / "ckpt")
     _assert_states_equal(state, load_checkpoint(tmp_path / "ckpt"))
     resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu")
-    assert resumed.iteration == 120
+    assert resumed.iteration == 125
     _assert_states_equal(state, resumed.state_dict())
 
 
 def test_u21_resumed_run_is_bitwise_equal_to_the_straight_run(tmp_path: Path) -> None:
     """U-21 (reference backend, CPU): 300 iterations straight against 150, a resume through a
     checkpoint directory, and 150 more give the same images, rates, loss terms, event reports
-    and final state, bitwise. Events grow and relocate rows on both sides of the resume."""
-    video = _scene(tmp_path / "scene")
+    and final state, bitwise. Events grow and relocate rows on both sides of the resume, which
+    falls in the middle of an epoch, so a partly used permutation is restored. The log window
+    restarts at a resume, so its means are compared before the resume only."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
     straight_trainer = _u21_trainer(video)
     straight = _run(straight_trainer)
     first = _u21_trainer(video)
     before = _run(first, 150)
-    save_checkpoint(first.state_dict(), tmp_path / "ckpt")
+    state = first.state_dict()
+    assert 0 < state.sampler["cursor"] < len(state.sampler["permutation"])
+    save_checkpoint(state, tmp_path / "ckpt")
     resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu")
     after = _run(resumed)
     assert _events_did_work(before) and _events_did_work(after)
-    _assert_logs_equal(straight, before + after)
+    _assert_logs_equal(straight[:150], before)
+    _assert_logs_equal(straight[150:], after, mean_losses=False)
     _assert_states_equal(straight_trainer.state_dict(), resumed.state_dict(), global_rng=False)
 
 

@@ -51,6 +51,8 @@ class MultiViewVideo:
         self.manifest = manifest
         self.records = list(manifest.records)
         train = [record for record in self.records if record.split == "train"]
+        if not train:  # read_scene_manifest refuses such a file; a hand-built manifest may not
+            raise ValueError(f"scene manifest {manifest.path}: needs at least one training image")
         # §1.4 "Time": τ₀ and τ₁ are the smallest and largest training timestamps.
         stamps = [record.timestamp for record in train]
         self.time = TimeNormalizer(min(stamps), max(stamps))
