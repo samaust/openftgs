@@ -13,6 +13,8 @@ How `openftgs.density` meets its §2.1 row for E10 and E11: the gradient statist
 
 Consumers tell the layouts apart by whether `gaussian_ids` is given (Q-36), and exactly one selector is accepted. The NDC scaling of D-12 multiplies the two gradient components by Python floats, so no tensor is built on the host, and each pair adds its norm to `g_sum` and one to `count`. A primitive seen by several cameras in one call counts once per camera in both layouts (Q-49); training renders one image per iteration (D-26), so it is counted at most once there.
 
+Note for M15: D-54's multi-image mode will average a loss over its b images, which shrinks each 2D-mean gradient by b. Before that mode feeds `update`, it must decide whether the accumulated gradient takes a factor for b, as gsplat's trainer multiplies by its number of cameras; otherwise τ_pos effectively rises b-fold (Q-49, owner answer).
+
 `update`, `mean` and `reset` read only shapes, dtypes and devices and make no host synchronization (§2.4 rule 3, D-49). U-16 checks this under torch's synchronization debug mode, which torch documents as a prototype that misses some synchronizing operations, so the check is evidence rather than proof.
 
 `resize_` follows the model at growth and pruning: the same `keep` mask (Q-23), and parent indices into the rows before the resize, so a split's children can name the parent that the same resize removes (Q-49). New rows copy their parent's statistics, which lets the relocation later in the same event score the grown region (D-45).
