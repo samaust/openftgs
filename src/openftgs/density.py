@@ -5,13 +5,18 @@ and the count-control modes.
 Spec: E10, E11, E17, §1.3. Band: Mechanics (§2.1).
 """
 
+import math
 from collections.abc import Mapping
 from typing import NoReturn
 
+import numpy as np
 import torch
 from torch import Tensor
 
-__all__ = ["GradStats"]  # Q-48
+from openftgs.config import RelocConfig
+from openftgs.model import FreeTimeGaussians
+
+__all__ = ["GradStats", "sampling_score"]  # Q-48
 
 
 def _fail(reason: str) -> NoReturn:
@@ -21,6 +26,20 @@ def _fail(reason: str) -> NoReturn:
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+# Q-50: every logit bound in this module (ô_dead of D-14, the ablation's thresholds) is float32
+# of the float64 logit; comparing a float32 tensor with this Python float compares in float32.
+def _logit_bound(p: float) -> float:
+    return float(np.float32(math.log(p) - math.log1p(-p)))
+
+
+def _check_stats(model: FreeTimeGaussians, stats: "GradStats") -> None:
+    """The statistics cover the model's rows, on its device (shapes only: no host sync)."""
+    if stats.num_gaussians != model.num_gaussians:
+        _fail(f"the statistics hold {stats.num_gaussians} rows, the model {model.num_gaussians}")
+    if stats.g_sum.device != model.means.device:
+        _fail(f"the statistics are on {stats.g_sum.device}, the model on {model.means.device}")
 
 
 class GradStats:
@@ -175,3 +194,23 @@ class GradStats:
             kept = value if keep is None else value[keep]
             resized.append(kept if parents is None else torch.cat([kept, parents]))
         self._g_sum, self._count = resized
+
+
+# Q-48: ρ for every row; the procedures mask out the dead set.
+def sampling_score(model: FreeTimeGaussians, stats: GradStats, cfg: RelocConfig) -> Tensor:
+    """ρ = λ_g·ĝ + λ_o·σ of E10 for every row, [N] float32. ĝ = min(1, g/Q) with Q the
+    `cfg.grad_quantile` quantile of g over the live rows visible at least once (D-13), and
+    ĝ ≡ 0 when Q is 0 or there is no such row. No host synchronization."""
+    _check_stats(model, stats)
+    logits = model.opacity_logits.detach()
+    sigma = torch.sigmoid(logits)
+    if model.num_gaussians == 0:
+        return sigma
+    g = stats.mean()
+    live_seen = (logits >= _logit_bound(cfg.dead_opacity)) & (stats.count > 0)  # D-14
+    # The quantile of the selected rows without a gather (no data-dependent shape): the other
+    # rows are NaN, which nanquantile ignores; torch's default linear interpolation (D-13).
+    q = torch.nanquantile(torch.where(live_seen, g, math.nan), cfg.grad_quantile)
+    positive = q > 0  # False for a NaN quantile (no live, visible row): ĝ ≡ 0 (E10)
+    g_hat = torch.where(positive, torch.clamp(g / torch.where(positive, q, 1.0), max=1.0), 0.0)
+    return cfg.lambda_g * g_hat + cfg.lambda_o * sigma

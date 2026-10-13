@@ -9,11 +9,15 @@ Gaussian), from an independent float64 evaluation of E11 written literally as Py
 from gsplat 1.5.3's `compute_relocation` as the oracle U-13 names (GPU).
 """
 
+import math
+
 import pytest
 import torch
-from builders import random_model, ring
+from builders import UNIT_TIME, random_model, random_params, ring
 
-from openftgs.density import GradStats
+from openftgs.config import RelocConfig
+from openftgs.density import GradStats, sampling_score
+from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 
 F32 = torch.float32
@@ -293,3 +297,64 @@ def test_u16_gsplat_packed_and_unpacked_layouts_give_the_same_statistics() -> No
     assert torch.equal(packed_stats.count, unpacked_stats.count)
     error = float(torch.linalg.vector_norm(packed_stats.g_sum - unpacked_stats.g_sum))
     assert error <= 1e-5 * float(torch.linalg.vector_norm(unpacked_stats.g_sum)), error
+
+
+# U-15 · the sampling score (E10, D-13; Q-48)
+
+O_DEAD = float(torch.tensor(math.log(0.005) - math.log1p(-0.005), dtype=F32))  # D-14
+
+
+def _model_with_logits(logits: list[float], *, seed: int = 0) -> FreeTimeGaussians:
+    """A random model (§1.1 tensors, SH degree 0) whose opacity logits are the given values."""
+    params = random_params(len(logits), sh_degree=0, generator=torch.Generator().manual_seed(seed))
+    params["opacity_logits"] = torch.tensor(logits, dtype=F32)
+    return FreeTimeGaussians(params, sh_degree=0, time=UNIT_TIME)
+
+
+def test_u15_normalized_gradient_uses_the_99th_percentile_of_live_visible_rows() -> None:
+    """U-15, E10, D-13: with λ_g = 1 and λ_o = 0, ρ = ĝ = min(1, g/Q₀.₉₉), Q taken with
+    torch.quantile's default interpolation over the live rows visible at least once; dead and
+    never-visible rows don't enter Q (a huge g on a dead row, and the zeros of never-visible
+    rows, would both move it); ĝ ∈ [0, 1] and ĝ = 1 above Q."""
+    n = 120
+    logits = [0.5] * n
+    sums = [float(k + 1) for k in range(n)]
+    counts = [1] * n
+    for row in range(100, 110):  # never visible
+        counts[row], sums[row] = 0, 0.0
+    for row in range(110, 120):  # dead, with the largest g of all
+        logits[row], sums[row] = -8.0, 1.0e6
+    model = _model_with_logits(logits)
+    stats = _stats_with(sums, counts)
+    cfg = RelocConfig(lambda_g=1.0, lambda_o=0.0)
+    g_hat = sampling_score(model, stats, cfg)
+    g = stats.mean()
+    q = torch.quantile(g[:100], 0.99)
+    assert float(q) == float(torch.quantile(torch.arange(1.0, 101.0), 0.99))
+    assert torch.equal(g_hat, torch.clamp(g / q, max=1.0))
+    assert bool(((g_hat >= 0) & (g_hat <= 1)).all())
+    assert torch.equal(g_hat[g >= q], torch.ones_like(g_hat[g >= q]))
+    assert torch.equal(g_hat[100:110], torch.zeros(10))
+
+
+@pytest.mark.parametrize("case", ["all zero", "mostly zero", "nothing live and visible"])
+def test_u15_zero_quantile_gives_half_the_base_opacity(case: str) -> None:
+    """U-15, E10: if Q₀.₉₉ is 0 (or there is no live, visible row to take it over), ĝ ≡ 0 and
+    ρ = 0.5σ with the default weights."""
+    n = 200
+    logits = [float(v) for v in torch.linspace(-4.0, 4.0, n)]
+    sums, counts = [0.0] * n, [1] * n
+    if case == "mostly zero":
+        sums[0] = 3.0  # one nonzero g in 200: the 99th percentile is still 0
+    elif case == "nothing live and visible":
+        counts = [0] * n
+    model = _model_with_logits(logits)
+    rho = sampling_score(model, _stats_with(sums, counts), RelocConfig())
+    sigma = torch.sigmoid(torch.tensor(logits, dtype=F32))
+    assert torch.equal(rho, 0.5 * sigma)
+
+
+def test_sampling_score_rejects_statistics_of_another_size() -> None:
+    """Q-48: the statistics must cover the model's rows (Q-26: ValueError)."""
+    with pytest.raises(ValueError):
+        sampling_score(_model_with_logits([0.0, 1.0]), GradStats(3), RelocConfig())
