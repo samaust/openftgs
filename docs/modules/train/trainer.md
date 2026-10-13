@@ -24,11 +24,11 @@ The backend follows the device: gsplat on a CUDA device, which D-76 requires of 
 
 A step returns a `StepLog`. Its loss terms are the detached tensors `total_loss` returns, on the device and unread, so a step makes no host synchronization outside gsplat's render, the events and the log reads (§2.4 rule 3, D-49). The trainer adds the terms into device-side sums and reads their means once every `PerfConfig.log_every` iterations; the same read checks the model's validity. After a resume the first window covers only the iterations since the resume; logs never feed back into training.
 
-The per-step copy of the image to the device synchronizes until the frame cache and prefetcher of D-51 (M12).
+Each record's camera is copied to the device once and kept there, so a render reads no camera from the host. The copy of each training iteration's image to the device still synchronizes, until the frame cache and prefetcher of D-51 (M12).
 
 ## Divergence
 
-A non-finite mean loss at a log read, or a model that fails `validate()` at a log read or before an event, makes `step` raise `FloatingPointError` naming the iteration (Q-69). It is a built-in exception, apart from the `ValueError` of input errors (Q-26), so M14 can map it to exit code 3 (Q-55).
+A non-finite mean loss at a log read, or a model that fails `validate()` or gradient statistics that aren't finite, at a log read or before an event, make `step` raise `FloatingPointError` naming the iteration (Q-69). It is a built-in exception, apart from the `ValueError` of input errors (Q-26), so M14 can map it to exit code 3 (Q-55).
 
 ## Callbacks and stopping
 
@@ -56,7 +56,7 @@ A run resumed from a checkpoint at iteration k is bitwise equal to the uninterru
 
 On gsplat the backward pass accumulates with atomic additions, so a resume holds up to floating-point reordering only, as §2.2 says.
 
-`load_state_dict` builds the new model, optimizer and statistics before replacing anything, so a rejected state leaves the trainer as it was. It requires the trainer's own configuration and the dataset's time unit, and adopts the state's time normalizer, S and Δt_f. `from_checkpoint` also refuses a checkpoint made from another scene manifest unless forced (owner answer, Q-70); a forced resume keeps the run's time normalizer, S and Δt_f, so its learning rates continue unchanged.
+`load_state_dict` builds the new model, optimizer and statistics, and checks the recorded global generator states on throwaway generators, before replacing anything, so a rejected state leaves the trainer and the process's generators as they were. It requires the trainer's own configuration and the dataset's time unit, and adopts the state's time normalizer, S and Δt_f. `from_checkpoint` also refuses a checkpoint made from another scene manifest unless forced (owner answer, Q-70); a forced resume keeps the run's time normalizer, S and Δt_f, so its learning rates continue unchanged.
 
 ## The model
 
@@ -64,12 +64,21 @@ The trainer trains a model passed to it in place, after moving it to the device;
 
 ## Settings from `PerfConfig`
 
-Global PyTorch flags are set around each step and restored afterwards, so a training step leaves the caller's process as it was (Q-73):
+What each field does in M10 (Q-73):
 
-- `deterministic` turns off cuDNN autotuning, asks for cuDNN's deterministic algorithms and PyTorch's deterministic kernels (with warnings only where none exists). fused-ssim stays in use: its backward pass writes each gradient element once, with no atomics (source log #73, answering Q-42's note). Without it the cuDNN flags are left alone; autotuning waits for its benchmark (B-4, M15).
-- `perc_precision` sets cuDNN's TF32 flag for the step (D-52).
+| Field | In M10 |
+| --- | --- |
+| `slice_impl` | set on the model (Q-66) |
+| `packed`, `precull` | passed to `render` (Q-36, Q-31) |
+| `adam` | passed to `build_optimizer` (Q-44) |
+| `log_every` | the period of the log reads and their validity check |
+| `deterministic` | during each training iteration: cuDNN autotuning off, cuDNN's deterministic algorithms, and PyTorch's deterministic kernels, warning only where none exists; fused-ssim stays in use, since its backward pass writes each gradient element once, with no atomics (source log #73, answering Q-42's note). Off, the cuDNN flags are left alone; autotuning waits for its benchmark (B-4, M15) |
+| `perc_precision` | "tf32" or "ieee": cuDNN's TF32 flag during each training iteration (D-52); "bf16" raises `NotImplementedError` (M15) |
+| `images_per_step` | above 1 raises `NotImplementedError` (D-54, M15) |
+| `frame_cache` | "gpu" or "mmap" raises `NotImplementedError` (D-51, M12); "auto" and "off" decode the image file at every training iteration |
+| `prefetch` | unused until M12 |
 
-Options that later milestones build raise `NotImplementedError` at construction rather than being ignored: bf16 LPIPS and several images per step (M15), and the GPU or memory-mapped frame cache (M12).
+The global flags are set around each training iteration and restored afterwards, so training leaves the caller's process as it was.
 
 ## Evaluation
 

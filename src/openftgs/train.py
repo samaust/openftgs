@@ -6,6 +6,7 @@ Spec: §1.3, §2.2 (Full checkpoint), §2.4 rule 3, D-26, D-45. Band: Orchestrat
 """
 
 import contextlib
+import dataclasses
 import hashlib
 import importlib.metadata
 import json
@@ -38,9 +39,22 @@ from openftgs.losses import LPIPSLoss, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.optim import FTGSOptimizer, build_optimizer
 from openftgs.render import render
-from openftgs.types import InitPoints, TimeNormalizer, TrainerState
+from openftgs.types import Camera, InitPoints, TimeNormalizer, TrainerState
 
 __all__ = ["Callback", "CalendarEntry", "StepLog", "Trainer", "calendar_entry"]  # Q-69
+
+
+def _check_int(value: object, low: int, high: int | None, what: str) -> int:
+    """An int (not a bool) in [low, high], or at least low when high is None."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < low
+        or (high is not None and value > high)
+    ):
+        bounds = f"in [{low}, {high}]" if high is not None else f">= {low}"
+        raise ValueError(f"{what} must be an int {bounds}, got {value!r}")
+    return value
 
 
 # The calendar (§1.3 Iteration calendar).
@@ -64,9 +78,7 @@ class CalendarEntry:
 def calendar_entry(cfg: TrainConfig, it: int) -> CalendarEntry:
     """The calendar of `cfg` at iteration `it` (§1.3 step 7 and Iteration calendar, E13): the
     active SH degree and the events, every window and period read from the configuration."""
-    iterations = cfg.optim.iterations
-    if isinstance(it, bool) or not isinstance(it, int) or not 1 <= it <= iterations:
-        raise ValueError(f"it must be an int in [1, {iterations}], got {it!r}")
+    _check_int(it, 1, cfg.optim.iterations, "it")  # D-41
     growth, reloc = cfg.growth, cfg.reloc
     on_period = it % reloc.every == 0  # growth events share the relocation period (§2.1)
     in_growth = growth.start <= it <= growth.stop
@@ -115,7 +127,7 @@ def _seeded(seed: int, role: str) -> torch.Generator:
     return torch.Generator().manual_seed(int.from_bytes(digest[:8], "little"))
 
 
-def _generator(state: object, role: str) -> torch.Generator:
+def _restored_generator(state: object, role: str) -> torch.Generator:
     if not isinstance(state, Tensor) or state.dtype != torch.uint8:
         raise ValueError(f"rng[{role!r}] must be a uint8 generator state")
     generator = torch.Generator()
@@ -141,20 +153,18 @@ class _Sampler:
         if state is None:
             self.epoch, self.cursor, self.permutation = 0, 0, self._draw()
             return
-        epoch, cursor, permutation = (state.get(k) for k in ("epoch", "cursor", "permutation"))
-        if not isinstance(permutation, list) or sorted(permutation) != sorted(self._indices):
+        permutation = state.get("permutation")
+        if not isinstance(permutation, list) or not all(
+            isinstance(i, int) and not isinstance(i, bool) for i in permutation
+        ):
+            raise ValueError("the sampler's permutation must be a list of record indices")
+        if sorted(permutation) != sorted(self._indices):
             raise ValueError(
                 "the sampler's permutation must permute this dataset's training images"
             )
-        if not all(isinstance(i, int) and not isinstance(i, bool) for i in permutation):
-            raise ValueError("the sampler's permutation must hold record indices")
-        for name, value, high in (("epoch", epoch, None), ("cursor", cursor, len(permutation))):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"the sampler's {name} must be an int >= 0, got {value!r}")
-            if high is not None and value > high:
-                raise ValueError(f"the sampler's {name} must not exceed {high}, got {value!r}")
-        assert isinstance(epoch, int) and isinstance(cursor, int)
-        self.epoch, self.cursor, self.permutation = epoch, cursor, list(permutation)
+        self.epoch = _check_int(state.get("epoch"), 0, None, "the sampler's epoch")
+        self.cursor = _check_int(state.get("cursor"), 0, len(permutation), "the sampler's cursor")
+        self.permutation = list(permutation)
 
     def _draw(self) -> list[int]:
         order = torch.randperm(len(self._indices), generator=self.generator).tolist()
@@ -196,45 +206,57 @@ def _global_rng() -> dict[str, Any]:
     }
 
 
-def _restore_global_rng(rng: Mapping[str, Any]) -> None:
-    """Q-72: the inverse of _global_rng; CUDA states only for initialized devices that exist."""
-    torch.set_rng_state(rng["torch_cpu"])
-    if torch.cuda.is_initialized():  # type: ignore[no-untyped-call]
-        for index, state in rng.get("torch_cuda", {}).items():
-            if int(index) < torch.cuda.device_count():
-                torch.cuda.set_rng_state(state, device=int(index))
-    version, internal, gauss = rng["python"]
-    random.setstate((version, tuple(internal), gauss))
-    numpy_state = rng["numpy"]
-    np.random.set_state(
-        {
-            "bit_generator": numpy_state["bit_generator"],
+def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
+    """Q-72: the recorded global generator states, checked on throwaway generators so that a
+    malformed state is a ValueError before anything changes, and the function that restores
+    them: CUDA states only when CUDA is initialized, for recorded devices that exist."""
+    try:
+        cpu = rng["torch_cpu"]
+        torch.Generator().set_state(cpu)
+        version, internal, gauss = rng["python"]
+        python_state = (version, tuple(internal), gauss)
+        random.Random().setstate(python_state)
+        numpy = rng["numpy"]
+        numpy_state = {
+            "bit_generator": numpy["bit_generator"],
             "state": {
-                "key": np.array(numpy_state["state"]["key"], dtype=np.uint32),
-                "pos": numpy_state["state"]["pos"],
+                "key": np.array(numpy["state"]["key"], dtype=np.uint32),
+                "pos": numpy["state"]["pos"],
             },
-            "has_gauss": numpy_state["has_gauss"],
-            "gauss": numpy_state["gauss"],
+            "has_gauss": numpy["has_gauss"],
+            "gauss": numpy["gauss"],
         }
-    )
+        np.random.RandomState().set_state(numpy_state)
+        cuda = {int(index): state for index, state in rng.get("torch_cuda", {}).items()}
+    except (AttributeError, KeyError, OverflowError, RuntimeError, TypeError, ValueError) as err:
+        raise ValueError(f"malformed global generator states in rng: {err!r}") from None
+    initialized = torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+    for index, state in cuda.items():
+        if not isinstance(state, Tensor) or state.dtype != torch.uint8:
+            raise ValueError(f"rng['torch_cuda'][{index}] must be a uint8 generator state")
+        if initialized and index < torch.cuda.device_count():
+            if state.numel() != torch.cuda.get_rng_state(index).numel():
+                raise ValueError(f"rng['torch_cuda'][{index}] has the wrong size")
+
+    def restore() -> None:
+        torch.set_rng_state(cpu)
+        if initialized:
+            for index, state in cuda.items():
+                if index < torch.cuda.device_count():
+                    torch.cuda.set_rng_state(state, device=index)
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+    return restore
 
 
-def _check_global_rng(rng: Mapping[str, Any]) -> None:
-    for key in ("torch_cpu", "python", "numpy"):
-        if key not in rng:
-            raise ValueError(f"rng must hold {key!r}")
-    if not isinstance(rng["torch_cpu"], Tensor) or rng["torch_cpu"].dtype != torch.uint8:
-        raise ValueError("rng['torch_cpu'] must be a uint8 generator state")
-    if not isinstance(rng.get("torch_cuda", {}), Mapping):
-        raise ValueError("rng['torch_cuda'] must map device indices to states")
-
-
-# Global PyTorch flags around a step (Q-73).
+# Global PyTorch flags around a training iteration (Q-73).
 
 
 @contextlib.contextmanager
 def _perf_flags(perf: PerfConfig) -> Iterator[None]:
-    """Q-73: PerfConfig's process-global flags for one step, restored afterwards."""
+    """Q-73: PerfConfig's process-global flags for one training iteration, restored
+    afterwards."""
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
     algorithms = (
@@ -394,6 +416,20 @@ class Trainer:
         if cfg.loss.lambda_perc > 0.0:
             self._perceptual = LPIPSLoss(cfg.loss.perc_net).to(self._device)
         self._evaluator: Evaluator | None = None
+        self._cameras: dict[int, Camera] = {}  # the records' cameras on the device, by id
+
+    def _camera(self, camera: Camera) -> Camera:
+        """§2.4 rule 3: a record's camera with its tensors on the device, copied once, so a
+        training iteration's render copies nothing from the host for it."""
+        placed = self._cameras.get(id(camera))
+        if placed is None:
+            placed = dataclasses.replace(
+                camera,
+                K=camera.K.to(self._device),
+                world_to_camera=camera.world_to_camera.to(self._device),
+            )
+            self._cameras[id(camera)] = placed
+        return placed
 
     def _place(self, model: FreeTimeGaussians) -> FreeTimeGaussians:
         model.slice_impl = self._cfg.perf.slice_impl  # Q-66
@@ -438,7 +474,7 @@ class Trainer:
             # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
             out = render(
                 run.model,
-                record.camera,
+                self._camera(record.camera),
                 t,
                 time_units="normalized",
                 sh_degree=entry.sh_degree,
@@ -490,12 +526,17 @@ class Trainer:
             mean_losses=self._log(terms, it),
         )
 
-    def _check_finite(self, it: int) -> None:
-        """Q-69: a model that fails §1.1's validity rules means the run diverged."""
+    def _check_valid(self, it: int) -> None:
+        """Q-69: a model that fails §1.1's validity rules, or non-finite gradient statistics,
+        mean the run diverged. Reads values, so it runs only where the run synchronizes."""
         try:
             self._run.model.validate()
         except ValueError as err:
             raise FloatingPointError(f"training diverged by iteration {it}: {err}") from err
+        if not bool(torch.isfinite(self._run.stats.g_sum).all()):
+            raise FloatingPointError(
+                f"training diverged by iteration {it}: the gradient statistics are not finite"
+            )
 
     def _event(
         self, entry: CalendarEntry, it: int
@@ -505,7 +546,7 @@ class Trainer:
         if not (entry.event or entry.reset_opacity):
             return None, None, None
         run, cfg = self._run, self._cfg
-        self._check_finite(it)
+        self._check_valid(it)
         growth = relocation = pruned = None
         if entry.grow:
             growth = grow(
@@ -548,7 +589,7 @@ class Trainer:
         self._window, self._window_count = {}, 0
         if not all(math.isfinite(value) for value in means.values()):
             raise FloatingPointError(f"training diverged by iteration {it}: mean losses {means}")
-        self._check_finite(it)
+        self._check_valid(it)
         return means
 
     def train(self, until: int | None = None, callbacks: Sequence[Callback] = ()) -> None:
@@ -556,14 +597,7 @@ class Trainer:
         callback that returns True stops training after that step (Q-69)."""
         iterations = self._cfg.optim.iterations
         target = iterations if until is None else until
-        if (
-            isinstance(target, bool)
-            or not isinstance(target, int)
-            or not self._run.iteration <= target <= iterations
-        ):
-            raise ValueError(
-                f"until must be an int in [{self._run.iteration}, {iterations}], got {until!r}"
-            )
+        _check_int(target, self._run.iteration, iterations, "until")
         while self._run.iteration < target:
             log = self.step()
             stops = [bool(callback(self, log)) for callback in callbacks]
@@ -572,6 +606,7 @@ class Trainer:
 
     # -- evaluation -----------------------------------------------------------------------------
 
+    # Q-74: the returned keys and what out_dir receives.
     def evaluate(self, split: str = "test", *, out_dir: Path | None = None) -> dict[str, float]:
         """The E16 metrics of a data split's images: the scene means of the entire images, and
         under "dynamic/<name>" those of the dynamic regions when there are any. With `out_dir`,
@@ -640,9 +675,7 @@ class Trainer:
         time_unit = self._dataset.manifest.time_unit
         if state.time_unit != time_unit:
             raise ValueError(f"the state's time unit {state.time_unit!r} isn't {time_unit!r}")
-        iteration = state.iteration
-        if isinstance(iteration, bool) or not 0 <= iteration <= cfg.optim.iterations:
-            raise ValueError(f"the state's iteration {iteration!r} is outside the run")
+        iteration = _check_int(state.iteration, 0, cfg.optim.iterations, "the state's iteration")
         if int(state.params["means"].shape[0]) > cfg.growth.n_max:
             raise ValueError(f"the state's N exceeds N_max = {cfg.growth.n_max}")
         model = FreeTimeGaussians(
@@ -654,18 +687,20 @@ class Trainer:
         stats = GradStats(model.num_gaussians, device=self._device)
         stats.load_state_dict(state.stats)
         rng = state.rng
-        _check_global_rng(rng)
-        sampler = _Sampler(self._training, _generator(rng.get("sampler"), "sampler"), state.sampler)
+        restore_global_rng = _global_rng_restorer(rng)
+        sampler = _Sampler(
+            self._training, _restored_generator(rng.get("sampler"), "sampler"), state.sampler
+        )
         run = _Run(
             model=model,
             optimizer=optimizer,
             stats=stats,
             sampler=sampler,
-            relocation=_generator(rng.get("relocation"), "relocation"),
+            relocation=_restored_generator(rng.get("relocation"), "relocation"),
             time=state.time,
             spatial_scale=state.spatial_scale,
             frame_dt=state.frame_dt,
             iteration=iteration,
         )
         self._install(run)
-        _restore_global_rng(rng)
+        restore_global_rng()

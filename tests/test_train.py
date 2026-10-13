@@ -55,15 +55,15 @@ def _scene(root: Path, *, frames: int = 5) -> MultiViewVideo:
     k/30, the fourth is the test view."""
     cams = ring(4, radius=4.0, elevation=1.0, width_px=32, height_px=24, focal=30.0)
     gt = random_model(24, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
-    views = [(cam, k / 30.0, "train") for k in range(frames) for cam in cams[:3]]
-    views += [(cams[3], k / 30.0, "test") for k in range(frames)]
-    return MultiViewVideo.from_manifest(write_scene(root, gt, views))
+    images = [(cam, k / 30.0, "train") for k in range(frames) for cam in cams[:3]]
+    images += [(cams[3], k / 30.0, "test") for k in range(frames)]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, images))
 
 
-def _init_points(n: int = 30, seed: int = 1) -> InitPoints:
+def _init_points(n: int = 30, seed: int = 1, *, extent: float = 1.2) -> InitPoints:
     g = torch.Generator().manual_seed(seed)
     return InitPoints(
-        positions=(torch.rand(n, 3, generator=g) - 0.5) * 1.2,
+        positions=(torch.rand(n, 3, generator=g) - 0.5) * extent,
         colors=torch.full((n, 3), 0.5),
         timestamps=torch.rand(n, generator=g, dtype=F64) * TAU1,
     )
@@ -72,6 +72,11 @@ def _init_points(n: int = 30, seed: int = 1) -> InitPoints:
 def _no_perceptual(**fields: object) -> TrainConfig:
     """A configuration without the perceptual loss, so CPU tests download nothing."""
     return TrainConfig(loss=LossConfig(lambda_perc=0.0), **fields)  # type: ignore[arg-type]
+
+
+def _all_finite(logs: Sequence[StepLog]) -> bool:
+    """No loss term of any iteration is NaN or infinite."""
+    return all(math.isfinite(float(value)) for log in logs for value in log.losses.values())
 
 
 def _run(trainer: Trainer, until: int | None = None) -> list[StepLog]:
@@ -100,8 +105,8 @@ def test_u17_sh_bands_activate_one_per_thousand_iterations() -> None:
     """U-17, E13: L_active steps at 1,000/1,001, 2,000/2,001 and 3,000/3,001, and stops at L
     (D-3)."""
     cfg = TrainConfig()
-    steps = {1: 0, 1000: 0, 1001: 1, 2000: 1, 2001: 2, 3000: 2, 3001: 3, 30_000: 3}
-    assert {it: calendar_entry(cfg, it).sh_degree for it in steps} == steps
+    degrees = {1: 0, 1000: 0, 1001: 1, 2000: 1, 2001: 2, 3000: 2, 3001: 3, 30_000: 3}
+    assert {it: calendar_entry(cfg, it).sh_degree for it in degrees} == degrees
     low = TrainConfig(sh_degree=1)
     assert [calendar_entry(low, it).sh_degree for it in (1000, 1001, 3001, 30_000)] == [0, 1, 1, 1]
 
@@ -159,7 +164,7 @@ def test_u26_smoke_run_for_each_sh_degree(tmp_path: Path, sh_degree: int) -> Non
     trainer = Trainer(cfg, video, _init_points(), device="cpu")
     logs = _run(trainer)
     assert trainer.iteration == 50 and [log.iteration for log in logs] == list(range(1, 51))
-    assert all(math.isfinite(float(log.losses["total"])) for log in logs)
+    assert _all_finite(logs)
     assert [log.sh_degree for log in logs] == [
         min((it - 1) // 10, sh_degree) for it in range(1, 51)
     ]
@@ -182,16 +187,16 @@ def _axis_camera(center: tuple[float, float, float], name: str) -> Camera:
 
 def _axis_scene(root: Path, timestamps: Sequence[float]) -> MultiViewVideo:
     """Four training cameras at (±2, 0, −5) and (0, ±2, −5), 2 from their centroid, and a test
-    camera far away, at the given raw timestamps."""
+    view far away, at the given raw timestamps."""
     centers = [(2.0, 0.0, -5.0), (-2.0, 0.0, -5.0), (0.0, 2.0, -5.0), (0.0, -2.0, -5.0)]
     cams = [_axis_camera(c, f"cam{k}") for k, c in enumerate(centers)]
     test = _axis_camera((40.0, 0.0, -5.0), "far")
     # The ground truth keeps its own time normalizer: a single timestamp holds no motion (D-71),
     # but the ground truth is only rendered at the scene's raw timestamps.
     gt = random_model(16, seed=0, sh_degree=1, time=UNIT_TIME, spread=0.6, log_scale=(-2.5, -1.5))
-    views = [(cam, tau, "train") for tau in timestamps for cam in cams]
-    views += [(test, tau, "test") for tau in timestamps]
-    return MultiViewVideo.from_manifest(write_scene(root, gt, views))
+    images = [(cam, tau, "train") for tau in timestamps for cam in cams]
+    images += [(test, tau, "test") for tau in timestamps]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, images))
 
 
 def test_spatial_scale_and_frame_interval_reach_the_rates(tmp_path: Path) -> None:
@@ -405,27 +410,54 @@ def test_u24_two_seeded_runs_are_bitwise_identical(tmp_path: Path) -> None:
     _assert_states_equal(a.state_dict(), b.state_dict(), global_rng=False)
 
 
+def _shared_setup_scene(root: Path) -> MultiViewVideo:
+    """§3.2 shared setup: eight 64×64 ring cameras looking at the origin, a black background
+    and S ≈ 1 (the ring's radius 0.9 is each center's distance from their centroid, so
+    S = 1.1 × 0.9), over five frames."""
+    cams = ring(8, radius=0.9, elevation=0.3, width_px=64, height_px=64, focal=64.0)
+    gt = random_model(24, seed=0, sh_degree=1, time=TIME, spread=0.15, log_scale=(-4.0, -3.0))
+    images = [(cam, k / 30.0, "train") for k in range(5) for cam in cams]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, images))
+
+
 def test_s10_tiny_scene_trains_stably_and_resumes(tmp_path: Path) -> None:
-    """S-10: 200 iterations on the CPU, on §3.2's shortened calendar (Q-75): the mean loss of
-    the last 20 iterations is below that of the first 20, nothing is NaN, and a checkpoint at
-    100 resumes to 200. N never decreases and stops growing after the growth window (§1.1,
-    D-18, U-25)."""
-    video = _scene(tmp_path / "scene")
+    """S-10: a tiny scene of §3.2's shared setup, 200 iterations on the CPU on its shortened
+    calendar (Q-75): the mean loss of the last 20 iterations is below that of the first 20, no
+    loss term is NaN, and a checkpoint at 100 resumes to 200. N never decreases and stops
+    growing after the growth window (§1.1, D-18, U-25)."""
+    video = _shared_setup_scene(tmp_path / "scene")
+    assert video.spatial_scale(1.1) == pytest.approx(0.99, rel=1e-5)
     base = _no_perceptual(init=InitConfig(points_per_frame=10), growth=GrowthConfig(n_max=150))
     cfg = shortened_config(200, base)
-    trainer = Trainer(cfg, video, _init_points(), device="cpu")
+    trainer = Trainer(cfg, video, _init_points(extent=0.3), device="cpu")
     logs = _run(trainer, 100)
     save_checkpoint(trainer.state_dict(), tmp_path / "ckpt")
     resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu")
     logs += _run(resumed)
     totals = [float(log.losses["total"]) for log in logs]
     assert [log.iteration for log in logs] == list(range(1, 201))
-    assert all(math.isfinite(value) for value in totals)
+    assert _all_finite(logs)
     assert sum(totals[-20:]) < sum(totals[:20])
     counts = [log.num_gaussians for log in logs]
     assert counts == sorted(counts)
     after = [log for log in logs if log.iteration > cfg.growth.stop]
     assert all(log.growth is None and log.num_gaussians == counts[-1] for log in after)
+
+
+def test_the_initial_subset_is_seeded(tmp_path: Path) -> None:
+    """§1.3 step 7, D-24, D-74, Q-72: init points beyond F·B are cut to a seeded uniform subset
+    drawn from the run's initialization generator: the same seed keeps the same points,
+    another seed others. Five frames at B = 4 keep 20 of 100 points."""
+    video = _scene(tmp_path)
+
+    def means(seed: int) -> torch.Tensor:
+        cfg = _no_perceptual(seed=seed, init=InitConfig(points_per_frame=4))
+        trainer = Trainer(cfg, video, _init_points(100), device="cpu")
+        return trainer.state_dict().params["means"]
+
+    first, again, other = means(0), means(0), means(1)
+    assert first.shape[0] == 20
+    assert torch.equal(first, again) and not torch.equal(first, other)
 
 
 # Events (§1.3 step 7, D-45; Q-51, Q-71).
@@ -437,11 +469,11 @@ _EVERY_ITERATION = dict(
 )
 
 
-def _one_live_row(video: MultiViewVideo, dead: int = 10) -> FreeTimeGaussians:
-    """One live primitive at the origin, in every camera's view, and `dead` primitives at
+def _one_live_row(video: MultiViewVideo) -> FreeTimeGaussians:
+    """One live primitive at the origin, in every camera's view, and ten primitives at
     σ = 0.001 far above the scene, in no camera's view, so they are never growth candidates."""
     rows = [{"mean": (0.0, 0.0, 0.0), "scale": 0.2, "logit": 1.0, "sh0": (0.5, 0.5, 0.5)}]
-    rows += [{"mean": (0.1 * k, 0.0, 40.0), "logit": logit_of(0.001)} for k in range(dead)]
+    rows += [{"mean": (0.1 * k, 0.0, 40.0), "logit": logit_of(0.001)} for k in range(10)]
     return model_from_rows(rows, sh_degree=3, time=video.time)
 
 
@@ -485,6 +517,19 @@ def test_divergence_raises_floating_point_error(tmp_path: Path) -> None:
         trainer.step()
 
 
+def test_non_finite_statistics_at_an_event_raise_floating_point_error(tmp_path: Path) -> None:
+    """Q-69: gradient statistics that aren't finite at an event mean the run diverged, reported
+    as FloatingPointError rather than as relocation's ValueError (from the two-axis review of
+    #84)."""
+    video = _scene(tmp_path)
+    trainer = Trainer(_no_perceptual(**_EVERY_ITERATION), video, _one_live_row(video), device="cpu")
+    state = trainer.state_dict()
+    state.stats["g_sum"][0] = float("nan")
+    trainer.load_state_dict(state)
+    with pytest.raises(FloatingPointError, match="statistics"):
+        trainer.step()
+
+
 # train(), callbacks and global flags (Q-69, Q-73).
 
 
@@ -518,18 +563,24 @@ def test_train_calls_callbacks_in_order_and_stops_when_one_asks(tmp_path: Path) 
         trainer.step()
 
 
-def test_a_step_leaves_the_global_torch_flags_as_they_were(tmp_path: Path) -> None:
-    """Q-73: deterministic mode and the TF32 setting apply during a step only."""
+def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_path: Path) -> None:
+    """Q-73: deterministic mode and the TF32 setting apply during a training iteration only."""
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
-    algorithms = torch.are_deterministic_algorithms_enabled()
+    algorithms = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
     try:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = True, False, True
         perf = PerfConfig(deterministic=True, perc_precision="ieee")
         trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
         trainer.step()
         assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (True, False, True)
-        assert torch.are_deterministic_algorithms_enabled() == algorithms
+        assert (
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+        ) == algorithms
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
 
@@ -562,8 +613,9 @@ def test_a_resume_refuses_a_changed_scene_manifest_unless_forced(tmp_path: Path)
 
 
 def test_load_state_dict_refuses_another_run_and_changes_nothing(tmp_path: Path) -> None:
-    """Q-69: a state of another configuration, or whose sampler doesn't fit the dataset, is a
-    ValueError, and the trainer keeps its own state."""
+    """Q-69, Q-72: a state of another configuration, whose sampler doesn't fit the dataset,
+    whose iteration isn't an int, or whose global generator states are malformed, is a
+    ValueError, and the trainer keeps its own state, global generators included."""
     video = _scene(tmp_path)
     trainer = _u21_trainer(video)
     _run(trainer, 10)
@@ -571,13 +623,38 @@ def test_load_state_dict_refuses_another_run_and_changes_nothing(tmp_path: Path)
     other = _u21_trainer(video, dataclasses.replace(U21, seed=5)).state_dict()
     with pytest.raises(ValueError, match="configuration"):
         trainer.load_state_dict(other)
-    broken = dataclasses.replace(before, sampler={**before.sampler, "permutation": [0, 1, 2]})
-    with pytest.raises(ValueError, match="permutation"):
-        trainer.load_state_dict(broken)
-    _assert_states_equal(trainer.state_dict(), before, global_rng=False)
+    broken = [
+        dataclasses.replace(before, sampler={**before.sampler, "permutation": [0, 1, 2]}),
+        dataclasses.replace(
+            before,
+            sampler={
+                **before.sampler,
+                "permutation": [float(i) for i in before.sampler["permutation"]],
+            },
+        ),
+        dataclasses.replace(before, iteration=10.0),  # type: ignore[arg-type]
+        dataclasses.replace(before, rng={**before.rng, "python": "x"}),
+        dataclasses.replace(before, rng={**before.rng, "numpy": {}}),
+        dataclasses.replace(
+            before, rng={**before.rng, "torch_cpu": torch.zeros(3, dtype=torch.uint8)}
+        ),
+    ]
+    for state in broken:
+        with pytest.raises(ValueError):
+            trainer.load_state_dict(state)
+    _assert_states_equal(trainer.state_dict(), before)
 
 
 # On the GPU: gsplat (U-21's GPU variant; D-57, Q-36, Q-73).
+
+
+def _flat(prefix: str, tree: object) -> dict[str, torch.Tensor]:
+    """The tensors of a tree of dicts, by their dotted paths."""
+    if isinstance(tree, torch.Tensor):
+        return {prefix: tree}
+    if isinstance(tree, dict):
+        return {k: v for key, sub in tree.items() for k, v in _flat(f"{prefix}.{key}", sub).items()}
+    return {}
 
 
 def _psnr(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -587,9 +664,9 @@ def _psnr(a: torch.Tensor, b: torch.Tensor) -> float:
 @pytest.mark.gpu
 def test_u21_on_gsplat_without_events(tmp_path: Path) -> None:
     """U-21 on the GPU, with no event in the window: 300 iterations straight against 150, a
-    resume and 150 more give the same image order and rates, every stored tensor within 1e-4
-    relative L2 error, and renders at least 50 dB apart (gsplat's backward pass reorders its
-    sums, §2.2)."""
+    resume and 150 more give the same image order and rates, every stored tensor (parameters,
+    Adam moments and step counters, statistics) within 1e-4 relative L2 error, and renders at
+    least 50 dB apart (gsplat's backward pass reorders its sums, §2.2)."""
     video = _scene(tmp_path / "scene")
     cfg = dataclasses.replace(
         U21,
@@ -612,17 +689,22 @@ def test_u21_on_gsplat_without_events(tmp_path: Path) -> None:
     assert [(log.image_index, log.rates) for log in straight] == [
         (log.image_index, log.rates) for log in before + after
     ]
-    a, b = straight_trainer.state_dict().params, resumed.state_dict().params
-    for name in a:
-        error = torch.linalg.vector_norm(a[name] - b[name]) / torch.linalg.vector_norm(a[name])
-        assert float(error) <= 1e-4, name
+    a, b = straight_trainer.state_dict(), resumed.state_dict()
+    tensors = {**_flat("params", a.params), **_flat("optim", a.optim), **_flat("stats", a.stats)}
+    others = {**_flat("params", b.params), **_flat("optim", b.optim), **_flat("stats", b.stats)}
+    assert set(tensors) == set(others)
+    for name, value in tensors.items():
+        x, y = value.double(), others[name].double()
+        scale = float(torch.linalg.vector_norm(x))
+        error = float(torch.linalg.vector_norm(x - y))
+        assert error <= 1e-4 * scale or error == 0.0, name
     test = next(r for r in video.records if r.split == "test")
-    images = []
-    for state in (a, b):
+    renders = []
+    for state in (a.params, b.params):
         model = FreeTimeGaussians(state, sh_degree=1, time=video.time).cuda()
         with torch.no_grad():
-            images.append(render(model, test.camera, test.timestamp).image)
-    assert _psnr(images[0], images[1]) >= 50.0
+            renders.append(render(model, test.camera, test.timestamp).image)
+    assert _psnr(renders[0], renders[1]) >= 50.0
 
 
 @pytest.mark.gpu
@@ -635,9 +717,9 @@ def test_gpu_runs_in_both_layouts(tmp_path: Path, packed: bool) -> None:
         growth=GrowthConfig(n_max=200),
         perf=PerfConfig(packed=packed, log_every=10),
     )
-    trainer = Trainer(shortened_config(60, base), video, _init_points(), device="cuda")
+    trainer = Trainer(shortened_config(50, base), video, _init_points(), device="cuda")
     logs = _run(trainer)
-    assert all(math.isfinite(float(log.losses["total"])) for log in logs)
+    assert len(logs) == 50 and _all_finite(logs)
     assert any(log.relocation is not None for log in logs)
 
 
@@ -645,12 +727,16 @@ def test_gpu_runs_in_both_layouts(tmp_path: Path, packed: bool) -> None:
 def test_gpu_deterministic_run(tmp_path: Path) -> None:
     """Q-73: deterministic mode trains on gsplat and restores the flags afterwards."""
     cudnn = torch.backends.cudnn
-    saved = (cudnn.benchmark, cudnn.deterministic)
+    saved = (cudnn.benchmark, cudnn.deterministic, torch.are_deterministic_algorithms_enabled())
     perf = PerfConfig(deterministic=True)
     trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cuda")
     logs = _run(trainer, 10)
-    assert all(math.isfinite(float(log.losses["total"])) for log in logs)
-    assert (cudnn.benchmark, cudnn.deterministic) == saved
+    assert _all_finite(logs)
+    assert (
+        cudnn.benchmark,
+        cudnn.deterministic,
+        torch.are_deterministic_algorithms_enabled(),
+    ) == saved
 
 
 # With the LPIPS networks (weights; D-77, Q-74).
@@ -669,9 +755,9 @@ def _evaluation_scene(root: Path) -> MultiViewVideo:
     """64×48 cameras, so the masks' left halves (32 px) are usable dynamic regions (Q-61)."""
     cams = ring(3, radius=4.0, elevation=1.0, width_px=64, height_px=48, focal=60.0)
     gt = random_model(24, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
-    views = [(cam, k / 30.0, "train") for k in range(5) for cam in cams[:2]]
-    views += [(cams[2], k / 30.0, "test") for k in (0, 2, 4)]
-    return MultiViewVideo.from_manifest(write_scene(root, gt, views, mask_tests=True))
+    images = [(cam, k / 30.0, "train") for k in range(5) for cam in cams[:2]]
+    images += [(cams[2], k / 30.0, "test") for k in (0, 2, 4)]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, images, mask_tests=True))
 
 
 @pytest.mark.weights
@@ -702,7 +788,7 @@ def test_evaluate_returns_scene_means_and_writes_the_metrics_report(tmp_path: Pa
 @pytest.mark.weights
 def test_an_evaluation_between_steps_leaves_the_run_unchanged(tmp_path: Path) -> None:
     """Q-74: evaluate draws from no generator and trains nothing, so a run with an evaluation
-    after its fifth step equals one without, bitwise."""
+    after its fifth iteration equals one without, bitwise."""
     video = _evaluation_scene(tmp_path / "scene")
     cfg = _no_perceptual(optim=OptimConfig(iterations=10))
     plain = Trainer(cfg, video, _init_points(), device="cpu")
