@@ -19,14 +19,14 @@ import torch
 from builders import look_at, ring, shortened_config, write_scene
 from torch import Tensor
 
-from openftgs.config import InitConfig, TrainConfig
+from openftgs.config import TrainConfig
 from openftgs.data import MultiViewVideo
 from openftgs.eval import psnr
 from openftgs.io import read_exchange
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer
-from openftgs.types import Camera, ExchangeModel, InitPoints, TimeNormalizer
+from openftgs.types import Camera, ExchangeModel, TimeNormalizer
 
 DATA = Path(__file__).parent / "data"
 SEEDS_FILE = DATA / "seeds.json"
@@ -296,19 +296,48 @@ def _gt_s3(seed: int) -> ExchangeModel:
     return exchange(arrays, tau0=0.0, tau1=span, degree=0)
 
 
+CLUTTER_COUNT = 2_000
+CLUTTER_SCALES = (0.005, 0.015)  # Q-78: smaller than the objects', the "small" Gaussians
+CLUTTER_OPACITY = (0.3, 0.99)  # Q-78: up to about 1, so an unregularized fit can saturate
+
+
+def _gt_clutter(seed: int, gt: ExchangeModel) -> ExchangeModel:
+    """S-5's 2,000 small random Gaussians (Q-78): static (v = 0) and always present (s = 2 in
+    normalized time, as S-2's objects), uniform in the view volume, with uniform time centers,
+    log-uniform scales in CLUTTER_SCALES, uniform opacities in CLUTTER_OPACITY and colors."""
+    g = torch.Generator().manual_seed(seed)
+    span = gt.tau1 - gt.tau0
+    n = CLUTTER_COUNT
+    arrays = {
+        "position": _uniform(g, -VOLUME, VOLUME, n, 3),
+        "time_center": _uniform(g, 0.0, span, n),
+        "duration": torch.full((n,), 2.0 * span, dtype=F64),
+        "velocity": torch.zeros(n, 3, dtype=F64),
+        "scale": _log_uniform(g, *CLUTTER_SCALES, n, 3),
+        "rotation": _rotations(g, n),
+        "opacity": _uniform(g, *CLUTTER_OPACITY, n),
+        "sh": sh_of(_uniform(g, 0.2, 0.9, n, 3)),
+    }
+    return exchange(arrays, tau0=gt.tau0, tau1=gt.tau1, degree=0)
+
+
 GROUND_TRUTH_FILES = {
     "s1": "s1_gt.safetensors",
     "s2": "s2_gt.safetensors",
     "s3": "s3_gt.safetensors",
+    "s5": "s5_gt.safetensors",
 }
 
 
 def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, ExchangeModel]:
-    """The ground truth of S-1, S-2 and S-3 from the committed seeds; S-5 to S-8 reuse S-2's."""
+    """The ground truth of S-1, S-2, S-3 and S-5 from the committed seeds: S-5's is S-2's 8
+    Gaussians (its first rows) followed by 2,000 small ones (Q-78); S-6 to S-8 reuse S-2's."""
+    s2 = _gt_s2(seeds["s2"]["ground_truth"])
     return {
         "s1": _gt_s1(seeds["s1"]["ground_truth"]),
-        "s2": _gt_s2(seeds["s2"]["ground_truth"]),
+        "s2": s2,
         "s3": _gt_s3(seeds["s3"]["ground_truth"]),
+        "s5": concatenated(s2, _gt_clutter(seeds["s5"]["clutter"], s2)),
     }
 
 
@@ -344,6 +373,11 @@ def replaced(model: ExchangeModel, **arrays: Tensor) -> ExchangeModel:
     for key, value in arrays.items():
         new[key] = value.to(model.arrays[key].dtype)
     return dataclasses.replace(model, arrays=new)
+
+
+def rows(model: ExchangeModel, index: slice) -> ExchangeModel:
+    """The model's rows selected by `index`."""
+    return dataclasses.replace(model, arrays={k: v[index] for k, v in model.arrays.items()})
 
 
 def concatenated(first: ExchangeModel, second: ExchangeModel) -> ExchangeModel:
@@ -476,26 +510,6 @@ def mean_psnr(model: FreeTimeGaussians, video: MultiViewVideo, indices: Iterable
 
 def split_indices(video: MultiViewVideo, split: str) -> list[int]:
     return [i for i, record in enumerate(video.records) if record.split == split]
-
-
-def clutter(
-    seed: int, count: int, time: TimeNormalizer, frame_dt: float, choices: Sequence[float]
-) -> ExchangeModel:
-    """Q-78, S-5: `count` primitives from `from_init_points` on seeded uniform points in the
-    view volume, with random colors and a random training frame each (3-NN scales, opacity 0.1,
-    default durations; §1.3 steps 7–9), as raw quantities at SH degree 3."""
-    g = torch.Generator().manual_seed(seed)
-    points = InitPoints(
-        positions=((torch.rand(count, 3, generator=g, dtype=F64) * 2 - 1) * VOLUME).to(F32),
-        colors=torch.rand(count, 3, generator=g, dtype=F64).to(F32),
-        timestamps=draw_taus(seed + 1, choices, count),
-    )
-    frames = math.floor(1.0 / frame_dt + 0.5) + 1
-    cfg = InitConfig(points_per_frame=math.ceil(count / frames))
-    model = FreeTimeGaussians.from_init_points(
-        points, time, cfg, frame_dt=frame_dt, generator=torch.Generator().manual_seed(seed + 2)
-    )
-    return model.to_exchange()
 
 
 def dead_rows(seed: int, gt: ExchangeModel, count: int, taus: Tensor) -> ExchangeModel:
