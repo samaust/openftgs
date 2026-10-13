@@ -253,7 +253,10 @@ def test_slice_impl_is_a_public_setting_of_the_model() -> None:
     raises NotImplementedError until D-50's operator exists, and "eager" gives what "auto" gives
     on the CPU."""
     model = _model(n=4)
-    assert model.slice_impl == "auto"
+    unit = TimeNormalizer(0.0, 1.0)
+    initialized = _init(_points([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [0.0, 1.0]), unit, 1.0)
+    imported = FreeTimeGaussians.from_exchange(model.to_exchange(), device="cpu")
+    assert (model.slice_impl, initialized.slice_impl, imported.slice_impl) == ("auto",) * 3
     auto = model.at_time(0.3)
     model.slice_impl = "eager"
     assert model.slice_impl == "eager"

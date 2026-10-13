@@ -632,13 +632,13 @@ def test_evaluator_runs_lpips_without_tf32_and_restores_the_flag(
 
 def _scene_for_evaluation(root: Path) -> MultiViewVideo:
     """Three 64×48 ring cameras over τ ∈ [0, 0.2]: ring00 trains; ring01 and ring02 are test
-    views, two of them sharing τ = 0.1, with masks whose left half is dynamic (32 px wide, so
+    images, two of them sharing τ = 0.1, with masks whose left half is dynamic (32 px wide, so
     every metric is defined on the region, Q-61)."""
     cams = ring(3, width_px=64, height_px=48, focal=60.0)
     gt = random_model(12, seed=0, sh_degree=1, time=TimeNormalizer(0.0, 0.2), spread=0.5)
-    views = [(cams[0], tau, "train") for tau in (0.0, 0.1, 0.2)]
-    views += [(cams[1], 0.0, "test"), (cams[2], 0.1, "test"), (cams[1], 0.1, "test")]
-    return MultiViewVideo.from_manifest(write_scene(root, gt, views, mask_tests=True))
+    images = [(cams[0], tau, "train") for tau in (0.0, 0.1, 0.2)]
+    images += [(cams[1], 0.0, "test"), (cams[2], 0.1, "test"), (cams[1], 0.1, "test")]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, images, mask_tests=True))
 
 
 @pytest.mark.weights

@@ -11,7 +11,7 @@ independent expectation, not a duplicate to share.
 import dataclasses
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -316,21 +316,19 @@ def _camera_json(camera: Camera) -> dict[str, Any]:
 def write_scene(
     root: Path,
     model: FreeTimeGaussians,
-    views: Sequence[tuple[Camera, float, str]],
+    images: Sequence[tuple[Camera, float, str]],
     *,
     mask_tests: bool = False,
-    time_unit: str = "s",
-    metadata: Mapping[str, Any] | None = None,
 ) -> Path:
-    """A scene manifest and its images in `root`, returning the manifest's path. Each view, a
+    """A scene manifest and its images in `root`, returning the manifest's path. Each image, a
     (camera, raw τ, data split) triple, is rendered from `model` with the reference backend at
     that τ, clamped to [0, 1] and rounded to an 8-bit RGB PNG. Cameras are keyed by name, so the
-    views of one camera share it. With `mask_tests`, each test image gets an 8-bit mask whose
+    images of one camera share it. With `mask_tests`, each test image gets an 8-bit mask whose
     left half is dynamic."""
     root.mkdir(parents=True, exist_ok=True)
     cameras: dict[str, dict[str, Any]] = {}
-    images: list[dict[str, Any]] = []
-    for k, (camera, tau, split) in enumerate(views):
+    entries: list[dict[str, Any]] = []
+    for k, (camera, tau, split) in enumerate(images):
         cameras.setdefault(camera.name, _camera_json(camera))
         with torch.no_grad():
             rgb = render(model, camera, tau, backend="reference").image[0]
@@ -351,26 +349,26 @@ def write_scene(
             entry["mask"] = f"masks/{camera.name}/{k:06d}.png"
             (root / entry["mask"]).parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(mask.numpy(), "L").save(root / entry["mask"])
-        images.append(entry)
+        entries.append(entry)
     manifest = {
         "format": "ftgs-scene",
         "version": 1,
-        "time_unit": time_unit,
+        "time_unit": "s",
         "cameras": cameras,
-        "images": images,
-        "metadata": dict(metadata or {"source": "synthetic"}),
+        "images": entries,
+        "metadata": {"source": "synthetic"},
     }
     path = root / "scene.json"
     path.write_text(json.dumps(manifest, indent=1))
     return path
 
 
-def shortened_config(iterations: int, base: TrainConfig | None = None) -> TrainConfig:
-    """§3.2 shared setup: `base` (default TrainConfig()) with T_it = `iterations` and every
+def shortened_config(iterations: int, base: TrainConfig) -> TrainConfig:
+    """§3.2 shared setup: `base` with T_it = `iterations` and every
     iteration count of its calendar (the growth and relocation windows, the event period and
     the SH interval, given for T_it = 30,000) multiplied by T_it/30,000 and rounded, half up
     (Q-75), with a minimum of 1."""
-    cfg = TrainConfig() if base is None else base
+    cfg = base
 
     def scaled(count: int) -> int:
         return max(1, math.floor(count * iterations / 30_000 + 0.5))  # Q-75
