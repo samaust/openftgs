@@ -417,6 +417,39 @@ def test_u9_lpips_maps_inputs_from_unit_range_to_plus_minus_one(
 
 
 @pytest.mark.weights
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_lpips_without_mapping_feeds_the_unit_range_images_to_the_network(
+    lpips_nets: dict[str, LPIPSLoss], net: str
+) -> None:
+    """D-68, Q-58: with map_inputs=False, LPIPSLoss equals lpips 0.1.4's network on the [0, 1]
+    images themselves (lpips_vgg_raw), exactly, as a mean over the batch; the default still
+    maps."""
+    import lpips
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # torchvision's `pretrained` deprecation
+        reference = lpips.LPIPS(net=net, verbose=False)
+    pred, gt = _image_pair((2, 32, 40, 3), seed=12, correlated=True, dtype=F32)
+    nchw = [x.permute(0, 3, 1, 2) for x in (pred, gt)]
+    with torch.no_grad():
+        expected = reference(nchw[0], nchw[1]).mean()
+        value = lpips_nets[net](pred, gt, map_inputs=False)
+        mapped = lpips_nets[net](pred, gt)
+    assert value.shape == ()
+    assert value.item() == expected.item()
+    assert mapped.item() != value.item()
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("flag", [1, 0, None, "yes"])
+def test_lpips_map_inputs_must_be_a_bool(lpips_nets: dict[str, LPIPSLoss], flag: object) -> None:
+    """Q-58: map_inputs is a bool."""
+    image = torch.zeros(32, 32, 3)
+    with pytest.raises(ValueError, match="map_inputs"):
+        lpips_nets["vgg"](image, image, map_inputs=flag)
+
+
+@pytest.mark.weights
 def test_lpips_weights_are_frozen_and_only_the_prediction_gets_a_gradient(
     lpips_nets: dict[str, LPIPSLoss],
 ) -> None:

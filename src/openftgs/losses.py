@@ -144,7 +144,8 @@ def ssim(
 
 class LPIPSLoss(torch.nn.Module):
     """L_perc: LPIPS with the given backbone on images in [0, 1], mapped to [−1, 1] (E7, D-9,
-    D-68), as the mean over the batch. The network is lpips 0.1.4's, frozen and kept in
+    D-68), as the mean over the batch; `forward(…, map_inputs=False)` skips the mapping, for
+    the lpips_vgg_raw metric (Q-58). The network is lpips 0.1.4's, frozen and kept in
     evaluation mode (Q-41)."""
 
     def __init__(self, net: Literal["vgg", "alex"] = "vgg") -> None:
@@ -170,12 +171,18 @@ class LPIPSLoss(torch.nn.Module):
         self._net.eval()
         return self
 
-    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+    # Q-58: map_inputs=False feeds the [0, 1] images unmapped, D-68's lpips_vgg_raw metric.
+    def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
+        if not isinstance(map_inputs, bool):
+            _fail(f"map_inputs must be a bool, got {map_inputs!r}")
         _check_pair(pred, gt)
         x, y = _batch_first(pred), _batch_first(gt)
-        # D-68: the network's documented input range. With frozen weights and a target that
-        # doesn't require a gradient, autograd records nothing on the target's branch (§2.4).
-        out: Tensor = self._net(2 * x - 1, 2 * y - 1)
+        if map_inputs:
+            # D-68: the network's documented input range.
+            x, y = 2 * x - 1, 2 * y - 1
+        # With frozen weights and a target that doesn't require a gradient, autograd records
+        # nothing on the target's branch (§2.4).
+        out: Tensor = self._net(x, y)
         return out.mean()
 
 
