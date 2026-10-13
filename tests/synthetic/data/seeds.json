@@ -1,0 +1,9 @@
+{
+  "s1": {"ground_truth": 1101, "offset": 1102},
+  "s2": {"ground_truth": 1201, "init_frames": 1202},
+  "s3": {"ground_truth": 1301},
+  "s5": {"clutter": 1501},
+  "s6": {"dead": 1601},
+  "s7": {"init_frames": 1701},
+  "s8": {"offsets": 1801, "init_images": 1802}
+}
