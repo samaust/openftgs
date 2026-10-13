@@ -63,7 +63,7 @@ def _fail(where: str, reason: str) -> NoReturn:
     raise ValueError(f"{where}: {reason}")
 
 
-def _check_header(meta: Mapping[str, str], fmt: str, where: str) -> None:
+def _check_header(meta: Mapping[str, object], fmt: str, where: str) -> None:
     """§2.2: `format` must match and the major part of `version` must be 1."""
     if meta.get("format") != fmt:
         _fail(where, f"format must be {fmt!r}, got {meta.get('format')!r}")
@@ -619,6 +619,7 @@ def load_checkpoint(directory: Path) -> TrainerState:
 _REQUEST = "ftgs-render-request"
 _RENDERS = "ftgs-renders"
 _ORTHONORMAL_TOLERANCE = 1e-5  # Q-56: max |RᵀR − I| of a request camera's rotation
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")  # Q-56: hashlib's hexdigest
 
 
 def _is_number(value: Any) -> bool:
@@ -700,7 +701,7 @@ def read_render_request(path: Path) -> RenderRequest:
     version = raw.get("version")
     if isinstance(version, bool) or not isinstance(version, int | str):
         _fail(where, f"version must be an int or a string, got {version!r}")
-    _check_header({"format": str(raw.get("format")), "version": str(version)}, _REQUEST, where)
+    _check_header({"format": raw.get("format"), "version": str(version)}, _REQUEST, where)
     time_unit = raw.get("time_unit")
     if not isinstance(time_unit, str) or not time_unit:
         _fail(where, f"time_unit must be a non-empty string, got {time_unit!r}")
@@ -742,7 +743,9 @@ def _check_renders(rgb: Mapping[str, Tensor], alpha: Mapping[str, Tensor], where
     for item_id, image in rgb.items():
         if not item_id:
             _fail(where, "render ids must be non-empty")
-        h, w = (int(image.shape[0]), int(image.shape[1])) if image.dim() == 3 else (-1, -1)
+        if image.dim() != 3:
+            _fail(f"{where}, rgb", f"{item_id} must be [H, W, 3], got {list(image.shape)}")
+        h, w = int(image.shape[0]), int(image.shape[1])
         _check_tensor(rgb, item_id, torch.float32, (h, w, 3), f"{where}, rgb")
         _check_tensor(alpha, item_id, torch.float32, (h, w, 1), f"{where}, alpha")
 
@@ -750,8 +753,11 @@ def _check_renders(rgb: Mapping[str, Tensor], alpha: Mapping[str, Tensor], where
 def write_renders(renders: Renders, path: Path, *, producer: str, request_sha256: str) -> None:
     """Write a ftgs-renders v1 file (§2.2; Q-56): `rgb/<id>` [H, W, 3] and `alpha/<id>`
     [H, W, 1], float32, rgb not clamped to 1, with the producer and the SHA-256 of the request
-    file's bytes as metadata."""
-    _check_renders(renders.rgb, renders.alpha, f"renders {path}")
+    file's bytes, as 64 lowercase hex digits, as metadata."""
+    where = f"renders {path}"
+    if not isinstance(request_sha256, str) or not _SHA256_PATTERN.fullmatch(request_sha256):
+        _fail(where, f"request_sha256 must be a SHA-256 hex digest, got {request_sha256!r}")
+    _check_renders(renders.rgb, renders.alpha, where)
     tensors = {f"rgb/{k}": v for k, v in renders.rgb.items()}
     tensors.update({f"alpha/{k}": renders.alpha[k] for k in renders.rgb})
     meta = {

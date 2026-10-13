@@ -10,13 +10,14 @@ another library's code path to the same published weights (§2.3).
 import json
 import math
 import warnings
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
 from torch import Tensor
 
 import openftgs.eval
+import openftgs.losses
 from openftgs.eval import (
     METRIC_NAMES,
     Evaluator,
@@ -97,6 +98,20 @@ def test_u23_dssim_is_one_minus_ssim_over_two(k: int) -> None:
     d = dssim_k(pred, gt, k)
     assert s.shape == d.shape == (3,)
     torch.testing.assert_close(d, (1.0 - s) / 2.0, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [F32, F64])
+def test_metrics_of_an_empty_batch_are_empty(dtype: torch.dtype) -> None:
+    """Q-60: one value per image, so a batch of no images gives no values from every metric,
+    not an error (from the second M9 milestone review)."""
+    pred = torch.zeros(0, 16, 16, 3, dtype=dtype)
+    gt = torch.zeros(0, 16, 16, 3, dtype=dtype)
+    assert psnr(pred, gt).shape == (0,)
+    for k in (1, 2):
+        s, d = ssim_k(pred, gt, k), dssim_k(pred, gt, k)
+        assert s.shape == d.shape == (0,)
+        assert s.dtype == d.dtype == dtype
+    assert ssim_k(torch.zeros(2, 0, 16, 16, 3), torch.zeros(2, 0, 16, 16, 3), 1).shape == (2, 0)
 
 
 def test_u23_dssim2_is_below_dssim1_on_a_noisy_pair() -> None:
@@ -211,7 +226,7 @@ def test_metrics_run_without_tf32_and_restore_the_flag(monkeypatch: pytest.Monke
     """D-52, §2.4 Precision: evaluation clears cuDNN's TF32 flag for its forward pass and
     restores it afterwards (Q-60)."""
     seen: list[bool] = []
-    original = openftgs.eval.ssim
+    original = openftgs.losses.ssim  # the function eval imports
 
     def spy(*args: object, **kwargs: object) -> Tensor:
         seen.append(torch.backends.cudnn.allow_tf32)
@@ -246,9 +261,10 @@ def _l_mask() -> Tensor:
 
 
 def test_u23_dynamic_region_crops_to_the_mask_box_and_blacks_out_both_images() -> None:
-    """U-23, App. B.1, D-67: masks binarize at 0.5 (Q-61: 0.5 counts as dynamic); both images
-    are clamped, set to black outside the mask, and cropped to the mask's bounding box, here
-    rows 5 … 44 and columns 10 … 49 (40×40). Exact."""
+    """U-23, App. B.1, D-67: masks binarize at 0.5 (Q-61: 0.5 counts as dynamic); the render is
+    clamped (the ground truth is used as given), then both images are set to black outside the
+    mask and cropped to the mask's bounding box, here rows 5 … 44 and columns 10 … 49 (40×40).
+    Exact."""
     g = _gen(3)
     pred = torch.rand(50, 60, 3, generator=g) * 1.4
     gt = torch.rand(50, 60, 3, generator=g)
@@ -343,7 +359,9 @@ def evaluator() -> Evaluator:
     return Evaluator(device="cpu")
 
 
-def _torchmetrics_lpips(net: str, pred: Tensor, gt: Tensor, *, normalize: bool) -> float:
+def _torchmetrics_lpips(
+    net: Literal["alex", "vgg"], pred: Tensor, gt: Tensor, *, normalize: bool
+) -> float:
     from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
     with warnings.catch_warnings():

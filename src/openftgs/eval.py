@@ -100,6 +100,8 @@ def ssim_k(pred: Tensor, gt: Tensor, k: int) -> Tensor:
         lead = pred.shape[:-3]
         x = pred.clamp(0.0, 1.0).reshape(-1, *pred.shape[-3:])
         y = gt.reshape(-1, *gt.shape[-3:])
+        if x.shape[0] == 0:  # Q-60: no images, no values
+            return pred.new_empty(lead)
         # One call per image through the loss's public SSIM, which averages over its batch.
         values = [ssim(x[i], y[i], data_range=float(k)) for i in range(x.shape[0])]
         return torch.stack(values).reshape(lead)
