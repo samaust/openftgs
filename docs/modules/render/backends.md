@@ -79,7 +79,7 @@ A render synchronizes where gsplat reads back the number of tile intersections a
 
 `render_request` answers a render request (§2.2, D-55, Q-57). Items that share a timestamp and an image size render in one `render()` call, since `render()` refuses cameras of different sizes (Q-32). Outputs are keyed by item id, which must be unique, never by camera name: a request built from a scene manifest's cameras repeats one camera at many times. The request's background and SH degree pass through. Its time unit must be the model's (Q-17). The whole request runs under inference mode, and the outputs are moved to the CPU in request order, so a large request doesn't hold every image on the GPU.
 
-Each call still runs the temporal slice for its time. The temporal index of D-55, and with it "activations computed once per model" (§2.4), go inside this function in M15, so its callers (the trainer's evaluation, `ftgs render`, `ftgs eval`) won't change.
+Each call still runs the temporal slice for its time. The temporal index of D-55, and with it "activations computed once per model" (§2.4), go inside this function in M15, so its callers (the trainer's evaluation, `ftgs render`, `ftgs eval`) won't change. Two copies synchronize and are M15's to weigh with B-7: each output's copy to the CPU, and the request background, built on the CPU and copied to the device in every call; a keyword-only `device` for the outputs and a background built on the model's device would remove them without changing any caller (Q-57).
 
 ## Where the backends differ
 
