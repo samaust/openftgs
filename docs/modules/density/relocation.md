@@ -32,6 +32,8 @@ The live set is tested on the stored logit against ô_dead (D-14). Every logit b
 - n is clamped as E11 says for the formula only; every drawn copy is still written;
 - the scale factor uses the unclamped σ_new.
 
+U-13 compares `mcmc_split` with gsplat 1.5.3's `compute_relocation`, a float32 kernel, over live targets. The largest difference measured on the RTX 4090 sits just under U-13's bound, at the lowest live opacity and a large n, and comes from float32 cancellation in the kernel's evaluation of σ_new, not from the float64 path (source log #60).
+
 The clamp has two halves. `mcmc_split` applies the upper bound. The lower bound is D-14's and is applied by the callers to the stored float32 logit, as a floor at ô_dead from the configuration: only a bound on the stored logit guarantees that every relocated row is live, since sigmoid(ô_dead) rounds below the threshold in float32 (Q-50).
 
 ## The relocation procedure

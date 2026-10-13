@@ -9,18 +9,22 @@ Gaussian), from an independent float64 evaluation of E11 written literally as Py
 from gsplat 1.5.3's `compute_relocation` as the oracle U-13 names (GPU).
 """
 
+import decimal
 import math
 
 import pytest
 import torch
 from builders import UNIT_TIME, random_model, random_params, ring
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from openftgs.config import RelocConfig
-from openftgs.density import GradStats, sampling_score
+from openftgs.density import GradStats, mcmc_split, sampling_score
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 
 F32 = torch.float32
+F64 = torch.float64
 
 
 # U-16 · gradient statistics (E10, D-12; Q-49)
@@ -358,3 +362,186 @@ def test_sampling_score_rejects_statistics_of_another_size() -> None:
     """Q-48: the statistics must cover the model's rows (Q-26: ValueError)."""
     with pytest.raises(ValueError):
         sampling_score(_model_with_logits([0.0, 1.0]), GradStats(3), RelocConfig())
+
+
+# U-13 · the relocation move (E11, D-14; Q-50)
+
+_DEC = decimal.Context(prec=50)
+
+
+def e11_oracle(sigma: float, n: int, a: float) -> tuple[float, float]:
+    """E11 for one target, written literally (σ_new = 1 − (1 − σ)^(1/n) and the double sum over
+    i and k), with n clamped to [1, 51], evaluated with Python's decimal at 50 digits: an
+    independent evaluation, stricter than the float64 one U-13 names. Returns the unclamped σ_new
+    and a_new."""
+    n = min(max(n, 1), 51)
+    one, s = decimal.Decimal(1), decimal.Decimal(sigma)
+    s_new = _DEC.subtract(one, _DEC.power(_DEC.subtract(one, s), _DEC.divide(one, n)))
+    denom = decimal.Decimal(0)
+    for i in range(1, n + 1):
+        for k in range(i):
+            term = _DEC.divide(
+                _DEC.multiply(math.comb(i - 1, k) * (-1) ** k, _DEC.power(s_new, k + 1)),
+                _DEC.sqrt(decimal.Decimal(k + 1)),
+            )
+            denom = _DEC.add(denom, term)
+    return float(s_new), float(_DEC.divide(_DEC.multiply(decimal.Decimal(a), s), denom))
+
+
+def opacity_after_copies(sigma_new: float, n: int) -> float:
+    """1 − (1 − σ_new)^n in 50-digit decimal: the opacity n stacked copies reach (E11)."""
+    one = decimal.Decimal(1)
+    return float(_DEC.subtract(one, _DEC.power(_DEC.subtract(one, decimal.Decimal(sigma_new)), n)))
+
+
+def _split64(sigma: list[float], n: list[int], a: list[float]) -> tuple[torch.Tensor, torch.Tensor]:
+    """mcmc_split on float64 inputs with isotropic scales a."""
+    scales = torch.tensor(a, dtype=F64)[:, None].expand(-1, 3).contiguous()
+    return mcmc_split(torch.tensor(sigma, dtype=F64), scales, torch.tensor(n))
+
+
+def test_u13_one_copy_leaves_opacity_and_scale_unchanged() -> None:
+    """U-13: n = 1 leaves σ and a unchanged (1e-10 relative; E11 runs in float64)."""
+    sigma = [0.005, 0.1, 0.5, 0.9, 0.999]
+    new_sigma, new_scales = _split64(sigma, [1] * 5, [0.25, 1.0, 2.0, 1e-3, 30.0])
+    torch.testing.assert_close(new_sigma, torch.tensor(sigma, dtype=F64), rtol=1e-10, atol=0.0)
+    expected = torch.tensor([0.25, 1.0, 2.0, 1e-3, 30.0], dtype=F64)[:, None].expand(-1, 3)
+    torch.testing.assert_close(new_scales, expected, rtol=1e-10, atol=0.0)
+
+
+def test_u13_two_copies_give_one_minus_root_of_one_minus_sigma() -> None:
+    """U-13: n = 2 gives σ_new = 1 − √(1 − σ): σ = 0.75 gives 0.5, and E11's sum is then
+    2·0.5 − 0.5²/√2, so a_new = a·0.75/(1 − 1/(4√2)) (worked by hand)."""
+    new_sigma, new_scales = _split64([0.75, 0.19], [2, 2], [1.0, 1.0])
+    torch.testing.assert_close(new_sigma, torch.tensor([0.5, 0.1], dtype=F64), rtol=1e-10, atol=0.0)
+    torch.testing.assert_close(
+        new_scales[0],
+        torch.full((3,), 0.75 / (1.0 - 1.0 / (4.0 * math.sqrt(2.0))), dtype=F64),
+        rtol=1e-10,
+        atol=0.0,
+    )
+
+
+def test_u13_n_copies_reach_the_original_opacity_and_scale_matches_e11() -> None:
+    """U-13: 1 − (1 − σ_new)^n = σ for n = 1 … 51, and the scale factor (computed in float64)
+    matches an independent evaluation of E11, both to 1e-10 relative."""
+    for sigma in (0.02, 0.3, 0.75, 0.97, 1.0 - 2.0**-23):
+        n = list(range(1, 52))
+        new_sigma, new_scales = _split64([sigma] * 51, n, [0.5] * 51)
+        for k, copies in enumerate(n):
+            assert opacity_after_copies(float(new_sigma[k]), copies) == pytest.approx(
+                sigma, rel=1e-10, abs=0.0
+            )
+            s_new, a_new = e11_oracle(sigma, copies, 0.5)
+            assert float(new_sigma[k]) == pytest.approx(s_new, rel=1e-10, abs=0.0)
+            assert float(new_scales[k, 0]) == pytest.approx(a_new, rel=1e-10, abs=0.0)
+
+
+def test_u13_clamp_active_case_uses_the_unclamped_opacity_for_the_scale() -> None:
+    """U-13, E11, D-14: with σ_j = 0.02 and n = 5, σ_new = 1 − 0.98^(1/5) < 0.005. a_new is
+    computed from that unclamped σ_new; the lower bound is D-14's, applied to the stored logit
+    by the procedures (Q-50), so mcmc_split returns σ_new as computed."""
+    new_sigma, new_scales = _split64([0.02], [5], [2.0])
+    s_new, a_new = e11_oracle(0.02, 5, 2.0)
+    assert s_new < 0.005
+    assert float(new_sigma[0]) == pytest.approx(s_new, rel=1e-10, abs=0.0)
+    assert float(new_scales[0, 0]) == pytest.approx(a_new, rel=1e-10, abs=0.0)
+
+
+def test_u13_upper_clamp_applies_after_the_scale() -> None:
+    """E11: σ_new is clamped to at most 1 − 2⁻²³ only after a_new is computed from the unclamped
+    σ_new (so with n = 1, a stays a)."""
+    new_sigma, new_scales = _split64([1.0 - 2.0**-30], [1], [3.0])
+    assert float(new_sigma[0]) == 1.0 - 2.0**-23
+    assert float(new_scales[0, 0]) == pytest.approx(3.0, rel=1e-10, abs=0.0)
+
+
+def test_u13_n_is_clamped_to_1_and_51() -> None:
+    """E11: n is clamped to [1, 51]: n = 60 gives the n = 51 result and n ≤ 0 the n = 1 one."""
+    new_sigma, new_scales = _split64([0.6] * 4, [60, 51, 0, -3], [1.0] * 4)
+    assert torch.equal(new_sigma[0], new_sigma[1]) and torch.equal(new_scales[0], new_scales[1])
+    assert torch.equal(new_sigma[2], new_sigma[3])
+    assert float(new_sigma[2]) == pytest.approx(0.6, rel=1e-10, abs=0.0)
+
+
+def test_mcmc_split_keeps_the_input_dtype() -> None:
+    """Q-50: E11 is computed in float64 and returned in the input's dtype."""
+    sigma = torch.tensor([0.3, 0.8], dtype=F32)
+    new_sigma, new_scales = mcmc_split(sigma, torch.ones(2, 3), torch.tensor([3, 7]))
+    assert new_sigma.dtype == F32 and new_scales.dtype == F32
+    ref_sigma, ref_scales = mcmc_split(
+        sigma.double(), torch.ones(2, 3, dtype=F64), torch.tensor([3, 7])
+    )
+    assert torch.equal(new_sigma, ref_sigma.float()) and torch.equal(new_scales, ref_scales.float())
+
+
+@pytest.mark.parametrize(
+    ("opacity", "scales", "n"),
+    [
+        (torch.ones(2) * 0.5, torch.ones(2, 3), torch.tensor([1.0, 2.0])),
+        (torch.ones(2) * 0.5, torch.ones(2, 3), torch.tensor([True, False])),
+        (torch.ones(2) * 0.5, torch.ones(3, 3), torch.tensor([1, 2])),
+        (torch.ones(2) * 0.5, torch.ones(2, 2), torch.tensor([1, 2])),
+        (torch.ones(2) * 0.5, torch.ones(2, 3, dtype=F64), torch.tensor([1, 2])),
+        (torch.ones(2, 1) * 0.5, torch.ones(2, 3), torch.tensor([1, 2])),
+        (torch.tensor([1, 0]), torch.ones(2, 3), torch.tensor([1, 2])),
+    ],
+)
+def test_mcmc_split_rejects_invalid_input(
+    opacity: torch.Tensor, scales: torch.Tensor, n: torch.Tensor
+) -> None:
+    """Q-50: opacity [k] and scales [k, 3] of one floating dtype, n [k] of an integer dtype."""
+    with pytest.raises(ValueError):
+        mcmc_split(opacity, scales, n)
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    rows=st.lists(
+        st.tuples(
+            st.floats(min_value=1e-6, max_value=1.0 - 2.0**-23),
+            st.integers(min_value=-3, max_value=60),
+            st.floats(min_value=1e-3, max_value=1e3),
+        ),
+        min_size=1,
+        max_size=8,
+    )
+)
+def test_u13_property_e11_holds_for_random_targets(rows: list[tuple[float, int, float]]) -> None:
+    """U-13 (hypothesis): for random σ in (0, 1 − 2⁻²³], n (clamped to [1, 51]) and a > 0,
+    σ_new and a_new match the independent evaluation and n copies reach σ, to 1e-10 relative."""
+    sigma, n, a = (list(col) for col in zip(*rows, strict=True))
+    new_sigma, new_scales = _split64(sigma, n, a)
+    for k in range(len(rows)):
+        s_new, a_new = e11_oracle(sigma[k], n[k], a[k])
+        assert float(new_sigma[k]) == pytest.approx(s_new, rel=1e-10, abs=0.0)
+        assert float(new_scales[k, 0]) == pytest.approx(a_new, rel=1e-10, abs=0.0)
+        copies = min(max(n[k], 1), 51)
+        assert opacity_after_copies(float(new_sigma[k]), copies) == pytest.approx(
+            sigma[k], rel=1e-10, abs=0.0
+        )
+
+
+@pytest.mark.gpu
+def test_u13_matches_gsplat_compute_relocation() -> None:
+    """U-13: against gsplat 1.5.3's compute_relocation (float32 kernel), within 5e-4 relative,
+    over a grid of target opacities in [0.005, 0.999] (live targets, D-14) and n = 1 … 51.
+    gsplat's outputs are unclamped (source log #55), as mcmc_split's are below 1 − 2⁻²³. The
+    worst error measured on the RTX 4090 is 4.9e-4, at σ = 0.005 and n = 36: float32
+    cancellation in the kernel's 1 − (1 − σ)^(1/n), which grows as σ falls below 0.005."""
+    from gsplat.relocation import compute_relocation
+
+    sigma = torch.linspace(0.005, 0.999, 400)[:, None].expand(400, 51).reshape(-1).contiguous()
+    n = torch.arange(1, 52)[None, :].expand(400, 51).reshape(-1).contiguous()
+    scales = torch.rand(sigma.shape[0], 3, generator=torch.Generator().manual_seed(0)) + 0.1
+    binoms = torch.zeros(51, 51)  # E11's C(i − 1, k), i − 1 and k in 0 … 50
+    for m in range(51):
+        for k in range(m + 1):
+            binoms[m, k] = math.comb(m, k)
+    # compute_relocation clamps its ratios in place, so it gets a copy.
+    ref_opacity, ref_scales = compute_relocation(
+        sigma.cuda(), scales.cuda(), n.clone().cuda(), binoms.cuda()
+    )
+    new_opacity, new_scales = mcmc_split(sigma.double(), scales.double(), n)
+    torch.testing.assert_close(ref_opacity.cpu().double(), new_opacity, rtol=5e-4, atol=0.0)
+    torch.testing.assert_close(ref_scales.cpu().double(), new_scales, rtol=5e-4, atol=0.0)

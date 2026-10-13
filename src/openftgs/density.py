@@ -16,7 +16,7 @@ from torch import Tensor
 from openftgs.config import RelocConfig
 from openftgs.model import FreeTimeGaussians
 
-__all__ = ["GradStats", "sampling_score"]  # Q-48
+__all__ = ["GradStats", "mcmc_split", "sampling_score"]  # Q-48
 
 
 def _fail(reason: str) -> NoReturn:
@@ -214,3 +214,61 @@ def sampling_score(model: FreeTimeGaussians, stats: GradStats, cfg: RelocConfig)
     positive = q > 0  # False for a NaN quantile (no live, visible row): ĝ ≡ 0 (E10)
     g_hat = torch.where(positive, torch.clamp(g / torch.where(positive, q, 1.0), max=1.0), 0.0)
     return cfg.lambda_g * g_hat + cfg.lambda_o * sigma
+
+
+_N_COPIES_MAX = 51  # E11: n is clamped to [1, 51]
+_OPACITY_MAX = 1.0 - 2.0**-23  # E11: the upper bound of σ_new
+_E11_TABLES: dict[torch.device, Tensor] = {}
+
+
+def _e11_table(device: torch.device) -> Tensor:
+    """[51, 51] float64: row n − 1, column k holds Σ_{i=1}^{n} C(i − 1, k)·(−1)^k/√(k + 1), the
+    coefficient of σ_new^(k+1) in E11's denominator. The binomial sums are exact Python integers;
+    built once per device (its copy to the device is the only host transfer)."""
+    if device not in _E11_TABLES:
+        rows = []
+        for n in range(1, _N_COPIES_MAX + 1):
+            rows.append(
+                [
+                    (-1) ** k * sum(math.comb(m, k) for m in range(n)) / math.sqrt(k + 1)
+                    for k in range(_N_COPIES_MAX)
+                ]
+            )
+        _E11_TABLES[device] = torch.tensor(rows, dtype=torch.float64).to(device)
+    return _E11_TABLES[device]
+
+
+# Q-50: computed in float64 and returned in the input's dtype; n clamped for the formula only;
+# the upper bound applied here, the lower bound (D-14) by the callers on the stored logit.
+def mcmc_split(opacity: Tensor, scales: Tensor, n: Tensor) -> tuple[Tensor, Tensor]:
+    """E11 for k targets that each end with n copies: `opacity` σ [k], `scales` a [k, 3] and
+    `n` [k] (integers) give σ_new = 1 − (1 − σ)^(1/n), clamped to at most 1 − 2⁻²³, and a_new,
+    computed from the unclamped σ_new."""
+    if not isinstance(opacity, Tensor) or not opacity.is_floating_point() or opacity.dim() != 1:
+        _fail("opacity must be a floating-point tensor of shape [k]")
+    k = int(opacity.shape[0])
+    if not isinstance(scales, Tensor) or tuple(scales.shape) != (k, 3):
+        _fail(f"scales must have shape [{k}, 3]")
+    if scales.dtype != opacity.dtype:
+        _fail(f"scales must be {opacity.dtype}, got {scales.dtype}")
+    if (
+        not isinstance(n, Tensor)
+        or n.dtype == torch.bool
+        or n.is_floating_point()
+        or n.is_complex()
+        or tuple(n.shape) != (k,)
+    ):
+        _fail(f"n must be an integer tensor of shape [{k}]")
+    if scales.device != opacity.device or n.device != opacity.device:
+        _fail("opacity, scales and n must be on one device")
+    f64 = torch.float64
+    sigma = opacity.to(f64)
+    copies = n.clamp(1, _N_COPIES_MAX).to(torch.int64)
+    # 1 − (1 − σ)^(1/n), in a form that stays accurate for small σ.
+    sigma_new = -torch.expm1(torch.log1p(-sigma) / copies.to(f64))
+    exponents = torch.arange(1, _N_COPIES_MAX + 1, dtype=f64, device=sigma.device)
+    powers = sigma_new[:, None] ** exponents  # σ_new^(k+1)
+    denominator = (_e11_table(sigma.device)[copies - 1] * powers).sum(dim=1)
+    new_scales = scales.to(f64) * (sigma / denominator)[:, None]
+    new_opacity = sigma_new.clamp(max=_OPACITY_MAX)
+    return new_opacity.to(opacity.dtype), new_scales.to(opacity.dtype)
