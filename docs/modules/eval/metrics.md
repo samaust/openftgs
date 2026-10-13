@@ -16,7 +16,7 @@ Evaluation is a forward pass with plain float32 convolutions (D-52): every metri
 
 `dynamic_region` turns a render, its ground truth and the test image's mask into the pair that the dynamic-region metrics compare (App. B.1, D-67). The mask is binarized at 0.5, a pixel counting as dynamic at 0.5 and above. The render is clamped, as for every metric; then both images are filled with black outside the mask and cropped to the mask's bounding box, the same box for both (Q-61).
 
-A mask with no dynamic pixel, or a box too small for every metric to be defined, gives no pair and a warning, and the report counts that image as skipped (Q-61). The minimum side comes from the largest window of the metrics, LPIPS-Alex's. Masks come in as bool, or floating in [0, 1]: an integer mask is refused, so whoever reads a mask file (M10's manifest reader, M14's `ftgs eval`) divides an 8-bit mask by 255 first, as §1.4 does for every 8-bit input (Q-61).
+The box is the bounding box of every dynamic pixel, as D-67 defines it, so a single stray mask pixel far from the subject enlarges the crop with black-on-black pixels, which raise PSNR and SSIM and lower LPIPS; masks are the user's to supply and clean (D-64), and the package doesn't filter them. A mask with no dynamic pixel, or a box too small for every metric to be defined, gives no pair and a warning, and the report counts that image as skipped (Q-61). The minimum side comes from the largest window of the metrics, LPIPS-Alex's. Masks come in as bool, or floating in [0, 1]: an integer mask is refused, so whoever reads a mask file (M10's manifest reader, M14's `ftgs eval`) divides an 8-bit mask by 255 first, as §1.4 does for every 8-bit input (Q-61).
 
 ## Averaging and the backbone
 
