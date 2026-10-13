@@ -60,7 +60,7 @@ On gsplat the backward pass accumulates with atomic additions, so a resume holds
 
 ## The model
 
-The trainer trains a model passed to it in place, after moving it to the device; built from init points, the model is the trainer's own. After `load_state_dict` or `from_checkpoint` the trainer works on a model it built from the state. The model's `slice_impl` is set from `PerfConfig` (Q-66).
+The trainer trains a copy of a model passed to it, made as the model copies the tensors it is given, so the caller's object is never modified or moved and one loaded model can start several runs (owner answer, Q-69). The copy goes through the model's constructor, so a model that breaks §1.1's validity rules is refused at construction as an input error (Q-76). Built from init points, the model is the trainer's own. `Trainer.model` returns the model being trained, read-only: the same object across training iterations and events, which resize it in place, and the object the optimizer was built for. `load_state_dict`, and so `from_checkpoint`, replaces it with the model built from the loaded state. The model's `slice_impl` is set from `PerfConfig` (Q-66).
 
 ## Settings from `PerfConfig`
 

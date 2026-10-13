@@ -348,7 +348,7 @@ class Trainer:
         self._configure(cfg, dataset, device)
         time_unit = dataset.manifest.time_unit
         if isinstance(init, FreeTimeGaussians):
-            # Q-69: a model passed in is trained in place; it must belong to this run.
+            # Q-69: a model passed in must belong to this run; the trainer trains a copy.
             if init.sh_degree != cfg.sh_degree:
                 raise ValueError(f"the model's SH degree {init.sh_degree} isn't {cfg.sh_degree}")
             if init.time != dataset.time:
@@ -359,7 +359,15 @@ class Trainer:
                 raise ValueError(
                     f"the model's N = {init.num_gaussians} exceeds N_max = {cfg.growth.n_max}"
                 )
-            model = init
+            # Q-69 (owner answer, #97): a copy, made as the model copies the tensors it is
+            # given, so the caller's object is never modified or moved. Q-76: the constructor
+            # checks §1.1, so a model that breaks the validity rules is refused here.
+            model = FreeTimeGaussians(
+                {name: getattr(init, name) for name in FreeTimeGaussians.PARAM_NAMES},
+                sh_degree=init.sh_degree,
+                time=init.time,
+                time_unit=init.time_unit,
+            )
         elif isinstance(init, InitPoints):
             # §1.3 steps 7–9 (D-24, D-74; Q-16), with the run's own initialization generator.
             model = FreeTimeGaussians.from_init_points(
@@ -465,6 +473,14 @@ class Trainer:
         self._window_count = 0
 
     # -- training -------------------------------------------------------------------------------
+
+    # Q-69 (owner answer, #97): read-only; load_state_dict replaces the model it returns.
+    @property
+    def model(self) -> FreeTimeGaussians:
+        """The model the trainer is training: the same object across training iterations and
+        events, which resize it in place; `load_state_dict` and `from_checkpoint` replace it with
+        the model of the loaded state."""
+        return self._run.model
 
     @property
     def iteration(self) -> int:
