@@ -30,7 +30,7 @@ The Adam moments and step counters are created when the optimizer is built, zero
 - **Moment reset.** `reset_rows` zeroes the Adam moments of the rows it is given, as indices that may repeat (relocation draws targets with replacement), and keeps each step counter (D-16).
 - **Resize.** The model replaces its parameters when it resizes, so the optimizer follows it: the caller resizes the model first, then calls the optimizer's `resize_` with the same keep mask (Q-23) and the number of appended rows. The kept rows' moments stay in order, new rows start with zero moments (D-45), each group is rebound to the model's new parameter, and the step counters are kept. A row count that doesn't match the model is rejected before anything changes (Q-44).
 
-Validation reads only dtypes, shapes and devices, never values, so `set_iteration`, `step`, `zero_grad` and a moment reset never synchronize (§2.4 rule 3). A resize with a keep mask does: gathering the kept rows needs their count on the host. It runs only at events, where D-49 allows the selection of kept rows to synchronize.
+Validation reads only dtypes, shapes and devices, never values, so `set_iteration`, `step`, `zero_grad` and a moment reset never synchronize (§2.4 rule 3). A resize with a keep mask does: gathering the kept rows needs their count on the host. It runs only at growth events, which synchronize anyway (§2.4 rule 3). A moment reset reads no values either, so keeping its indices within the rows is the caller's precondition (Q-44).
 
 ## The checkpoint's optimizer files
 

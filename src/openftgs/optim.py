@@ -41,7 +41,8 @@ class _GroupSchedule:
         if self.kind == "annealed":
             return float(self.eta0 ** (1.0 - u) * self.eta1**u)  # E12 (D-19)
         if self.kind == "exponential":
-            return float(self.eta0 * (self.eta1 / self.eta0) ** u)  # E13
+            # E13 as written; at u = 1 it can differ from η₁ by an ulp, within U-17's tolerance.
+            return float(self.eta0 * (self.eta1 / self.eta0) ** u)
         return self.eta0
 
 
@@ -53,7 +54,9 @@ def _group_schedules(
     schedules = [
         _GroupSchedule("means", cfg.means_lr[0] * s, cfg.means_lr[1] * s, "exponential"),  # D-27
         _GroupSchedule("times", cfg.times_lr[0], cfg.times_lr[1], "exponential"),  # D-20
-        _GroupSchedule("log_durations", cfg.log_durations_lr, cfg.log_durations_lr, "constant"),
+        _GroupSchedule(
+            "log_durations", cfg.log_durations_lr, cfg.log_durations_lr, "constant"
+        ),  # D-20
         _GroupSchedule(
             "velocities", cfg.velocities_lr[0] * v_scale, cfg.velocities_lr[1] * v_scale, "annealed"
         ),  # D-19
@@ -234,8 +237,10 @@ class FTGSOptimizer:
 
     # -- rows -----------------------------------------------------------------------------------
 
-    # Q-44: rows are int64 indices in any order, repeats allowed (relocation draws targets with
-    # replacement); bool masks are refused, as Q-23 keeps them for row selection.
+    # Q-44: rows are int64 indices in [0, N), in any order, repeats allowed (relocation draws
+    # targets with replacement); bool masks are refused, as Q-23 keeps them for row selection.
+    # The range is the caller's precondition: checking values would synchronize (§2.4 rule 3),
+    # and an index outside it fails inside index_fill_ (on CUDA, as a device-side assert).
     def reset_rows(self, rows: Tensor) -> None:
         """Zero the Adam moments of `rows` in every group and keep the step counters (D-16)."""
         if rows.dtype != torch.int64 or rows.dim() != 1:
@@ -251,8 +256,8 @@ class FTGSOptimizer:
         """Follow a model resize that kept the rows of the bool mask `keep` [N] and appended
         `n_append` rows: kept rows keep their moments in order, new rows start with zero moments
         (D-45), each group moves to the model's new tensor, and the step counters stay (§1.3
-        Growth step 4). On error nothing changes. With `keep`, the gather synchronizes, as D-49
-        allows for the selection of kept rows at an event."""
+        Growth step 4). On error nothing changes. With `keep`, the gather synchronizes; resizes
+        happen only at growth events, which synchronize anyway (§2.4 rule 3)."""
         if isinstance(n_append, bool) or not isinstance(n_append, int) or n_append < 0:
             _fail(f"n_append must be an int ≥ 0, got {n_append!r}")
         groups = list(self._groups())
