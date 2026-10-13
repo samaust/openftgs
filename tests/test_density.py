@@ -13,18 +13,46 @@ import decimal
 import math
 
 import pytest
+import scipy.spatial.transform
+import scipy.stats
 import torch
-from builders import UNIT_TIME, random_model, random_params, ring
+from builders import (
+    CAM_A,
+    UNIT_TIME,
+    model_from_rows,
+    random_model,
+    random_params,
+    ring,
+    sh0_for,
+)
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from openftgs.config import RelocConfig
-from openftgs.density import GradStats, mcmc_split, sampling_score
+from openftgs.config import OptimConfig, RelocConfig
+from openftgs.density import (
+    GradStats,
+    RelocationReport,
+    mcmc_split,
+    relocate,
+    sampling_score,
+)
 from openftgs.model import FreeTimeGaussians
+from openftgs.optim import FTGSOptimizer, build_optimizer
 from openftgs.render import render
 
 F32 = torch.float32
 F64 = torch.float64
+PARAM_NAMES = (  # §1.1, written out: the tests' own expectation
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+    "sh0",
+    "shN",
+)
 
 
 # U-16 · gradient statistics (E10, D-12; Q-49)
@@ -545,3 +573,323 @@ def test_u13_matches_gsplat_compute_relocation() -> None:
     new_opacity, new_scales = mcmc_split(sigma.double(), scales.double(), n)
     torch.testing.assert_close(ref_opacity.cpu().double(), new_opacity, rtol=5e-4, atol=0.0)
     torch.testing.assert_close(ref_scales.cpu().double(), new_scales, rtol=5e-4, atol=0.0)
+
+
+# U-14 · the relocation procedure (§1.3 Relocation, D-14 to D-16; Q-50, Q-51, Q-55)
+
+LOGIT_DEAD = math.log(1e-3 / (1.0 - 1e-3))  # σ = 0.001: dead (D-14) and culled (D-32)
+
+
+def _relocation_scene(
+    logits: list[float], *, seed: int = 0, sh_degree: int = 0
+) -> tuple[FreeTimeGaussians, FTGSOptimizer]:
+    """A random model whose rows have the given opacity logits and distinct time centers
+    (row k has μt = k/N, so a moved copy names its target), with an optimizer whose Adam
+    moments are nonzero after one step on seeded gradients (the logits and time centers are
+    set back to these values after the step)."""
+    n = len(logits)
+    params = random_params(n, sh_degree=sh_degree, generator=torch.Generator().manual_seed(seed))
+    params["opacity_logits"] = torch.tensor(logits, dtype=F32)
+    params["times"] = torch.arange(n, dtype=F32) / n
+    model = FreeTimeGaussians(params, sh_degree=sh_degree, time=UNIT_TIME)
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=1.0, frame_dt=0.1)
+    grads = torch.Generator().manual_seed(seed + 1)
+    for name in PARAM_NAMES:
+        p = getattr(model, name)
+        p.grad = torch.randn(p.shape, generator=grads)
+    opt.step()
+    opt.zero_grad()
+    with torch.no_grad():  # the step moved them: restore the given logits and time centers
+        model.opacity_logits.copy_(params["opacity_logits"])
+        model.times.copy_(params["times"])
+    return model, opt
+
+
+def _rows_of(model: FreeTimeGaussians) -> dict[str, torch.Tensor]:
+    return {name: getattr(model, name).detach().clone() for name in PARAM_NAMES}
+
+
+def _target_of(model: FreeTimeGaussians, rows: torch.Tensor) -> torch.Tensor:
+    """The original row each given row's time center names (row k has μt = k/N)."""
+    n = model.num_gaussians
+    return torch.round(model.times.detach()[rows] * n).to(torch.int64)
+
+
+def test_u14_moved_copies_carry_their_targets_updated_rows() -> None:
+    """U-14, §1.3 Relocation steps 3–5, D-15: every dead primitive becomes a moved copy of a live
+    target, equal to its target's updated row except its position (bitwise); N is unchanged;
+    afterwards every row is live (D-14: relocated logits are at least ô_dead); the report counts
+    the dead rows and the distinct targets."""
+    logits = [1.0, 0.0, LOGIT_DEAD, 2.0, LOGIT_DEAD, LOGIT_DEAD, -1.0, LOGIT_DEAD]
+    model, opt = _relocation_scene(logits)
+    stats = GradStats(8)
+    report = relocate(model, opt, stats, RelocConfig(), generator=torch.Generator().manual_seed(5))
+    assert model.num_gaussians == 8
+    dead_rows = torch.tensor([2, 4, 5, 7])
+    targets = _target_of(model, dead_rows)
+    assert set(targets.tolist()) <= {0, 1, 3, 6}
+    after = _rows_of(model)
+    for name in PARAM_NAMES:
+        if name != "means":
+            assert torch.equal(after[name][dead_rows], after[name][targets]), name
+    assert bool((model.opacity_logits.detach() >= O_DEAD).all())
+    assert report == RelocationReport(dead=4, targets=len(set(targets.tolist())))
+
+
+def test_u14_a_logit_exactly_at_the_dead_threshold_counts_as_live() -> None:
+    """U-14, D-14: ô = ô_dead (the float32 logit of 0.005) is live; one float32 step below is
+    dead. A moved copy takes its target's time center, a target keeps its own (exact)."""
+    below = float(torch.nextafter(torch.tensor(O_DEAD), torch.tensor(-math.inf)))
+    model, opt = _relocation_scene([O_DEAD, below, 2.0, 2.0])
+    times = model.times.detach().clone()
+    report = relocate(model, opt, GradStats(4), RelocConfig(), generator=torch.Generator())
+    assert report.dead == 1
+    assert float(model.times.detach()[0]) == float(times[0])  # live: not overwritten
+    assert int(_target_of(model, torch.tensor([1]))) in (0, 2, 3)
+    assert float(model.times.detach()[1]) != float(times[1])  # dead: now a moved copy
+
+
+@pytest.mark.parametrize("case", ["no dead primitive", "no live primitive"])
+def test_u14_empty_dead_or_live_set_is_a_no_op_that_still_resets_statistics(case: str) -> None:
+    """U-14, §1.3 Relocation step 1: with an empty dead set or an empty live set the model, the
+    Adam moments and the generator are untouched (bitwise); the gradient statistics are still
+    reset (Q-51, owner answer)."""
+    logits = [0.5, 1.0, -1.0] if case == "no dead primitive" else [LOGIT_DEAD, -9.0, -12.0]
+    model, opt = _relocation_scene(logits)
+    before, moments = _rows_of(model), opt.state_dict()
+    stats = _stats_with([1.0, 2.0, 3.0], [1, 1, 1])
+    gen = torch.Generator().manual_seed(9)
+    gen_state = gen.get_state()
+    report = relocate(model, opt, stats, RelocConfig(), generator=gen)
+    assert report == RelocationReport(dead=0, targets=0)
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
+    for name, state in opt.state_dict().items():
+        for key in ("exp_avg", "exp_avg_sq", "step"):
+            assert torch.equal(state[key], moments[name][key])
+    assert torch.equal(gen.get_state(), gen_state)
+    assert torch.equal(stats.count, torch.zeros(3, dtype=torch.int32))
+
+
+def test_u14_targets_are_drawn_in_proportion_to_the_score() -> None:
+    """U-14, D-15: 10⁵ dead primitives draw their targets from 5 live ones with probability
+    ∝ ρ (here 0.5σ, the statistics being zero): χ² test, p > 0.001."""
+    sigma = [0.05, 0.1, 0.2, 0.3, 0.35]
+    n_dead = 100_000
+    logits = [math.log(s / (1.0 - s)) for s in sigma] + [LOGIT_DEAD] * n_dead
+    model, opt = _relocation_scene(logits)
+    rho = 0.5 * torch.sigmoid(torch.tensor(logits[:5], dtype=F32)).double()
+    relocate(
+        model,
+        opt,
+        GradStats(len(logits)),
+        RelocConfig(),
+        generator=torch.Generator().manual_seed(1),
+    )
+    observed = torch.bincount(_target_of(model, torch.arange(5, 5 + n_dead)), minlength=5)
+    expected = rho / rho.sum() * n_dead
+    p_value = scipy.stats.chisquare(observed.double().numpy(), expected.numpy()).pvalue
+    assert p_value > 0.001, p_value
+
+
+def test_u14_moments_are_zeroed_on_targets_and_moved_copies_only() -> None:
+    """U-14, D-16: the Adam moments of every target and every moved copy are zero and the
+    others unchanged (bitwise); step counters are unchanged. Every row index relocate passes to
+    reset_rows lies in [0, N) (Q-44: the caller's precondition)."""
+    logits = [1.0, LOGIT_DEAD, 0.0, LOGIT_DEAD, 0.5, 0.2, LOGIT_DEAD, 0.8, -0.5, 1.5]
+    model, opt = _relocation_scene(logits)
+    before = opt.state_dict()
+    passed: list[torch.Tensor] = []
+    reset_rows = opt.reset_rows
+
+    def spy(rows: torch.Tensor, *, names: object = None) -> None:
+        passed.append(rows.clone())
+        reset_rows(rows, names=names)  # type: ignore[arg-type]
+
+    opt.reset_rows = spy  # type: ignore[method-assign]
+    relocate(model, opt, GradStats(10), RelocConfig(), generator=torch.Generator().manual_seed(3))
+    moved = torch.tensor([1, 3, 6])
+    targets = torch.unique(_target_of(model, moved))
+    reset = torch.zeros(10, dtype=torch.bool)
+    reset[moved] = True
+    reset[targets] = True
+    after = opt.state_dict()
+    for name in after:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(after[name][key][reset], torch.zeros_like(after[name][key][reset]))
+            assert torch.equal(after[name][key][~reset], before[name][key][~reset]), (name, key)
+        assert torch.equal(after[name]["step"], before[name]["step"])
+    assert passed and all(bool(((r >= 0) & (r < 10)).all()) for r in passed)
+
+
+def test_u14_without_reset_moved_moments_only_targets_are_zeroed() -> None:
+    """D-16's alternative (RelocConfig.reset_moved_moments = False): only the targets' moments
+    are zeroed; the moved copies keep the moments their rows had."""
+    logits = [1.0, LOGIT_DEAD, 0.0, LOGIT_DEAD, 0.5]
+    model, opt = _relocation_scene(logits)
+    before = opt.state_dict()
+    relocate(
+        model,
+        opt,
+        GradStats(5),
+        RelocConfig(reset_moved_moments=False),
+        generator=torch.Generator().manual_seed(2),
+    )
+    targets = torch.unique(_target_of(model, torch.tensor([1, 3])))
+    after = opt.state_dict()
+    for name in after:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(
+                after[name][key][targets], torch.zeros_like(after[name][key][targets])
+            )
+            for row in (1, 3):
+                assert torch.equal(after[name][key][row], before[name][key][row])
+
+
+def test_u14_same_seed_gives_the_same_result() -> None:
+    """U-14: the same model, statistics and generator seed give bitwise the same model."""
+    results = []
+    for _ in range(2):
+        model, opt = _relocation_scene([0.3, LOGIT_DEAD, 1.0, LOGIT_DEAD, LOGIT_DEAD, 2.0], seed=4)
+        stats = _stats_with([0.5, 0.0, 2.0, 1.0, 0.0, 0.25], [1, 0, 2, 1, 0, 1])
+        relocate(model, opt, stats, RelocConfig(), generator=torch.Generator().manual_seed(11))
+        results.append(_rows_of(model))
+    for name in PARAM_NAMES:
+        assert torch.equal(results[0][name], results[1][name])
+
+
+def test_u14_stacked_copies_keep_the_targets_position() -> None:
+    """RelocConfig.copy_position = "stack" (D-15's alternative, used by U-13's render test):
+    moved copies keep the target's position exactly."""
+    model, opt = _relocation_scene([1.0, LOGIT_DEAD, 0.0, LOGIT_DEAD])
+    relocate(
+        model,
+        opt,
+        GradStats(4),
+        RelocConfig(copy_position="stack"),
+        generator=torch.Generator().manual_seed(6),
+    )
+    moved = torch.tensor([1, 3])
+    assert torch.equal(model.means.detach()[moved], model.means.detach()[_target_of(model, moved)])
+
+
+def test_u14_invalid_model_or_all_zero_scores_raise_before_any_draw() -> None:
+    """§1.1 validity rules (Q-55) and Q-51: a non-finite model, or live scores that are all 0
+    (λ_o = 0 with zero statistics, which Q-11 allows), raise ValueError before the generator is
+    used and before anything is written."""
+    gen = torch.Generator().manual_seed(1)
+    state = gen.get_state()
+    model, opt = _relocation_scene([1.0, LOGIT_DEAD, 0.0])
+    with torch.no_grad():
+        model.sh0[0, 0, 1] = math.nan
+    with pytest.raises(ValueError):
+        relocate(model, opt, GradStats(3), RelocConfig(), generator=gen)
+    model, opt = _relocation_scene([1.0, LOGIT_DEAD, 0.0])
+    before = _rows_of(model)
+    with pytest.raises(ValueError, match="sampling scores"):
+        relocate(model, opt, GradStats(3), RelocConfig(lambda_o=0.0), generator=gen)
+    assert torch.equal(gen.get_state(), state)
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(model, name).detach(), before[name])
+
+
+def test_u13_a_target_drawn_more_than_50_times_uses_n_51() -> None:
+    """E11: n is clamped to 51 for the formula, but every one of the 60 dead primitives is still
+    moved onto the single live target, and all 61 rows carry E11's values for n = 51."""
+    model, opt = _relocation_scene([0.4] + [LOGIT_DEAD] * 60)
+    sigma = float(torch.sigmoid(torch.tensor(0.4, dtype=F32)).double())
+    a = torch.exp(model.log_scales.detach()[0].double())
+    report = relocate(model, opt, GradStats(61), RelocConfig(), generator=torch.Generator())
+    assert report == RelocationReport(dead=60, targets=1)
+    s_new, _ = e11_oracle(sigma, 51, 1.0)
+    expected_logit = float(torch.logit(torch.tensor(s_new, dtype=F64)).float())
+    assert torch.equal(model.opacity_logits.detach(), torch.full((61,), expected_logit))
+    expected_scales = torch.log(torch.stack([a * e11_oracle(sigma, 51, 1.0)[1]] * 61)).float()
+    torch.testing.assert_close(model.log_scales.detach(), expected_scales, rtol=0.0, atol=1e-6)
+    assert torch.equal(_target_of(model, torch.arange(61)), torch.zeros(61, dtype=torch.int64))
+
+
+def test_u13_clamp_active_case_through_relocate() -> None:
+    """U-13, E11, D-14: one target with σ_j = 0.02 and four dead primitives (n = 5): σ_new falls
+    below 0.005, so every row's logit is clamped to ô_dead (live), while the scales use the
+    unclamped σ_new: â = log(a_new) rounded to float32."""
+    model, opt = _relocation_scene([math.log(0.02 / 0.98)] + [LOGIT_DEAD] * 4)
+    sigma = float(torch.sigmoid(model.opacity_logits.detach()[0].double()))
+    a = torch.exp(model.log_scales.detach()[0].double())
+    relocate(model, opt, GradStats(5), RelocConfig(), generator=torch.Generator())
+    assert torch.equal(model.opacity_logits.detach(), torch.full((5,), O_DEAD))
+    factor = e11_oracle(sigma, 5, 1.0)[1]
+    expected = torch.log(a * factor).float()
+    for row in range(5):
+        torch.testing.assert_close(model.log_scales.detach()[row], expected, rtol=0.0, atol=1e-6)
+
+
+def _whitened(offsets: torch.Tensor, quat: list[float], scales: list[float]) -> torch.Tensor:
+    """Offsets from a Gaussian's mean mapped to its whitened coordinates diag(1/a)·Rᵀ·x, with R
+    from SciPy's quaternion convention (scalar last), independent of openftgs.model (E5)."""
+    w, x, y, z = quat
+    rotation = torch.tensor(scipy.spatial.transform.Rotation.from_quat([x, y, z, w]).as_matrix())
+    return (offsets.double() @ rotation) / torch.tensor(scales, dtype=F64)
+
+
+def assert_standard_normal(samples: torch.Tensor, bound: float = 0.01) -> None:
+    """Q-54 (owner answer): every entry of the sample mean within `bound` of 0 and every entry of
+    the sample covariance within `bound` of the identity, in whitened coordinates: the per-entry
+    measure in units of √Cᵢᵢ and √(Cᵢᵢ·Cⱼⱼ)."""
+    mean = samples.mean(dim=0)
+    centered = samples - mean
+    covariance = centered.T @ centered / (samples.shape[0] - 1)
+    assert float(mean.abs().max()) <= bound, mean
+    assert float((covariance - torch.eye(3, dtype=samples.dtype)).abs().max()) <= bound, covariance
+
+
+def test_u14_moved_copies_positions_follow_the_targets_gaussian() -> None:
+    """U-14, E11, D-15: the positions of 10⁶ moved copies (Q-54: 10⁶ draws, owner answer) of one
+    anisotropic, rotated target match the target's Gaussian μ_j + R_j·diag(a_j)·z, with a_j its
+    scales before the move (Q-51), in mean and covariance within 1%."""
+    n_dead = 1_000_000
+    model, opt = _relocation_scene([1.5] + [LOGIT_DEAD] * n_dead)
+    quat, scales = [0.9, 0.3, -0.2, 0.25], [0.5, 0.1, 0.02]
+    with torch.no_grad():
+        model.quats[0] = torch.tensor(quat)
+        model.log_scales[0] = torch.log(torch.tensor(scales))
+    mu = model.means.detach()[0].clone()
+    norm = math.sqrt(sum(c * c for c in quat))
+    relocate(
+        model, opt, GradStats(n_dead + 1), RelocConfig(), generator=torch.Generator().manual_seed(8)
+    )
+    offsets = model.means.detach()[1:] - mu
+    assert_standard_normal(_whitened(offsets, [c / norm for c in quat], scales))
+
+
+def test_u13_render_is_nearly_unchanged_by_relocating_stacked_copies() -> None:
+    """U-13, E11: a render at the targets' μt before and after relocating 30 dead primitives onto
+    10 targets with copy_position = "stack" differ by PSNR ≥ 30 dB (reference backend). The dead
+    primitives have σ = 0.001, below the 1/255 cull (D-32), so the first render shows the
+    targets alone."""
+    colors = [(0.9, 0.2, 0.1), (0.1, 0.8, 0.3), (0.2, 0.3, 0.9), (0.8, 0.8, 0.2), (0.6, 0.1, 0.7)]
+    rows = []
+    for k, (x, y) in enumerate((x, y) for y in (-3.0, 3.0) for x in (-6.0, -3.0, 0.0, 3.0, 6.0)):
+        rows.append(
+            {
+                "mean": (x, y, 4.0),
+                "scale": 0.5,
+                "logit": -1.0 + 0.4 * k,
+                "sh0": sh0_for(colors[k % 5]),
+            }
+        )
+    rows += [{"mean": (0.0, 0.0, 4.0), "logit": LOGIT_DEAD}] * 30
+    model = model_from_rows(rows)
+    opt = build_optimizer(model, OptimConfig(), spatial_scale=1.0, frame_dt=0.1)
+    before = render(model, CAM_A, 0.5, time_units="normalized", backend="reference").image.detach()
+    report = relocate(
+        model,
+        opt,
+        GradStats(40),
+        RelocConfig(copy_position="stack"),
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert report.dead == 30
+    after = render(model, CAM_A, 0.5, time_units="normalized", backend="reference").image.detach()
+    psnr = -10.0 * math.log10(float(((after - before) ** 2).mean()))
+    assert psnr >= 30.0, psnr

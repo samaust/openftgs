@@ -7,6 +7,7 @@ Spec: E10, E11, E17, §1.3. Band: Mechanics (§2.1).
 
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import NoReturn
 
 import numpy as np
@@ -14,9 +15,25 @@ import torch
 from torch import Tensor
 
 from openftgs.config import RelocConfig
-from openftgs.model import FreeTimeGaussians
+from openftgs.model import FreeTimeGaussians, rotation_matrix
+from openftgs.optim import FTGSOptimizer
 
-__all__ = ["GradStats", "mcmc_split", "sampling_score"]  # Q-48
+__all__ = [  # Q-48
+    "GradStats",
+    "RelocationReport",
+    "mcmc_split",
+    "relocate",
+    "sampling_score",
+]
+
+
+@dataclass(frozen=True)
+class RelocationReport:
+    """What a relocation did (Q-48): the number of dead primitives moved and of distinct
+    targets."""
+
+    dead: int
+    targets: int
 
 
 def _fail(reason: str) -> NoReturn:
@@ -272,3 +289,99 @@ def mcmc_split(opacity: Tensor, scales: Tensor, n: Tensor) -> tuple[Tensor, Tens
     new_scales = scales.to(f64) * (sigma / denominator)[:, None]
     new_opacity = sigma_new.clamp(max=_OPACITY_MAX)
     return new_opacity.to(opacity.dtype), new_scales.to(opacity.dtype)
+
+
+def _check_generator(generator: object) -> None:
+    if not isinstance(generator, torch.Generator):
+        _fail(f"generator must be a torch.Generator, got {type(generator).__name__}")
+
+
+def _draw_targets(scores: Tensor, count: int, generator: torch.Generator) -> Tensor:
+    """`count` rows drawn with replacement, with probability ∝ `scores` (D-15), on the
+    generator's device (as in `FreeTimeGaussians.from_init_points`), returned on the scores'
+    device. The scores must be finite with a positive sum (Q-51): otherwise torch.multinomial
+    fails on the CPU and asserts on CUDA."""
+    if not bool(torch.isfinite(scores).all()) or not bool(scores.sum() > 0):
+        _fail(
+            "the live primitives' sampling scores must be finite with a positive sum "
+            "(λ_o = 0 with a zero gradient quantile gives all zeros)"
+        )
+    draws = torch.multinomial(
+        scores.to(generator.device), count, replacement=True, generator=generator
+    )
+    return draws.to(scores.device)
+
+
+# Q-50, Q-51: E11 once per target, then the moved copies (relocation's dead rows, or the score
+# mode's new rows), shared by relocate and grow.
+def _move(
+    model: FreeTimeGaussians, draws: Tensor, cfg: RelocConfig, generator: torch.Generator
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Apply E11 in place to every row named in `draws` (one entry per copy, repeats allowed),
+    with n = 1 + its number of draws, and return the target rows and the copies' nine tensors,
+    one row per draw: the target's updated tensors, placed per `cfg.copy_position` (D-15)."""
+    n_rows = model.num_gaussians
+    device = model.means.device
+    counts = torch.zeros(n_rows, dtype=torch.int64, device=device)
+    counts.index_add_(0, draws, torch.ones_like(draws))  # bincount would read its max back
+    targets = torch.nonzero(counts).squeeze(1)
+    with torch.no_grad():
+        logits, log_scales = model.opacity_logits, model.log_scales
+        # E11's a_j and the target's Gaussian are the target's before the move (Q-51).
+        means = model.means.index_select(0, draws)
+        rs = rotation_matrix(model.quats.index_select(0, draws))
+        rs = rs * torch.exp(log_scales.index_select(0, draws))[:, None, :]  # R·diag(a)
+        sigma = torch.sigmoid(logits[targets].double())
+        new_sigma, new_scales = mcmc_split(
+            sigma, torch.exp(log_scales[targets].double()), 1 + counts[targets]
+        )
+        # D-14: the lower bound of E11's clamp, on the stored float32 logit (Q-50).
+        new_logits = torch.logit(new_sigma).float().clamp_min(_logit_bound(cfg.dead_opacity))
+        logits.index_copy_(0, targets, new_logits)
+        log_scales.index_copy_(0, targets, torch.log(new_scales).float())
+        copies = {
+            name: getattr(model, name).detach().index_select(0, draws)
+            for name in FreeTimeGaussians.PARAM_NAMES
+        }
+        if cfg.copy_position == "sample":
+            # D-15: μ_j + R_j·diag(a_j)·z, z ~ N(0, I₃), drawn after the targets (Q-51).
+            z = torch.randn(
+                (int(draws.shape[0]), 3), generator=generator, device=generator.device
+            ).to(device)
+            copies["means"] = means + (rs @ z[:, :, None]).squeeze(-1)
+    return targets, copies
+
+
+# Q-51: the procedure's details; Q-55: the validity checks before the draws and after the writes.
+def relocate(
+    model: FreeTimeGaussians,
+    optimizer: FTGSOptimizer,
+    stats: GradStats,
+    cfg: RelocConfig,
+    *,
+    generator: torch.Generator,
+) -> RelocationReport:
+    """Move every dead primitive onto a live target (§1.3 Relocation, E11, D-14 to D-16), then
+    reset the gradient statistics. `cfg.enabled` is the trainer's switch and isn't read here.
+    Synchronizes with the host: an event does anyway (§2.4 rule 3)."""
+    _check_stats(model, stats)
+    _check_generator(generator)
+    model.validate()
+    logits = model.opacity_logits.detach()
+    dead = logits < _logit_bound(cfg.dead_opacity)  # D-14, in float32
+    n_dead = int(dead.sum())
+    if n_dead == 0 or n_dead == model.num_gaussians:
+        stats.reset()
+        return RelocationReport(dead=0, targets=0)
+    scores = torch.where(dead, 0.0, sampling_score(model, stats, cfg))
+    draws = _draw_targets(scores, n_dead, generator)
+    dead_rows = torch.nonzero(dead).squeeze(1)  # ascending: they take the draws in draw order
+    targets, copies = _move(model, draws, cfg, generator)
+    with torch.no_grad():
+        for name in FreeTimeGaussians.PARAM_NAMES:
+            getattr(model, name).index_copy_(0, dead_rows, copies[name])
+    # D-16: zero the moments of the targets and the moved copies, or of the targets only.
+    optimizer.reset_rows(torch.cat([targets, dead_rows]) if cfg.reset_moved_moments else targets)
+    model.validate()  # §1.1: checked after every relocation
+    stats.reset()  # §1.3 step 7 (Q-51, owner answer)
+    return RelocationReport(dead=n_dead, targets=int(targets.shape[0]))
