@@ -11,7 +11,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, get_args
 
 import torch
 from torch import Tensor
@@ -31,6 +31,7 @@ from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer
 __all__ = ["FreeTimeGaussians", "GaussiansAtTime", "covariance", "rotation_matrix"]  # Q-20
 
 _SH_DEGREES = (0, 1, 2, 3)  # D-3
+_SliceImpl = Literal["auto", "eager", "compiled", "cuda"]  # PerfConfig.slice_impl (D-50, Q-13)
 _MIN_QUAT_NORM = 1e-8  # §1.1 validity rules
 _OPACITY_EPS = 1e-7  # §2.2 ftgs-if: opacity clamped to [1e-7, 1 − 1e-7] on export and import
 _KNN_CHUNK = 1 << 24  # distances held at once by the 3-NN search (rows × points)
@@ -165,8 +166,7 @@ class FreeTimeGaussians(torch.nn.Module):
         self.sh_degree = _check_sh_degree(sh_degree)
         self.time = time
         self.time_unit = time_unit  # Q-17
-        # Q-13; how PerfConfig.slice_impl reaches it is M10's.
-        self._slice_impl: Literal["auto", "eager", "compiled", "cuda"] = "auto"
+        self._slice_impl: _SliceImpl = "auto"  # Q-66
         # §2.1: the caller's tensors are plain data, so the parameters get their own storage.
         self._set_params({k: v.detach().clone() for k, v in params.items()})
 
@@ -389,6 +389,18 @@ class FreeTimeGaussians(torch.nn.Module):
             bool(params["times"].any()) or bool(params["velocities"].any())
         ):
             _fail("with a single timestamp (T_τ = 0), times and velocities must be 0 (§1.4)")
+
+    # Q-66 (owner answer): public, so the trainer can set PerfConfig.slice_impl on any model.
+    @property
+    def slice_impl(self) -> _SliceImpl:
+        """The temporal-slice implementation `at_time` runs (D-50, Q-13): "auto" by default."""
+        return self._slice_impl
+
+    @slice_impl.setter
+    def slice_impl(self, value: _SliceImpl) -> None:
+        if value not in get_args(_SliceImpl):
+            _fail(f"slice_impl must be one of {get_args(_SliceImpl)}, got {value!r}")
+        self._slice_impl = value
 
     @property
     def num_gaussians(self) -> int:

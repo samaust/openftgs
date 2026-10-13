@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reading and writing full checkpoints (TrainerState), FTGS-IF exchange files (ExchangeModel),
-ftgs-init files (InitPoints), render requests (RenderRequest) and their renders (Renders), and
-PLY files for viewers, with the validators of the exchange and init formats. Plain data in and
-out: this module imports neither openftgs.model nor openftgs.train.
+ftgs-init files (InitPoints), render requests (RenderRequest) and their renders (Renders), scene
+manifests (SceneManifest), and PLY files for viewers, with the validators of the exchange and
+init formats. Plain data in and out: this module imports neither openftgs.model nor
+openftgs.train.
 
-Spec: §2.2, D-30, D-34, D-73. Band: Foundation (§2.1).
+Spec: §2.2, D-30, D-34, D-73; Q-64. Band: Foundation (§2.1).
 """
 
 import hashlib
@@ -28,10 +29,12 @@ from openftgs.config import config_from_dict
 from openftgs.types import (
     Camera,
     ExchangeModel,
+    ImageRecord,
     InitPoints,
     RenderItem,
     RenderRequest,
     Renders,
+    SceneManifest,
     TimeNormalizer,
     TrainerState,
 )
@@ -42,6 +45,7 @@ __all__ = [
     "read_init_points",
     "read_render_request",
     "read_renders",
+    "read_scene_manifest",
     "save_checkpoint",
     "validate_exchange",
     "validate_init_points",
@@ -677,6 +681,22 @@ def _parse_camera(value: Any, name: str, where: str) -> Camera:
     )
 
 
+def _check_json_header(raw: Mapping[str, Any], fmt: str, where: str) -> None:
+    """§2.2 for the JSON formats: `format`, and a `version` of major 1 written as a JSON int or
+    a "major.minor" string (Q-56)."""
+    version = raw.get("version")
+    if isinstance(version, bool) or not isinstance(version, int | str):
+        _fail(where, f"version must be an int or a string, got {version!r}")
+    _check_header({"format": raw.get("format"), "version": str(version)}, fmt, where)
+
+
+def _time_unit(raw: Mapping[str, Any], where: str) -> str:
+    time_unit = raw.get("time_unit")
+    if not isinstance(time_unit, str) or not time_unit:
+        _fail(where, f"time_unit must be a non-empty string, got {time_unit!r}")
+    return time_unit
+
+
 def _parse_item(value: Any, where: str) -> RenderItem:
     if not isinstance(value, dict):
         _fail(where, "every item must be an object")
@@ -698,13 +718,8 @@ def read_render_request(path: Path) -> RenderRequest:
         raise ValueError(f"{where}: not a readable JSON file: {err}") from None
     if not isinstance(raw, dict):
         _fail(where, "the file must hold an object")
-    version = raw.get("version")
-    if isinstance(version, bool) or not isinstance(version, int | str):
-        _fail(where, f"version must be an int or a string, got {version!r}")
-    _check_header({"format": raw.get("format"), "version": str(version)}, _REQUEST, where)
-    time_unit = raw.get("time_unit")
-    if not isinstance(time_unit, str) or not time_unit:
-        _fail(where, f"time_unit must be a non-empty string, got {time_unit!r}")
+    _check_json_header(raw, _REQUEST, where)
+    time_unit = _time_unit(raw, where)
     background = raw.get("background", [0.0, 0.0, 0.0])
     if not isinstance(background, list) or len(background) != 3:
         _fail(where, "background must be a list of three numbers")
@@ -787,6 +802,100 @@ def read_renders(path: Path, *, request_sha256: str | None = None) -> Renders:
     _check_renders(rgb, alpha, where)
     ids = sorted(rgb)  # Q-56: the file keeps no item order
     return Renders(rgb={k: rgb[k] for k in ids}, alpha={k: alpha[k] for k in ids})
+
+
+# ftgs-scene (§2.2): the scene manifest. Q-64 (owner answer): parsed here, beside the other
+# formats; openftgs.data builds the multi-view video from it.
+
+_SCENE = "ftgs-scene"
+_SPLITS = ("train", "test")
+_OVERRIDES = ("K", "world_to_camera")  # §2.2: per-image keys for moving or zooming cameras
+
+
+def _relative_path(value: Any, what: str, where: str) -> Path:
+    # §2.2: paths are relative to the manifest file.
+    if not isinstance(value, str) or not value:
+        _fail(where, f"{what} must be a non-empty path, got {value!r}")
+    path = Path(value)
+    if path.is_absolute():
+        _fail(where, f"{what} must be relative to the manifest, got {value!r}")
+    return path
+
+
+def read_scene_manifest(path: Path) -> SceneManifest:
+    """Read and validate a ftgs-scene file (§2.2; Q-64): the image records in file order, with
+    paths resolved against the manifest's directory, the test images' masks, the metadata, the
+    time unit and the SHA-256 of the file's bytes as read. Cameras are checked as a render
+    request's (Q-56); unknown keys are ignored. Whether the files exist is not checked here."""
+    path = Path(path)
+    where = f"scene manifest {path}"
+    try:
+        data = path.read_bytes()
+        raw = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError) as err:
+        raise ValueError(f"{where}: not a readable JSON file: {err}") from None
+    if not isinstance(raw, dict):
+        _fail(where, "the file must hold an object")
+    _check_json_header(raw, _SCENE, where)
+    time_unit = _time_unit(raw, where)
+    cameras = raw.get("cameras")
+    if not isinstance(cameras, dict):
+        _fail(where, "cameras must be an object")
+    parsed: dict[str, tuple[dict[str, Any], Camera]] = {}
+    for name, value in cameras.items():
+        at = f"{where}, camera {name!r}"
+        if not isinstance(value, dict):
+            _fail(at, "camera must be an object")
+        # §2.2: undistorted pinhole images; an absent model means pinhole.
+        if value.get("model", "pinhole") != "pinhole":
+            _fail(at, f"model must be 'pinhole', got {value.get('model')!r}")
+        parsed[name] = (value, _parse_camera(value, name, at))
+    images = raw.get("images")
+    if not isinstance(images, list) or not images:
+        _fail(where, "images must be a non-empty list")
+    root = path.parent
+    records: list[ImageRecord] = []
+    masks: list[Path | None] = []
+    for k, image in enumerate(images):
+        at = f"{where}, image {k}"
+        if not isinstance(image, dict):
+            _fail(at, "every image must be an object")
+        name = image.get("camera")
+        if not isinstance(name, str) or name not in parsed:
+            _fail(at, f"camera must name one of the manifest's cameras, got {name!r}")
+        base, camera = parsed[name]
+        if any(key in image for key in _OVERRIDES):
+            # §2.2: an image may override K and world_to_camera; it gets a camera of its own.
+            merged = {**base, **{key: image[key] for key in _OVERRIDES if key in image}}
+            camera = _parse_camera(merged, name, at)
+        timestamp = _finite_number(image.get("timestamp"), "timestamp", at)
+        image_path = root / _relative_path(image.get("path"), "path", at)
+        split = image.get("split")
+        if split not in _SPLITS:
+            _fail(at, f"split must be 'train' or 'test', got {split!r}")
+        frame_index = image.get("frame_index")
+        if frame_index is not None and (
+            isinstance(frame_index, bool) or not isinstance(frame_index, int)
+        ):
+            _fail(at, f"frame_index must be an int, got {frame_index!r}")
+        mask = image.get("mask")
+        if mask is not None and split != "test":
+            _fail(at, "only test images may carry a mask (§2.2)")
+        masks.append(None if mask is None else root / _relative_path(mask, "mask", at))
+        records.append(ImageRecord(camera, timestamp, image_path, split, frame_index))
+    if not any(record.split == "train" for record in records):
+        _fail(where, "needs at least one training image")
+    metadata = raw.get("metadata", {})
+    if not isinstance(metadata, dict):
+        _fail(where, "metadata must be an object")
+    return SceneManifest(
+        path=path,
+        sha256=hashlib.sha256(data).hexdigest(),
+        time_unit=time_unit,
+        records=tuple(records),
+        masks=tuple(masks),
+        metadata=metadata,
+    )
 
 
 # PLY snapshot for viewers (Q-18): export-only, never read back.

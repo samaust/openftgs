@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dataclasses for the package's public data: the frozen Camera, ImageRecord, InitPoints,
 TimeNormalizer and ExchangeModel, RenderOutput, and TrainerState, the plain data a checkpoint
-holds; the render request and its renders (Q-56); and the frame interval Δt_f of E14.
+holds; the render request and its renders (Q-56); the parsed scene manifest (Q-64); and the frame
+interval Δt_f of E14.
 
 Spec: §1.4, §2.2, E14. Band: Foundation (§2.1).
 """
@@ -27,6 +28,7 @@ __all__ = [
     "RenderOutput",
     "RenderRequest",
     "Renders",
+    "SceneManifest",
     "TimeNormalizer",
     "TrainerState",
     "frame_interval",
@@ -177,6 +179,17 @@ class Renders:
     # Keyed by item id: in request order from render_request, sorted from read_renders (Q-56).
     rgb: dict[str, Tensor]  # id → [H, W, 3] float32, not clamped to 1
     alpha: dict[str, Tensor]  # id → [H, W, 1] float32
+
+
+# Q-64: the contents of a ftgs-scene file (§2.2), as io's reader returns them.
+@dataclass(frozen=True)
+class SceneManifest:
+    path: Path  # the manifest file
+    sha256: str  # SHA-256 of the file's bytes as read, as 64 lowercase hex digits
+    time_unit: str
+    records: tuple[ImageRecord, ...]  # in file order; image paths resolved against path.parent
+    masks: tuple[Path | None, ...]  # aligned with records; only test images carry one
+    metadata: dict[str, Any]
 
 
 def frame_interval(camera_timestamps: Mapping[str, Sequence[float]], time: TimeNormalizer) -> float:

@@ -105,12 +105,16 @@ The seven-step unit of training on one image: take the next image, compute its n
 _Avoid_: step, training step, batch
 
 **Event**:
-What happens at an iteration that is a multiple of 100 within the relocation window: growth while it ≤ 15,000, then relocation, then the reset of the gradient statistics, in that order; the period is K_reloc. §1.3 step 7, D-45
+What happens at an iteration that is a multiple of K_reloc inside the growth or relocation window (500–15,000 and 500–25,000 by default): growth inside the growth window, then relocation, then the reset of the gradient statistics, in that order; in the "w/o periodic relocation" ablation, pruning follows growth and the opacity reset follows pruning. §1.3 step 7, D-45
 _Avoid_: densification step, refinement, strategy step, pruning step, the paper's N for the period
 
 **Calendar**:
 The table of iterations at which SH bands activate, growth and relocation events fall, regularization applies and the run ends; synthetic tests shorten every count in proportion to T_it. §1.3 Iteration calendar, §3.2
 _Avoid_: schedule (reserved for learning rates), timeline, test calendar as a different thing
+
+**Calendar entry**:
+What the calendar holds for one iteration: its active SH degree, and whether growth, relocation, pruning and the opacity reset happen there. §1.3 Iteration calendar
+_Avoid_: schedule (reserved for learning rates), plan, tick
 
 **Growth**:
 The part of an event, in iterations 500 to 15,000, that adds primitives by cloning or splitting candidates; nothing is deleted. §1.3 Growth, D-18
@@ -241,7 +245,7 @@ The removal of primitives whose base opacity is below 0.005 and, after iteration
 _Avoid_: deletion, culling (reserved for rendering), removal, relocation (which moves primitives instead)
 
 **Opacity reset**:
-The periodic clamp of every base opacity to at most 0.01, done only in the "w/o periodic relocation" ablation, every 3,000 iterations. §1.3 Count-control modes
+The clamp of every base opacity to at most 0.01, done only in the "w/o periodic relocation" ablation, every 3,000 iterations within the growth window. §1.3 Count-control modes
 _Avoid_: opacity clamp, alpha reset, reset_opa (gsplat's name), moment reset (a different operation)
 
 **† configuration**:
@@ -255,6 +259,18 @@ _Avoid_: target metric, baseline number, spec value
 **Training configuration**:
 The nested set of hyperparameters, `TrainConfig` and its sub-configs, whose field names are the spec's hyperparameter names; stored in full in every checkpoint manifest and named the same way in the harness config. §2.1, §2.2, §3.3
 _Avoid_: hparams, settings file, options, config (unqualified, in prose)
+
+**Sampler**:
+The seeded per-epoch permutation of the training images, with its position in the current epoch, from which each training iteration takes its image. D-26
+_Avoid_: dataloader, shuffler, batch sampler
+
+**Epoch**:
+One pass of the sampler over every training image, in one permutation. D-26
+_Avoid_: iteration (one image), round, pass (unqualified)
+
+**Step log**:
+What one training iteration reports to its caller: its image, times, active SH degree, rates, loss terms, primitive count and any event's reports. §2.1 `StepLog`
+_Avoid_: metrics (reserved for E16), history, training record
 
 ### Initialization
 
@@ -391,7 +407,7 @@ The camera held out for evaluation: cam00 on Neural3DV, 0015, 0007 or 0009 on Se
 _Avoid_: held-out view, held-out camera, test camera (outside the converter's argument name), validation view, novel view (a camera not in the dataset at all)
 
 **Multi-view video**:
-The dataset object `MultiViewVideo`: the image records of a scene manifest with their time normalizer, spatial scale and frame interval, loading images lazily. §2.1
+The dataset object `MultiViewVideo`: the image records of a scene manifest with their time normalizer, spatial scale, frame interval and test-image masks, loading images lazily. §2.1
 _Avoid_: dataset (unqualified), video, sequence, scene (the manifest)
 
 **Frame cache**:
@@ -447,6 +463,10 @@ _Avoid_: snapshot, save, .pt, model (when the exchange model is meant)
 **Trainer state**:
 The plain data a checkpoint holds: iteration, config, time normalizer, S, Δt_f, the nine stored tensors, Adam moments and step counters, gradient statistics, generator states and sampler state. §2.1 `TrainerState`
 _Avoid_: state dict (PyTorch's generic term), session, run state
+
+**Resume**:
+Continuing a run from a checkpoint, bit-exact on the reference backend; a forced resume, on a changed scene manifest, keeps the run's time normalizer, S and Δt_f. §2.2 Full checkpoint
+_Avoid_: restart, reload, warm start
 
 ### Evaluation
 

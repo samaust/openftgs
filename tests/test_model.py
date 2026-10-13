@@ -2,7 +2,7 @@
 """FreeTimeGaussians and E5 in openftgs.model: U-5, the steps-7–9 part of U-19, the model side
 of U-22, the shape parts of U-26, the §1.1 validity rules, and the gradients of the compiled
 at_time (U-28, #45) (D-2, D-3, D-5, D-24, D-25; Q-13, Q-15, Q-16, Q-17, Q-19 to Q-21, Q-23 to
-Q-25, Q-27).
+Q-25, Q-27, Q-66).
 
 Expected values are worked by hand from the spec: E5's matrix and its rotation about an axis,
 the §1.1 initial values and shapes, the §2.2 ftgs-if conversions, and k-NN distances of point
@@ -245,6 +245,36 @@ def test_at_time_is_the_temporal_slice_plus_the_sh_concat() -> None:
         torch.testing.assert_close(getattr(got, name), getattr(ref, name), rtol=0, atol=0)
     assert torch.equal(got.passes_cull, ref.passes_cull)
     assert torch.equal(got.sh, torch.cat([p["sh0"], p["shN"]], dim=1))
+
+
+def test_slice_impl_is_a_public_setting_of_the_model() -> None:
+    """Q-66 (owner answer), Q-13: every model starts at "auto"; the setting accepts
+    PerfConfig.slice_impl's values, and at_time runs the implementation it names, so "cuda"
+    raises NotImplementedError until D-50's operator exists, and "eager" gives what "auto" gives
+    on the CPU."""
+    model = _model(n=4)
+    unit = TimeNormalizer(0.0, 1.0)
+    initialized = _init(_points([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [0.0, 1.0]), unit, 1.0)
+    imported = FreeTimeGaussians.from_exchange(model.to_exchange(), device="cpu")
+    assert (model.slice_impl, initialized.slice_impl, imported.slice_impl) == ("auto",) * 3
+    auto = model.at_time(0.3)
+    model.slice_impl = "eager"
+    assert model.slice_impl == "eager"
+    eager = model.at_time(0.3)
+    torch.testing.assert_close(eager.means_t, auto.means_t, rtol=0, atol=0)
+    torch.testing.assert_close(eager.opacities_t, auto.opacities_t, rtol=0, atol=0)
+    model.slice_impl = "cuda"
+    with pytest.raises(NotImplementedError):
+        model.at_time(0.3)
+
+
+@pytest.mark.parametrize("value", ["fast", "", None, 1])
+def test_slice_impl_rejects_other_values(value: object) -> None:
+    """Q-66: only PerfConfig.slice_impl's values; the setting is left unchanged."""
+    model = _model(n=2)
+    with pytest.raises(ValueError, match="slice_impl"):
+        model.slice_impl = value  # type: ignore[assignment]
+    assert model.slice_impl == "auto"
 
 
 def test_at_time_cuts_sh_to_the_requested_degree() -> None:

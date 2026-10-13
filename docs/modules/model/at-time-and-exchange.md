@@ -12,7 +12,7 @@ The nine stored tensors of §1.1 are registered as parameters under their own na
 
 ## What `at_time` returns
 
-`at_time` takes a normalized time, a float as in §2.1, and runs the temporal slice of `openftgs.motion` (Q-12, Q-13). It returns `GaussiansAtTime`: the slice's fields plus the SH coefficients, the DC band and the higher bands concatenated and cut to the requested degree. The SH coefficients don't depend on time, so the concat isn't part of the slice; the culling mask, the base opacity and the E8 terms are carried along so a training step computes the slice once (D-49).
+`at_time` takes a normalized time, a float as in §2.1, and runs the temporal slice of `openftgs.motion` (Q-12, Q-13) with the implementation the model's `slice_impl` names. `slice_impl` is a public attribute, "auto" by default and checked when set; the trainer sets it from `PerfConfig.slice_impl`, and every way of building a model starts at "auto" (owner answer, Q-66). It returns `GaussiansAtTime`: the slice's fields plus the SH coefficients, the DC band and the higher bands concatenated and cut to the requested degree. The SH coefficients don't depend on time, so the concat isn't part of the slice; the culling mask, the base opacity and the E8 terms are carried along so a training step computes the slice once (D-49).
 
 E5 lives here as `rotation_matrix` and `covariance`, below the render backends and density, which both need it (U-5).
 
