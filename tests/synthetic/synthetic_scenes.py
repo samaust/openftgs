@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 import torch
-from builders import look_at, ring, shortened_config, write_scene
+from builders import C0, look_at, ring, shortened_config, write_scene
 from torch import Tensor
 
 from openftgs.config import TrainConfig
@@ -31,7 +31,6 @@ from openftgs.types import Camera, ExchangeModel, TimeNormalizer
 DATA = Path(__file__).parent / "data"
 SEEDS_FILE = DATA / "seeds.json"
 FPS = 30.0
-C0 = 0.28209479177387814  # §1.1
 F64 = torch.float64
 F32 = torch.float32
 
@@ -44,8 +43,6 @@ DEAD_CLEARANCE = 5.0 * SCALE_RANGE[1]  # Q-78: dead rows of S-6 away from every 
 SPEED_RANGE = (0.125, 0.5)  # Q-77: §3.2's 0.5–2 per unit t, × ¼
 CENTER_RADIUS = 0.2  # Q-79: S-2 centers at t = ½ within 0.2 of the origin
 VOLUME = 0.35  # half-width of the cube that holds every trajectory: the view volume
-
-Device = Literal["cpu", "cuda"]
 
 
 def tau(frame: float) -> float:
@@ -73,7 +70,7 @@ def ring_rig() -> Rig:
     train = ring(8, radius=0.9, elevation=0.3, width_px=SIZE, height_px=SIZE, focal=64.0)
     angle = 2 * math.pi / 16
     held_out = look_at(
-        (0.9 * math.cos(angle), 0.9 * math.sin(angle), 0.5),
+        (0.9 * math.cos(angle), 0.9 * math.sin(angle), 0.5),  # Q-79
         width=SIZE,
         height=SIZE,
         focal=64.0,
@@ -82,9 +79,10 @@ def ring_rig() -> Rig:
     return Rig(train, [held_out])
 
 
+# Q-79: the hemisphere rig.
 _TRAIN_ELEVATIONS = (20.0, 40.0, 60.0)  # degrees; four azimuths each
 _TEST_VIEWS = ((30.0, 45.0), (50.0, 135.0), (25.0, 225.0), (55.0, 315.0))  # (elev, azim)
-HEMISPHERE_FOCAL = 56.0
+HEMISPHERE_FOCAL = 56.0  # Q-77, Q-79: every trajectory in view
 
 
 def _on_sphere(radius: float, elevation: float, azimuth: float) -> tuple[float, float, float]:
@@ -231,9 +229,9 @@ def _gt_s2(seed: int) -> ExchangeModel:
     taus = frame_taus()
     rig = hemisphere_rig()
     cameras = rig.train + rig.test
-    rows: list[dict[str, Tensor]] = []
+    drawn: list[dict[str, Tensor]] = []
     tracks: list[Tensor] = []
-    while len(rows) < 8:
+    while len(drawn) < 8:
         center = _uniform(g, -CENTER_RADIUS, CENTER_RADIUS, 3)
         direction = torch.randn(3, generator=g, dtype=F64)
         direction = direction / torch.linalg.vector_norm(direction)
@@ -259,9 +257,9 @@ def _gt_s2(seed: int) -> ExchangeModel:
             float(torch.linalg.vector_norm(track - t, dim=1).min()) < SEPARATION for t in tracks
         ):
             continue
-        rows.append(row)
+        drawn.append(row)
         tracks.append(track)
-    arrays = {k: torch.stack([row[k] for row in rows]) for k in rows[0]}
+    arrays = {k: torch.stack([row[k] for row in drawn]) for k in drawn[0]}
     for k in ("time_center", "duration", "opacity"):
         arrays[k] = arrays[k].reshape(-1)
     return exchange(arrays, tau0=0.0, tau1=span, degree=0)
@@ -341,6 +339,16 @@ def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, Exchang
     }
 
 
+def same_exchange(a: ExchangeModel, b: ExchangeModel) -> bool:
+    """Whether two exchange models hold the same header fields and bitwise-equal arrays."""
+    fields = ("sh_degree", "tau0", "tau1", "time_unit", "producer")
+    return (
+        all(getattr(a, f) == getattr(b, f) for f in fields)
+        and a.arrays.keys() == b.arrays.keys()
+        and all(torch.equal(a.arrays[k], b.arrays[k]) for k in a.arrays)
+    )
+
+
 def ground_truth(scene: str) -> ExchangeModel:
     """A committed ground-truth file (§3.2)."""
     return read_exchange(DATA / GROUND_TRUTH_FILES[scene])
@@ -393,7 +401,10 @@ def at_trajectory_points(gt: ExchangeModel, taus: Tensor) -> ExchangeModel:
     """Q-79, S-2: each primitive at its ground-truth position at its own raw time taus[i], with
     μt = taus[i] and v = 0; everything else as the ground truth."""
     a = gt.arrays
-    points = a["position"].to(F64) + a["velocity"].to(F64) * (taus - a["time_center"])[:, None]
+    # E1 at each primitive's own time: the diagonal of the all-times trajectories.
+    points = torch.diagonal(
+        trajectory_points(a["position"], a["velocity"], a["time_center"], taus), dim1=0, dim2=1
+    ).T
     return replaced(
         gt, position=points, time_center=taus.to(F64), velocity=torch.zeros_like(points)
     )
@@ -409,11 +420,11 @@ def draw_taus(seed: int, choices: Sequence[float], n: int) -> Tensor:
 # Scenes on disk.
 
 
-Image = tuple[Camera, float, Literal["train", "test"]]
+SceneImage = tuple[Camera, float, Literal["train", "test"]]
 
 
 def scene_video(
-    root: Path, gt: ExchangeModel, images: Sequence[Image], device: str
+    root: Path, gt: ExchangeModel, images: Sequence[SceneImage], device: str
 ) -> MultiViewVideo:
     """The ground truth rendered on `device` with that device's backend into a scene manifest
     and 8-bit PNGs (§3.2), and its multi-view video. The ground truth renders under the
@@ -427,14 +438,14 @@ def scene_video(
 
 def grid(
     cameras: Iterable[Camera], taus: Iterable[float], split: Literal["train", "test"]
-) -> list[Image]:
+) -> list[SceneImage]:
     return [(camera, t, split) for t in taus for camera in cameras]
 
 
 # Training (§3.2 shared setup; Q-75, Q-79).
 
 
-def config(iterations: int, base: TrainConfig) -> TrainConfig:
+def synthetic_config(iterations: int, base: TrainConfig) -> TrainConfig:
     """`base` without the perceptual loss (Q-79), on the shortened calendar of §3.2 (Q-75)."""
     loss = dataclasses.replace(base.loss, lambda_perc=0.0)
     return shortened_config(iterations, dataclasses.replace(base, loss=loss))

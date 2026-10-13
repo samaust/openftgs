@@ -12,20 +12,20 @@ import dataclasses
 import functools
 import math
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
 import torch
+from builders import C0
 from synthetic_scenes import (
-    C0,
     DATA,
     FPS,
     GROUND_TRUTH_FILES,
+    SceneImage,
     assert_rows_matched,
     at_trajectory_points,
     concatenated,
-    config,
     dead_rows,
     draw_taus,
     frame_taus,
@@ -40,8 +40,10 @@ from synthetic_scenes import (
     replaced,
     ring_rig,
     rows,
+    same_exchange,
     scene_video,
     split_indices,
+    synthetic_config,
     tau,
     train,
     trajectory_error,
@@ -53,25 +55,59 @@ from openftgs.config import GrowthConfig, LossConfig, RelocConfig, TrainConfig
 from openftgs.data import MultiViewVideo
 from openftgs.io import read_exchange
 from openftgs.train import StepLog, Trainer
-from openftgs.types import ExchangeModel
+from openftgs.types import ExchangeModel, TimeNormalizer
 
 DEVICES = [pytest.param("cpu", id="cpu"), pytest.param("cuda", id="cuda", marks=pytest.mark.gpu)]
 Record = Callable[[str, object], None]
+
+
+def _record(record_property: Record, prefix: str, values: dict[str, float]) -> None:
+    for name, value in values.items():
+        record_property(f"{prefix}_{name}", value)
 
 
 def test_committed_ground_truth_reproduces_from_its_seeds() -> None:
     """§3.2 ("ground-truth files and seeds are committed"): the generator, run from the committed
     seeds, gives the committed ftgs-if files bitwise."""
     for scene, model in generate_ground_truth(load_seeds()).items():
-        committed = read_exchange(DATA / GROUND_TRUTH_FILES[scene])
-        assert (committed.sh_degree, committed.tau0, committed.tau1) == (
-            model.sh_degree,
-            model.tau0,
-            model.tau1,
-        )
-        assert committed.arrays.keys() == model.arrays.keys()
-        for key, value in model.arrays.items():
-            assert torch.equal(committed.arrays[key], value), (scene, key)
+        assert same_exchange(read_exchange(DATA / GROUND_TRUTH_FILES[scene]), model), scene
+
+
+def test_recovery_measures_on_a_ground_truth_with_known_errors() -> None:
+    """Q-80's measures against S-2's ground truth perturbed by known amounts: a position shift d
+    gives a trajectory error of ‖d‖; shifting μt by δ and μx by v·δ leaves the trajectory
+    unchanged (§3.2's note on S-2); velocities × 1.1 give a magnitude and vector error of 0.1
+    and no angle; velocities turned by 2° in a plane containing them give an angle of 2°, no
+    magnitude error and a vector error of 2·sin 1°."""
+    gt = ground_truth("s2")
+    a = gt.arrays
+    frame = TimeNormalizer(gt.tau0, gt.tau1)
+    position, velocity = a["position"].to(torch.float64), a["velocity"].to(torch.float64)
+    taus = frame_taus()
+
+    d = torch.tensor([0.003, 0.0, 0.004], dtype=torch.float64)
+    shifted = model_under(replaced(gt, position=position + d), frame, sh_degree=0)
+    assert trajectory_error(shifted, gt, taus) == pytest.approx(0.005, abs=1e-6)
+    delta = tau(1.5)
+    moved = replaced(gt, position=position + velocity * delta, time_center=a["time_center"] + delta)
+    assert trajectory_error(model_under(moved, frame, sh_degree=0), gt, taus) <= 1e-6
+
+    faster = model_under(replaced(gt, velocity=1.1 * velocity), frame, sh_degree=0)
+    errors = velocity_errors(faster, gt)
+    assert errors["magnitude"] == pytest.approx(0.1, abs=1e-5)
+    assert errors["vector"] == pytest.approx(0.1, abs=1e-5)
+    assert errors["angle_deg"] <= 0.05
+
+    theta = math.radians(2.0)
+    side = torch.linalg.cross(velocity, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float64))
+    side = side / torch.linalg.vector_norm(side, dim=1, keepdim=True)
+    speed = torch.linalg.vector_norm(velocity, dim=1, keepdim=True)
+    turned_velocity = math.cos(theta) * velocity + math.sin(theta) * speed * side
+    turned = model_under(replaced(gt, velocity=turned_velocity), frame, sh_degree=0)
+    errors = velocity_errors(turned, gt)
+    assert errors["angle_deg"] == pytest.approx(2.0, abs=0.01)
+    assert errors["magnitude"] <= 1e-5
+    assert errors["vector"] == pytest.approx(2 * math.sin(theta / 2), abs=1e-5)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -101,7 +137,7 @@ def test_s1_one_static_gaussian_recovers_position_and_appearance(
         sh=torch.zeros_like(gt.arrays["sh"]),  # gray: C₀·0 + ½
         opacity=torch.full_like(gt.arrays["opacity"], 0.1),  # D-5 (Q-79)
     )
-    cfg = config(
+    cfg = synthetic_config(
         2_000,
         TrainConfig(
             sh_degree=0,
@@ -142,11 +178,39 @@ def test_s1_one_static_gaussian_recovers_position_and_appearance(
 S2_ITERATIONS = 5_000
 
 
-def _s2_config(iterations: int = S2_ITERATIONS, **fields: object) -> TrainConfig:
-    """S-2's configuration: growth off (§3.2), relocation and λ_reg at their defaults, SH degree
-    3 (Q-79), on the shortened calendar of `iterations` (5,000 by default)."""
-    base = TrainConfig(growth=GrowthConfig(mode="none"))
-    return config(iterations, dataclasses.replace(base, **fields))  # type: ignore[arg-type]
+def _s2_config(iterations: int = S2_ITERATIONS, *, reloc: RelocConfig | None = None) -> TrainConfig:
+    """S-2's configuration: growth off (§3.2), relocation (unless `reloc` is given) and λ_reg at
+    their defaults, SH degree 3 (Q-79), on the shortened calendar of `iterations` (5,000 by
+    default)."""
+    base = TrainConfig(growth=GrowthConfig(mode="none"), reloc=reloc or RelocConfig())
+    return synthetic_config(iterations, base)
+
+
+def _train(
+    cfg: TrainConfig,
+    video: MultiViewVideo,
+    init: ExchangeModel,
+    device: str,
+    callbacks: Sequence[Callable[[Trainer, StepLog], None]] = (),
+) -> tuple[Trainer, list[StepLog]]:
+    """A run from `init` under the video's time normalizer, at SH degree 3."""
+    return train(cfg, video, model_under(init, video.time, sh_degree=3), device, callbacks)
+
+
+def _held_out_psnr(trainer: Trainer, video: MultiViewVideo) -> float:
+    return mean_psnr(trainer.model, video, split_indices(video, "test"))  # Q-80
+
+
+def _s2_scene(
+    root: Path, device: str, scene: str = "s2"
+) -> tuple[ExchangeModel, MultiViewVideo, list[float]]:
+    """A ground truth of the S-2 family and its scene (12 training and 4 held-out hemisphere
+    cameras, 30 frames)."""
+    gt = ground_truth(scene)
+    rig = hemisphere_rig()
+    taus = [tau(k) for k in range(30)]
+    images = grid(rig.train, taus, "train") + grid(rig.test, taus, "test")
+    return gt, scene_video(root, gt, images, device), taus
 
 
 def _s2_init(gt: ExchangeModel, seed: int, choices: list[float]) -> ExchangeModel:
@@ -159,34 +223,21 @@ def _s2_init(gt: ExchangeModel, seed: int, choices: list[float]) -> ExchangeMode
 def _s2_run(device: str) -> dict[str, float]:
     """S-2's run on `device` and its measures; cached so S-8 compares against the same
     synchronized run (Q-80)."""
-    gt = ground_truth("s2")
-    rig = hemisphere_rig()
-    taus = [tau(k) for k in range(30)]
     with tempfile.TemporaryDirectory() as root:
-        video = scene_video(
-            Path(root), gt, grid(rig.train, taus, "train") + grid(rig.test, taus, "test"), device
-        )
+        gt, video, taus = _s2_scene(Path(root), device)
         S = video.spatial_scale(1.1)
         init = _s2_init(gt, load_seeds()["s2"]["init_frames"], taus)
-        trainer, logs = train(
-            _s2_config(), video, model_under(init, video.time, sh_degree=3), device
-        )
+        trainer, logs = _train(_s2_config(), video, init, device)
         assert_rows_matched(logs, 8)
-        model = trainer.model
-        velocity = velocity_errors(model, gt)
+        velocity = velocity_errors(trainer.model, gt)  # Q-80
         return {
             "S": S,
-            "trajectory_error_over_S": trajectory_error(model, gt, frame_taus()) / S,
+            "trajectory_error_over_S": trajectory_error(trainer.model, gt, frame_taus()) / S,
             "velocity_magnitude": velocity["magnitude"],
             "velocity_angle_deg": velocity["angle_deg"],
             "velocity_vector": velocity["vector"],
-            "held_out_psnr": mean_psnr(model, video, split_indices(video, "test")),
+            "held_out_psnr": _held_out_psnr(trainer, video),
         }
-
-
-def _record(record_property: Record, prefix: str, values: dict[str, float]) -> None:
-    for name, value in values.items():
-        record_property(f"{prefix}_{name}", value)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -220,8 +271,9 @@ def test_s7_interpolates_at_unseen_odd_frames(
         tmp_path, gt, grid(rig.train, even, "train") + grid(rig.train, odd, "test"), device
     )
     init = _s2_init(gt, load_seeds()["s7"]["init_frames"], even)  # D-66: training frames only
-    trainer, logs = train(_s2_config(), video, model_under(init, video.time, sh_degree=3), device)
+    trainer, logs = _train(_s2_config(), video, init, device)
     assert_rows_matched(logs, 8)
+    # Q-79, Q-80: even frames are the training images themselves, odd frames the test split.
     psnr_even = mean_psnr(trainer.model, video, split_indices(video, "train"))
     psnr_odd = mean_psnr(trainer.model, video, split_indices(video, "test"))
     _record(record_property, f"s7_{device}", {"psnr_even": psnr_even, "psnr_odd": psnr_odd})
@@ -240,17 +292,17 @@ def test_s8_per_image_timestamps_recover_unsynchronized_cameras(
     seeds = load_seeds()["s8"]
     g = torch.Generator().manual_seed(seeds["offsets"])
     offsets = torch.rand(len(rig.train), generator=g, dtype=torch.float64).tolist()
-    images = [
+    images: list[SceneImage] = [
         (camera, tau(k + delta), "train")
         for k in range(30)
         for camera, delta in zip(rig.train, offsets, strict=True)
     ]
-    video = scene_video(tmp_path, gt, images, device)  # type: ignore[arg-type]
+    video = scene_video(tmp_path, gt, images, device)
     choices = sorted({t for _, t, _ in images})
-    init = with_degree(at_trajectory_points(gt, draw_taus(seeds["init_images"], choices, 8)), 3)
-    trainer, logs = train(_s2_config(), video, model_under(init, video.time, sh_degree=3), device)
+    init = _s2_init(gt, seeds["init_images"], choices)
+    trainer, logs = _train(_s2_config(), video, init, device)
     assert_rows_matched(logs, 8)
-    unsynchronized = velocity_errors(trainer.model, gt)["vector"]
+    unsynchronized = velocity_errors(trainer.model, gt)["vector"]  # Q-80
     synchronized = _s2_run(device)["velocity_vector"]
     _record(
         record_property,
@@ -286,13 +338,12 @@ def test_s3_recovers_time_centers_and_durations(
         time_center=a["time_center"] + tau(2),
         duration=torch.full_like(a["duration"], tau(1)),
     )
-    cfg = _s2_config(S3_ITERATIONS)
-    trainer, logs = train(cfg, video, model_under(init, video.time, sh_degree=3), device)
+    trainer, logs = _train(_s2_config(S3_ITERATIONS), video, init, device)
     assert_rows_matched(logs, 12)
     p = physical(trainer.model)
     center_error = float(((p["time_center"] - a["time_center"]).abs() * FPS).max())
     duration_error = float((p["duration"] / a["duration"] - 1.0).abs().max())
-    held_out = mean_psnr(trainer.model, video, split_indices(video, "test"))
+    held_out = _held_out_psnr(trainer, video)
     _record(
         record_property,
         f"s3_{device}",
@@ -305,18 +356,6 @@ def test_s3_recovers_time_centers_and_durations(
     assert center_error <= 0.5
     assert duration_error <= 0.25
     assert held_out >= 33.0
-
-
-def _s2_scene(
-    root: Path, device: str, scene: str = "s2"
-) -> tuple[ExchangeModel, MultiViewVideo, list[float]]:
-    """A ground truth of the S-2 family and its scene (12 training and 4 held-out hemisphere
-    cameras, 30 frames)."""
-    gt = ground_truth(scene)
-    rig = hemisphere_rig()
-    taus = [tau(k) for k in range(30)]
-    images = grid(rig.train, taus, "train") + grid(rig.test, taus, "test")
-    return gt, scene_video(root, gt, images, device), taus
 
 
 @pytest.mark.gpu
@@ -333,20 +372,16 @@ def test_s5_regularization_keeps_fewer_primitives_opaque(
     objects = _s2_init(rows(gt, slice(0, 8)), load_seeds()["s2"]["init_frames"], taus)
     init = concatenated(objects, with_degree(rows(gt, slice(8, None)), 3))
     init = replaced(init, opacity=torch.full_like(init.arrays["opacity"], 0.1))
-    start = model_under(init, video.time, sh_degree=3)
     growth = GrowthConfig(n_max=10_000)  # mode "gradient" (Q-78)
     results: dict[str, float] = {}
     for name, lambda_reg in (("no_reg", 0.0), ("reg", 1e-2)):
-        cfg = config(
-            S2_ITERATIONS, TrainConfig(loss=LossConfig(lambda_reg=lambda_reg), growth=growth)
-        )
-        trainer, _ = train(cfg, video, start, device)
+        loss = LossConfig(lambda_reg=lambda_reg)
+        cfg = synthetic_config(S2_ITERATIONS, TrainConfig(loss=loss, growth=growth))
+        trainer, _ = _train(cfg, video, init, device)
         opacity = physical(trainer.model)["opacity"]
         results[f"{name}_opaque_share"] = float((opacity > 0.9).to(torch.float64).mean())
         results[f"{name}_count"] = float(opacity.shape[0])
-        results[f"{name}_held_out_psnr"] = mean_psnr(
-            trainer.model, video, split_indices(video, "test")
-        )
+        results[f"{name}_held_out_psnr"] = _held_out_psnr(trainer, video)
     _record(record_property, f"s5_{device}", results)
     assert results["reg_opaque_share"] < results["no_reg_opaque_share"]
     assert results["reg_held_out_psnr"] >= results["no_reg_held_out_psnr"] - 0.5
@@ -357,7 +392,7 @@ DEAD_LOGIT = float(torch.tensor(math.log(0.005) - math.log1p(-0.005), dtype=torc
 
 
 @dataclasses.dataclass(frozen=True)
-class _S6:
+class _S6Runs:
     counts: frozenset[int]  # N over every iteration of both runs
     first_event_dead: int  # dead rows the first relocation event moved
     dead_after_event: tuple[int, ...]  # event iterations that left a dead row
@@ -367,20 +402,20 @@ class _S6:
 
 
 @functools.cache
-def _s6_runs(device: str) -> _S6:
+def _s6_runs(device: str) -> _S6Runs:
     """S-6's two runs on `device` (relocation on and off, Q-78), shared by its two tests."""
     with tempfile.TemporaryDirectory() as root:
         gt, video, taus = _s2_scene(Path(root), device)
         seeds = load_seeds()
         dead = dead_rows(seeds["s6"]["dead"], gt, 8, frame_taus())
         init = concatenated(_s2_init(gt, seeds["s2"]["init_frames"], taus), with_degree(dead, 3))
-        start = model_under(init, video.time, sh_degree=3)
         events: list[StepLog] = []
         dead_after: list[int] = []
 
         def check_event(trainer: Trainer, log: StepLog) -> None:
             if log.relocation is not None:
                 events.append(log)
+                # Q-78: right after an event, where E11's lower clamp leaves no dead row.
                 if not bool((trainer.model.opacity_logits.detach() >= DEAD_LOGIT).all()):
                     dead_after.append(log.iteration)
 
@@ -388,12 +423,12 @@ def _s6_runs(device: str) -> _S6:
         psnrs: dict[str, float] = {}
         for name, enabled in (("on", True), ("off", False)):
             cfg = _s2_config(reloc=RelocConfig(enabled=enabled))
-            trainer, logs = train(cfg, video, start, device, [check_event] if enabled else [])
+            trainer, logs = _train(cfg, video, init, device, [check_event] if enabled else [])
             counts.update(log.num_gaussians for log in logs)
-            psnrs[name] = mean_psnr(trainer.model, video, split_indices(video, "test"))
+            psnrs[name] = _held_out_psnr(trainer, video)
         first = events[0].relocation
         assert first is not None
-        return _S6(
+        return _S6Runs(
             counts=frozenset(counts),
             first_event_dead=first.dead,
             dead_after_event=tuple(dead_after),
@@ -404,11 +439,22 @@ def _s6_runs(device: str) -> _S6:
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(device: str) -> None:
+def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(
+    device: str, record_property: Record
+) -> None:
     """S-6: S-2's initialization plus as many dead primitives (σ = 10⁻³) away from the objects,
     N = 16 (Q-78), relocation on, growth off. N stays constant; the first relocation event moves
     all 8 dead rows (Q-82); right after each event no row is dead (Q-78)."""
     runs = _s6_runs(device)
+    _record(
+        record_property,
+        f"s6_{device}",
+        {
+            "events": float(runs.events),
+            "first_event_dead": float(runs.first_event_dead),
+            "events_leaving_a_dead_row": float(len(runs.dead_after_event)),
+        },
+    )
     assert runs.counts == {16}
     assert runs.events > 0
     assert runs.first_event_dead == 8
@@ -416,8 +462,9 @@ def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(device: str) -> 
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.xfail(
+@pytest.mark.xfail(  # Q-82
     strict=True,
+    raises=AssertionError,
     reason="Q-82: unattainable under E10 and E11 for S-2's one-Gaussian objects; the measured "
     "gain is recorded in the Calibration data table, pending a spec decision",
 )
