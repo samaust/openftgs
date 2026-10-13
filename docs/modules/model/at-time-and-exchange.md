@@ -8,6 +8,8 @@ The nine stored tensors of §1.1 are registered as parameters under their own na
 
 `resize_` takes a bool mask for the kept rows, so it can't reorder or repeat them, and appends new rows last (Q-23). It revalidates the whole model, so a non-finite value anywhere surfaces at the next resize. It builds new parameters, so an optimizer must rebind them (M7).
 
+`validate()` applies the same checks to the current parameters without rebuilding them; the constructor and `validate()` share one private checker (Q-55). Relocation writes the parameters in place, so it calls `validate()` before it draws and after it writes, as §1.1 asks after every relocation. Like the constructor, it reads values and so synchronizes on a GPU, which events allow (§2.4 rule 3).
+
 ## What `at_time` returns
 
 `at_time` takes a normalized time, a float as in §2.1, and runs the temporal slice of `openftgs.motion` (Q-12, Q-13). It returns `GaussiansAtTime`: the slice's fields plus the SH coefficients, the DC band and the higher bands concatenated and cut to the requested degree. The SH coefficients don't depend on time, so the concat isn't part of the slice; the culling mask, the base opacity and the E8 terms are carried along so a training step computes the slice once (D-49).

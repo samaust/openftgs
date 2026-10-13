@@ -128,6 +128,14 @@ _Avoid_: duplicate (gsplat's name), copy (reserved for relocation)
 The growth of a larger candidate into two children drawn from its Gaussian with scales divided by 1.6, which replace it; the split is spatial only. E17, D-43
 _Avoid_: 4D split, subdivide, split (for the train/test label, which is a data split)
 
+**Parent**:
+The candidate a grown row comes from: the primitive a clone copies, or the one a split replaces with its two children; its gradient statistics pass to its new rows. §1.3 Growth, E17, D-45
+_Avoid_: source, original, donor, target (reserved for relocation)
+
+**Child**:
+One of the two rows a split makes from its parent and that replace it, carrying the parent's tensors except a position drawn from its Gaussian and scales divided by 1.6. E17, D-43
+_Avoid_: offspring, split Gaussian, new Gaussian, clone (an exact copy)
+
 **Cap N_max**:
 The maximum primitive count, 3,000,000 by default and 500,000 in the † configuration; when candidates exceed the room left, the largest-g ones grow, ties to the lower row. D-44, D-39
 _Avoid_: budget (reserved for the initial budget B and the budgets of benchmarks), max Gaussians, limit
@@ -145,7 +153,7 @@ Every primitive not in the dead set; the population scored and drawn from in a r
 _Avoid_: alive mask, survivors, kept set
 
 **Target**:
-A live primitive drawn with replacement, with probability proportional to its sampling score, to receive one or more dead primitives in a relocation. §1.3 Relocation step 3
+A live primitive drawn with replacement, with probability proportional to its sampling score, to receive one or more dead primitives in a relocation, or new rows in the "score" count-control mode. §1.3 Relocation step 3, §1.3 Count-control modes
 _Avoid_: destination, parent (reserved for growth), donor
 
 **Relocation move**:
@@ -227,6 +235,14 @@ _Avoid_: scene scale, scene extent, scene radius, cameras_extent (3DGS's name), 
 **Ablation**:
 A configured departure from the default method that reproduces one of the paper's §4.2 variants, such as "w/o 4D initialization" (zero initial velocities) or "w/o periodic relocation" (relocation off; 3DGS densification with pruning and opacity resets in its place). §1.3, §1.4
 _Avoid_: variant, baseline, experiment
+
+**Pruning**:
+The removal of primitives whose base opacity is below 0.005 and, after iteration 3,000, of those whose largest scale exceeds 0.1·S; done only in the "w/o periodic relocation" ablation, the one exception to N never decreasing. §1.3 Count-control modes, §1.1
+_Avoid_: deletion, culling (reserved for rendering), removal, relocation (which moves primitives instead)
+
+**Opacity reset**:
+The periodic clamp of every base opacity to at most 0.01, done only in the "w/o periodic relocation" ablation, every 3,000 iterations. §1.3 Count-control modes
+_Avoid_: opacity clamp, alpha reset, reset_opa (gsplat's name), moment reset (a different operation)
 
 **† configuration**:
 The default configuration with N_max = 500,000, reproducing the paper's "≤ 500k primitives" rows. D-39
