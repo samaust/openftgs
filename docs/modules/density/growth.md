@@ -14,11 +14,11 @@ New rows go last, so kept rows keep their order (§1.3 Growth step 4): clones fi
 - `FTGSOptimizer.resize_` gives the new rows zero Adam moments (D-45) and rebinds to the model's new parameters (Q-44);
 - `GradStats.resize_` copies each new row's statistics from its parent (D-45).
 
-Growth only adds: N never decreases (§1.1, D-42). First measurement (CPU, the seed the test uses): U-25's 10⁶ split offsets are off the parent's Gaussian by at most 0.21% in the whitened mean and covariance, inside the 1% of Q-54.
+Growth only adds: N never decreases (§1.1, D-42). First measurement (CPU, the seed the test uses): U-25's 10⁶ split offsets are off the parent's Gaussian by at most 0.21% in the whitened mean and covariance, inside Q-54's bound.
 
 ## The "score" and "none" modes
 
-In the "score" mode, `grow` appends rows drawn in proportion to the sampling score and initializes them with E11, as relocation's moved copies are (§1.3 Count-control modes). It shares relocation's move: the targets are drawn from the live set only, since a dead target would be rewritten at ô_dead by E11's logit floor and then skipped as live by the relocation of the same event (Q-52). Each target gets E11 with its number of copies and zeroed Adam moments; the new rows are its updated copies in draw order, placed per `copy_position`, inheriting its statistics. The model is validated and the live scores checked before the draw, as in relocation (Q-51, Q-55).
+In the "score" mode, `grow` appends rows drawn in proportion to the sampling score and initializes them with E11, as relocation's moved copies are (§1.3 Count-control modes). It shares relocation's move: the targets are drawn from the live set only, since a dead target would be rewritten at ô_dead by E11's logit floor and then skipped as live by the relocation of the same event (Q-52). Each target gets E11 with its number of draws plus one and zeroed Adam moments; the new rows carry its updated tensors, one per draw in draw order, placed per `copy_position`, inheriting its statistics. Whenever rows are to be added, the model is validated first and the live scores checked before the draw, as in relocation (Q-51, Q-55); with no live row, nothing is added (Q-52).
 
 In the "none" mode, `grow` touches nothing and draws nothing.
 

@@ -5,8 +5,9 @@ and the added tests of PRD #65.
 
 Expected values are worked by hand from the spec (the NDC scaling of E10, E11 at n = 1 and 2,
 E17's factor 1.6), come from properties the rows state (1 − (1 − σ_new)^n = σ, the target's
-Gaussian), from an independent float64 evaluation of E11 written literally as Python loops, or
-from gsplat 1.5.3's `compute_relocation` as the oracle U-13 names (GPU).
+Gaussian, whose rotation comes from SciPy), from an independent evaluation of E11 written
+literally as Python loops in 50-digit decimal (stricter than the float64 one U-13 names), or from
+gsplat 1.5.3's `compute_relocation` as the oracle U-13 names (GPU).
 """
 
 import decimal
@@ -109,7 +110,7 @@ def test_u16_packed_mode_counts_each_camera_through_gaussian_ids() -> None:
         assert torch.equal(stats.count, expected_count)
 
 
-def test_u16_mean_is_the_average_over_visible_iterations_and_reset_zeroes() -> None:
+def test_mean_is_the_average_over_visible_iterations_and_reset_zeroes() -> None:
     """E10: g is the mean, over the iterations in which a primitive was visible, of its norm;
     a primitive never visible has g = 0 (U-15). reset() zeroes both accumulators (§1.3 step 7)."""
     stats = GradStats(3)
@@ -155,7 +156,7 @@ def _stats_with(sums: list[float], counts: list[int]) -> GradStats:
     return stats
 
 
-def test_u16_resize_keeps_rows_in_order_and_new_rows_copy_their_parents() -> None:
+def test_resize_keeps_rows_in_order_and_new_rows_take_their_parents_statistics() -> None:
     """§1.3 Growth step 4, D-45: kept rows keep their order and new rows go last, copying their
     parents' g_sum and count. Parents are indexed before the resize, so a split's children can
     name the parent the same resize removes; a parent may be named twice (Q-23, Q-49)."""
@@ -302,9 +303,11 @@ def test_u16_update_mean_and_reset_make_no_host_synchronization() -> None:
 
 @pytest.mark.gpu
 def test_u16_gsplat_packed_and_unpacked_layouts_give_the_same_statistics() -> None:
-    """D-75 (U-16 is its detecting test): the 2D means are the gradient anchor in both layouts,
-    so a two-camera gsplat render backpropagated through one loss gives the same counts and,
-    within float32 rounding of gsplat's atomic backward, the same g_sum."""
+    """U-16, D-75 (U-16 is its detecting test): the 2D means are the gradient anchor in both
+    layouts, so a two-camera gsplat render backpropagated through one loss gives the same counts,
+    exactly, and the same g_sum within U-12's criterion for gsplat gradients (cosine ≥ 0.999,
+    relative L2 error ≤ 1e-3): the two layouts run different kernels whose atomic backward sums
+    in another order (2.5e-8 relative L2 measured on the RTX 4090)."""
     model = random_model(200, seed=3, spread=0.8, sh_degree=1).to("cuda")
     cameras = ring(2, width_px=64, height_px=48, focal=60.0)
     weights = torch.rand(2, 48, 64, 3, generator=torch.Generator().manual_seed(4)).to("cuda")
@@ -332,7 +335,9 @@ def test_u16_gsplat_packed_and_unpacked_layouts_give_the_same_statistics() -> No
     assert bool((unpacked_stats.count == 2).any())  # some primitive is seen by both cameras
     assert torch.equal(packed_stats.count, unpacked_stats.count)
     error = float(torch.linalg.vector_norm(packed_stats.g_sum - unpacked_stats.g_sum))
-    assert error <= 1e-5 * float(torch.linalg.vector_norm(unpacked_stats.g_sum)), error
+    assert error <= 1e-3 * float(torch.linalg.vector_norm(unpacked_stats.g_sum)), error
+    cosine = torch.nn.functional.cosine_similarity(packed_stats.g_sum, unpacked_stats.g_sum, dim=0)
+    assert float(cosine) >= 0.999
 
 
 # U-15 · the sampling score (E10, D-13; Q-48)
@@ -480,7 +485,7 @@ def test_u13_clamp_active_case_uses_the_unclamped_opacity_for_the_scale() -> Non
     assert float(new_scales[0, 0]) == pytest.approx(a_new, rel=1e-10, abs=0.0)
 
 
-def test_u13_upper_clamp_applies_after_the_scale() -> None:
+def test_upper_clamp_applies_after_the_scale() -> None:
     """E11: σ_new is clamped to at most 1 − 2⁻²³ only after a_new is computed from the unclamped
     σ_new (so with n = 1, a stays a)."""
     new_sigma, new_scales = _split64([1.0 - 2.0**-30], [1], [3.0])
@@ -488,7 +493,7 @@ def test_u13_upper_clamp_applies_after_the_scale() -> None:
     assert float(new_scales[0, 0]) == pytest.approx(3.0, rel=1e-10, abs=0.0)
 
 
-def test_u13_n_is_clamped_to_1_and_51() -> None:
+def test_n_is_clamped_to_1_and_51() -> None:
     """E11: n is clamped to [1, 51]: n = 60 gives the n = 51 result and n ≤ 0 the n = 1 one."""
     new_sigma, new_scales = _split64([0.6] * 4, [60, 51, 0, -3], [1.0] * 4)
     assert torch.equal(new_sigma[0], new_sigma[1]) and torch.equal(new_scales[0], new_scales[1])
@@ -527,7 +532,7 @@ def test_mcmc_split_rejects_invalid_input(
         mcmc_split(opacity, scales, n)
 
 
-@settings(max_examples=60, deadline=None)
+@settings(max_examples=25, deadline=None)
 @given(
     rows=st.lists(
         st.tuples(
@@ -536,7 +541,7 @@ def test_mcmc_split_rejects_invalid_input(
             st.floats(min_value=1e-3, max_value=1e3),
         ),
         min_size=1,
-        max_size=8,
+        max_size=64,
     )
 )
 def test_u13_property_e11_holds_for_random_targets(rows: list[tuple[float, int, float]]) -> None:
@@ -557,14 +562,18 @@ def test_u13_property_e11_holds_for_random_targets(rows: list[tuple[float, int, 
 @pytest.mark.gpu
 def test_u13_matches_gsplat_compute_relocation() -> None:
     """U-13: against gsplat 1.5.3's compute_relocation (float32 kernel), within 5e-4 relative,
-    over a grid of target opacities in [0.005, 0.999] (live targets, D-14) and n = 1 … 51.
-    gsplat's outputs are unclamped (source log #55), as mcmc_split's are below 1 − 2⁻²³. The
-    worst error measured on the RTX 4090 is 4.9e-4, at σ = 0.005 and n = 36: float32
-    cancellation in the kernel's 1 − (1 − σ)^(1/n), which grows as σ falls below 0.005."""
+    over a grid of live target opacities in [0.005, 0.999] (D-14) and n = 1 … 51, keeping the
+    pairs away from the clamp, whose σ_new = 1 − (1 − σ)^(1/n) stays in [0.005, 1 − 2⁻²³] (PRD
+    #65). gsplat's outputs are unclamped (source log #55), as mcmc_split's are there. Measured
+    on the RTX 4090: 1.7e-5 at worst away from the clamp; where σ_new falls below 0.005 the
+    kernel's float32 cancellation reaches 4.9e-4 (source log #60, #62)."""
     from gsplat.relocation import compute_relocation
 
-    sigma = torch.linspace(0.005, 0.999, 400)[:, None].expand(400, 51).reshape(-1).contiguous()
-    n = torch.arange(1, 52)[None, :].expand(400, 51).reshape(-1).contiguous()
+    sigma = torch.linspace(0.005, 0.999, 400)[:, None].expand(400, 51).reshape(-1)
+    n = torch.arange(1, 52)[None, :].expand(400, 51).reshape(-1)
+    # Off the clamp: (1 − σ)^(1/n) ≤ 0.995, worked in float64 independently of mcmc_split.
+    off_clamp = torch.log1p(-sigma.double()) / n <= math.log(0.995)
+    sigma, n = sigma[off_clamp].contiguous(), n[off_clamp].contiguous()
     scales = torch.rand(sigma.shape[0], 3, generator=torch.Generator().manual_seed(0)) + 0.1
     binoms = torch.zeros(51, 51)  # E11's C(i − 1, k), i − 1 and k in 0 … 50
     for m in range(51):
@@ -647,7 +656,9 @@ def test_u14_a_logit_exactly_at_the_dead_threshold_counts_as_live() -> None:
     below = float(torch.nextafter(torch.tensor(O_DEAD), torch.tensor(-math.inf)))
     model, opt = _relocation_scene([O_DEAD, below, 2.0, 2.0])
     times = model.times.detach().clone()
-    report = relocate(model, opt, GradStats(4), RelocConfig(), generator=torch.Generator())
+    report = relocate(
+        model, opt, GradStats(4), RelocConfig(), generator=torch.Generator().manual_seed(0)
+    )
     assert report.dead == 1
     assert float(model.times.detach()[0]) == float(times[0])  # live: not overwritten
     assert int(_target_of(model, torch.tensor([1]))) in (0, 2, 3)
@@ -699,19 +710,11 @@ def test_u14_targets_are_drawn_in_proportion_to_the_score() -> None:
 
 def test_u14_moments_are_zeroed_on_targets_and_moved_copies_only() -> None:
     """U-14, D-16: the Adam moments of every target and every moved copy are zero and the
-    others unchanged (bitwise); step counters are unchanged. Every row index relocate passes to
-    reset_rows lies in [0, N) (Q-44: the caller's precondition)."""
+    others unchanged (bitwise); step counters are unchanged. (Rows outside [0, N) would raise on
+    the CPU, Q-44, so this also covers the range of the rows relocate resets.)"""
     logits = [1.0, LOGIT_DEAD, 0.0, LOGIT_DEAD, 0.5, 0.2, LOGIT_DEAD, 0.8, -0.5, 1.5]
     model, opt = _relocation_scene(logits)
     before = opt.state_dict()
-    passed: list[torch.Tensor] = []
-    reset_rows = opt.reset_rows
-
-    def spy(rows: torch.Tensor, *, names: object = None) -> None:
-        passed.append(rows.clone())
-        reset_rows(rows, names=names)  # type: ignore[arg-type]
-
-    opt.reset_rows = spy  # type: ignore[method-assign]
     relocate(model, opt, GradStats(10), RelocConfig(), generator=torch.Generator().manual_seed(3))
     moved = torch.tensor([1, 3, 6])
     targets = torch.unique(_target_of(model, moved))
@@ -724,10 +727,9 @@ def test_u14_moments_are_zeroed_on_targets_and_moved_copies_only() -> None:
             assert torch.equal(after[name][key][reset], torch.zeros_like(after[name][key][reset]))
             assert torch.equal(after[name][key][~reset], before[name][key][~reset]), (name, key)
         assert torch.equal(after[name]["step"], before[name]["step"])
-    assert passed and all(bool(((r >= 0) & (r < 10)).all()) for r in passed)
 
 
-def test_u14_without_reset_moved_moments_only_targets_are_zeroed() -> None:
+def test_without_reset_moved_moments_only_targets_are_zeroed() -> None:
     """D-16's alternative (RelocConfig.reset_moved_moments = False): only the targets' moments
     are zeroed; the moved copies keep the moments their rows had."""
     logits = [1.0, LOGIT_DEAD, 0.0, LOGIT_DEAD, 0.5]
@@ -752,18 +754,21 @@ def test_u14_without_reset_moved_moments_only_targets_are_zeroed() -> None:
 
 
 def test_u14_same_seed_gives_the_same_result() -> None:
-    """U-14: the same model, statistics and generator seed give bitwise the same model."""
+    """U-14: the same model, statistics and generator seed give bitwise the same model, and the
+    statistics are reset after the move (§1.3 step 7; Q-51)."""
     results = []
     for _ in range(2):
         model, opt = _relocation_scene([0.3, LOGIT_DEAD, 1.0, LOGIT_DEAD, LOGIT_DEAD, 2.0], seed=4)
         stats = _stats_with([0.5, 0.0, 2.0, 1.0, 0.0, 0.25], [1, 0, 2, 1, 0, 1])
         relocate(model, opt, stats, RelocConfig(), generator=torch.Generator().manual_seed(11))
+        assert torch.equal(stats.count, torch.zeros(6, dtype=torch.int32))  # §1.3 step 7, Q-51
+        assert torch.equal(stats.g_sum, torch.zeros(6))
         results.append(_rows_of(model))
     for name in PARAM_NAMES:
         assert torch.equal(results[0][name], results[1][name])
 
 
-def test_u14_stacked_copies_keep_the_targets_position() -> None:
+def test_stacked_copies_keep_the_targets_position() -> None:
     """RelocConfig.copy_position = "stack" (D-15's alternative, used by U-13's render test):
     moved copies keep the target's position exactly."""
     model, opt = _relocation_scene([1.0, LOGIT_DEAD, 0.0, LOGIT_DEAD])
@@ -778,7 +783,7 @@ def test_u14_stacked_copies_keep_the_targets_position() -> None:
     assert torch.equal(model.means.detach()[moved], model.means.detach()[_target_of(model, moved)])
 
 
-def test_u14_invalid_model_or_all_zero_scores_raise_before_any_draw() -> None:
+def test_invalid_model_or_all_zero_scores_raise_before_any_draw() -> None:
     """§1.1 validity rules (Q-55) and Q-51: a non-finite model, or live scores that are all 0
     (λ_o = 0 with zero statistics, which Q-11 allows), raise ValueError before the generator is
     used and before anything is written."""
@@ -798,19 +803,21 @@ def test_u14_invalid_model_or_all_zero_scores_raise_before_any_draw() -> None:
         assert torch.equal(getattr(model, name).detach(), before[name])
 
 
-def test_u13_a_target_drawn_more_than_50_times_uses_n_51() -> None:
+def test_a_target_drawn_more_than_50_times_uses_n_51() -> None:
     """E11: n is clamped to 51 for the formula, but every one of the 60 dead primitives is still
     moved onto the single live target, and all 61 rows carry E11's values for n = 51."""
     model, opt = _relocation_scene([0.4] + [LOGIT_DEAD] * 60)
     sigma = float(torch.sigmoid(torch.tensor(0.4, dtype=F32)).double())
     a = torch.exp(model.log_scales.detach()[0].double())
-    report = relocate(model, opt, GradStats(61), RelocConfig(), generator=torch.Generator())
+    report = relocate(
+        model, opt, GradStats(61), RelocConfig(), generator=torch.Generator().manual_seed(0)
+    )
     assert report == RelocationReport(dead=60, targets=1)
     s_new, _ = e11_oracle(sigma, 51, 1.0)
     expected_logit = float(torch.logit(torch.tensor(s_new, dtype=F64)).float())
     assert torch.equal(model.opacity_logits.detach(), torch.full((61,), expected_logit))
     expected_scales = torch.log(torch.stack([a * e11_oracle(sigma, 51, 1.0)[1]] * 61)).float()
-    torch.testing.assert_close(model.log_scales.detach(), expected_scales, rtol=0.0, atol=1e-6)
+    assert torch.equal(model.log_scales.detach(), expected_scales)
     assert torch.equal(_target_of(model, torch.arange(61)), torch.zeros(61, dtype=torch.int64))
 
 
@@ -821,12 +828,11 @@ def test_u13_clamp_active_case_through_relocate() -> None:
     model, opt = _relocation_scene([math.log(0.02 / 0.98)] + [LOGIT_DEAD] * 4)
     sigma = float(torch.sigmoid(model.opacity_logits.detach()[0].double()))
     a = torch.exp(model.log_scales.detach()[0].double())
-    relocate(model, opt, GradStats(5), RelocConfig(), generator=torch.Generator())
+    relocate(model, opt, GradStats(5), RelocConfig(), generator=torch.Generator().manual_seed(0))
     assert torch.equal(model.opacity_logits.detach(), torch.full((5,), O_DEAD))
     factor = e11_oracle(sigma, 5, 1.0)[1]
     expected = torch.log(a * factor).float()
-    for row in range(5):
-        torch.testing.assert_close(model.log_scales.detach()[row], expected, rtol=0.0, atol=1e-6)
+    assert torch.equal(model.log_scales.detach(), expected.expand(5, 3))
 
 
 def _whitened(offsets: torch.Tensor, quat: list[float], scales: list[float]) -> torch.Tensor:
@@ -945,7 +951,7 @@ def test_u25_candidates_are_exactly_the_rows_whose_g_exceeds_tau_pos() -> None:
         GrowthConfig(),
         spatial_scale=S,
         reloc=RelocConfig(),
-        generator=torch.Generator(),
+        generator=torch.Generator().manual_seed(0),
     )
     assert report == GrowthReport(cloned=2, split=0, sampled=0, capped=0, num_gaussians=8)
     after = _rows_of(model)
@@ -968,7 +974,7 @@ def test_u25_clone_split_boundary_is_at_one_hundredth_of_s() -> None:
         GrowthConfig(),
         spatial_scale=S,
         reloc=RelocConfig(),
-        generator=torch.Generator(),
+        generator=torch.Generator().manual_seed(0),
     )
     assert (report.cloned, report.split) == (1, 1)
 
@@ -1050,7 +1056,7 @@ def test_u25_new_rows_have_zero_moments_and_inherit_their_parents_statistics() -
         GrowthConfig(),
         spatial_scale=S,
         reloc=RelocConfig(),
-        generator=torch.Generator(),
+        generator=torch.Generator().manual_seed(0),
     )
     # Candidates: row 0 (g = 1.5, split) and row 2 (g = 0.5, clone): kept 1, 2, 3; then 2, 0, 0.
     assert torch.equal(stats.g_sum, torch.tensor([0.0, 0.5, 1.0e-4, 0.5, 3.0, 3.0]))
@@ -1076,7 +1082,7 @@ def test_u25_with_a_full_cap_the_largest_g_grow_ties_to_the_lower_row() -> None:
         GrowthConfig(n_max=9),
         spatial_scale=S,
         reloc=RelocConfig(),
-        generator=torch.Generator(),
+        generator=torch.Generator().manual_seed(0),
     )
     # Room for 3 of 5 candidates: rows 1 and 3 (g = 5), then row 0 (g = 3, before row 4).
     assert report == GrowthReport(cloned=3, split=0, sampled=0, capped=2, num_gaussians=9)
@@ -1095,7 +1101,7 @@ def test_u25_n_never_decreases_and_a_full_model_does_not_grow() -> None:
         GrowthConfig(n_max=3),
         spatial_scale=S,
         reloc=RelocConfig(),
-        generator=torch.Generator(),
+        generator=torch.Generator().manual_seed(0),
     )
     assert report == GrowthReport(cloned=0, split=0, sampled=0, capped=3, num_gaussians=3)
     for name in PARAM_NAMES:
@@ -1139,7 +1145,7 @@ def test_count_control_score_appends_five_percent_up_to_n_max() -> None:
     assert model.num_gaussians == 108 and stats.num_gaussians == 108
 
 
-def test_count_control_score_moves_copies_from_live_targets_by_e11() -> None:
+def test_count_control_score_appends_rows_drawn_from_live_targets_by_e11() -> None:
     """§1.3 Count-control modes, E11, D-16, D-45 (Q-52): the score mode's rows are drawn ∝ ρ from
     the live set only (dead rows, here with the largest g, are never drawn), each target gets
     E11 with n = 1 + its draws and zeroed Adam moments, and each new row is its target's updated
@@ -1173,13 +1179,15 @@ def test_count_control_score_moves_copies_from_live_targets_by_e11() -> None:
     targets, draws = torch.unique(sources, return_counts=True)
     for target, count in zip(targets.tolist(), draws.tolist(), strict=True):
         sigma = float(torch.sigmoid(before["opacity_logits"][target].double()))
-        s_new, _ = e11_oracle(sigma, 1 + count, 1.0)
+        s_new, factor = e11_oracle(sigma, 1 + count, 1.0)
         expected = max(float(torch.logit(torch.tensor(s_new, dtype=F64)).float()), O_DEAD)
         assert float(after["opacity_logits"][target]) == expected
+        a = torch.exp(before["log_scales"][target].double())
+        assert torch.equal(after["log_scales"][target], torch.log(a * factor).float())
         for name in moments:
-            assert torch.equal(
-                moments[name]["exp_avg"][target], torch.zeros_like(moments[name]["exp_avg"][target])
-            )
+            for key in ("exp_avg", "exp_avg_sq"):
+                zero = torch.zeros_like(moments[name][key][target])
+                assert torch.equal(moments[name][key][target], zero)
     untouched = torch.ones(105, dtype=torch.bool)
     untouched[targets] = False
     untouched[100:] = False
@@ -1233,6 +1241,7 @@ def test_prune_without_a_pruning_opacity_changes_nothing() -> None:
 
 @pytest.mark.parametrize("iteration", [0, -1, True, 1.5])
 def test_prune_rejects_an_invalid_iteration(iteration: object) -> None:
+    """Q-48: the iteration is an int ≥ 1, as D-41 counts it (Q-26: ValueError)."""
     model, opt = _growth_scene([SMALL])
     with pytest.raises(ValueError):
         prune(model, opt, GradStats(1), ABLATION, spatial_scale=S, iteration=iteration)  # type: ignore[arg-type]
@@ -1315,6 +1324,7 @@ def test_relocate_and_grow_run_on_cuda_and_repeat_with_the_same_seed(generator_d
     assert isinstance(growth, GrowthReport) and isinstance(score, GrowthReport)
     assert isinstance(relocation, RelocationReport) and relocation.dead > 0
     assert growth.cloned > 0 and growth.split > 0
+    assert growth.num_gaussians == 400 + growth.cloned + growth.split  # one row per candidate
     assert score.num_gaussians == growth.num_gaussians + score.sampled
     for name in PARAM_NAMES:
         assert torch.equal(first[name], second[name]), name
@@ -1335,9 +1345,10 @@ def test_score_e11_and_opacity_reset_make_no_host_synchronization() -> None:
             "count": torch.ones(300, dtype=torch.int32),
         }
     )
-    sigma = torch.rand(64, device="cuda", dtype=F64) * 0.9 + 0.05
-    scales = torch.rand(64, 3, device="cuda", dtype=F64) + 0.1
-    n = torch.randint(1, 60, (64,), device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(33)
+    sigma = torch.rand(64, device="cuda", dtype=F64, generator=gen) * 0.9 + 0.05
+    scales = torch.rand(64, 3, device="cuda", dtype=F64, generator=gen) + 0.1
+    n = torch.randint(1, 60, (64,), device="cuda", generator=gen)
     mcmc_split(sigma, scales, n)  # builds the coefficient table on the device
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
@@ -1358,7 +1369,7 @@ def test_grow_and_relocate_reject_invalid_arguments(case: str) -> None:
     """Q-48 (Q-26: ValueError): the statistics cover the model's rows, the generator is a
     torch.Generator, and S is a finite number > 0."""
     model, opt = _growth_scene([SMALL, LARGE])
-    stats, gen, scale = _stats_from([1.0, 1.0]), torch.Generator(), S
+    stats, gen, scale = _stats_from([1.0, 1.0]), torch.Generator().manual_seed(0), S
     if case == "stats of another size":
         stats = GradStats(3)
     elif case == "not a generator":

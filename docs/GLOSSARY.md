@@ -130,7 +130,7 @@ _Avoid_: 4D split, subdivide, split (for the train/test label, which is a data s
 
 **Parent**:
 The candidate a grown row comes from: the primitive a clone copies, or the one a split replaces with its two children; its gradient statistics pass to its new rows. §1.3 Growth, E17, D-45
-_Avoid_: source, original, donor, target (reserved for relocation)
+_Avoid_: source, original, donor, target (reserved for relocation and the "score" mode)
 
 **Child**:
 One of the two rows a split makes from its parent and that replace it, carrying the parent's tensors except a position drawn from its Gaussian and scales divided by 1.6. E17, D-43

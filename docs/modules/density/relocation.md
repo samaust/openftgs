@@ -32,7 +32,7 @@ The live set is tested on the stored logit against ô_dead (D-14). Every logit b
 - n is clamped as E11 says for the formula only; every drawn copy is still written;
 - the scale factor uses the unclamped σ_new.
 
-U-13 compares `mcmc_split` with gsplat 1.5.3's `compute_relocation`, a float32 kernel, over live targets. The largest difference measured on the RTX 4090 sits just under U-13's bound, at the lowest live opacity and a large n, and comes from float32 cancellation in the kernel's evaluation of σ_new, not from the float64 path (source log #60).
+U-13 compares `mcmc_split` with gsplat 1.5.3's `compute_relocation`, a float32 kernel, over live targets whose σ_new stays off the clamp, as the PRD asked; there the two agree far inside U-13's bound. Where σ_new falls below the dead threshold, so that only a_new is kept, the difference grows to just under the bound, from float32 cancellation in the kernel's evaluation of σ_new, not from the float64 path (source log #60, #62).
 
 The clamp has two halves. `mcmc_split` applies the upper bound. The lower bound is D-14's and is applied by the callers to the stored float32 logit, as a floor at ô_dead from the configuration: only a bound on the stored logit guarantees that every relocated row is live, since sigmoid(ô_dead) rounds below the threshold in float32 (Q-50).
 
@@ -50,9 +50,9 @@ The clamp has two halves. `mcmc_split` applies the upper bound. The lower bound 
 8. It checks the validity rules again, as §1.1 asks after every relocation.
 9. It resets the statistics, always, even when nothing moved (owner answer, Q-51). With relocation off, the trainer resets them itself (M10).
 
-First measurements (CPU, the seeds the tests use): U-14's 10⁶ position draws are off the target's Gaussian by at most 0.09% in the whitened mean and 0.25% in the whitened covariance, well inside the 1% of Q-54; U-13's render before and after relocating stacked copies differs by 40.4 dB.
+First measurements (CPU, the seeds the tests use): U-14's 10⁶ position draws are off the target's Gaussian by at most 0.09% in the whitened mean and 0.25% in the whitened covariance, well inside Q-54's bound; U-13's render before and after relocating stacked copies differs by 40.4 dB.
 
-Writing in place keeps the parameters' identity, so the optimizer keeps its references and step counters; relocation never changes N. The random draws come in a fixed order (the multinomial, then the normal draw), so a resumed run can repeat them (U-21, M10). `relocate` doesn't read `RelocConfig.enabled`: that is the trainer's switch for calling it.
+Writing in place keeps the parameters' identity, so the optimizer keeps its references and step counters; relocation never changes N. The optimizer must be the model's own, built for it by `build_optimizer`: `FTGSOptimizer` has no public row count to check against, so the pairing is the caller's precondition (Q-48), and the trainer (M10) holds the three together. The random draws come in a fixed order (the multinomial, then the normal draw), so a resumed run can repeat them (U-21, M10). `relocate` doesn't read `RelocConfig.enabled`: that is the trainer's switch for calling it.
 
 ## Host synchronization
 

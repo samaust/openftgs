@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gradient statistics, growth (clone and split), the relocation score, the dead set, relocation,
+"""Gradient statistics, growth (clone and split), the sampling score, the dead set, relocation,
 and the count-control modes.
 
 Spec: E10, E11, E17, §1.3. Band: Mechanics (§2.1).
@@ -10,7 +10,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NoReturn
 
-import numpy as np
 import torch
 from torch import Tensor
 
@@ -66,7 +65,12 @@ def _is_int(value: object) -> bool:
 # Q-50: every logit bound in this module (ô_dead of D-14, the ablation's thresholds) is float32
 # of the float64 logit; comparing a float32 tensor with this Python float compares in float32.
 def _logit_bound(p: float) -> float:
-    return float(np.float32(math.log(p) - math.log1p(-p)))
+    return float(torch.tensor(math.log(p) - math.log1p(-p), dtype=torch.float32))
+
+
+def _live(model: FreeTimeGaussians, cfg: RelocConfig) -> Tensor:
+    """[N] bool: the live set, ô ≥ ô_dead; the dead set is the rest (D-14, in float32)."""
+    return model.opacity_logits.detach() >= _logit_bound(cfg.dead_opacity)
 
 
 def _check_stats(model: FreeTimeGaussians, stats: "GradStats") -> None:
@@ -237,12 +241,11 @@ def sampling_score(model: FreeTimeGaussians, stats: GradStats, cfg: RelocConfig)
     `cfg.grad_quantile` quantile of g over the live rows visible at least once (D-13), and
     ĝ ≡ 0 when Q is 0 or there is no such row. No host synchronization."""
     _check_stats(model, stats)
-    logits = model.opacity_logits.detach()
-    sigma = torch.sigmoid(logits)
+    sigma = torch.sigmoid(model.opacity_logits.detach())
     if model.num_gaussians == 0:
         return sigma
     g = stats.mean()
-    live_seen = (logits >= _logit_bound(cfg.dead_opacity)) & (stats.count > 0)  # D-14
+    live_seen = _live(model, cfg) & (stats.count > 0)
     # The quantile of the selected rows without a gather (no data-dependent shape): the other
     # rows are NaN, which nanquantile ignores; torch's default linear interpolation (D-13).
     q = torch.nanquantile(torch.where(live_seen, g, math.nan), cfg.grad_quantile)
@@ -330,14 +333,15 @@ def _draw_targets(scores: Tensor, count: int, generator: torch.Generator) -> Ten
     return draws.to(scores.device)
 
 
-# Q-50, Q-51: E11 once per target, then the moved copies (relocation's dead rows, or the score
-# mode's new rows), shared by relocate and grow.
-def _move(
+# Q-50, Q-51: the relocation move once per target, then one row per draw (relocation's moved
+# copies, or the score mode's new rows), shared by relocate and grow.
+def _relocation_move(
     model: FreeTimeGaussians, draws: Tensor, cfg: RelocConfig, generator: torch.Generator
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Apply E11 in place to every row named in `draws` (one entry per copy, repeats allowed),
-    with n = 1 + its number of draws, and return the target rows and the copies' nine tensors,
-    one row per draw: the target's updated tensors, placed per `cfg.copy_position` (D-15)."""
+    """Apply E11 in place to every target named in `draws` (one entry per row to fill,
+    repeats allowed), with n = 1 + its number of draws, and return the target rows and, one row
+    per draw, the nine tensors of the row to fill: its target's updated tensors, placed per
+    `cfg.copy_position` (D-15)."""
     n_rows = model.num_gaussians
     device = model.means.device
     counts = torch.zeros(n_rows, dtype=torch.int64, device=device)
@@ -357,7 +361,7 @@ def _move(
         new_logits = torch.logit(new_sigma).float().clamp_min(_logit_bound(cfg.dead_opacity))
         logits.index_copy_(0, targets, new_logits)
         log_scales.index_copy_(0, targets, torch.log(new_scales).float())
-        copies = {
+        filled = {
             name: getattr(model, name).detach().index_select(0, draws)
             for name in FreeTimeGaussians.PARAM_NAMES
         }
@@ -366,8 +370,8 @@ def _move(
             z = torch.randn(
                 (int(draws.shape[0]), 3), generator=generator, device=generator.device
             ).to(device)
-            copies["means"] = means + (rs @ z[:, :, None]).squeeze(-1)
-    return targets, copies
+            filled["means"] = means + (rs @ z[:, :, None]).squeeze(-1)
+    return targets, filled
 
 
 # Q-51: the procedure's details; Q-55: the validity checks before the draws and after the writes.
@@ -380,13 +384,13 @@ def relocate(
     generator: torch.Generator,
 ) -> RelocationReport:
     """Move every dead primitive onto a live target (§1.3 Relocation, E11, D-14 to D-16), then
-    reset the gradient statistics. `cfg.enabled` is the trainer's switch and isn't read here.
+    reset the gradient statistics. `optimizer` must be the model's (built for it by
+    `build_optimizer`; Q-48). `cfg.enabled` is the trainer's switch and isn't read here.
     Synchronizes with the host: an event does anyway (§2.4 rule 3)."""
     _check_stats(model, stats)
     _check_generator(generator)
     model.validate()
-    logits = model.opacity_logits.detach()
-    dead = logits < _logit_bound(cfg.dead_opacity)  # D-14, in float32
+    dead = ~_live(model, cfg)
     n_dead = int(dead.sum())
     if n_dead == 0 or n_dead == model.num_gaussians:
         stats.reset()
@@ -394,10 +398,10 @@ def relocate(
     scores = torch.where(dead, 0.0, sampling_score(model, stats, cfg))
     draws = _draw_targets(scores, n_dead, generator)
     dead_rows = torch.nonzero(dead).squeeze(1)  # ascending: they take the draws in draw order
-    targets, copies = _move(model, draws, cfg, generator)
+    targets, moved = _relocation_move(model, draws, cfg, generator)
     with torch.no_grad():
         for name in FreeTimeGaussians.PARAM_NAMES:
-            getattr(model, name).index_copy_(0, dead_rows, copies[name])
+            getattr(model, name).index_copy_(0, dead_rows, moved[name])
     # D-16: zero the moments of the targets and the moved copies, or of the targets only.
     optimizer.reset_rows(torch.cat([targets, dead_rows]) if cfg.reset_moved_moments else targets)
     model.validate()  # §1.1: checked after every relocation
@@ -502,7 +506,8 @@ def grow(
     """One growth event in the configured count-control mode (§1.3 Growth and Count-control
     modes, E17, D-18, D-42 to D-45): "gradient" clones and splits the candidates, "score" appends
     rows drawn ∝ ρ and initialized by E11, "none" does nothing. Model, optimizer and statistics
-    are resized together. Synchronizes with the host: an event does anyway (§2.4 rule 3)."""
+    are resized together; `optimizer` must be the model's (Q-48). Synchronizes with the host: an
+    event does anyway (§2.4 rule 3)."""
     _check_stats(model, stats)
     _check_generator(generator)
     scale = _check_spatial_scale(spatial_scale)
@@ -516,7 +521,7 @@ def grow(
 
 
 # Q-52: the score mode draws from the live set only, applies E11 like relocation, zeroes the
-# targets' moments (D-16) and appends the copies with their targets' statistics (D-45).
+# targets' moments (D-16) and appends the new rows with their targets' statistics (D-45).
 def _grow_by_score(
     model: FreeTimeGaussians,
     optimizer: FTGSOptimizer,
@@ -528,15 +533,17 @@ def _grow_by_score(
     n = model.num_gaussians
     # §1.3 Count-control modes: max(0, min(N_max, ⌊(1 + rate)·N⌋) − N) new rows.
     n_add = max(0, min(cfg.n_max, math.floor((1.0 + cfg.score_rate) * n)) - n)
-    live = model.opacity_logits.detach() >= _logit_bound(reloc.dead_opacity)  # D-14
-    if n_add == 0 or not bool(live.any()):
+    if n_add == 0:
         return GrowthReport(cloned=0, split=0, sampled=0, capped=0, num_gaussians=n)
     model.validate()  # Q-55: a non-finite model raises before the draw
+    live = _live(model, reloc)
+    if not bool(live.any()):  # Q-52: no live row to draw from, so nothing is added
+        return GrowthReport(cloned=0, split=0, sampled=0, capped=0, num_gaussians=n)
     scores = torch.where(live, sampling_score(model, stats, reloc), 0.0)
     draws = _draw_targets(scores, n_add, generator)
-    targets, copies = _move(model, draws, reloc, generator)
+    targets, new_rows = _relocation_move(model, draws, reloc, generator)
     optimizer.reset_rows(targets)
-    _resize_all(model, optimizer, stats, keep=None, append=copies, parents=draws)
+    _resize_all(model, optimizer, stats, keep=None, append=new_rows, parents=draws)
     return GrowthReport(
         cloned=0, split=0, sampled=n_add, capped=0, num_gaussians=model.num_gaussians
     )
