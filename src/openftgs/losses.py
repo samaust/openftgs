@@ -207,12 +207,11 @@ def total_loss(
     # Q-41: iterations count from 1 (D-41).
     if isinstance(it, bool) or not isinstance(it, int) or it < 1:
         _fail(f"it must be an int >= 1, got {it!r}")
-    if cfg.lambda_perc > 0.0:
-        if perceptual is None:
-            _fail("lambda_perc > 0 needs the perceptual network (perceptual=LPIPSLoss(...))")
-        # Q-41: the network must be the backbone LossConfig names (D-9).
-        if perceptual._backbone != cfg.perc_net:
-            _fail(f"perceptual uses {perceptual._backbone!r}, but cfg.perc_net is {cfg.perc_net!r}")
+    if cfg.lambda_perc > 0.0 and perceptual is None:
+        _fail("lambda_perc > 0 needs the perceptual network (perceptual=LPIPSLoss(...))")
+    # Q-41: a network passed in must be the backbone LossConfig names (D-9), whatever λ_perc.
+    if perceptual is not None and perceptual._backbone != cfg.perc_net:
+        _fail(f"perceptual uses {perceptual._backbone!r}, but cfg.perc_net is {cfg.perc_net!r}")
     _check_pair(pred, gt)
     terms: dict[str, Tensor] = {}
     weighted: list[Tensor] = []

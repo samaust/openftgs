@@ -594,7 +594,7 @@ def test_u10_regularization_is_independent_of_the_camera() -> None:
     )
 
 
-def test_total_loss_returns_detached_scalars_without_host_sync() -> None:
+def test_total_loss_returns_detached_scalars_on_the_image_device() -> None:
     """Q-40: the terms are detached 0-d tensors on the images' device, and "total" is the
     returned loss's value."""
     model = random_model(10, seed=27)
@@ -661,11 +661,12 @@ def test_u9_total_loss_is_the_weighted_sum_of_its_terms(lpips_nets: dict[str, LP
 @pytest.mark.weights
 def test_total_loss_needs_the_backbone_the_config_names(lpips_nets: dict[str, LPIPSLoss]) -> None:
     """Q-41 (D-9): a perceptual network with another backbone than cfg.perc_net is a
-    ValueError."""
+    ValueError, whatever λ_perc."""
     model = random_model(4, seed=0)
     pred, gt = _detached_pair(34, dtype=F32)
-    with pytest.raises(ValueError):
-        total_loss(pred, gt, model, 0.5, 1, LossConfig(), perceptual=lpips_nets["alex"])
+    for cfg in (LossConfig(), NO_PERC):
+        with pytest.raises(ValueError):
+            total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=lpips_nets["alex"])
     cfg = LossConfig(perc_net="alex")
     _, terms = total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=lpips_nets["alex"])
     assert "perceptual" in terms
