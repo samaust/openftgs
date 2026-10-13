@@ -1348,3 +1348,38 @@ def test_score_e11_and_opacity_reset_make_no_host_synchronization() -> None:
     finally:
         torch.cuda.set_sync_debug_mode(0)
     assert rho.shape == (300,) and new_sigma.shape == (64,)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["stats of another size", "not a generator", "bool scale", "zero scale", "infinite scale"],
+)
+def test_grow_and_relocate_reject_invalid_arguments(case: str) -> None:
+    """Q-48 (Q-26: ValueError): the statistics cover the model's rows, the generator is a
+    torch.Generator, and S is a finite number > 0."""
+    model, opt = _growth_scene([SMALL, LARGE])
+    stats, gen, scale = _stats_from([1.0, 1.0]), torch.Generator(), S
+    if case == "stats of another size":
+        stats = GradStats(3)
+    elif case == "not a generator":
+        gen = 0  # type: ignore[assignment]
+    elif case == "bool scale":
+        scale = True
+    elif case == "zero scale":
+        scale = 0.0
+    elif case == "infinite scale":
+        scale = math.inf
+    with pytest.raises(ValueError):
+        grow(
+            model,
+            opt,
+            stats,
+            GrowthConfig(),
+            spatial_scale=scale,
+            reloc=RelocConfig(),
+            generator=gen,
+        )
+    if case in ("stats of another size", "not a generator"):
+        with pytest.raises(ValueError):
+            relocate(model, opt, stats, RelocConfig(), generator=gen)
+    assert model.num_gaussians == 2
