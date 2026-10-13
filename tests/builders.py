@@ -365,16 +365,20 @@ def write_scene(
 
 def shortened_config(iterations: int, base: TrainConfig) -> TrainConfig:
     """§3.2 shared setup: `base` with T_it = `iterations` and every
-    iteration count of its calendar (the growth and relocation windows, the event period and
-    the SH interval, given for T_it = 30,000) multiplied by T_it/30,000 and rounded, half up
-    (Q-75), with a minimum of 1."""
+    iteration count of its calendar (the growth and relocation windows, the event period, the
+    SH interval and, when set, the last iteration of the 4D regularization, given for
+    T_it = 30,000) multiplied by T_it/30,000 and rounded, half up (Q-75), with a minimum of 1."""
     cfg = base
 
     def scaled(count: int) -> int:
         return max(1, math.floor(count * iterations / 30_000 + 0.5))  # Q-75
 
+    reg_until = cfg.loss.reg_until
     return dataclasses.replace(
         cfg,
+        loss=dataclasses.replace(
+            cfg.loss, reg_until=None if reg_until is None else scaled(reg_until)
+        ),
         growth=dataclasses.replace(
             cfg.growth, start=scaled(cfg.growth.start), stop=scaled(cfg.growth.stop)
         ),

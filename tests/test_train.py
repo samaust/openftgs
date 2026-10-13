@@ -262,6 +262,15 @@ def test_a_model_must_belong_to_the_run(tmp_path: Path) -> None:
         Trainer(_no_perceptual(), video, unit, device="cpu")
 
 
+def test_the_ablation_turns_relocation_off(tmp_path: Path) -> None:
+    """§1.3 Count-control modes, Q-71: a pruning opacity selects the "w/o periodic relocation"
+    ablation, so with relocation on the configuration is refused rather than run in a mode the
+    spec doesn't define (from the M10 milestone review)."""
+    cfg = _no_perceptual(reloc=RelocConfig(prune_opacity=0.005))
+    with pytest.raises(ValueError, match="prune_opacity"):
+        Trainer(cfg, _scene(tmp_path), _init_points(), device="cpu")
+
+
 @pytest.mark.parametrize(
     "perf",
     [
@@ -564,15 +573,18 @@ def test_train_calls_callbacks_in_order_and_stops_when_one_asks(tmp_path: Path) 
 
 
 def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_path: Path) -> None:
-    """Q-73: deterministic mode and the TF32 setting apply during a training iteration only."""
+    """Q-73: deterministic mode, the TF32 setting and the matmul precision (D-52) apply during a
+    training iteration only."""
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    matmul = torch.get_float32_matmul_precision()
     algorithms = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
     )
     try:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = True, False, True
+        torch.set_float32_matmul_precision("high")
         perf = PerfConfig(deterministic=True, perc_precision="ieee")
         trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
         trainer.step()
@@ -581,8 +593,10 @@ def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_pat
             torch.are_deterministic_algorithms_enabled(),
             torch.is_deterministic_algorithms_warn_only_enabled(),
         ) == algorithms
+        assert torch.get_float32_matmul_precision() == "high"
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+        torch.set_float32_matmul_precision(matmul)
 
 
 # Resuming another run's state (§2.2; Q-46, Q-69, Q-70, Q-72).

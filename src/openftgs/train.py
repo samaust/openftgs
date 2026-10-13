@@ -263,8 +263,10 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
     )
+    matmul = torch.get_float32_matmul_precision()
     try:
         cudnn.allow_tf32 = perf.perc_precision == "tf32"  # D-52
+        torch.set_float32_matmul_precision("highest")  # D-52: no TF32 in matrix products
         if perf.deterministic:
             # §2.4 Settings: autotuning off, deterministic kernels where PyTorch has them.
             # fused-ssim stays: its backward writes each gradient element once (source log #73).
@@ -275,6 +277,18 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
         torch.use_deterministic_algorithms(algorithms[0], warn_only=algorithms[1])
+        torch.set_float32_matmul_precision(matmul)
+
+
+def _check_ablation(cfg: TrainConfig) -> None:
+    """Q-71: the "w/o periodic relocation" ablation turns relocation off (§1.3 Count-control
+    modes), so a pruning opacity with relocation on, a mode the spec doesn't define, is
+    refused rather than run."""
+    if cfg.reloc.enabled and cfg.reloc.prune_opacity is not None:
+        raise ValueError(
+            "reloc.prune_opacity selects the ablation, which turns relocation off: set "
+            "reloc.enabled to False"
+        )
 
 
 def _check_perf(perf: PerfConfig) -> None:
@@ -401,6 +415,7 @@ class Trainer:
         return trainer
 
     def _configure(self, cfg: TrainConfig, dataset: MultiViewVideo, device: str) -> None:
+        _check_ablation(cfg)
         _check_perf(cfg.perf)
         self._cfg = cfg
         self._dataset = dataset

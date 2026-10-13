@@ -18,7 +18,7 @@ The backend follows the device: gsplat on a CUDA device, which D-76 requires of 
 
 ## The calendar
 
-`calendar_entry(cfg, it)` is a pure function of the configuration and the iteration, so U-17 checks a 30,000-iteration calendar without training (Q-71). Every window and period comes from the configuration, so a shortened calendar (§3.2) needs no other change. Growth and relocation share the event period (`RelocConfig.every`) and have their own windows. In the "w/o periodic relocation" ablation, selected by `RelocConfig.prune_opacity`, pruning runs at every growth event and the opacity reset at every multiple of `density.OPACITY_RESET_EVERY` inside the growth window (owner answer, Q-71; Q-67).
+`calendar_entry(cfg, it)` is a pure function of the configuration and the iteration, so U-17 checks a 30,000-iteration calendar without training (Q-71). Every window and period comes from the configuration, so a shortened calendar (§3.2) needs no other change. Growth and relocation share the event period (`RelocConfig.every`) and have their own windows. In the "w/o periodic relocation" ablation, selected by `RelocConfig.prune_opacity`, pruning runs at every growth event and the opacity reset at every multiple of `density.OPACITY_RESET_EVERY` inside the growth window (owner answer, Q-71; Q-67). The ablation turns relocation off, so the trainer refuses a pruning opacity with relocation on (Q-71).
 
 ## The step log and the log window
 
@@ -73,7 +73,7 @@ What each field does in M10 (Q-73):
 | `adam` | passed to `build_optimizer` (Q-44) |
 | `log_every` | the period of the log reads and their validity check |
 | `deterministic` | during each training iteration: cuDNN autotuning off, cuDNN's deterministic algorithms, and PyTorch's deterministic kernels, warning only where none exists; fused-ssim stays in use, since its backward pass writes each gradient element once, with no atomics (source log #73, answering Q-42's note). Off, the cuDNN flags are left alone; autotuning waits for its benchmark (B-4, M15) |
-| `perc_precision` | "tf32" or "ieee": cuDNN's TF32 flag during each training iteration (D-52); "bf16" raises `NotImplementedError` (M15) |
+| `perc_precision` | "tf32" or "ieee": cuDNN's TF32 flag during each training iteration (D-52); "bf16" raises `NotImplementedError` (M15). The float32 matmul precision is "highest" during each training iteration whatever the setting, so TF32 never reaches matrix products (D-52) |
 | `images_per_step` | above 1 raises `NotImplementedError` (D-54, M15) |
 | `frame_cache` | "gpu" or "mmap" raises `NotImplementedError` (D-51, M12); "auto" and "off" decode the image file at every training iteration |
 | `prefetch` | unused until M12 |
