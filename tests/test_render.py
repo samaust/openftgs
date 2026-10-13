@@ -1139,18 +1139,29 @@ def test_render_request_warns_outside_the_training_span() -> None:
         render_request(random_model(3, seed=2), request, backend="reference")
 
 
-def test_render_request_chunks_large_groups_without_changing_images(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Private: the chunk size of `render_request` bounds memory only (Q-57); with two cameras
-    per call, the four-camera group still gives every item's own render, bitwise."""
-    import openftgs.render
-
+def test_render_request_keys_outputs_by_item_id_whatever_the_camera_names() -> None:
+    """Q-57: outputs are keyed by item id. Items built in Python may share one camera object or
+    carry unrelated camera names (as cameras from a scene manifest do), across times and within
+    one group."""
     model = random_model(30, seed=4, spread=0.8)
-    request = _mixed_request()
-    expected = render_request(model, request, backend="reference")
-    monkeypatch.setattr(openftgs.render, "_CAMERAS_PER_CALL", 2)
-    chunked = render_request(model, request, backend="reference")
-    for item in request.items:
-        assert torch.equal(chunked.rgb[item.id], expected.rgb[item.id])
-        assert torch.equal(chunked.alpha[item.id], expected.alpha[item.id])
+    shared = ring(2, width_px=24, height_px=16)  # named ring00 and ring01
+    items = (
+        RenderItem("t0-a", 0.25, shared[0]),
+        RenderItem("t1-a", 0.75, shared[0]),
+        RenderItem("t0-b", 0.25, shared[1]),
+        RenderItem("t0-a-again", 0.25, shared[0]),
+    )
+    out = render_request(model, RenderRequest(items=items, time_unit="s"), backend="reference")
+    assert list(out.rgb) == ["t0-a", "t1-a", "t0-b", "t0-a-again"]
+    for item in items:
+        single = render(model, item.camera, item.timestamp, backend="reference")
+        assert torch.equal(out.rgb[item.id], single.image[0])
+    assert not torch.equal(out.rgb["t0-a"], out.rgb["t1-a"])
+
+
+def test_render_request_rejects_duplicate_ids() -> None:
+    """Q-56, Q-57: item ids are unique within a request, also for one built in Python."""
+    camera = pinhole(8, 6, fx=10.0, fy=10.0, cx=4.0, cy=3.0)
+    items = (RenderItem("x", 0.2, camera), RenderItem("x", 0.4, camera))
+    with pytest.raises(ValueError, match="unique"):
+        render_request(random_model(3, seed=2), RenderRequest(items, "s"), backend="reference")

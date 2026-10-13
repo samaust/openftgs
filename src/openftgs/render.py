@@ -19,7 +19,7 @@ from torch import Tensor
 
 from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
 from openftgs.sh import sh_basis
-from openftgs.types import Camera, RenderOutput, RenderRequest, Renders
+from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders
 
 __all__ = ["render", "render_request"]
 
@@ -36,7 +36,6 @@ _EXTENT_MAX = 3.33  # E6: the screen-space extent never exceeds 3.33 standard de
 _SH_OFFSET = 0.5  # E2: the SH sum + 0.5, clamped at 0 per channel; D-4
 _BACKGROUND = (0.0, 0.0, 0.0)  # E6: c_bg is black; D-34
 _CHUNK_ELEMENTS = 1 << 22  # pixel–primitive pairs composited at once (bounds memory only)
-_CAMERAS_PER_CALL = 16  # Q-57: cameras per render() call in render_request (bounds memory only)
 
 # gsplat's settings (D-6, D-57); E6's constants above are passed to it as well.
 _RASTERIZE_MODE: Literal["classic", "antialiased"] = (
@@ -114,7 +113,8 @@ def render_request(
     timestamp, with the request's background and SH degree, keyed by item id in request order.
 
     Items that share a timestamp and an image size render in one `render()` call (D-55); the
-    temporal index comes in M15. Runs in inference mode; outputs are CPU inference tensors.
+    temporal index comes in M15. Item ids must be unique; outputs are keyed by them, whatever
+    the cameras' names. Runs in inference mode; outputs are CPU inference tensors.
     """
     # Q-57, Q-17: the timestamps are raw τ in the request's unit, which must be the model's.
     if request.time_unit != model.time_unit:
@@ -122,29 +122,30 @@ def render_request(
             f"the request's time_unit {request.time_unit!r} differs from the model's "
             f"{model.time_unit!r}"
         )
-    groups: dict[tuple[float, int, int], list[Camera]] = {}
+    ids = [item.id for item in request.items]
+    if len(set(ids)) != len(ids):  # Q-56: unique ids, also in a request built in Python
+        raise ValueError("render request item ids must be unique")
+    groups: dict[tuple[float, int, int], list[RenderItem]] = {}
     for item in request.items:
         key = (item.timestamp, item.camera.width, item.camera.height)
-        groups.setdefault(key, []).append(item.camera)
+        groups.setdefault(key, []).append(item)
     background = torch.tensor(request.background, dtype=torch.float32)
     rgb: dict[str, Tensor] = {}
     alpha: dict[str, Tensor] = {}
     with torch.inference_mode():
-        for (timestamp, _, _), cams in groups.items():
-            for start in range(0, len(cams), _CAMERAS_PER_CALL):
-                chunk = cams[start : start + _CAMERAS_PER_CALL]
-                out = render(
-                    model,
-                    chunk,
-                    timestamp,
-                    sh_degree=request.sh_degree,
-                    background=background,
-                    backend=backend,
-                )
-                for k, cam in enumerate(chunk):
-                    rgb[cam.name] = out.image[k].cpu()
-                    alpha[cam.name] = out.alpha[k].cpu()
-    ids = [item.id for item in request.items]
+        for (timestamp, _, _), group in groups.items():
+            # D-55: cameras that share a time (and, for render(), a size) render in one call.
+            out = render(
+                model,
+                [item.camera for item in group],
+                timestamp,
+                sh_degree=request.sh_degree,
+                background=background,
+                backend=backend,
+            )
+            for k, item in enumerate(group):
+                rgb[item.id] = out.image[k].cpu()
+                alpha[item.id] = out.alpha[k].cpu()
     return Renders(rgb={i: rgb[i] for i in ids}, alpha={i: alpha[i] for i in ids})
 
 
