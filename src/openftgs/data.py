@@ -6,12 +6,21 @@ YAML camera reader, the frame cache and prefetcher, and the Fastest-10 frames of
 Spec: §1.4, D-51, D-61, D-69. Band: Foundation (§2.1).
 """
 
+import concurrent.futures
+import importlib.metadata
+import json
 import math
+import multiprocessing
 import numbers
+import os
 import re
-from collections.abc import Iterable
+import shutil
+import subprocess
+import threading
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, Literal
 
 import numpy as np
 import torch
@@ -19,13 +28,14 @@ import yaml
 from PIL import Image
 from torch import Tensor
 
-from openftgs.io import read_scene_manifest
+from openftgs.io import read_scene_manifest, write_scene_manifest
 from openftgs.types import Camera, ImageRecord, SceneManifest, TimeNormalizer, frame_interval
 
 __all__ = [
     "MultiViewVideo",
     "camera_from_llff",
     "camera_from_opencv",
+    "convert_n3dv",
     "fastest_frames",
     "read_opencv_yaml",
     "resize_area",
@@ -503,3 +513,419 @@ def read_opencv_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"{path}: the top level must be a mapping")
     return data
+
+
+# Dataset conversion (§1.4 "Dataset protocols", D-48; Q-85 to Q-101): ffmpeg runs as a separate
+# program, frames are processed and encoded in a process pool (§2.4 "Threads and processes").
+
+_HWACCELS = ("none", "cuda")
+# Q-92: the software format hwdownload hands over, from the stream's pixel format.
+_CUDA_FORMATS = {
+    "yuv420p": "nv12",
+    "yuvj420p": "nv12",
+    "nv12": "nv12",
+    "yuv420p10le": "p010le",
+    "p010le": "p010le",
+    "yuv444p": "yuv444p",
+    "yuvj444p": "yuv444p",
+}
+_PNG_LEVEL = 1  # §2.4: a fast PNG level; PNG is lossless, so pixels don't depend on it
+
+
+@dataclass(frozen=True)
+class _Tools:
+    ffmpeg: str
+    ffprobe: str
+    version: str
+
+
+@dataclass(frozen=True)
+class _VideoInfo:
+    width: int
+    height: int
+    pix_fmt: str
+    frames: int
+
+
+def _program(name: str, what: str) -> str:
+    found = shutil.which(name)
+    if found is None:
+        raise ValueError(
+            f"{what} not found: {name!r} (D-48: the converters need ffmpeg 5.1 or later)"
+        )
+    return found
+
+
+def _version_line(program: str, what: str) -> str:
+    try:
+        result = subprocess.run([program, "-version"], capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as err:
+        raise ValueError(f"{what} at {program!r} doesn't run: {err}") from None
+    lines = result.stdout.splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _tools(ffmpeg: str, ffprobe: str | None) -> _Tools:
+    """Q-85: ffprobe defaults to the one beside a path-given ffmpeg, else the one on PATH."""
+    resolved = _program(ffmpeg, "ffmpeg")
+    if ffprobe is None:
+        separators = [os.sep] + ([os.altsep] if os.altsep else [])
+        ffprobe = (
+            str(Path(resolved).with_name("ffprobe"))
+            if any(sep in ffmpeg for sep in separators)
+            else "ffprobe"
+        )
+    probe = _program(ffprobe, "ffprobe")
+    version = _version_line(resolved, "ffmpeg")
+    _version_line(probe, "ffprobe")
+    return _Tools(resolved, probe, version)
+
+
+def _probe(tools: _Tools, video: Path) -> _VideoInfo:
+    """Width, height, pixel format and frame count of the first video stream (§1.4: read with
+    ffprobe from the same installation); `-count_frames` when the container states no count."""
+
+    def stream(extra: list[str], entries: str) -> dict[str, Any]:
+        command = [
+            tools.ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            *extra,
+            "-show_entries",
+            f"stream={entries}",
+            "-of",
+            "json",
+            str(video),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0 or result.stderr.strip():
+            raise ValueError(f"ffprobe failed on {video}: {result.stderr.strip()}")
+        streams = json.loads(result.stdout or "{}").get("streams") or []
+        if not streams:
+            raise ValueError(f"{video}: no video stream")
+        found: dict[str, Any] = streams[0]
+        return found
+
+    info = stream([], "width,height,pix_fmt,nb_frames")
+    try:
+        frames = int(info["nb_frames"])
+    except (KeyError, TypeError, ValueError):
+        frames = int(stream(["-count_frames"], "nb_read_frames").get("nb_read_frames", 0))
+    return _VideoInfo(int(info["width"]), int(info["height"]), str(info.get("pix_fmt", "")), frames)
+
+
+def _decode_command(
+    tools: _Tools,
+    video: Path,
+    info: _VideoInfo,
+    *,
+    count: int,
+    window: tuple[int, int] | None,
+    hwaccel: str,
+) -> list[str]:
+    """The ffmpeg command of §1.4: the first `count` frames, or with `window` = (N0, N1) the
+    decode indices N0 ≤ n < N1, as raw RGB24 on stdout (D-48). Q-92: with CUDA, hardware frames
+    downloaded explicitly, so a decode that can't use CUDA fails instead of falling back."""
+    command = [tools.ffmpeg, "-v", "error"]
+    filters: list[str] = []
+    if hwaccel == "cuda":
+        software = _CUDA_FORMATS.get(info.pix_fmt)
+        if software is None:
+            raise ValueError(
+                f"{video}: --hwaccel cuda can't decode pixel format {info.pix_fmt!r}; "
+                "use --hwaccel none"
+            )
+        command += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        # Back to the stream's own format, so the RGB conversion is the CPU path's: the frames
+        # then match CPU decoding (U-27).
+        native = "" if software == info.pix_fmt else f",format={info.pix_fmt}"
+        filters.append(f"hwdownload,format={software}{native}")
+    command += ["-i", str(video), "-map", "0:v:0"]
+    if window is not None:
+        filters.append(f"select='between(n\\,{window[0]}\\,{window[1] - 1})'")
+    if filters:
+        command += ["-vf", ",".join(filters)]
+    if window is not None:
+        command += ["-fps_mode", "passthrough", "-frames:v", str(count)]
+    else:
+        command += ["-frames:v", str(count), "-fps_mode", "passthrough"]
+    return command + ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+
+
+def _read_exactly(stream: IO[bytes], size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _decode(command: list[str], info: _VideoInfo, count: int, video: Path) -> Iterator[np.ndarray]:
+    """The frames ffmpeg writes, exactly W·H·3 bytes each (§1.4). Q-93: a short read, a
+    nonzero exit or any message at `-v error` is a ValueError."""
+    size = info.width * info.height * 3
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert process.stdout is not None and process.stderr is not None
+    errors: list[bytes] = []
+    reader = threading.Thread(target=lambda: errors.append(process.stderr.read()), daemon=True)  # type: ignore[union-attr]
+    reader.start()
+    read = 0
+    try:
+        while read < count:
+            data = _read_exactly(process.stdout, size)
+            if len(data) < size:
+                break
+            read += 1
+            yield np.frombuffer(data, dtype=np.uint8).reshape(info.height, info.width, 3)
+        process.stdout.read()
+    finally:
+        if process.poll() is None and read < count:
+            process.kill()
+        process.wait()
+        reader.join()
+    message = errors[0].decode(errors="replace").strip() if errors else ""
+    if read < count or process.returncode != 0 or message:
+        raise ValueError(
+            f"{video}: ffmpeg gave {read} of {count} frames (exit code {process.returncode})"
+            + (f": {message}" if message else "")
+            + " (Q-93: errors in frames decoded before a window count too)"
+        )
+
+
+def _pool_init() -> None:
+    torch.set_num_threads(1)  # §2.4: one thread per pool worker
+
+
+def _write_frame(
+    source: np.ndarray | str,
+    path: str,
+    size: tuple[int, int],
+    K: np.ndarray | None = None,
+    dist: np.ndarray | None = None,
+) -> None:
+    """One output frame (a pool task): undistorted with K and dist in OpenCV's convention when
+    they distort, resized to `size` by area averaging with one 8-bit rounding (Q-90), and
+    written as 8-bit RGB PNG."""
+    frame = source if isinstance(source, np.ndarray) else _read_rgb(Path(source))
+    width, height = size
+    resized = (frame.shape[1], frame.shape[0]) != (width, height)
+    if dist is not None and _coefficients(dist).any():
+        values = undistort_image(frame.astype(np.float64), K, dist)
+        if resized:
+            values = resize_area(values, width, height)
+        out = np.clip(np.rint(values), 0, 255).astype(np.uint8)
+    elif resized:
+        out = resize_area(frame, width, height)
+    else:
+        out = frame
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.ascontiguousarray(out), "RGB").save(target, compress_level=_PNG_LEVEL)
+
+
+def _read_rgb(path: Path) -> np.ndarray:
+    """An 8-bit image file as [H, W, 3] uint8 (alpha dropped; §1.4 "Images")."""
+    with Image.open(path) as image:
+        if image.mode not in _IMAGE_MODES:
+            raise ValueError(f"{path}: mode must be one of {_IMAGE_MODES}, got {image.mode!r}")
+        return np.asarray(image)[..., :3]
+
+
+@dataclass
+class _CameraJob:
+    """One camera's frames: decoded from `video`, or read from `images`, then processed into
+    `outputs` (frame_index order)."""
+
+    name: str
+    outputs: list[Path]
+    size: tuple[int, int]
+    video: Path | None = None
+    info: _VideoInfo | None = None
+    window: tuple[int, int] | None = None
+    images: list[Path] = field(default_factory=list)
+    K: np.ndarray | None = None
+    dist: np.ndarray | None = None
+
+
+def _worker_count(jobs: int) -> int:
+    if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs < 0:
+        raise ValueError(f"jobs must be an int >= 0, got {jobs!r}")
+    return jobs or max(1, (os.cpu_count() or 1) // 4)  # §2.4: one per four cores
+
+
+def _run_jobs(
+    jobs: Sequence[_CameraJob], tools: _Tools | None, *, hwaccel: str, workers: int
+) -> dict[str, list[str]]:
+    """Decode up to `workers` cameras at once, each frame processed and written by a process
+    pool (§2.4); outputs don't depend on `workers`. Returns each camera's ffmpeg command."""
+    commands: dict[str, list[str]] = {}
+    total = sum(len(job.outputs) for job in jobs)
+    pool_size = max(1, min(os.cpu_count() or 1, total))
+    in_flight = threading.BoundedSemaphore(2 * pool_size)  # bounds decoded frames held in memory
+    context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        pool_size, mp_context=context, initializer=_pool_init
+    ) as pool:
+
+        def submit(
+            source: np.ndarray | str, job: _CameraJob, k: int
+        ) -> concurrent.futures.Future[None]:
+            in_flight.acquire()
+            future = pool.submit(
+                _write_frame, source, str(job.outputs[k]), job.size, job.K, job.dist
+            )
+            future.add_done_callback(lambda _: in_flight.release())
+            return future
+
+        def camera(job: _CameraJob) -> list[concurrent.futures.Future[None]]:
+            futures = []
+            if job.video is not None:
+                assert tools is not None and job.info is not None
+                count = len(job.outputs)
+                command = _decode_command(
+                    tools, job.video, job.info, count=count, window=job.window, hwaccel=hwaccel
+                )
+                commands[job.name] = command
+                for k, frame in enumerate(_decode(command, job.info, count, job.video)):
+                    futures.append(submit(frame, job, k))
+            else:
+                for k, image in enumerate(job.images):
+                    futures.append(submit(str(image), job, k))
+            return futures
+
+        with concurrent.futures.ThreadPoolExecutor(min(workers, len(jobs)) or 1) as threads:
+            per_camera = list(threads.map(camera, jobs))
+        for futures in per_camera:
+            for future in futures:
+                future.result()
+    return {job.name: commands[job.name] for job in jobs if job.name in commands}
+
+
+def _prepare_out(dst: Path) -> Path:
+    """Q-88: OUT is absent or an empty directory."""
+    dst = Path(dst)
+    if dst.exists() and (not dst.is_dir() or any(dst.iterdir())):
+        raise ValueError(f"{dst}: the output must be absent or an empty directory")
+    dst.mkdir(parents=True, exist_ok=True)
+    return dst
+
+
+def _producer() -> str:
+    try:
+        return f"openftgs {importlib.metadata.version('openftgs')}"
+    except importlib.metadata.PackageNotFoundError:
+        return "openftgs"
+
+
+def _check_frames(frames: int) -> None:
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames < 1:
+        raise ValueError(f"frames must be an int >= 1, got {frames!r}")
+
+
+def _check_hwaccel(hwaccel: str) -> None:
+    if hwaccel not in _HWACCELS:
+        raise ValueError(f"hwaccel must be one of {_HWACCELS}, got {hwaccel!r}")
+
+
+def _ffmpeg_metadata(tools: _Tools, hwaccel: str, commands: dict[str, list[str]]) -> dict[str, Any]:
+    return {
+        "path": tools.ffmpeg,
+        "ffprobe": tools.ffprobe,
+        "version": tools.version,
+        "hwaccel": hwaccel,
+        "decoder": "cuda" if hwaccel == "cuda" else "cpu",  # Q-92: CUDA runs or fails
+        "commands": commands,
+    }
+
+
+_N3DV_FPS = 30  # §1.4: Neural3DV frame k at k/30 s
+_N3DV_TEST = "cam00"  # D-29
+_N3DV_VIDEO = re.compile(r"cam\d+\.mp4")
+
+
+def convert_n3dv(
+    src: Path,
+    dst: Path,
+    *,
+    frames: int = 300,
+    resize: float = 0.5,
+    ffmpeg: str = "ffmpeg",
+    hwaccel: Literal["none", "cuda"] = "none",
+    jobs: int = 0,
+    ffprobe: str | None = None,
+) -> Path:
+    """Convert a Neural3DV scene (D-28, D-48; Q-85, Q-88, Q-94, Q-95): `poses_bounds.npy`'s rows
+    belong to the `camXX.mp4` files in name order; the first `frames` frames of each video,
+    decoded by the user's ffmpeg, area-resized by `resize` and written as PNG; frame k at k/30 s;
+    cam00 the test view. Returns the path of OUT/scene.json."""
+    src = Path(src)
+    _check_frames(frames)
+    _check_hwaccel(hwaccel)
+    workers = _worker_count(jobs)
+    resized_size(1, 1, resize)
+    poses_path = src / "poses_bounds.npy"
+    if not poses_path.is_file():
+        raise ValueError(f"{src}: no poses_bounds.npy")
+    try:
+        poses = np.load(poses_path, allow_pickle=False)
+    except (OSError, ValueError) as err:
+        raise ValueError(f"{poses_path}: not a readable array: {err}") from None
+    videos = sorted(p for p in src.iterdir() if _N3DV_VIDEO.fullmatch(p.name))
+    if poses.ndim != 2 or poses.shape[1] != 17 or poses.shape[0] != len(videos):
+        raise ValueError(
+            f"{src}: poses_bounds.npy must hold one 17-value row per camXX.mp4 (Q-95), got "
+            f"{list(poses.shape)} for {len(videos)} videos"
+        )
+    out = _prepare_out(dst)
+    work = out / ".work"
+    try:
+        tools = _tools(ffmpeg, ffprobe)
+        cameras: list[Camera] = []
+        camera_jobs: list[_CameraJob] = []
+        bounds: dict[str, list[float]] = {}
+        for row, video in zip(poses, videos, strict=True):
+            name = video.stem
+            full = camera_from_llff(row, name=name)
+            info = _probe(tools, video)
+            if (info.width, info.height) != (full.width, full.height):
+                raise ValueError(
+                    f"{video}: size {info.width}x{info.height} differs from its poses_bounds row's "
+                    f"{full.width}x{full.height} (Q-95)"
+                )
+            if info.frames < frames:
+                raise ValueError(
+                    f"{video}: {info.frames} frames, fewer than the {frames} asked for"
+                )
+            size = resized_size(full.width, full.height, resize)
+            cameras.append(resize_camera(full, *size))
+            outputs = [out / "images" / name / f"{k:06d}.png" for k in range(frames)]
+            camera_jobs.append(_CameraJob(name, outputs, size, video=video, info=info))
+            bounds[name] = [float(row[15]), float(row[16])]
+        commands = _run_jobs(camera_jobs, tools, hwaccel=hwaccel, workers=workers)
+        records = [
+            ImageRecord(
+                camera, k / _N3DV_FPS, path, "test" if camera.name == _N3DV_TEST else "train", k
+            )
+            for camera, job in zip(cameras, camera_jobs, strict=True)
+            for k, path in enumerate(job.outputs)
+        ]
+        metadata = {
+            "source": f"n3dv/{src.name}",  # Q-62
+            "converter": "n3dv",
+            "producer": _producer(),
+            "resize": resize,
+            "fps": _N3DV_FPS,
+            "frames": frames,
+            "ffmpeg": _ffmpeg_metadata(tools, hwaccel, commands),
+            "bounds": bounds,
+        }
+        write_scene_manifest(out / "scene.json", records, time_unit="s", metadata=metadata)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return out / "scene.json"
