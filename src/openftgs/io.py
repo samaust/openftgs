@@ -15,7 +15,7 @@ import math
 import os
 import re
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -53,6 +53,7 @@ __all__ = [
     "write_init_points",
     "write_ply",
     "write_renders",
+    "write_scene_manifest",
 ]
 
 _VERSION = 1  # the major version this module reads and writes (§2.2)
@@ -896,6 +897,104 @@ def read_scene_manifest(path: Path) -> SceneManifest:
         masks=tuple(masks),
         metadata=metadata,
     )
+
+
+def _float32_json(value: Tensor) -> list[Any]:
+    """Q-84: each value as the shortest decimal that reads back to the same float32."""
+    array = value.detach().to("cpu", torch.float32).numpy()
+    return [[float(str(x)) for x in row] for row in array]
+
+
+def _camera_entry(camera: Camera) -> dict[str, Any]:
+    return {
+        "width": camera.width,
+        "height": camera.height,
+        "model": "pinhole",
+        "K": _float32_json(camera.K),
+        "world_to_camera": _float32_json(camera.world_to_camera),
+    }
+
+
+def _manifest_path(path: Path, root: Path, what: str, where: str) -> str:
+    """§2.2: paths are written relative to the manifest, in POSIX form."""
+    try:
+        relative = Path(os.path.relpath(Path(path).absolute(), root.absolute()))
+    except ValueError:  # another drive on Windows
+        _fail(where, f"{what} {path} is not under the manifest's directory {root}")
+    if relative.parts[:1] == ("..",):
+        _fail(where, f"{what} {path} is not under the manifest's directory {root}")
+    return relative.as_posix()
+
+
+def write_scene_manifest(
+    path: Path,
+    records: Sequence[ImageRecord],
+    *,
+    time_unit: str = "s",
+    masks: Sequence[Path | None] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> SceneManifest:
+    """Write a ftgs-scene v1 file (§2.2; Q-64, Q-84) and return it as `read_scene_manifest`
+    reads it back. One camera entry per camera name comes from that name's first record; a
+    later record whose K or world-to-camera differs gets a per-image override. Camera values are
+    written as the shortest decimals that read back to the same float32 values, so the reader
+    rebuilds each camera bitwise. Image and mask paths must lie under the manifest's directory.
+    The file is written to a temporary sibling, validated by reading it back, then renamed."""
+    path = Path(path)
+    where = f"scene manifest {path}"
+    root = path.parent
+    masks = [None] * len(records) if masks is None else list(masks)
+    if len(masks) != len(records):
+        _fail(where, f"masks must align with the records: {len(masks)} for {len(records)}")
+    cameras: dict[str, Camera] = {}
+    entries: dict[str, dict[str, Any]] = {}
+    images: list[dict[str, Any]] = []
+    for k, (record, mask) in enumerate(zip(records, masks, strict=True)):
+        at = f"{where}, image {k}"
+        camera = record.camera
+        image: dict[str, Any] = {"camera": camera.name, "timestamp": float(record.timestamp)}
+        if record.frame_index is not None:
+            image["frame_index"] = int(record.frame_index)
+        image["path"] = _manifest_path(record.image_path, root, "image", at)
+        image["split"] = record.split
+        base = cameras.setdefault(camera.name, camera)
+        if base is not camera:
+            if (base.width, base.height) != (camera.width, camera.height):
+                _fail(
+                    at,
+                    f"camera {camera.name!r} must keep one size, "
+                    f"{(base.width, base.height)} and {(camera.width, camera.height)} differ",
+                )
+            entry = entries[camera.name]
+            own = _camera_entry(camera)
+            for key in _OVERRIDES:
+                if own[key] != entry[key]:
+                    image[key] = own[key]
+        else:
+            entries[camera.name] = _camera_entry(camera)
+        if mask is not None:
+            image["mask"] = _manifest_path(mask, root, "mask", at)
+        images.append(image)
+    raw = {
+        "format": _SCENE,
+        "version": _VERSION,
+        "time_unit": time_unit,
+        "cameras": entries,
+        "images": images,
+        "metadata": dict(metadata or {}),
+    }
+    try:
+        text = json.dumps(raw, indent=1, allow_nan=False)
+    except (TypeError, ValueError) as err:
+        raise ValueError(f"{where}: not writable as JSON: {err}") from None
+    temporary = root / f".{path.name}.tmp-{os.getpid()}"
+    try:
+        temporary.write_text(text + "\n", encoding="utf-8")
+        read_scene_manifest(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return read_scene_manifest(path)
 
 
 # PLY snapshot for viewers (Q-18): export-only, never read back.
