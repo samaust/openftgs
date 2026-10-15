@@ -21,6 +21,7 @@ import subprocess
 import tarfile
 import threading
 import zlib
+from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,13 +31,17 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from torch import Tensor
 
 from openftgs.io import read_scene_manifest, write_scene_manifest
 from openftgs.types import Camera, ImageRecord, SceneManifest, TimeNormalizer, frame_interval
 
 __all__ = [
+    "FrameCache",
     "MultiViewVideo",
+    "Prefetcher",
     "camera_from_llff",
     "camera_from_opencv",
     "convert_n3dv",
@@ -1658,3 +1663,273 @@ def convert_selfcap(
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return out / "scene.json"
+
+
+# The frame cache and the prefetcher (D-51; Q-98, Q-99).
+
+_CACHE_FORMAT = "ftgs-frame-cache"
+_CACHE_VERSION = "1"
+_CACHE_PLACEMENTS = ("gpu", "mmap")
+
+
+def _cache_groups(dataset: "MultiViewVideo") -> list[tuple[str, list[int]]]:
+    """The training records grouped by camera name, in order of first appearance (Q-98)."""
+    groups: dict[str, list[int]] = {}
+    for index, record in enumerate(dataset.records):
+        if record.split == "train":
+            groups.setdefault(record.camera.name, []).append(index)
+    return list(groups.items())
+
+
+def _cache_metadata(dataset: "MultiViewVideo", camera: str, records: list[int]) -> dict[str, str]:
+    return {
+        "format": _CACHE_FORMAT,
+        "version": _CACHE_VERSION,
+        "manifest_sha256": dataset.manifest.sha256,
+        "camera": camera,
+        "records": json.dumps(records, separators=(",", ":")),
+    }
+
+
+def _cache_file_valid(path: Path, metadata: dict[str, str], shape: tuple[int, ...]) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with safe_open(str(path), framework="pt") as file:
+            return bool(
+                file.metadata() == metadata and tuple(file.get_slice("frames").get_shape()) == shape
+            )
+    except Exception:  # an unreadable file is rebuilt like a stale one
+        return False
+
+
+class FrameCache:
+    """The uint8 copy of every training image (D-51; Q-84, Q-98): one safetensors file per
+    camera beside the scene manifest, keyed by its SHA-256, held in GPU memory ("gpu") or
+    memory-mapped and read one frame at a time ("mmap"). `open` builds it when missing or
+    stale."""
+
+    def __init__(
+        self,
+        directory: Path,
+        placement: str,
+        where: dict[int, tuple[int, int]],
+        frames: list[Any],
+    ) -> None:
+        self.directory = directory
+        self.placement = placement
+        self._where = where
+        self._frames = frames  # GPU tensors, or safetensors slices of the memory-mapped files
+        self._files: list[Any] = []
+
+    @staticmethod
+    def default_directory(manifest: SceneManifest) -> Path:
+        """`<manifest dir>/.ftgs-cache/<manifest sha256>` (Q-98)."""
+        return manifest.path.parent / ".ftgs-cache" / manifest.sha256
+
+    @staticmethod
+    def size_of(dataset: "MultiViewVideo") -> int:
+        """The bytes of the training images as uint8, the cache's payload."""
+        return sum(
+            r.camera.width * r.camera.height * 3 for r in dataset.records if r.split == "train"
+        )
+
+    @classmethod
+    def build(
+        cls, dataset: "MultiViewVideo", *, directory: Path | None = None, jobs: int = 0
+    ) -> Path:
+        """Write the cache's files, keeping the valid ones, and return its directory. PNGs are
+        decoded by `jobs` threads (0: one per core)."""
+        directory = (
+            Path(directory) if directory is not None else cls.default_directory(dataset.manifest)
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        workers = jobs or os.cpu_count() or 1
+        for k, (camera, records) in enumerate(_cache_groups(dataset)):
+            first = dataset.records[records[0]].camera
+            shape = (len(records), first.height, first.width, 3)
+            metadata = _cache_metadata(dataset, camera, records)
+            path = directory / f"{k:04d}.safetensors"
+            if _cache_file_valid(path, metadata, shape):
+                continue
+            with concurrent.futures.ThreadPoolExecutor(workers) as threads:
+                frames = list(
+                    threads.map(
+                        lambda i: _read(
+                            dataset.records[i].image_path, _size(dataset.records[i]), _IMAGE_MODES
+                        )[..., :3],
+                        records,
+                    )
+                )
+            if any(frame.shape != shape[1:] for frame in frames):
+                raise ValueError(f"camera {camera!r}: its training images differ in size")
+            temporary = directory / f".{path.name}.tmp-{os.getpid()}"
+            try:
+                save_file(
+                    {"frames": torch.from_numpy(np.stack(frames))},
+                    str(temporary),
+                    metadata=metadata,
+                )
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return directory
+
+    @classmethod
+    def open(
+        cls,
+        dataset: "MultiViewVideo",
+        *,
+        placement: Literal["gpu", "mmap"],
+        device: str | torch.device = "cpu",
+        directory: Path | None = None,
+    ) -> "FrameCache":
+        """The cache of `dataset`, built first when missing or stale; "gpu" loads every camera's
+        frames onto `device`, "mmap" keeps the files memory-mapped (D-51, Q-98)."""
+        if placement not in _CACHE_PLACEMENTS:
+            raise ValueError(f"placement must be one of {_CACHE_PLACEMENTS}, got {placement!r}")
+        directory = cls.build(dataset, directory=directory)
+        where: dict[int, tuple[int, int]] = {}
+        frames: list[Any] = []
+        files: list[Any] = []
+        for k, (_, records) in enumerate(_cache_groups(dataset)):
+            path = directory / f"{k:04d}.safetensors"
+            for row, index in enumerate(records):
+                where[index] = (k, row)
+            if placement == "gpu":
+                frames.append(load_file(str(path), device=str(torch.device(device)))["frames"])
+            else:
+                file = safe_open(str(path), framework="pt")
+                files.append(file)
+                frames.append(file.get_slice("frames"))  # type: ignore[no-untyped-call]
+        cache = cls(directory, placement, where, frames)
+        cache._files = files
+        return cache
+
+    @property
+    def nbytes(self) -> int:
+        """The size of the cache's files."""
+        return sum(p.stat().st_size for p in self.directory.glob("*.safetensors"))
+
+    def frame(self, index: int) -> Tensor:
+        """Training image `index` as uint8 [H, W, 3]: a view in GPU memory, or read from the
+        memory-mapped file onto the CPU."""
+        if index not in self._where:
+            raise IndexError(f"record {index} is not a training image of this cache")
+        k, row = self._where[index]
+        if self.placement == "gpu":
+            frame: Tensor = self._frames[k][row]
+            return frame
+        frame = self._frames[k][row : row + 1][0]
+        return frame
+
+
+class Prefetcher:
+    """Images in a known order, read ahead (D-51; Q-84, Q-99): `schedule` gives the upcoming
+    training record indices, `take` returns one as float32 [H, W, 3] in [0, 1] on `device`,
+    bitwise equal to `MultiViewVideo.load_image`. On CUDA a thread copies frames through a ring
+    of pinned buffers on a side stream, and the current stream waits on each copy's event; on the
+    CPU the thread reads ahead; `depth` 0 reads each image when it is taken."""
+
+    def __init__(
+        self, cache: FrameCache, *, device: str | torch.device = "cpu", depth: int = 8
+    ) -> None:
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 0:
+            raise ValueError(f"depth must be an int >= 0, got {depth!r}")
+        self._cache = cache
+        self._device = torch.device(device)
+        self._depth = depth
+        self._cuda = self._device.type == "cuda"
+        # On CUDA, x / <python float> multiplies by the reciprocal, which isn't bitwise the CPU's
+        # x / 255.0; dividing by a 0-dim device tensor is (measured; Q-99).
+        self._divisor: Tensor | float = (
+            torch.full((), 255.0, device=self._device) if self._cuda else 255.0
+        )
+        self._plan: deque[int] = deque()
+        self._pending: deque[tuple[int, concurrent.futures.Future[Any]]] = deque()
+        self._executor = concurrent.futures.ThreadPoolExecutor(1) if depth > 0 else None
+        self._stream = torch.cuda.Stream(self._device) if self._cuda else None  # type: ignore[no-untyped-call]
+        self._free: dict[tuple[int, ...], list[tuple[Tensor, Any]]] = {}
+        self._lock = threading.Lock()
+
+    def schedule(self, indices: Sequence[int]) -> None:
+        """The upcoming record indices, in the order they will be taken."""
+        upcoming = list(indices)
+        pending = [index for index, _ in self._pending]
+        if upcoming[: len(pending)] == pending:
+            self._plan = deque(upcoming[len(pending) :])
+        else:
+            self._drop()
+            self._plan = deque(upcoming)
+        self._fill()
+
+    def take(self, index: int) -> Tensor:
+        """Record `index`'s image as float32 [H, W, 3] on the device, ready on the current
+        stream; read directly when it isn't next in the schedule."""
+        if self._pending and self._pending[0][0] == index:
+            _, future = self._pending.popleft()
+            item = future.result()
+        else:
+            self._drop()
+            self._plan.clear()
+            item = self._load(index)
+        image = self._finish(item)
+        self._fill()
+        return image
+
+    def close(self) -> None:
+        self._drop()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+
+    def _fill(self) -> None:
+        if self._executor is None:
+            return
+        while self._plan and len(self._pending) < self._depth:
+            index = self._plan.popleft()
+            self._pending.append((index, self._executor.submit(self._load, index)))
+
+    def _drop(self) -> None:
+        while self._pending:
+            _, future = self._pending.popleft()
+            self._release(future.result())
+
+    def _buffer(self, shape: tuple[int, ...]) -> Tensor:
+        with self._lock:
+            free = self._free.get(shape)
+            entry = free.pop() if free else None
+        if entry is None:
+            return torch.empty(shape, dtype=torch.uint8, pin_memory=True)
+        buffer, event = entry
+        if event is not None:
+            event.synchronize()  # the buffer's last copy is done (on this worker, not the trainer)
+        return buffer
+
+    def _release(self, item: tuple[Tensor, Any, Tensor | None]) -> None:
+        _, event, buffer = item
+        if buffer is not None:
+            with self._lock:
+                self._free.setdefault(tuple(buffer.shape), []).append((buffer, event))
+
+    def _load(self, index: int) -> tuple[Tensor, Any, Tensor | None]:
+        frame = self._cache.frame(index)
+        if frame.device == self._device or not self._cuda:
+            return frame, None, None
+        assert self._stream is not None
+        buffer = self._buffer(tuple(frame.shape))
+        buffer.copy_(frame)
+        with torch.cuda.stream(self._stream):
+            on_device = buffer.to(self._device, non_blocking=True)
+            event = torch.cuda.Event()  # type: ignore[no-untyped-call]
+            event.record(self._stream)
+        return on_device, event, buffer
+
+    def _finish(self, item: tuple[Tensor, Any, Tensor | None]) -> Tensor:
+        frame, event, _ = item
+        if event is not None:
+            current = torch.cuda.current_stream(self._device)
+            current.wait_event(event)
+            frame.record_stream(current)
+        image = frame.to(torch.float32) / self._divisor
+        self._release(item)
+        return image
