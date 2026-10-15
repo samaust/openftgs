@@ -8,12 +8,20 @@ INTER_AREA, the undistortion maps and images, and FileStorage's readback.
 """
 
 import math
+from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 import pytest
 
-from openftgs.data import resize_area, resized_size, undistort_image, undistortion_map
+from openftgs.data import (
+    read_opencv_yaml,
+    resize_area,
+    resized_size,
+    undistort_image,
+    undistortion_map,
+)
 
 
 def _integrate(image: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -139,3 +147,156 @@ def test_u35_tilted_and_unknown_models_are_rejected(count: int) -> None:
     count OpenCV doesn't define."""
     with pytest.raises(ValueError, match="tilted" if count == 14 else "coefficients"):
         undistortion_map(_K, np.zeros(count), 20, 10)
+
+
+# U-36 · the OpenCV-style YAML reader (D-61).
+
+
+def _opencv_values(path: Path) -> dict[str, Any]:
+    """U-36's oracle: every top-level value as OpenCV's FileStorage reads it back."""
+    storage = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
+    values: dict[str, Any] = {}
+    for key in storage.root().keys():
+        node = storage.getNode(key)
+        if node.isSeq():
+            values[key] = [node.at(i).string() for i in range(node.size())]
+        elif node.isString():
+            values[key] = node.string()
+        elif node.isInt():
+            values[key] = int(node.real())
+        elif node.isReal():
+            values[key] = node.real()
+        else:
+            values[key] = node.mat()
+    storage.release()
+    return values
+
+
+def _assert_same(got: Any, want: Any) -> None:
+    if isinstance(want, np.ndarray):
+        assert isinstance(got, np.ndarray)
+        assert got.dtype == want.dtype and got.shape == want.shape
+        assert np.array_equal(got, want, equal_nan=np.issubdtype(want.dtype, np.floating))
+        assert got.tobytes() == want.tobytes() or np.isnan(want).any()
+    elif isinstance(want, float) and math.isnan(want):
+        assert isinstance(got, float) and math.isnan(got)
+    else:
+        assert got == want and type(got) is type(want)
+
+
+def _write_with_opencv(path: Path) -> None:
+    storage = cv2.FileStorage(str(path), cv2.FILE_STORAGE_WRITE)
+    storage.write("names", ["0000", "0015", "0023"])
+    rng = np.random.default_rng(36)
+    storage.write("K_0015", np.array([[1460.25, 0.0, 959.5], [0.0, 1461.0, 539.5], [0, 0, 1]]))
+    storage.write("D_0015", np.array([[-0.21], [0.05], [1e-5], [-3e-4], [0.0]]))
+    storage.write("F_f32", rng.normal(size=(3, 4)).astype(np.float32))
+    storage.write("F_special", np.array([[np.nan, np.inf, -np.inf, -0.0, 1 / 3]], np.float32))
+    storage.write("I_i32", rng.integers(-1000, 1000, size=(2, 3), dtype=np.int32))
+    storage.write("U_u8", rng.integers(0, 256, size=(1, 5), dtype=np.uint8))
+    storage.write("C_i8", np.array([[-3, 4]], np.int8))
+    storage.write("W_u16", np.array([[65535, 1]], np.uint16))
+    storage.write("S_i16", np.array([[-32768, 7]], np.int16))
+    storage.write("H_f16", np.array([[1.5, -2.25]], np.float16))
+    storage.write("M_3d", rng.normal(size=(2, 2, 3)))
+    storage.write("H_0015", 2160)
+    storage.write("x", 0.1)
+    storage.write("big", 1e300)
+    storage.write("label", "hair")
+    storage.release()
+
+
+@pytest.mark.parametrize("header", ["as written", "%YAML:1.0"])
+def test_u36_reads_what_opencv_writes(tmp_path: Path, header: str) -> None:
+    """U-36, D-61: files written by OpenCV's FileStorage (opencv-matrix entries of several
+    shapes and types, a sequence of names, scalars) read back with every value equal to what
+    OpenCV reads, bitwise; once as OpenCV 5 writes them (`%YAML 1.2`) and once with the
+    `%YAML:1.0` header older OpenCV writes, which isn't valid YAML (Q-91)."""
+    path = tmp_path / "calib.yml"
+    _write_with_opencv(path)
+    if header != "as written":
+        lines = path.read_text().splitlines()
+        assert lines[0].startswith("%YAML")
+        path.write_text("\n".join([header, *lines[1:]]) + "\n")
+    want = _opencv_values(path)
+    got = read_opencv_yaml(path)
+    assert set(got) == set(want)
+    for key in want:
+        _assert_same(got[key], want[key])
+
+
+def test_u36_reads_a_hand_written_calibration_in_the_selfcap_shape(tmp_path: Path) -> None:
+    """U-36, D-63: a file in the shape of SelfCap's optimized/intri.yml and extri.yml (names,
+    K_, D_ 5×1, H_, W_, ccm_, R_ as a Rodrigues vector, Rot_, T_), written by hand with the
+    `%YAML:1.0` header, reads back as OpenCV reads it."""
+    text = """%YAML:1.0
+---
+names:
+   - "0000"
+   - "0001"
+K_0000: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 2.2048e+03, 0., 1.9195e+03, 0., 2.2049e+03, 1.0795e+03, 0., 0., 1. ]
+D_0000: !!opencv-matrix
+   rows: 5
+   cols: 1
+   dt: d
+   data: [ -1.0e-01, 8.5e-02, 0., 0., 0. ]
+H_0000: 2160
+W_0000: 3840
+ccm_0000: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1., 0., 0., 0., 1., 0., 0., 0., 1. ]
+R_0000: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ 1.2e-01, -2.5e+00, 3.0e-02 ]
+Rot_0000: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ -0.8, 0., -0.6, 0., 1., 0., 0.6, 0., -0.8 ]
+T_0000: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ 0.5, -1.25, 4. ]
+"""
+    path = tmp_path / "intri.yml"
+    path.write_text(text)
+    want = _opencv_values(path)
+    got = read_opencv_yaml(path)
+    assert (
+        set(got)
+        == set(want)
+        == {
+            "names",
+            "K_0000",
+            "D_0000",
+            "H_0000",
+            "W_0000",
+            "ccm_0000",
+            "R_0000",
+            "Rot_0000",
+            "T_0000",
+        }
+    )
+    for key in want:
+        _assert_same(got[key], want[key])
+    assert got["names"] == ["0000", "0001"]
+
+
+def test_yaml_reader_rejects_files_that_are_not_calibration_maps(tmp_path: Path) -> None:
+    """Q-91: a file whose top level isn't a mapping, or that isn't YAML, is a ValueError."""
+    path = tmp_path / "bad.yml"
+    path.write_text("- 1\n- 2\n")
+    with pytest.raises(ValueError):
+        read_opencv_yaml(path)
+    path.write_text("a: [1, 2\n")
+    with pytest.raises(ValueError):
+        read_opencv_yaml(path)

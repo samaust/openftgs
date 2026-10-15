@@ -8,12 +8,14 @@ Spec: §1.4, D-51, D-61, D-69. Band: Foundation (§2.1).
 
 import math
 import numbers
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import yaml
 from PIL import Image
 from torch import Tensor
 
@@ -25,6 +27,7 @@ __all__ = [
     "camera_from_llff",
     "camera_from_opencv",
     "fastest_frames",
+    "read_opencv_yaml",
     "resize_area",
     "resize_camera",
     "resized_size",
@@ -425,3 +428,78 @@ def undistort_image(image: np.ndarray, K: Any, dist: Any) -> np.ndarray:
     if eight_bit:
         return np.clip(np.rint(out), 0, 255).astype(np.uint8)
     return out
+
+
+# The OpenCV-style YAML reader (D-61; Q-84, Q-91): PyYAML with a constructor for OpenCV's
+# matrices, written from the format OpenCV's FileStorage writes (the probe in the source log).
+
+_OPENCV_DTYPES = {
+    "u": np.uint8,
+    "c": np.int8,
+    "w": np.uint16,
+    "s": np.int16,
+    "i": np.int32,
+    "f": np.float32,
+    "d": np.float64,
+    "h": np.float16,
+}
+_DT_PATTERN = re.compile(r"([1-9][0-9]*)?([ucwsifdh])")
+
+
+class _OpenCVLoader(yaml.SafeLoader):  # type: ignore[misc]  # PyYAML ships no types
+    """PyYAML's safe loader plus OpenCV's matrices and its `.Nan` spelling (Q-91)."""
+
+
+def _opencv_matrix(loader: yaml.SafeLoader, node: yaml.MappingNode) -> np.ndarray:
+    fields = loader.construct_mapping(node, deep=True)
+    dt = fields.get("dt")
+    match = _DT_PATTERN.fullmatch(str(dt))
+    if match is None:
+        raise yaml.constructor.ConstructorError(
+            None, None, f"unknown matrix dt {dt!r}", node.start_mark
+        )
+    channels = int(match.group(1) or 1)
+    if "sizes" in fields:  # opencv-nd-matrix
+        shape = tuple(int(n) for n in fields["sizes"])
+    else:
+        shape = (int(fields["rows"]), int(fields["cols"]))
+    if channels > 1:
+        shape += (channels,)
+    data = fields.get("data", [])
+    if not isinstance(data, list) or len(data) != math.prod(shape):
+        raise yaml.constructor.ConstructorError(
+            None, None, f"matrix data must hold {math.prod(shape)} values", node.start_mark
+        )
+    dtype = _OPENCV_DTYPES[match.group(2)]
+    wide = np.float64 if np.issubdtype(dtype, np.floating) else np.int64
+    return np.array(data, dtype=wide).astype(dtype).reshape(shape)
+
+
+_OpenCVLoader.add_constructor("tag:yaml.org,2002:opencv-matrix", _opencv_matrix)
+_OpenCVLoader.add_constructor("tag:yaml.org,2002:opencv-nd-matrix", _opencv_matrix)
+# OpenCV writes NaN as `.Nan`, which YAML 1.1's float pattern (`.nan`, `.NaN`, `.NAN`) misses.
+_OpenCVLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:float", re.compile(r"^[-+]?\.Nan$"), list("-+.")
+)
+
+
+def read_opencv_yaml(path: Path) -> dict[str, Any]:
+    """The top-level mapping of a file written by OpenCV's FileStorage (D-61; Q-84, Q-91):
+    `!!opencv-matrix` entries become NumPy arrays of shape (rows, cols) or (rows, cols,
+    channels) in the dtype their `dt` names, so values equal what OpenCV reads back; other
+    values are as PyYAML reads them. A `%YAML:1.0` first line, which isn't valid YAML, is
+    dropped."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as err:
+        raise ValueError(f"{path}: not a readable text file: {err}") from None
+    if text.startswith("%YAML:"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    try:
+        data = yaml.load(text, Loader=_OpenCVLoader)
+    except yaml.YAMLError as err:
+        raise ValueError(f"{path}: not an OpenCV-style YAML file: {err}") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: the top level must be a mapping")
+    return data
