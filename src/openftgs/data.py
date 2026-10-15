@@ -28,6 +28,8 @@ __all__ = [
     "resize_area",
     "resize_camera",
     "resized_size",
+    "undistort_image",
+    "undistortion_map",
 ]
 
 _IMAGE_MODES = ("RGB", "RGBA")  # §1.4 "Images": 8-bit RGB, alpha dropped (D-34); Q-65
@@ -338,6 +340,88 @@ def resize_area(image: np.ndarray, width: int, height: int) -> np.ndarray:
     out: np.ndarray = np.asarray(
         sum(by_col[rows[:, k]] * row_weights[:, k].reshape(shape) for k in range(rows.shape[1]))
     )
+    if eight_bit:
+        return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+    return out
+
+
+# Undistortion (D-61; Q-84, Q-90): OpenCV's documented camera model (calib3d), written from its
+# documentation.
+
+_COEFFICIENT_COUNTS = (0, 4, 5, 8, 12)
+
+
+def _coefficients(dist: Any) -> np.ndarray:
+    """The 12 coefficients k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4 of OpenCV's model,
+    zero-padded from 0, 4, 5, 8 or 12 given; the tilted model (14) is refused (D-61)."""
+    values = np.asarray(dist, dtype=np.float64).reshape(-1)
+    if values.size == 14:
+        raise ValueError("the tilted (14-coefficient) distortion model is not supported (D-61)")
+    if values.size not in _COEFFICIENT_COUNTS:
+        raise ValueError(
+            f"distortion must have 0, 4, 5, 8 or 12 coefficients, got {values.size} coefficients"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("distortion coefficients must be finite")
+    return np.concatenate([values, np.zeros(12 - values.size)])
+
+
+def undistortion_map(K: Any, dist: Any, width: int, height: int) -> np.ndarray:
+    """For every pixel of the undistorted width × height image, its source position (x, y) in
+    the distorted image, [H, W, 2] float64, by the steps of OpenCV's initUndistortRectifyMap
+    with R = I and the new camera matrix equal to K (D-61; Q-84). K uses OpenCV's integer
+    pixel centres, as calibration files do."""
+    K64 = _matrix64(K, (3, 3), "K")
+    k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4 = _coefficients(dist)
+    fx, fy, cx, cy = K64[0, 0], K64[1, 1], K64[0, 2], K64[1, 2]
+    v, u = np.mgrid[0:height, 0:width].astype(np.float64)
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+    r2 = x * x + y * y
+    r4 = r2 * r2
+    r6 = r4 * r2
+    radial = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (1 + k4 * r2 + k5 * r4 + k6 * r6)
+    xd = x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x) + s1 * r2 + s2 * r4
+    yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y + s3 * r2 + s4 * r4
+    return np.stack([fx * xd + cx, fy * yd + cy], axis=-1)
+
+
+def _sample_bilinear(image: np.ndarray, positions: np.ndarray) -> np.ndarray:
+    """Bilinear samples of an [H, W] or [H, W, C] array at [h, w, 2] positions (x, y), pixel
+    centres at integers, pixels outside the image counting as 0 (D-61), in float64."""
+    height, width = image.shape[:2]
+    values = image.astype(np.float64)
+    x, y = positions[..., 0], positions[..., 1]
+    x0, y0 = np.floor(x), np.floor(y)
+    wx, wy = x - x0, y - y0
+    out = np.zeros(positions.shape[:2] + image.shape[2:], dtype=np.float64)
+    extra = (...,) + (None,) * (image.ndim - 2)
+    for dy, wgt_y in ((0, 1 - wy), (1, wy)):
+        for dx, wgt_x in ((0, 1 - wx), (1, wx)):
+            xi, yi = x0 + dx, y0 + dy
+            valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+            xs = np.clip(xi, 0, width - 1).astype(np.int64)
+            ys = np.clip(yi, 0, height - 1).astype(np.int64)
+            out += values[ys, xs] * (wgt_x * wgt_y * valid)[extra]
+    return out
+
+
+def undistort_image(image: np.ndarray, K: Any, dist: Any) -> np.ndarray:
+    """The undistorted image, same size, K unchanged (D-61; Q-84): bilinear samples at
+    `undistortion_map`'s positions, zeros where the source lies outside. uint8 input gives uint8
+    output rounded half to even; floating input gives float64 (Q-90: the caller may resize the
+    float64 values before rounding). Zero coefficients return the input's values unchanged."""
+    if image.ndim not in (2, 3):
+        raise ValueError(f"image must be [H, W] or [H, W, C], got shape {image.shape}")
+    eight_bit = image.dtype == np.uint8
+    if not eight_bit and not np.issubdtype(image.dtype, np.floating):
+        raise ValueError(f"image must be uint8 or floating, got {image.dtype}")
+    coefficients = _coefficients(dist)
+    if not coefficients.any():
+        _matrix64(K, (3, 3), "K")
+        return image.copy() if eight_bit else image.astype(np.float64)
+    height, width = image.shape[:2]
+    out = _sample_bilinear(image, undistortion_map(K, coefficients, width, height))
     if eight_bit:
         return np.clip(np.rint(out), 0, 255).astype(np.uint8)
     return out

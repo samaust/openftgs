@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import pytest
 
-from openftgs.data import resize_area, resized_size
+from openftgs.data import resize_area, resized_size, undistort_image, undistortion_map
 
 
 def _integrate(image: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -72,3 +72,70 @@ def test_u34_eight_bit_output_rounds_half_to_even() -> None:
     and 4."""
     image = np.array([[1, 2, 2, 3, 3, 4]], dtype=np.uint8)
     assert resize_area(image, 3, 1).tolist() == [[2, 2, 4]]
+
+
+# U-35 · undistortion (D-61).
+
+_K = np.array([[180.0, 0.0, 97.3], [0.0, 175.0, 61.8], [0.0, 0.0, 1.0]])  # OpenCV convention
+_COEFFICIENTS = {
+    4: [-0.21, 0.05, 0.0012, -0.0008],
+    5: [-0.21, 0.05, 0.0012, -0.0008, -0.01],
+    8: [-0.21, 0.05, 0.0012, -0.0008, -0.01, 0.02, -0.003, 0.001],
+    12: [-0.21, 0.05, 0.0012, -0.0008, -0.01, 0.02, -0.003, 0.001, 0.002, -0.001, 0.0015, 0.0005],
+}
+
+
+@pytest.mark.parametrize("count", [4, 5, 8, 12])
+def test_u35_maps_match_opencv(count: int) -> None:
+    """U-35, D-61: the source-position maps for the 4-, 5-, 8- and 12-coefficient models agree
+    with OpenCV's initUndistortRectifyMap (R = I, new camera matrix = K) to 1e-3 px."""
+    dist = np.array(_COEFFICIENTS[count])
+    got = undistortion_map(_K, dist, 200, 120)
+    map_x, map_y = cv2.initUndistortRectifyMap(_K, dist, None, _K, (200, 120), cv2.CV_32FC1)
+    assert got.shape == (120, 200, 2) and got.dtype == np.float64
+    np.testing.assert_allclose(got[..., 0], map_x, rtol=0.0, atol=1e-3)
+    np.testing.assert_allclose(got[..., 1], map_y, rtol=0.0, atol=1e-3)
+
+
+@pytest.mark.parametrize("count", [4, 5, 8, 12])
+def test_u35_images_match_opencv_away_from_the_border(count: int) -> None:
+    """U-35, D-61: images of a smooth pattern (gradients well below 32 levels per pixel) agree
+    with OpenCV's undistort within one 8-bit level wherever the source position lies at least
+    one pixel inside the image."""
+    y, x = np.mgrid[0:120, 0:200].astype(np.float64)
+    pattern = np.stack(
+        [128 + 90 * np.sin(x / 17) * np.cos(y / 23), 40 + 1.5 * x, 200 - 1.2 * y], axis=-1
+    )
+    image = np.clip(np.rint(pattern), 0, 255).astype(np.uint8)
+    dist = np.array(_COEFFICIENTS[count])
+    got = undistort_image(image, _K, dist)
+    want = cv2.undistort(image, _K, dist)
+    map_x, map_y = cv2.initUndistortRectifyMap(_K, dist, None, _K, (200, 120), cv2.CV_32FC1)
+    inside = (map_x >= 1) & (map_x <= 200 - 2) & (map_y >= 1) & (map_y <= 120 - 2)
+    assert got.dtype == np.uint8 and got.shape == image.shape
+    assert inside.mean() > 0.8
+    assert np.abs(got.astype(int) - want.astype(int))[inside].max() <= 1
+
+
+def test_u35_zero_coefficients_are_the_identity() -> None:
+    """U-35: zero coefficients (none, or all zero) leave the image unchanged."""
+    image = np.random.default_rng(1).integers(0, 256, size=(30, 40, 3), dtype=np.uint8)
+    assert np.array_equal(undistort_image(image, _K, []), image)
+    assert np.array_equal(undistort_image(image, _K, np.zeros(5)), image)
+
+
+def test_u35_pixels_without_a_source_are_zero() -> None:
+    """D-61: output pixels whose source position lies outside the image are 0."""
+    image = np.full((60, 80, 3), 200, dtype=np.uint8)
+    K = np.array([[60.0, 0.0, 39.5], [0.0, 60.0, 29.5], [0.0, 0.0, 1.0]])
+    got = undistort_image(image, K, [0.8, 0.0, 0.0, 0.0])  # strong pincushion: corners leave
+    assert got[0, 0].tolist() == [0, 0, 0]
+    assert got[30, 40].tolist() == [200, 200, 200]
+
+
+@pytest.mark.parametrize("count", [14, 3, 6])
+def test_u35_tilted_and_unknown_models_are_rejected(count: int) -> None:
+    """U-35, D-61: a 14-coefficient (tilted) input is rejected with a clear error, as is any
+    count OpenCV doesn't define."""
+    with pytest.raises(ValueError, match="tilted" if count == 14 else "coefficients"):
+        undistortion_map(_K, np.zeros(count), 20, 10)
