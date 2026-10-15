@@ -611,8 +611,16 @@ One of the thirty-eight §3.1 tests that pin an equation or convention with a nu
 _Avoid_: spec test, equation test, regression test
 
 **Converter check C-n**:
-One of the five §3.1 checks of a converter against real dataset geometry, run only when the dataset is present and never in CI. §3.1
+One of the five §3.1 checks of a converter against the geometry of the paper's datasets, run only when the dataset is present and never in CI; this project does not run them, apart from C-4's Gaussian-dot part. §3.1, D-79
 _Avoid_: dataset test, integration test
+
+**Synthetic-dataset check G-n**:
+One of the seven §3.1 checks of the converters and the frame cache against openftgs-synth's ground truth, run only where that dataset is present and never in CI. §3.1, D-79
+_Avoid_: synthetic scene (reserved for S-n), dataset test, ground-truth test
+
+**openftgs-synth**:
+The owner's CC0-1.0 rendered multi-view video dataset, with exact ground truth, on which this project validates in place of the paper's non-commercial datasets. §1.4 Validation data, D-79
+_Avoid_: synthetic scene (reserved for S-n), synthetic dataset (unqualified), test data
 
 **Synthetic scene S-n**:
 One of the eleven §3.2 recovery tests that train on a scene with known ground truth and check what was recovered, not just that the code ran. §3.2
