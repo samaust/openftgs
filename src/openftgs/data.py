@@ -25,6 +25,7 @@ __all__ = [
     "camera_from_llff",
     "camera_from_opencv",
     "fastest_frames",
+    "resize_area",
     "resize_camera",
     "resized_size",
 ]
@@ -290,3 +291,53 @@ def resize_camera(camera: Camera, width: int, height: int) -> Camera:
     K[1, [1, 2]] *= height / camera.height
     w2c = camera.world_to_camera.to(torch.float64).numpy()
     return _camera(K, w2c[:3, :3], w2c[:3, 3], width, height, camera.name)
+
+
+# Area resizing (D-33, D-61; Q-84, Q-89, Q-90).
+
+
+def _area_weights(size: int, new_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Banded weights of D-33's area averaging along one axis: output pixel j covers
+    [j·s, (j + 1)·s) of the input, s = size/new_size, each input pixel a unit square; returns
+    the first input index of each output pixel and the weights of its taps, in float64."""
+    scale = size / new_size
+    edges = np.arange(new_size + 1, dtype=np.float64) * scale
+    edges[-1] = size  # exact, whatever the rounding of new_size·scale
+    first = np.floor(edges[:-1]).astype(np.int64)
+    taps = int(math.ceil(scale)) + 1
+    index = first[:, None] + np.arange(taps)[None, :]
+    overlap = np.minimum(index + 1, edges[1:, None]) - np.maximum(index, edges[:-1, None])
+    weights = np.clip(overlap, 0.0, None) / scale
+    weights[index >= size] = 0.0
+    return np.minimum(index, size - 1), weights
+
+
+def resize_area(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    """D-33's area resizing of an [H, W] or [H, W, C] array to width × height: every output
+    pixel is the mean of the input over its footprint, input pixels being constant squares,
+    separably in float64 (Q-84). uint8 input gives uint8 output rounded half to even; floating
+    input gives float64."""
+    if image.ndim not in (2, 3):
+        raise ValueError(f"image must be [H, W] or [H, W, C], got shape {image.shape}")
+    for size, what in ((width, "width"), (height, "height")):
+        if isinstance(size, bool) or not isinstance(size, int | np.integer) or size < 1:
+            raise ValueError(f"{what} must be an int >= 1, got {size!r}")
+    eight_bit = image.dtype == np.uint8
+    if not eight_bit and not np.issubdtype(image.dtype, np.floating):
+        raise ValueError(f"image must be uint8 or floating, got {image.dtype}")
+    values = image.astype(np.float64)
+    rows, row_weights = _area_weights(values.shape[0], height)
+    cols, col_weights = _area_weights(values.shape[1], width)
+    # Columns, then rows: each a sum over the few taps of the footprint (§2.4 rule 1: no loop
+    # over pixels).
+    shape = (1, -1) + (1,) * (values.ndim - 2)
+    by_col = sum(
+        values[:, cols[:, k]] * col_weights[:, k].reshape(shape) for k in range(cols.shape[1])
+    )
+    shape = (-1,) + (1,) * (values.ndim - 1)
+    out: np.ndarray = np.asarray(
+        sum(by_col[rows[:, k]] * row_weights[:, k].reshape(shape) for k in range(rows.shape[1]))
+    )
+    if eight_bit:
+        return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+    return out
