@@ -10,6 +10,7 @@ import math
 import numbers
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -17,9 +18,16 @@ from PIL import Image
 from torch import Tensor
 
 from openftgs.io import read_scene_manifest
-from openftgs.types import ImageRecord, SceneManifest, TimeNormalizer, frame_interval
+from openftgs.types import Camera, ImageRecord, SceneManifest, TimeNormalizer, frame_interval
 
-__all__ = ["MultiViewVideo", "fastest_frames"]
+__all__ = [
+    "MultiViewVideo",
+    "camera_from_llff",
+    "camera_from_opencv",
+    "fastest_frames",
+    "resize_camera",
+    "resized_size",
+]
 
 _IMAGE_MODES = ("RGB", "RGBA")  # §1.4 "Images": 8-bit RGB, alpha dropped (D-34); Q-65
 _MASK_MODES = ("1", "L")  # Q-65: bilevel or 8-bit grayscale masks
@@ -190,3 +198,95 @@ def fastest_frames(frames: Iterable[Tensor], *, count: int = 10) -> int:
     scores = torch.tensor(diffs, dtype=torch.float64).unfold(0, width, 1).sum(dim=1)
     # Q-59: the first maximum, so ties go to the lowest start.
     return int(torch.nonzero(scores == scores.max())[0, 0])
+
+
+# Cameras (§1.4 "World and camera frames", D-28, D-33; Q-84, Q-89).
+
+_ROTATION_TOLERANCE = 1e-6  # max |RᵀR − I| accepted from a calibration file
+
+
+def _matrix64(value: Any, shape: tuple[int, ...], what: str) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != shape or not np.all(np.isfinite(array)):
+        raise ValueError(f"{what} must be a finite {shape} array, got shape {array.shape}")
+    return array
+
+
+def _camera(
+    K: np.ndarray, rotation: np.ndarray, translation: np.ndarray, width: int, height: int, name: str
+) -> Camera:
+    """A Camera from float64 parts in the continuous convention, stored as float32 (§2.1)."""
+    for size, what in ((width, "width"), (height, "height")):
+        if isinstance(size, bool) or not isinstance(size, int | np.integer) or size < 1:
+            raise ValueError(f"{what} must be an int >= 1, got {size!r}")
+    if K[0, 1] != 0.0 or K[1, 0] != 0.0 or K[2].tolist() != [0.0, 0.0, 1.0]:
+        raise ValueError("K must be [[fx, 0, cx], [0, fy, cy], [0, 0, 1]] (no skew)")
+    if not (K[0, 0] > 0.0 and K[1, 1] > 0.0):
+        raise ValueError(f"K must have fx > 0 and fy > 0, got {K[0, 0]} and {K[1, 1]}")
+    error = np.abs(rotation.T @ rotation - np.eye(3)).max()
+    if error > _ROTATION_TOLERANCE or np.linalg.det(rotation) <= 0.0:
+        raise ValueError("R must be a rotation matrix (orthonormal, determinant +1)")
+    w2c = np.eye(4)
+    w2c[:3, :3] = rotation
+    w2c[:3, 3] = translation
+    return Camera(
+        K=torch.from_numpy(K).to(torch.float32),
+        world_to_camera=torch.from_numpy(w2c).to(torch.float32),
+        width=int(width),
+        height=int(height),
+        name=name,
+    )
+
+
+def camera_from_opencv(
+    K: Any, R: Any, T: Any, *, width: int, height: int, name: str = ""
+) -> Camera:
+    """A camera from an OpenCV calibration (Q-84): K with pixel centres at integers gains +0.5
+    on cx and cy (§1.4), and R, T go straight into world_to_camera, x_cam = R·x + T (D-63)."""
+    K64 = _matrix64(K, (3, 3), "K").copy()
+    K64[0, 2] += 0.5
+    K64[1, 2] += 0.5
+    translation = _matrix64(np.asarray(T, dtype=np.float64).reshape(-1), (3,), "T")
+    return _camera(K64, _matrix64(R, (3, 3), "R"), translation, width, height, name)
+
+
+def camera_from_llff(pose: Any, *, name: str = "") -> Camera:
+    """A camera from a row of Neural3DV's poses_bounds.npy, or its 3×5 matrix (D-28; Q-84):
+    the camera-to-world rotation's columns point down, right and back, so the OpenCV rotation
+    is [col₁, col₀, −col₂]; then the camera centre and (H, W, focal); fx = fy = focal and
+    c = (W/2, H/2), already the image centre in the continuous convention."""
+    array = np.asarray(pose, dtype=np.float64)
+    if array.shape == (17,):
+        array = array[:15]
+    if array.shape == (15,):
+        array = array.reshape(3, 5)
+    matrix = _matrix64(array, (3, 5), "an LLFF pose (17 values, 15 values or 3x5)")
+    down, right, back, centre, hwf = (matrix[:, k] for k in range(5))
+    height, width, focal = hwf
+    if height != round(height) or width != round(width):
+        raise ValueError(f"an LLFF pose's H and W must be integers, got {height} and {width}")
+    rotation = np.stack([right, down, -back])  # world-to-camera: rows are the camera's axes
+    K = np.array([[focal, 0.0, width / 2], [0.0, focal, height / 2], [0.0, 0.0, 1.0]])
+    return _camera(K, rotation, -rotation @ centre, int(width), int(height), name)
+
+
+def resized_size(width: int, height: int, ratio: float) -> tuple[int, int]:
+    """§1.4's W′ = round(W·r) and H′ = round(H·r), an exact half rounding up, at least 1
+    (Q-89)."""
+    if (
+        isinstance(ratio, bool)
+        or not isinstance(ratio, numbers.Real)
+        or not (math.isfinite(ratio) and ratio > 0.0)
+    ):
+        raise ValueError(f"ratio must be a finite number > 0, got {ratio!r}")
+    return max(1, math.floor(width * ratio + 0.5)), max(1, math.floor(height * ratio + 0.5))
+
+
+def resize_camera(camera: Camera, width: int, height: int) -> Camera:
+    """The camera of the image resized to width × height: fx and cx scale by W′/W, fy and cy by
+    H′/H (§1.4, D-33); the pose is unchanged."""
+    K = camera.K.to(torch.float64).numpy().copy()
+    K[0, [0, 2]] *= width / camera.width
+    K[1, [1, 2]] *= height / camera.height
+    w2c = camera.world_to_camera.to(torch.float64).numpy()
+    return _camera(K, w2c[:3, :3], w2c[:3, 3], width, height, camera.name)
