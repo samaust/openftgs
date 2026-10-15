@@ -7,6 +7,8 @@ Spec: §1.4, D-51, D-61, D-69. Band: Foundation (§2.1).
 """
 
 import concurrent.futures
+import gzip
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -16,7 +18,9 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 import threading
+import zlib
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +41,7 @@ __all__ = [
     "camera_from_opencv",
     "convert_n3dv",
     "convert_opencv_yaml",
+    "convert_selfcap",
     "fastest_frames",
     "read_opencv_yaml",
     "resize_area",
@@ -1127,4 +1132,529 @@ def convert_opencv_yaml(
         write_scene_manifest(out / "scene.json", records, time_unit="s", metadata=metadata)
     finally:
         shutil.rmtree(out / ".work", ignore_errors=True)
+    return out / "scene.json"
+
+
+# SelfCap (§1.4, D-59, D-60, D-63, D-64, D-69; Q-86, Q-87, Q-93, Q-94, Q-97, Q-101).
+
+# FreeTimeGS scene: (sequence, test camera, window [N0, N1), resize ratio), from §1.4's table.
+_SELFCAP_SCENES: dict[str, tuple[str, str, tuple[int, int], float]] = {
+    "dance1": ("hair", "0015", (4120, 4180), 0.5),
+    "dance2": ("hair", "0015", (5530, 5590), 0.5),
+    "corgi1": ("corgi", "0007", (200, 260), 0.5),
+    "corgi2": ("corgi", "0007", (2950, 3010), 0.5),
+    "bike1": ("bike", "0009", (8900, 8960), 1.0),
+    "bike2": ("bike", "0009", (30020, 30080), 1.0),
+}
+_SELFCAP_DEFAULT_RESIZE = 0.5  # Q-97: other scene names, the protocol's ratio for 4K video
+_SELFCAP_FPS = 60  # D-59: τ = n/60 s minus the sync offset
+_SELFCAP_CALIBRATION = ("intri.yml", "extri.yml", "sync.json")
+_FULL_OPENCV_COEFFICIENTS = 8  # k1, k2, p1, p2, k3, k4, k5, k6 (COLMAP's FULL_OPENCV)
+_FASTEST = 10  # D-69
+
+
+class _HashingReader:
+    """A binary reader that hashes every byte it passes on (Q-86: the archive's SHA-256 is of
+    the bytes as downloaded, read once)."""
+
+    def __init__(self, file: IO[bytes]) -> None:
+        self._file = file
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._file.read(size)
+        self.digest.update(data)
+        return data
+
+    def drain(self) -> None:
+        while self.read(1 << 20):
+            pass
+
+
+def _safe_member(member: tarfile.TarInfo) -> tuple[str, ...] | None:
+    """A member's path parts, or None for anything but a regular file at a relative path
+    without `..` (Q-86: archives are untrusted data)."""
+    parts = tuple(Path(member.name).parts)
+    if not member.isreg() or not parts or Path(member.name).is_absolute() or ".." in parts:
+        return None
+    return parts
+
+
+def _extract_archive(
+    archive: Path, work: Path, *, videos: bool, calibration: bool
+) -> tuple[str, list[str]]:
+    """Stream `archive` once: extract `*/videos/*.mp4` into work/videos and
+    `*/optimized/{intri.yml, extri.yml, sync.json}` into work/optimized, hash every byte, and
+    return the SHA-256 and the warnings (Q-86). A gzip CRC failure after every member came out
+    whole is a warning; one that cuts a member short is an error."""
+    if not archive.is_file():
+        raise ValueError(
+            f"{archive}: archive not found (Q-86: SRC holds the archives as downloaded)"
+        )
+    warnings: list[str] = []
+    extracted: set[Path] = set()
+    with archive.open("rb") as raw:
+        reader = _HashingReader(raw)
+        stream = gzip.GzipFile(fileobj=reader, mode="rb")  # type: ignore[call-overload]
+        try:
+            with tarfile.open(fileobj=stream, mode="r|") as tar:
+                for member in tar:
+                    parts = _safe_member(member)
+                    if parts is None or len(parts) < 2:
+                        continue
+                    if videos and parts[-2] == "videos" and parts[-1].endswith(".mp4"):
+                        target = work / "videos" / parts[-1]
+                    elif (
+                        calibration
+                        and parts[-2] == "optimized"
+                        and parts[-1] in _SELFCAP_CALIBRATION
+                    ):
+                        target = work / "optimized" / parts[-1]
+                    else:
+                        continue
+                    if target in extracted:
+                        raise ValueError(f"{archive}: more than one member matches {target.name}")
+                    source = tar.extractfile(member)
+                    assert source is not None
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with target.open("wb") as out:
+                        shutil.copyfileobj(source, out)
+                    if target.stat().st_size != member.size:
+                        raise ValueError(f"{archive}: member {member.name} is incomplete")
+                    extracted.add(target)
+            stream.read()  # to the gzip trailer, where the CRC is checked
+        except (gzip.BadGzipFile, zlib.error, EOFError, tarfile.ReadError) as err:
+            if extracted or not (videos or calibration):
+                warnings.append(f"{archive.name}: {err} after its members were extracted (§1.4)")
+            else:
+                raise ValueError(f"{archive}: not a readable tar.gz archive: {err}") from None
+        reader.drain()
+    return reader.digest.hexdigest(), warnings
+
+
+def _sync_offsets(path: Path, names: Sequence[str]) -> dict[str, float]:
+    """sync.json: an object of camera name → offset in seconds (D-59, Q-101)."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise ValueError(f"{path}: not a readable JSON file: {err}") from None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: must be an object of camera name to offset in seconds")
+    offsets = {}
+    for name in names:
+        value = raw.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"{path}: camera {name!r} needs a finite offset, got {value!r}")
+        offsets[name] = float(value)
+    return offsets
+
+
+def _colmap_version(colmap: str) -> tuple[str, str]:
+    resolved = shutil.which(colmap)
+    if resolved is None:
+        raise ValueError(
+            f"COLMAP not found: {colmap!r} (D-60: SelfCap's protocol undistorts with COLMAP; "
+            "undistort='internal' uses the package's own undistortion)"
+        )
+    try:
+        result = subprocess.run([resolved, "help"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise ValueError(f"COLMAP at {resolved!r} doesn't run: {err}") from None
+    lines = (result.stdout or result.stderr).splitlines()
+    return resolved, lines[0].strip() if lines else ""
+
+
+def _quaternion(rotation: np.ndarray) -> np.ndarray:
+    """(w, x, y, z) of a rotation matrix, w ≥ 0 (COLMAP's images.txt order, QW first)."""
+    m = rotation
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    candidates = [
+        (1 + trace, [1 + trace, m[2, 1] - m[1, 2], m[0, 2] - m[2, 0], m[1, 0] - m[0, 1]]),
+        (
+            1 + m[0, 0] - m[1, 1] - m[2, 2],
+            [
+                m[2, 1] - m[1, 2],
+                1 + m[0, 0] - m[1, 1] - m[2, 2],
+                m[0, 1] + m[1, 0],
+                m[0, 2] + m[2, 0],
+            ],
+        ),
+        (
+            1 - m[0, 0] + m[1, 1] - m[2, 2],
+            [
+                m[0, 2] - m[2, 0],
+                m[0, 1] + m[1, 0],
+                1 - m[0, 0] + m[1, 1] - m[2, 2],
+                m[1, 2] + m[2, 1],
+            ],
+        ),
+        (
+            1 - m[0, 0] - m[1, 1] + m[2, 2],
+            [
+                m[1, 0] - m[0, 1],
+                m[0, 2] + m[2, 0],
+                m[1, 2] + m[2, 1],
+                1 - m[0, 0] - m[1, 1] + m[2, 2],
+            ],
+        ),
+    ]
+    _, q = max(candidates, key=lambda c: c[0])
+    quat: np.ndarray = np.array(q) / np.linalg.norm(q)
+    return quat if quat[0] >= 0 else -quat
+
+
+def _read_colmap_text(
+    folder: Path,
+) -> tuple[dict[int, tuple[int, int, np.ndarray]], dict[str, int]]:
+    """PINHOLE cameras (id → (W, H, [fx, fy, cx, cy])) and image name → camera id of a text
+    model (COLMAP's documented format)."""
+    cameras: dict[int, tuple[int, int, np.ndarray]] = {}
+    for line in (folder / "cameras.txt").read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split()
+        if parts[1] != "PINHOLE":
+            raise ValueError(f"{folder}: COLMAP's undistorted camera is {parts[1]}, not PINHOLE")
+        cameras[int(parts[0])] = (
+            int(parts[2]),
+            int(parts[3]),
+            np.array([float(v) for v in parts[4:8]]),
+        )
+    images: dict[str, int] = {}
+    lines = [
+        line
+        for line in (folder / "images.txt").read_text().splitlines()
+        if not line.startswith("#")
+    ]
+    for line in lines[::2]:
+        parts = line.split()
+        if len(parts) >= 10:
+            images[" ".join(parts[9:])] = int(parts[8])
+    return cameras, images
+
+
+def _colmap_undistort(
+    colmap: str,
+    work: Path,
+    calibrated: Sequence[_Calibrated],
+    frames: dict[str, list[Path]],
+    sizes: dict[str, tuple[int, int]],
+) -> tuple[dict[str, tuple[int, int, np.ndarray]], list[list[str]], Path]:
+    """D-60, Q-97: COLMAP's image_undistorter with blank_pixels 0 on a text model of FULL_OPENCV
+    cameras (cx, cy + 0.5 for COLMAP's pixel centres), its binary output converted to text; the
+    read-back PINHOLE camera of each camera (W, H, [fx, fy, cx, cy]) in the continuous
+    convention, unshifted; and the folder of undistorted images."""
+    model, output, text = (
+        work / "colmap" / "sparse_in",
+        work / "colmap" / "undistorted",
+        work / "colmap" / "text",
+    )
+    model.mkdir(parents=True, exist_ok=True)
+    camera_lines, image_lines = [], []
+    image_id = 0
+    for camera_id, cal in enumerate(calibrated, start=1):
+        coefficients = _coefficients(cal.dist)
+        width, height = sizes[cal.name]
+        params = [cal.K[0, 0], cal.K[1, 1], cal.K[0, 2] + 0.5, cal.K[1, 2] + 0.5, *coefficients[:8]]
+        camera_lines.append(
+            f"{camera_id} FULL_OPENCV {width} {height} " + " ".join(repr(float(v)) for v in params)
+        )
+        pose = [*_quaternion(cal.rotation), *cal.translation]
+        pose_text = " ".join(repr(float(v)) for v in pose)  # plain decimals for COLMAP's parser
+        for path in frames[cal.name]:
+            image_id += 1
+            name = f"{cal.name}/{path.name}"
+            image_lines.append(f"{image_id} {pose_text} {camera_id} {name}\n")
+    (model / "cameras.txt").write_text("\n".join(camera_lines) + "\n")
+    (model / "images.txt").write_text("\n".join(image_lines) + "\n")
+    (model / "points3D.txt").write_text("")
+    image_root = frames[calibrated[0].name][0].parent.parent
+    commands = [
+        [
+            colmap,
+            "image_undistorter",
+            "--image_path",
+            str(image_root),
+            "--input_path",
+            str(model),
+            "--output_path",
+            str(output),
+            "--output_type",
+            "COLMAP",
+            "--blank_pixels",
+            "0",
+        ],
+        [
+            colmap,
+            "model_converter",
+            "--input_path",
+            str(output / "sparse"),
+            "--output_path",
+            str(text),
+            "--output_type",
+            "TXT",
+        ],
+    ]
+    text.mkdir(parents=True, exist_ok=True)
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise ValueError(
+                f"COLMAP failed: {' '.join(command[:2])}: {result.stderr.strip()[-2000:]}"
+            )
+    cameras, images = _read_colmap_text(text)
+    read_back: dict[str, tuple[int, int, np.ndarray]] = {}
+    for cal in calibrated:
+        ids = {images.get(f"{cal.name}/{path.name}") for path in frames[cal.name]}
+        if len(ids) != 1 or None in ids:
+            raise ValueError(f"COLMAP's model doesn't give camera {cal.name}'s images one camera")
+        read_back[cal.name] = cameras[ids.pop()]  # type: ignore[index]
+    return read_back, commands, output / "images"
+
+
+def _masks(folder: Path, indices: Sequence[int]) -> tuple[dict[int, Path], dict[str, Any]]:
+    """D-64, Q-87: DIR/<n:06d>.png per test image and DIR/masks.json; a missing mask is
+    refused (§1.4: one mask per test image)."""
+    sidecar = folder / "masks.json"
+    try:
+        info = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise ValueError(f"{sidecar}: masks need a readable masks.json (Q-87): {err}") from None
+    if (
+        not isinstance(info, dict)
+        or not isinstance(info.get("mask_source"), str)
+        or not isinstance(info.get("masks_approximate"), bool)
+    ):
+        raise ValueError(f"{sidecar}: needs mask_source (a string) and masks_approximate (a bool)")
+    paths = {n: folder / f"{n:06d}.png" for n in indices}
+    missing = [p.name for p in paths.values() if not p.is_file()]
+    if missing:
+        raise ValueError(f"{folder}: no mask for these test images: {', '.join(missing)}")
+    return paths, {
+        "mask_source": info["mask_source"],
+        "masks_approximate": info["masks_approximate"],
+    }
+
+
+def _copy_mask(source: Path, target: Path, size: tuple[int, int]) -> None:
+    with Image.open(source) as image:
+        if image.mode not in _MASK_MODES:
+            raise ValueError(
+                f"{source}: mask mode must be one of {_MASK_MODES}, got {image.mode!r}"
+            )
+        if image.size != size:
+            raise ValueError(
+                f"{source}: mask size must be {size} (the converted test image), got {image.size}"
+            )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+
+
+def convert_selfcap(
+    src: Path,
+    dst: Path,
+    *,
+    scene: str,
+    window: tuple[int, int] | None = None,
+    test_camera: str | None = None,
+    undistort: Literal["colmap", "internal"] = "colmap",
+    colmap: str = "colmap",
+    use_sync: bool = True,
+    masks: Path | None = None,
+    calib: Path | None = None,
+    ffmpeg: str = "ffmpeg",
+    hwaccel: Literal["none", "cuda"] = "none",
+    jobs: int = 0,
+    ffprobe: str | None = None,
+) -> Path:
+    """Convert a SelfCap scene (§1.4, D-59, D-60, D-63, D-64; Q-86, Q-87, Q-97, Q-101): SRC
+    holds the archives as downloaded; dance1 … bike2 take window and test camera from the
+    card's table, other names need both. Frames N0 ≤ n < N1 of every camera, undistorted by
+    COLMAP (or the package with undistort='internal'), area-resized, with τ = n/60 minus the
+    camera's sync offset. Returns the path of OUT/scene.json."""
+    src = Path(src)
+    if undistort not in ("colmap", "internal"):
+        raise ValueError(f"undistort must be 'colmap' or 'internal', got {undistort!r}")
+    _check_hwaccel(hwaccel)
+    workers = _worker_count(jobs)
+    if scene in _SELFCAP_SCENES:
+        sequence, table_test, table_window, ratio = _SELFCAP_SCENES[scene]
+        window = window or table_window
+        test_camera = test_camera or table_test
+    else:
+        if window is None or test_camera is None:
+            raise ValueError(
+                f"scene {scene!r} isn't in the card's table: pass window and test_camera"
+            )
+        sequence, ratio = scene, _SELFCAP_DEFAULT_RESIZE
+    n0, n1 = (int(window[0]), int(window[1]))
+    if not 0 <= n0 < n1:
+        raise ValueError(f"window must be (N0, N1) with 0 <= N0 < N1, got {window!r}")
+    indices = list(range(n0, n1))
+    colmap_path, colmap_version = _colmap_version(colmap) if undistort == "colmap" else ("", "")
+    mask_paths, mask_metadata = _masks(Path(masks), indices) if masks is not None else ({}, {})
+    out = _prepare_out(dst)
+    work = out / ".work"
+    try:
+        tools = _tools(ffmpeg, ffprobe)
+        archives: dict[str, str] = {}
+        warnings: list[str] = []
+        release = src / f"{sequence}-release.tar.gz"
+        calib_archive = src / "hair-calib.tar.gz" if sequence == "hair" and calib is None else None
+        from_release = calib is None and calib_archive is None
+        digest, found = _extract_archive(
+            release, work / "release", videos=True, calibration=from_release
+        )
+        archives[release.name], warnings = digest, warnings + found
+        if calib is not None:
+            folder = Path(calib)
+            optimized = (
+                folder / "optimized" if (folder / "optimized" / "intri.yml").is_file() else folder
+            )
+            calibration_source = str(folder)
+        elif calib_archive is not None:
+            digest, found = _extract_archive(
+                calib_archive, work / "calib", videos=False, calibration=True
+            )
+            archives[calib_archive.name], warnings = digest, warnings + found
+            optimized, calibration_source = work / "calib" / "optimized", calib_archive.name
+        else:
+            optimized, calibration_source = work / "release" / "optimized", release.name
+        calibrated = _calibration(optimized / "intri.yml", optimized / "extri.yml")
+        names = [cal.name for cal in calibrated]
+        if test_camera not in names:
+            raise ValueError(f"test camera {test_camera!r} is not among the calibrated cameras")
+        sync_path = optimized / "sync.json"
+        synced = use_sync and sync_path.is_file()
+        offsets = _sync_offsets(sync_path, names) if synced else dict.fromkeys(names, 0.0)
+        infos: dict[str, _VideoInfo] = {}
+        for cal in calibrated:
+            video = work / "release" / "videos" / f"{cal.name}.mp4"
+            if not video.is_file():
+                raise ValueError(f"{release}: no video for camera {cal.name}")
+            info = infos[cal.name] = _probe(tools, video)
+            if cal.size is not None and cal.size != (info.width, info.height):
+                raise ValueError(
+                    f"camera {cal.name}: W_ and H_ {cal.size} differ from its video's "
+                    f"{(info.width, info.height)}"
+                )
+            if info.frames < n1:
+                raise ValueError(f"{video}: {info.frames} frames, the window needs {n1}")
+            if undistort == "colmap" and np.asarray(cal.dist).size > _FULL_OPENCV_COEFFICIENTS:
+                raise ValueError(
+                    f"camera {cal.name}: COLMAP's FULL_OPENCV holds at most 8 coefficients (Q-97)"
+                )
+        cameras: dict[str, Camera] = {}
+        camera_jobs: list[_CameraJob] = []
+        commands: dict[str, list[str]] = {}
+        colmap_commands: list[list[str]] = []
+        if undistort == "internal":
+            for cal in calibrated:
+                info = infos[cal.name]
+                size = resized_size(info.width, info.height, ratio)
+                full = camera_from_opencv(
+                    cal.K,
+                    cal.rotation,
+                    cal.translation,
+                    width=info.width,
+                    height=info.height,
+                    name=cal.name,
+                )
+                cameras[cal.name] = resize_camera(full, *size)
+                outputs = [out / "images" / cal.name / f"{n:06d}.png" for n in indices]
+                camera_jobs.append(
+                    _CameraJob(
+                        cal.name,
+                        outputs,
+                        size,
+                        video=work / "release" / "videos" / f"{cal.name}.mp4",
+                        info=info,
+                        window=(n0, n1),
+                        K=cal.K,
+                        dist=cal.dist,
+                    )
+                )
+            commands = _run_jobs(camera_jobs, tools, hwaccel=hwaccel, workers=workers)
+        else:
+            raw_jobs, raw_frames = [], {}
+            for cal in calibrated:
+                info = infos[cal.name]
+                raw = [work / "colmap" / "images" / cal.name / f"{n:06d}.png" for n in indices]
+                raw_frames[cal.name] = raw
+                raw_jobs.append(
+                    _CameraJob(
+                        cal.name,
+                        raw,
+                        (info.width, info.height),
+                        video=work / "release" / "videos" / f"{cal.name}.mp4",
+                        info=info,
+                        window=(n0, n1),
+                    )
+                )
+            commands = _run_jobs(raw_jobs, tools, hwaccel=hwaccel, workers=workers)
+            sizes = {name: (infos[name].width, infos[name].height) for name in names}
+            read_back, colmap_commands, undistorted = _colmap_undistort(
+                colmap_path, work, calibrated, raw_frames, sizes
+            )
+            for cal in calibrated:
+                width, height, (fx, fy, cx, cy) = read_back[cal.name]
+                K = np.array(
+                    [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
+                )  # continuous: no shift
+                size = resized_size(width, height, ratio)
+                full = _camera(K, cal.rotation, cal.translation, width, height, cal.name)
+                cameras[cal.name] = resize_camera(full, *size)
+                images = [undistorted / cal.name / f"{n:06d}.png" for n in indices]
+                outputs = [out / "images" / cal.name / f"{n:06d}.png" for n in indices]
+                camera_jobs.append(_CameraJob(cal.name, outputs, size, images=images))
+            _run_jobs(camera_jobs, None, hwaccel=hwaccel, workers=workers)
+        records, record_masks = [], []
+        for job in camera_jobs:
+            camera = cameras[job.name]
+            for n, path in zip(indices, job.outputs, strict=True):
+                split: Literal["train", "test"] = "test" if job.name == test_camera else "train"
+                mask = None
+                if split == "test" and n in mask_paths:
+                    mask = out / "masks" / job.name / f"{n:06d}.png"
+                    _copy_mask(mask_paths[n], mask, (camera.width, camera.height))
+                records.append(
+                    ImageRecord(camera, n / _SELFCAP_FPS - offsets[job.name], path, split, n)
+                )
+                record_masks.append(mask)
+        metadata: dict[str, Any] = {
+            "source": f"selfcap/{scene}",
+            "converter": "selfcap",
+            "producer": _producer(),
+            "resize": ratio,
+            "fps": _SELFCAP_FPS,
+            "window": [n0, n1],
+            "test_camera": test_camera,
+            "archives": archives,
+            "calibration": calibration_source,
+            "sync": synced,
+            "undistort": undistort,
+            "ffmpeg": _ffmpeg_metadata(tools, hwaccel, commands),
+            "warnings": warnings,
+            **mask_metadata,
+        }
+        if undistort == "colmap":
+            metadata["colmap"] = {
+                "path": colmap_path,
+                "version": colmap_version,
+                "commands": colmap_commands,
+            }
+        if scene == "dance1" and len(indices) >= _FASTEST:
+            test_job = next(job for job in camera_jobs if job.name == test_camera)
+            frames = (torch.from_numpy(_read_rgb(p)) for p in test_job.outputs)
+            start = n0 + fastest_frames(frames, count=_FASTEST)
+            metadata["fastest_10"] = [start, start + _FASTEST]  # D-69, Q-59: frame_index values
+        write_scene_manifest(
+            out / "scene.json", records, time_unit="s", masks=record_masks, metadata=metadata
+        )
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     return out / "scene.json"
