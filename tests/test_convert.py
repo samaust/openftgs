@@ -14,12 +14,13 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
-from openftgs.data import camera_from_llff, convert_n3dv
+from openftgs.data import camera_from_llff, camera_from_opencv, convert_n3dv, convert_opencv_yaml
 from openftgs.io import read_scene_manifest
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -29,7 +30,13 @@ needs_ffmpeg = pytest.mark.skipif(
 
 
 def _video(
-    path: Path, *, width: int = 64, height: int = 48, frames: int = 10, lossless: bool = True
+    path: Path,
+    *,
+    width: int = 64,
+    height: int = 48,
+    frames: int = 10,
+    lossless: bool = True,
+    smooth: bool = False,
 ) -> Path:
     """A lavfi testsrc clip; the lossless clips decode to exactly what ffmpeg's PNG decode
     gives."""
@@ -38,7 +45,8 @@ def _video(
         codec = ["-c:v", "libx264rgb", "-qp", "0"]
     else:
         codec = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
-    source = f"testsrc=size={width}x{height}:rate=30"
+    pattern = "gradients" if smooth else "testsrc"  # gradients: smooth content (U-35's oracle)
+    source = f"{pattern}=size={width}x{height}:rate=30"
     subprocess.run(
         [
             "ffmpeg",
@@ -218,3 +226,156 @@ def test_u27_hardware_decoding_is_within_one_level_of_cpu_decoding(tmp_path: Pat
         assert np.abs(x - y).max() <= 1
         differing += int((x != y).any(axis=-1).sum())
     print(f"U-27 hwaccel: {differing} differing pixels of {len(cpu.records) * 160 * 128}")
+
+
+# OpenCV-style YAML converter (D-61, D-63; Q-85, Q-96).
+
+_YAML_K = np.array([[60.0, 0.0, 31.5], [0.0, 60.0, 23.5], [0.0, 0.0, 1.0]])  # OpenCV convention
+_YAML_D = np.array([[-0.12], [0.03], [0.0005], [-0.0004], [0.0]])
+
+
+def _rodrigues(vector: np.ndarray) -> np.ndarray:
+    matrix, _ = cv2.Rodrigues(vector)
+    return np.asarray(matrix)
+
+
+def _write_calibration(
+    root: Path,
+    names: list[str],
+    *,
+    rot_error: float = 0.0,
+    ccm: np.ndarray | None = None,
+    distortion: np.ndarray = _YAML_D,
+    sizes: tuple[int, int] | None = (64, 48),
+) -> None:
+    """intri.yml and extri.yml as OpenCV's FileStorage writes them, in the SelfCap key family
+    (D-63): names, K_, D_, H_, W_, (ccm_), R_ (Rodrigues), Rot_, T_."""
+    root.mkdir(parents=True, exist_ok=True)
+    intri = cv2.FileStorage(str(root / "intri.yml"), cv2.FILE_STORAGE_WRITE)
+    extri = cv2.FileStorage(str(root / "extri.yml"), cv2.FILE_STORAGE_WRITE)
+    intri.write("names", names)
+    extri.write("names", names)
+    for k, name in enumerate(names):
+        intri.write(f"K_{name}", _YAML_K)
+        intri.write(f"D_{name}", distortion)
+        if sizes is not None:
+            intri.write(f"W_{name}", sizes[0])
+            intri.write(f"H_{name}", sizes[1])
+        if ccm is not None:
+            intri.write(f"ccm_{name}", ccm)
+        vector = np.array([[0.0], [0.1 * k], [0.0]])
+        rot = _rodrigues(vector)
+        rot[0, 0] += rot_error
+        extri.write(f"R_{name}", vector)
+        extri.write(f"Rot_{name}", rot)
+        extri.write(f"T_{name}", np.array([[0.2 * k], [0.0], [3.0]]))
+    intri.release()
+    extri.release()
+
+
+def _yaml_source(
+    root: Path, names: list[str], *, images: bool = False, frames: int = 4, **calibration: Any
+) -> Path:
+    _write_calibration(root, names, **calibration)
+    for name in names:
+        video = _video(root / "videos" / f"{name}.mp4", frames=frames, smooth=True)
+        if images:
+            pngs = _ffmpeg_pngs(video, root / "images" / name, frames)
+            video.unlink()
+            del pngs
+    if images:
+        (root / "videos").rmdir()
+    return root
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("images", [False, True])
+def test_opencv_yaml_undistorts_shifts_and_times_frames(tmp_path: Path, images: bool) -> None:
+    """§1.4 ENeRF-Outdoor, D-61, D-63, Q-85, Q-96: frames from videos or image folders are
+    undistorted with the file's K (OpenCV's convention), so they match OpenCV's undistort within
+    one 8-bit level away from the border at resize 1.0; the manifest's K is the file's with
+    +0.5 on cx and cy; R and T are world-to-camera; frame k at k/fps; the test camera is the
+    test view."""
+    src = _yaml_source(tmp_path / "actor1", ["0000", "0001"], images=images)
+    manifest = read_scene_manifest(
+        convert_opencv_yaml(
+            src, tmp_path / "out", fps=60.0, frames=3, resize=1.0, test_camera="0001", jobs=1
+        )
+    )
+    assert len(manifest.records) == 6
+    for record in manifest.records:
+        assert record.split == ("test" if record.camera.name == "0001" else "train")
+        assert record.frame_index is not None
+        assert record.timestamp == record.frame_index / 60.0
+    record = next(r for r in manifest.records if r.camera.name == "0001" and r.frame_index == 2)
+    want = camera_from_opencv(
+        _YAML_K,
+        _rodrigues(np.array([[0.0], [0.1], [0.0]])),
+        np.array([0.2, 0.0, 3.0]),
+        width=64,
+        height=48,
+        name="0001",
+    )
+    assert torch.equal(record.camera.K, want.K)
+    torch.testing.assert_close(
+        record.camera.world_to_camera, want.world_to_camera, rtol=0.0, atol=1e-7
+    )
+    frames = (
+        _ffmpeg_pngs(src / "videos" / "0001.mp4", tmp_path / "o", 3)
+        if not images
+        else [np.asarray(Image.open(src / "images" / "0001" / f"{k:03d}.png")) for k in (1, 2, 3)]
+    )
+    oracle = cv2.undistort(frames[2], _YAML_K, _YAML_D)
+    map_x, map_y = cv2.initUndistortRectifyMap(
+        _YAML_K, _YAML_D, None, _YAML_K, (64, 48), cv2.CV_32FC1
+    )
+    inside = (map_x >= 1) & (map_x <= 62) & (map_y >= 1) & (map_y <= 46)
+    got = np.asarray(Image.open(record.image_path)).astype(int)
+    assert np.abs(got - oracle.astype(int))[inside].max() <= 1
+    assert manifest.metadata["converter"] == "opencv-yaml"
+    assert manifest.metadata["test_camera"] == "0001" and manifest.metadata["fps"] == 60.0
+    assert ("ffmpeg" in manifest.metadata) is (not images)
+
+
+@needs_ffmpeg
+def test_opencv_yaml_without_a_test_camera_has_only_training_images(tmp_path: Path) -> None:
+    """Q-85: without `test_camera` every image is a training image."""
+    src = _yaml_source(tmp_path / "s", ["0000", "0001"], frames=2)
+    manifest = read_scene_manifest(
+        convert_opencv_yaml(src, tmp_path / "out", fps=30.0, frames=2, resize=0.5)
+    )
+    assert {r.split for r in manifest.records} == {"train"}
+    assert {(r.camera.width, r.camera.height) for r in manifest.records} == {(32, 24)}
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("case", ["rot", "ccm", "size", "camera", "frames"])
+def test_opencv_yaml_refuses_inconsistent_calibrations(tmp_path: Path, case: str) -> None:
+    """D-63, Q-96: Rot and Rodrigues(R) differing by more than 1e-6, a ccm that isn't the
+    identity, W_/H_ differing from the frames, an unknown test camera and too few frames are
+    ValueErrors."""
+    kwargs: dict[str, Any] = {}
+    frames, test = 2, None
+    if case == "rot":
+        kwargs["rot_error"] = 1e-5
+    elif case == "ccm":
+        kwargs["ccm"] = np.diag([1.0, 1.0, 1.01])
+    elif case == "size":
+        kwargs["sizes"] = (64, 50)
+    elif case == "camera":
+        test = "0009"
+    elif case == "frames":
+        frames = 5
+    src = _yaml_source(tmp_path / "s", ["0000", "0001"], frames=4, **kwargs)
+    with pytest.raises(ValueError):
+        convert_opencv_yaml(
+            src, tmp_path / "out", fps=30.0, frames=frames, resize=1.0, test_camera=test
+        )
+    assert not (tmp_path / "out" / "scene.json").exists()
+
+
+@needs_ffmpeg
+def test_opencv_yaml_accepts_an_identity_ccm(tmp_path: Path) -> None:
+    """D-63: an identity ccm is accepted."""
+    src = _yaml_source(tmp_path / "s", ["0000", "0001"], frames=2, ccm=np.eye(3))
+    assert convert_opencv_yaml(src, tmp_path / "out", fps=30.0, frames=1, resize=1.0).exists()

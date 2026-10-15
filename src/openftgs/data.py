@@ -36,6 +36,7 @@ __all__ = [
     "camera_from_llff",
     "camera_from_opencv",
     "convert_n3dv",
+    "convert_opencv_yaml",
     "fastest_frames",
     "read_opencv_yaml",
     "resize_area",
@@ -928,4 +929,202 @@ def convert_n3dv(
         write_scene_manifest(out / "scene.json", records, time_unit="s", metadata=metadata)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    return out / "scene.json"
+
+
+# OpenCV-style YAML calibrations (D-61, D-63; Q-96, Q-97).
+
+_ROT_TOLERANCE = 1e-6  # D-63: Rot against Rodrigues(R), max-abs
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+
+def _rodrigues(vector: np.ndarray) -> np.ndarray:
+    """The rotation matrix of a Rodrigues vector, in float64."""
+    theta = float(np.linalg.norm(vector))
+    if theta == 0.0:
+        return np.eye(3)
+    k = vector / theta
+    cross = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    matrix: np.ndarray = (
+        np.cos(theta) * np.eye(3) + (1 - np.cos(theta)) * np.outer(k, k) + np.sin(theta) * cross
+    )
+    return matrix
+
+
+@dataclass(frozen=True)
+class _Calibrated:
+    """One camera of an OpenCV-style calibration, K in OpenCV's integer-centre convention."""
+
+    name: str
+    K: np.ndarray
+    dist: np.ndarray
+    rotation: np.ndarray
+    translation: np.ndarray
+    size: tuple[int, int] | None  # (W, H) from W_ and H_, when present
+
+
+def _calibration(intri_path: Path, extri_path: Path) -> list[_Calibrated]:
+    """The cameras of intri.yml and extri.yml (D-61, D-63; Q-96): `names`, K_, D_ or dist_,
+    optional W_ and H_, an optional ccm_ that must be the identity, Rot_ and/or R_ (agreeing
+    within 1e-6 when both), T_."""
+    for path in (intri_path, extri_path):
+        if not path.is_file():
+            raise ValueError(f"{path}: calibration file not found")
+    intri, extri = read_opencv_yaml(intri_path), read_opencv_yaml(extri_path)
+    names = intri.get("names", extri.get("names"))
+    if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+        raise ValueError(f"{intri_path}: `names` must be a non-empty list of strings")
+
+    def get(source: dict[str, Any], key: str, shape: tuple[int, ...], where: Path) -> np.ndarray:
+        if key not in source:
+            raise ValueError(f"{where}: no {key}")
+        return _matrix64(np.asarray(source[key], dtype=np.float64).reshape(shape), shape, key)
+
+    cameras = []
+    for name in names:
+        K = get(intri, f"K_{name}", (3, 3), intri_path)
+        dist_key = f"D_{name}" if f"D_{name}" in intri else f"dist_{name}"
+        dist = (
+            np.asarray(intri[dist_key], dtype=np.float64).reshape(-1)
+            if dist_key in intri
+            else np.zeros(0)
+        )
+        _coefficients(dist)
+        ccm = intri.get(f"ccm_{name}")
+        if ccm is not None and not np.array_equal(np.asarray(ccm, dtype=np.float64), np.eye(3)):
+            raise ValueError(f"{intri_path}: ccm_{name} is not the identity (D-63)")
+        rotations = []
+        if f"Rot_{name}" in extri:
+            rotations.append(get(extri, f"Rot_{name}", (3, 3), extri_path))
+        if f"R_{name}" in extri:
+            vector = np.asarray(extri[f"R_{name}"], dtype=np.float64).reshape(-1)
+            rotations.append(_rodrigues(vector) if vector.size == 3 else vector.reshape(3, 3))
+        if not rotations:
+            raise ValueError(f"{extri_path}: no Rot_{name} or R_{name}")
+        if len(rotations) == 2 and np.abs(rotations[0] - rotations[1]).max() > _ROT_TOLERANCE:
+            raise ValueError(
+                f"{extri_path}: Rot_{name} and Rodrigues(R_{name}) differ by more than "
+                f"{_ROT_TOLERANCE} (D-63)"
+            )
+        translation = get(extri, f"T_{name}", (3,), extri_path)
+        size = None
+        if f"W_{name}" in intri or f"H_{name}" in intri:
+            size = (int(intri.get(f"W_{name}", 0)), int(intri.get(f"H_{name}", 0)))
+        cameras.append(_Calibrated(name, K, dist, rotations[0], translation, size))
+    return cameras
+
+
+def _image_files(folder: Path) -> list[Path]:
+    return sorted(p for p in folder.iterdir() if p.suffix.lower() in _IMAGE_SUFFIXES)
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        return image.size
+
+
+def convert_opencv_yaml(
+    src: Path,
+    dst: Path,
+    *,
+    fps: float,
+    frames: int,
+    resize: float,
+    ffmpeg: str = "ffmpeg",
+    hwaccel: Literal["none", "cuda"] = "none",
+    jobs: int = 0,
+    ffprobe: str | None = None,
+    test_camera: str | None = None,
+) -> Path:
+    """Convert a dataset with OpenCV-style YAML calibrations, such as ENeRF-Outdoor (§1.4,
+    D-61, D-63; Q-85, Q-96): intri.yml and extri.yml in SRC, frames from `images/<camera>/`
+    (the first `frames` files by name) or `videos/<camera>.mp4`; frames undistorted with the
+    file's K, K shifted by +0.5, frames and K resized; frame k at k/fps s; `test_camera` the
+    test view. Returns the path of OUT/scene.json."""
+    src = Path(src)
+    if (
+        isinstance(fps, bool)
+        or not isinstance(fps, numbers.Real)
+        or not (math.isfinite(fps) and fps > 0)
+    ):
+        raise ValueError(f"fps must be a finite number > 0, got {fps!r}")
+    _check_frames(frames)
+    _check_hwaccel(hwaccel)
+    workers = _worker_count(jobs)
+    resized_size(1, 1, resize)
+    calibrated = _calibration(src / "intri.yml", src / "extri.yml")
+    if test_camera is not None and test_camera not in [c.name for c in calibrated]:
+        raise ValueError(f"test_camera {test_camera!r} is not among the calibrated cameras")
+    out = _prepare_out(dst)
+    try:
+        tools: _Tools | None = None
+        cameras: list[Camera] = []
+        camera_jobs: list[_CameraJob] = []
+        for cal in calibrated:
+            folder, video = src / "images" / cal.name, src / "videos" / f"{cal.name}.mp4"
+            outputs = [out / "images" / cal.name / f"{k:06d}.png" for k in range(frames)]
+            if folder.is_dir():
+                images = _image_files(folder)[:frames]
+                if len(images) < frames:
+                    raise ValueError(f"{folder}: {len(images)} images, fewer than {frames}")
+                sizes = {_image_size(p) for p in images}
+                if len(sizes) != 1:
+                    raise ValueError(f"{folder}: the images differ in size: {sorted(sizes)}")
+                (width, height), info = sizes.pop(), None
+            elif video.is_file():
+                tools = tools or _tools(ffmpeg, ffprobe)
+                info = _probe(tools, video)
+                if info.frames < frames:
+                    raise ValueError(f"{video}: {info.frames} frames, fewer than {frames}")
+                width, height, images = info.width, info.height, []
+            else:
+                raise ValueError(f"{src}: no images/{cal.name}/ or videos/{cal.name}.mp4")
+            if cal.size is not None and cal.size != (width, height):
+                raise ValueError(
+                    f"{src}: camera {cal.name}'s W_ and H_ {cal.size} differ from its frames' "
+                    f"{(width, height)}"
+                )
+            size = resized_size(width, height, resize)
+            full = camera_from_opencv(
+                cal.K, cal.rotation, cal.translation, width=width, height=height, name=cal.name
+            )
+            cameras.append(resize_camera(full, *size))
+            camera_jobs.append(
+                _CameraJob(
+                    cal.name,
+                    outputs,
+                    size,
+                    video=video if info is not None else None,
+                    info=info,
+                    images=images,
+                    K=cal.K,
+                    dist=cal.dist,
+                )
+            )
+        commands = _run_jobs(camera_jobs, tools, hwaccel=hwaccel, workers=workers)
+        records = [
+            ImageRecord(
+                camera,
+                k / fps,
+                path,
+                "test" if camera.name == test_camera else "train",
+                k,
+            )
+            for camera, job in zip(cameras, camera_jobs, strict=True)
+            for k, path in enumerate(job.outputs)
+        ]
+        metadata: dict[str, Any] = {
+            "source": f"opencv-yaml/{src.name}",
+            "converter": "opencv-yaml",
+            "producer": _producer(),
+            "resize": resize,
+            "fps": fps,
+            "frames": frames,
+            "test_camera": test_camera,
+        }
+        if tools is not None:
+            metadata["ffmpeg"] = _ffmpeg_metadata(tools, hwaccel, commands)
+        write_scene_manifest(out / "scene.json", records, time_unit="s", metadata=metadata)
+    finally:
+        shutil.rmtree(out / ".work", ignore_errors=True)
     return out / "scene.json"
