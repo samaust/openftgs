@@ -404,7 +404,7 @@ _Avoid_: split (unqualified, reserved for growth), partition, fold, subset
 
 **Test view**:
 The camera held out for evaluation: cam00 on Neural3DV, 0015, 0007 or 0009 on SelfCap, configurable on ENeRF-Outdoor; its images form the test split. D-29
-_Avoid_: held-out view, held-out camera, test camera (outside the converter's argument name), validation view, novel view (a camera not in the dataset at all)
+_Avoid_: held-out view, held-out camera, test camera (outside the converters' argument names), validation view, novel view (a camera not in the dataset at all)
 
 **Multi-view video**:
 The dataset object `MultiViewVideo`: the image records of a scene manifest with their time normalizer, spatial scale, frame interval and test-image masks, loading images lazily. §2.1
@@ -413,6 +413,10 @@ _Avoid_: dataset (unqualified), video, sequence, scene (the manifest)
 **Frame cache**:
 The uint8 copy of every training image, one safetensors tensor per camera keyed by the manifest's hash, placed on the GPU when it fits and memory-mapped otherwise. D-51
 _Avoid_: image cache, dataloader, preload
+
+**Cache placement**:
+Where the frame cache lives during training: "gpu", the whole cache in GPU memory, or "mmap", memory-mapped files read one frame at a time; "auto" chooses after the first training iteration from the free GPU memory. D-51, §2.4 Settings
+_Avoid_: cache mode, storage backend, residency
 
 **Prefetcher**:
 The thread that copies the next images, in the sampler's known order, through pinned buffers to the GPU on a side stream. D-51
@@ -433,6 +437,10 @@ _Avoid_: downsample factor, scale (reserved), resolution level
 **SelfCap window**:
 The 60-frame range of 0-based decode indices n, from the dataset card, that forms one FreeTimeGS scene of a longer SelfCap sequence. §1.4, D-59
 _Avoid_: clip, segment, frame range, bucket
+
+**Decode index n**:
+A frame's 0-based position in its video's decode order; the frame index of SelfCap images and the numbering of the SelfCap window. §1.4 Dataset protocols, D-59
+_Avoid_: frame number (ambiguous with file numbers, which SelfCap offsets), presentation index, timestamp index
 
 **Sync offset**:
 A SelfCap camera's offset in seconds from `optimized/sync.json`, subtracted from the frame-index time n/60 to give the image's raw timestamp. D-59

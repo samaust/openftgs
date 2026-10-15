@@ -24,7 +24,7 @@ The backend follows the device: gsplat on a CUDA device, which D-76 requires of 
 
 A step returns a `StepLog`. Its loss terms are the detached tensors `total_loss` returns, on the device and unread, so a step makes no host synchronization outside gsplat's render, the events and the log reads (§2.4 rule 3, D-49). The trainer adds the terms into device-side sums and reads their means once every `PerfConfig.log_every` iterations; the same read checks the model's validity. After a resume the first window covers only the iterations since the resume; logs never feed back into training.
 
-Every training record's camera is copied to the device when the trainer is built, so a training iteration's render reads no camera from the host. The copy of each training iteration's image to the device still synchronizes, until the frame cache and prefetcher of D-51 (M12).
+Every training record's camera is copied to the device when the trainer is built, so a training iteration's render reads no camera from the host. Each training iteration's image comes from the frame cache: on the GPU directly, or through the prefetcher, which copies it from pinned memory on a side stream ahead of time (D-51, `docs/modules/data/frame-cache.md`).
 
 ## Divergence
 
@@ -75,8 +75,8 @@ What each field does in M10 (Q-73):
 | `deterministic` | during each training iteration: cuDNN autotuning off, cuDNN's deterministic algorithms, and PyTorch's deterministic kernels, warning only where none exists; fused-ssim stays in use, since its backward pass writes each gradient element once, with no atomics (source log #73, answering Q-42's note). Off, the cuDNN flags are left alone; autotuning waits for its benchmark (B-4, M15) |
 | `perc_precision` | "tf32" or "ieee": cuDNN's TF32 flag during each training iteration (D-52); "bf16" raises `NotImplementedError` (M15). The float32 matmul precision is "highest" during each training iteration whatever the setting, so TF32 never reaches matrix products (D-52) |
 | `images_per_step` | above 1 raises `NotImplementedError` (D-54, M15) |
-| `frame_cache` | "gpu" or "mmap" raises `NotImplementedError` (D-51, M12); "auto" and "off" decode the image file at every training iteration |
-| `prefetch` | unused until M12 |
+| `frame_cache` | "gpu" or "mmap" places the frame cache there; "auto" chooses after the first iteration (mmap on a CPU device); "off" decodes the image file at every training iteration (D-51, Q-99) |
+| `prefetch` | how many images the prefetcher keeps in flight; 0 reads each one when it is needed (Q-99) |
 
 The global flags are set around each training iteration and restored afterwards, so training leaves the caller's process as it was.
 

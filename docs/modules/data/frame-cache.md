@@ -1,0 +1,15 @@
+# The frame cache and prefetcher in `openftgs.data`
+
+How D-51 is met: training reads its images from a uint8 copy instead of decoding a PNG at every iteration, and in the sampler's order through a prefetcher. PNG files stay the stable interface (§2.2); `MultiViewVideo.load_image` still decodes them. Layout, placement and the trainer's hook are Q-98's and Q-99's.
+
+## Layout
+
+A cache sits beside its manifest, in `.ftgs-cache/<manifest sha256>/`: one safetensors file per camera with training images, holding that camera's training frames as uint8 [F, H, W, 3] in manifest order. Each file's metadata names the format, its version, the manifest hash, the camera and the record indices of its frames; files are written under a temporary name and renamed. A cache is valid when every file's metadata matches the dataset. A PNG edited under an unchanged manifest isn't detected: rebuild the cache after such an edit. `FrameCache.build` writes a cache; `ftgs cache` (M14) will call it.
+
+## Placements
+
+"gpu" loads every camera's tensor into GPU memory; "mmap" leaves the files memory-mapped and reads one frame at a time with safetensors' `get_slice`, so the operating system keeps what it can in RAM. With "auto", a run on the CPU uses "mmap"; a CUDA run decodes its first iteration's image as before, then measures the free GPU memory and chooses "gpu" when the cache fits in half of what is free after reserving room for growth to N_max, else "mmap" (Q-99). "off" keeps decoding PNGs. If the cache directory can't be created, "auto" falls back to "off" with a warning, while an explicit placement raises.
+
+## The prefetcher
+
+The sampler's order is known ahead (D-26): its private `peek` returns the rest of the current permutation and the next epoch's, drawn on a copy of the generator's state, so the stream itself never moves (Q-72). The prefetcher keeps `prefetch` images in flight: on CUDA through a ring of pinned buffers copied on a side stream, the training stream waiting on each buffer's event; on the CPU through a reader thread. `take` returns float32 values, the uint8 frame divided by 255 on the device, bitwise equal to `load_image`'s. A resumed run rebuilds the queue from the restored sampler, so it trains on the same images in the same order as a straight run (U-30).
