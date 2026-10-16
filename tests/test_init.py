@@ -8,6 +8,7 @@ import importlib
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -19,9 +20,11 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from safetensors import safe_open
 from torch import Tensor
 
 import openftgs
+from openftgs.config import InitConfig
 from openftgs.data import MultiViewVideo
 from openftgs.init import (
     DenseMatcher,
@@ -32,6 +35,8 @@ from openftgs.init import (
     roma_provenance,
     triangulate_dlt,
 )
+from openftgs.io import read_init_points, write_init_points
+from openftgs.model import FreeTimeGaussians
 from openftgs.types import Camera, InitPoints
 
 
@@ -972,3 +977,239 @@ def test_u19_initialization_reads_no_test_image(tmp_path: Path) -> None:
     assert len(points.positions) > 0
     assert sorted(_by_camera(dataset, stand_in.calls)) == [("A", "B"), ("A", "B")]
     assert not {i for call in stand_in.calls for i in call} & set(tests)
+
+
+_FIELDS = ("positions", "colors", "timestamps", "velocities", "durations", "frame_ids")
+
+
+def _same(a: InitPoints, b: InitPoints) -> bool:
+    return all(torch.equal(getattr(a, name), getattr(b, name)) for name in _FIELDS)
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+def test_u19_seeded_subsets_of_at_most_stride_times_b_points_per_frame(
+    tmp_path: Path, stride: int
+) -> None:
+    """§1.3 step 7, D-24; Q-111: each init frame keeps at most k_stride·B points, a seeded
+    uniform subset kept in the order of the frame's full set; the same seed gives identical
+    init points, another seed another subset."""
+    dataset = _rig_scene(tmp_path, [n * _FRAME for n in range(5)])
+    b = 100
+
+    def run(seed: int, budget: int = b) -> InitPoints:
+        stand_in = _StandIn(dataset, points=_static())
+        return _run(dataset, stand_in, stride=stride, points_per_frame=budget, seed=seed)
+
+    full, first, again, other = run(4, 10_000), run(4), run(4), run(5)
+    assert _same(first, again)
+    assert first.frame_ids is not None and full.frame_ids is not None
+    assert other.frame_ids is not None
+    for k in range(0, 5, stride):
+        whole = full.positions[full.frame_ids == k]
+        kept = first.positions[first.frame_ids == k]
+        assert len(whole) > stride * b
+        assert len(kept) == stride * b
+        # Each kept point is one of the frame's points, in the frame's order.
+        rows = [int((whole == point).all(dim=1).nonzero()) for point in kept]
+        assert rows == sorted(set(rows))
+        others = other.positions[other.frame_ids == k]
+        assert set(map(tuple, kept.tolist())) != set(map(tuple, others.tolist()))
+
+
+def test_u19_scales_come_from_the_points_roma_init_keeps(tmp_path: Path) -> None:
+    """§1.3 step 8, D-25: `roma_init` → `from_init_points` gives each point the mean distance
+    to its 3 nearest neighbours among the output points that share its frame id (the points
+    kept after `roma_init`'s per-frame subsample), floored at 1e-7, by a float64 brute force."""
+    dataset = _rig_scene(tmp_path, [n * _FRAME for n in range(3)])
+    points = _run(dataset, _StandIn(dataset, points=_static()), points_per_frame=150)
+    model = FreeTimeGaussians.from_init_points(
+        points,
+        dataset.time,
+        InitConfig(points_per_frame=1000),
+        frame_dt=dataset.frame_dt,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.equal(model.means.detach(), points.positions)
+    assert points.frame_ids is not None
+    expected = torch.empty(len(points.positions), dtype=torch.float64)
+    for k in range(3):
+        rows = points.frame_ids == k
+        assert int(rows.sum()) == 150
+        X = points.positions[rows].to(torch.float64)
+        d = torch.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(dim=2))
+        d.fill_diagonal_(math.inf)
+        nearest = torch.sort(d, dim=1).values[:, :3]
+        expected[rows] = torch.log(nearest.mean(dim=1).clamp_min(1e-7))
+    got = model.log_scales.detach().to(torch.float64)
+    torch.testing.assert_close(got, expected[:, None].expand(-1, 3), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("taus", "frames"), [([n * _FRAME for n in range(10)], 10), ([0.0], 1)], ids=["F10", "one"]
+)
+def test_u19_a_file_whose_init_frames_total_more_than_f_times_b_builds_a_model(
+    tmp_path: Path, taus: list[float], frames: int
+) -> None:
+    """D-74, §1.3 step 7: at k_stride = 3, `roma_init`'s per-frame caps sum to more than F·B
+    (12·B for F = 10, whose slots are 0, 3, 6 and 9; 3·B for a single timestamp). Through
+    `write_init_points(metadata=roma_provenance(cfg))`, `read_init_points` and
+    `from_init_points(n_max=F·B)`, the model holds at most F·B points and passes the N_max
+    check, and the file's metadata holds the `roma_init` key."""
+    b = 20
+    dataset = _rig_scene(tmp_path / "scene", taus)
+    cfg = RomaInitConfig(stride=3, points_per_frame=b)
+    points = roma_init(dataset, cfg, devices=["cpu"], matcher=_StandIn(dataset, points=_static()))
+    slots = len(range(0, frames, 3))
+    assert len(points.positions) == slots * 3 * b > frames * b
+    path = tmp_path / "init.safetensors"
+    write_init_points(points, path, time_unit="s", producer="test", metadata=roma_provenance(cfg))
+    with safe_open(str(path), framework="pt") as f:
+        assert json.loads(f.metadata()["roma_init"])["stride"] == 3
+    model = FreeTimeGaussians.from_init_points(
+        read_init_points(path, time_unit="s"),
+        dataset.time,
+        InitConfig(points_per_frame=b),
+        frame_dt=dataset.frame_dt,
+        generator=torch.Generator().manual_seed(0),
+        n_max=frames * b,
+    )
+    assert len(model.means) == frames * b
+
+
+def _permuted_copy(path: Path, seed: int) -> Path:
+    """The manifest at `path` with its `images` array shuffled, beside it."""
+    raw = json.loads(path.read_text())
+    random.Random(seed).shuffle(raw["images"])
+    copy = path.with_name("permuted.json")
+    copy.write_text(json.dumps(raw))
+    return copy
+
+
+def test_u33_shards_and_pair_order_give_bitwise_identical_init_points(tmp_path: Path) -> None:
+    """U-33 (CPU), D-54, D-56; Q-106, Q-111, Q-112: one shard, three shards, and three shards
+    on a copy of the manifest whose images are shuffled give bitwise identical init points.
+    The scene draws a subset of each pair's matches (certainties vary) and of each slot's
+    points; it is unsynchronized, with a moving plane, and holds no two images of one camera
+    at one timestamp."""
+    offsets = {"X": 0.0, "L": 0.1, "Lp": -0.2, "R": 0.3, "Rp": 0.05}
+    shots: list[Shot] = [
+        (camera, (n + offset) * _FRAME, "train")
+        for n in range(4)
+        for camera, offset in offsets.items()
+    ]
+    path = _write_scene(tmp_path, _fan(1.0), shots)
+    plane = _plane(3.0, step=3)
+
+    def moving(tau: float) -> torch.Tensor:
+        return plane + torch.tensor([3.0 * tau, 0.0, 6.0 * tau], dtype=torch.float64)
+
+    def certainty(i: int) -> float:
+        return 0.5 + 0.5 * ((i * 37) % 101) / 100
+
+    outputs = []
+    for manifest, devices in [
+        (path, ["cpu"]),
+        (path, ["cpu"] * 3),
+        (_permuted_copy(path, 1), ["cpu"] * 3),
+    ]:
+        dataset = MultiViewVideo.from_manifest(manifest)
+        stand_in = _StandIn(dataset, points=moving, certainty=certainty)
+        outputs.append(
+            _run(dataset, stand_in, devices, matches_per_pair=40, points_per_frame=50, seed=7)
+        )
+    assert outputs[0].frame_ids is not None
+    assert sorted(set(outputs[0].frame_ids.tolist())) == [0, 1, 2, 3]
+    assert len(outputs[0].positions) == 4 * 50  # every slot holds more than B points
+    assert _same(outputs[0], outputs[1])
+    assert _same(outputs[0], outputs[2])
+
+
+def test_roma_init_sets_the_deterministic_flags_for_the_call_and_restores_them(
+    tmp_path: Path,
+) -> None:
+    """§2.4 "Initialization and conversion", D-56; Q-112: during matching, float32 matmul
+    precision is "highest", cuDNN autotuning is off and deterministic cuDNN and strict
+    deterministic algorithms are on, whatever the caller set; afterwards the caller's flags
+    are back, also when a dense matcher raises, whose exception reaches the caller."""
+    dataset = _rig_scene(tmp_path, [0.0, _FRAME])
+    cudnn = torch.backends.cudnn
+    saved = _flags()
+    try:
+        torch.set_float32_matmul_precision("high")
+        cudnn.benchmark, cudnn.deterministic = True, False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        before = _flags()
+        stand_in = _StandIn(dataset, points=_static())
+        _run(dataset, stand_in, ["cpu", "cpu"])
+        assert set(stand_in.flags) == {("highest", False, True, True, False)}
+        assert _flags() == before
+
+        def failing(device: torch.device) -> DenseMatcher:
+            def match(image_a: Tensor, image_b: Tensor) -> tuple[Tensor, Tensor]:
+                raise RuntimeError("matcher failed")
+
+            return match
+
+        with pytest.raises(RuntimeError, match="matcher failed"):
+            roma_init(dataset, RomaInitConfig(), devices=["cpu", "cpu"], matcher=failing)
+        assert _flags() == before
+    finally:
+        precision, benchmark, deterministic, algorithms, warn_only = saved
+        torch.set_float32_matmul_precision(str(precision))
+        cudnn.benchmark, cudnn.deterministic = bool(benchmark), bool(deterministic)
+        torch.use_deterministic_algorithms(bool(algorithms), warn_only=bool(warn_only))
+
+
+def test_roma_init_refuses_devices_none_without_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-106: `devices` None means every visible CUDA device, so without one it raises
+    ValueError (the hardware is stood in for: this machine may have a GPU)."""
+    dataset = _rig_scene(tmp_path, [0.0])
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    with pytest.raises(ValueError, match="CUDA"):
+        roma_init(dataset, RomaInitConfig(), matcher=_StandIn(dataset, points=_static()))
+
+
+@pytest.mark.parametrize(
+    "devices", ["cpu", [], ["not a device"]], ids=["string", "empty", "unknown"]
+)
+def test_roma_init_refuses_malformed_devices(tmp_path: Path, devices: Any) -> None:
+    """Q-T136.2: `devices` is a non-empty sequence of device names."""
+    dataset = _rig_scene(tmp_path, [0.0])
+    with pytest.raises(ValueError, match="device"):
+        roma_init(dataset, RomaInitConfig(), devices=devices, matcher=_StandIn(dataset))
+
+
+def test_roma_init_refuses_when_no_point_survives(tmp_path: Path) -> None:
+    """Q-106: when no point survives matching and D-22's filters, roma_init raises
+    ValueError; here every match lies behind both cameras."""
+    dataset = _rig_scene(tmp_path, [0.0, _FRAME])
+    a, b = dataset.records[0].camera, dataset.records[1].camera
+    behind = [_crafted(a, b, (0.3, 0.2, -2.0))]
+    with pytest.raises(ValueError, match="no point"):
+        _run(dataset, _StandIn(dataset, crafted={("A", "B"): behind}))
+
+
+@pytest.mark.parametrize(
+    ("warp", "certainty"),
+    [
+        (torch.zeros(5, 3), torch.ones(5)),
+        (torch.zeros(5, 4), torch.ones(4)),
+        (torch.zeros(5, 4), torch.ones(5, 1)),
+        (torch.zeros(5, 4, dtype=torch.int64), torch.ones(5)),
+    ],
+    ids=["warp-3-columns", "certainty-short", "certainty-2d", "integer-warp"],
+)
+def test_roma_init_refuses_a_malformed_dense_matcher_output(
+    tmp_path: Path, warp: Tensor, certainty: Tensor
+) -> None:
+    """Q-106, Q-T136.2: a dense matcher returns a floating-point warp [M, 4] and certainty
+    [M]; anything else raises ValueError."""
+    dataset = _rig_scene(tmp_path, [0.0])
+
+    def matcher(device: torch.device) -> DenseMatcher:
+        return lambda image_a, image_b: (warp, certainty)
+
+    with pytest.raises(ValueError, match="dense matcher"):
+        roma_init(dataset, RomaInitConfig(), devices=["cpu"], matcher=matcher)
