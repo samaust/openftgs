@@ -1,2 +1,40 @@
 openftgs
 Copyright 2026 Samuel Austin
+
+
+Third-party software
+--------------------
+
+openftgs includes a copy of RoMa's inference code in the package openftgs._vendor.romatch
+(folder openftgs/_vendor/romatch). The license texts named below sit in that folder: RoMa's
+as LICENSE, the others in its LICENSES folder. Its VENDOR.json records the upstream commit,
+the SHA-256 of every file and license text, and how each file was changed; every changed file
+carries a modification notice.
+
+RoMa (https://github.com/Parskatt/RoMa), commit 77f8d68803526dcddfd9b7a46bc76125bdc25f15
+Copyright (c) 2023 Johan Edstedt
+Licensed under the MIT License (LICENSE).
+
+The DINOv2 layers in RoMa's models/transformer (https://github.com/facebookresearch/dinov2)
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Licensed under the Apache License, Version 2.0 (LICENSES/DINOv2.txt). DINOv2 has no NOTICE
+file. Their file headers reference:
+- DINO (https://github.com/facebookresearch/dino), licensed under the Apache License,
+  Version 2.0 (LICENSES/DINO.txt);
+- timm (https://github.com/huggingface/pytorch-image-models), Copyright 2019 Ross Wightman,
+  licensed under the Apache License, Version 2.0 (LICENSES/timm.txt).
+
+Patch2Pix (https://github.com/GrumpyZhou/patch2pix), credited in RoMa's utils/utils.py
+Copyright (c) 2020 Qunjie Zhou
+Licensed under the MIT License (LICENSES/Patch2Pix.txt).
+
+LoFTR (https://github.com/zju3dv/LoFTR), from which RoMa's utils/utils.py adapts code
+Licensed under the Apache License, Version 2.0 (LICENSES/LoFTR.txt).
+
+Kornia (https://github.com/kornia/kornia), named as a precaution for the epipolar-distance
+helpers in RoMa's utils/utils.py, which import kornia
+Licensed under the Apache License, Version 2.0 (LICENSES/Kornia.txt).
+
+InLoc (https://github.com/HajimeTaira/InLoc_demo), whose approach RoMa's utils/utils.py credits
+Copyright (c) 2017 Hajime Taira
+Licensed under the MIT License (LICENSES/InLoc.txt).

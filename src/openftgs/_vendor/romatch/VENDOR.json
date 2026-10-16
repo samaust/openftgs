@@ -1,0 +1,254 @@
+{
+  "upstream": "https://github.com/Parskatt/RoMa",
+  "commit": "77f8d68803526dcddfd9b7a46bc76125bdc25f15",
+  "script": "scripts/vendor_roma.py",
+  "package": "openftgs._vendor.romatch",
+  "notice": "Modified by openftgs from RoMa 77f8d68 by the vendoring script; see VENDOR.json",
+  "licenses": [
+    {
+      "path": "LICENSE",
+      "project": "RoMa",
+      "license": "MIT",
+      "source": "https://raw.githubusercontent.com/Parskatt/RoMa/77f8d68803526dcddfd9b7a46bc76125bdc25f15/LICENSE",
+      "sha256": "6f02ad61c3fd4509343d619b55501354bcebfd67ad5460c853d02c7ab46ff4bd"
+    },
+    {
+      "path": "LICENSES/DINOv2.txt",
+      "project": "DINOv2",
+      "license": "Apache-2.0",
+      "source": "https://raw.githubusercontent.com/facebookresearch/dinov2/7764ea0f912e53c92e82eb78a2a1631e92725fc8/LICENSE",
+      "sha256": "600cc67cc4cb2f5ea317dcfc687ad1c74dc4bec8782bbe9db0afd83513b935b7"
+    },
+    {
+      "path": "LICENSES/DINO.txt",
+      "project": "DINO",
+      "license": "Apache-2.0",
+      "source": "https://raw.githubusercontent.com/facebookresearch/dino/7c446df5b9f45747937fb0d72314eb9f7b66930a/LICENSE",
+      "sha256": "50e6751797c50dedd75ef1b8a0d9e42f5f8472e9fbce91f34718e9f97b0c780a"
+    },
+    {
+      "path": "LICENSES/timm.txt",
+      "project": "timm",
+      "license": "Apache-2.0",
+      "source": "https://raw.githubusercontent.com/huggingface/pytorch-image-models/637f8191614a4be38e144ab2f870f69cbc03ad30/LICENSE",
+      "sha256": "71b111620fa32c17a80ccd6db2da759d31a591e497d8b5f382174f59d1b59d49"
+    },
+    {
+      "path": "LICENSES/LoFTR.txt",
+      "project": "LoFTR",
+      "license": "Apache-2.0",
+      "source": "https://raw.githubusercontent.com/zju3dv/LoFTR/94e98b695be18acb43d5d3250f52226a8e36f839/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "LICENSES/Patch2Pix.txt",
+      "project": "Patch2Pix",
+      "license": "MIT",
+      "source": "https://raw.githubusercontent.com/GrumpyZhou/patch2pix/0777495b2cff1e876b16cba7f1f7cfcde400bef5/LICENSE",
+      "sha256": "c7318b22a3827cf6b8765342fbf647af30ab7f7b09b943223b8fbfbef43b49b5"
+    },
+    {
+      "path": "LICENSES/Kornia.txt",
+      "project": "Kornia",
+      "license": "Apache-2.0",
+      "source": "https://raw.githubusercontent.com/kornia/kornia/542752eff7dc9c41917302c22afc7cdf4a69d13b/LICENSE",
+      "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+    },
+    {
+      "path": "LICENSES/InLoc.txt",
+      "project": "InLoc",
+      "license": "MIT",
+      "source": "https://raw.githubusercontent.com/HajimeTaira/InLoc_demo/b4c42de09d288f35e65ec0156608c704d6176b4f/README.md",
+      "sha256": "95970e9a4ee8a54762a380de6b09b2909af819eda7324428dd9c023c8bc1a0ef",
+      "source_sha256": "b35cbfd4a05b4e6d2a3a34c2f8447c72867d5eeeabe9b50ef201d5cafc6bfab1",
+      "extract": "lines 141-147 of the source: the fenced block under the heading '### LICENSE' (lines 140-168), from its first line through the end of the paragraph that begins 'THE SOFTWARE IS PROVIDED', byte for byte, joined by LF with one final LF; the request to cite two papers and their BibTeX entries, which follow in the block, are left out"
+    }
+  ],
+  "files": [
+    {
+      "path": "__init__.py",
+      "upstream_path": "romatch/__init__.py",
+      "upstream_blob": "45c2aff7bb510b1d8dfcdc9c4d91ffc3aa5021f6",
+      "sha256": "6c02c6a719caa08da5a3c0797774bf3aa1c3d6f78c2ca503cb74c655aa711f3b",
+      "patch": []
+    },
+    {
+      "path": "models/__init__.py",
+      "upstream_path": "romatch/models/__init__.py",
+      "upstream_blob": "7650c9c7480920905e27578f175fcb5f995cc8ba",
+      "sha256": "0641a484dd03c6fd4b99fff0e92360aa8492cad8c5510727b69f2fbdfc66b226",
+      "patch": []
+    },
+    {
+      "path": "models/encoders.py",
+      "upstream_path": "romatch/models/encoders.py",
+      "upstream_blob": "96019f76124566dbc6752ab67c0fc9642e492e65",
+      "sha256": "46daf65150b7e4f6a688a906d005f708751ea1a598518586fd98539677b68769",
+      "patch": [
+        "1 absolute romatch import rewritten to openftgs._vendor.romatch (1 at module level)",
+        "modification notice added at line 1"
+      ]
+    },
+    {
+      "path": "models/matcher.py",
+      "upstream_path": "romatch/models/matcher.py",
+      "upstream_blob": "05b5c46e97641ec73148c33ffd17106fc611491e",
+      "sha256": "8afa27cc12984a344e4e6db398e39d8c91b034cb4ea892d960a3b46c0b0319d0",
+      "patch": [
+        "6 absolute romatch imports rewritten to openftgs._vendor.romatch (5 at module level; 1 inside RegressionMatcher.visualize_warp)",
+        "modification notice added at line 1"
+      ]
+    },
+    {
+      "path": "models/model_zoo/__init__.py",
+      "upstream_path": "romatch/models/model_zoo/__init__.py",
+      "upstream_blob": "2b2b38b01f8889c9073142459faedd6ede875471",
+      "sha256": "be696bc2559a367fccdaaf724e61f755c09c32a2fea7e9cd3af5af40d446477a",
+      "patch": []
+    },
+    {
+      "path": "models/model_zoo/roma_models.py",
+      "upstream_path": "romatch/models/model_zoo/roma_models.py",
+      "upstream_blob": "4de319359c0877aab81b59de32bae0a24814ecef",
+      "sha256": "6bb64841c500455f93fddc5ab521c6c9f6c79fe44a5d0299a111a464a13d9d0a",
+      "patch": [
+        "4 absolute romatch imports rewritten to openftgs._vendor.romatch (4 at module level)",
+        "modification notice added at line 1"
+      ]
+    },
+    {
+      "path": "models/tiny.py",
+      "upstream_path": "romatch/models/tiny.py",
+      "upstream_blob": "88f44af6c9a6255831734d096167724f89d040ce",
+      "sha256": "ccdbd85afa035b4dad9827c5ea182fd369b3c26db9fd5b440a6d486e505c1a15",
+      "patch": [
+        "2 absolute romatch imports rewritten to openftgs._vendor.romatch (1 at module level; 1 inside TinyRoMa.visualize_warp)",
+        "modification notice added at line 1"
+      ]
+    },
+    {
+      "path": "models/transformer/__init__.py",
+      "upstream_path": "romatch/models/transformer/__init__.py",
+      "upstream_blob": "983f03ccc51cdbcef6166a160fe50652a81418d7",
+      "sha256": "0f72871f9f2761d4593d3f2fbdd5758e5faeaf14c01ee482c6b3a6f5fc88c39c",
+      "patch": [
+        "1 absolute romatch import rewritten to openftgs._vendor.romatch (1 at module level)",
+        "modification notice added at line 1"
+      ]
+    },
+    {
+      "path": "models/transformer/dinov2.py",
+      "upstream_path": "romatch/models/transformer/dinov2.py",
+      "upstream_blob": "b556c63096d17239c8603d5fe626c331963099fd",
+      "sha256": "0b835699807843d883167dd44723150bcbe08973ecb1f2a9d9817a1d962883ed",
+      "patch": []
+    },
+    {
+      "path": "models/transformer/layers/__init__.py",
+      "upstream_path": "romatch/models/transformer/layers/__init__.py",
+      "upstream_blob": "31f196aacac5be8a7c537a3dfa8f97084671b466",
+      "sha256": "6dbf9db5fd20e694d01c7c6f4bb2709890b65d17d03f666df0fddc1c77a7af28",
+      "patch": []
+    },
+    {
+      "path": "models/transformer/layers/attention.py",
+      "upstream_path": "romatch/models/transformer/layers/attention.py",
+      "upstream_blob": "da27d93102a62f31b69507c145705216f815078e",
+      "sha256": "319763dcf2ec23321518b2be292dbe6b7a203fcb18b51d987e496d57ce271851",
+      "patch": [
+        "the module-level try/except ImportError statement around the xformers import replaced by the dedented statements of its except branch, which assign XFORMERS_AVAILABLE",
+        "modification notice added after the 5-line leading comment header"
+      ]
+    },
+    {
+      "path": "models/transformer/layers/block.py",
+      "upstream_path": "romatch/models/transformer/layers/block.py",
+      "upstream_blob": "a711a1f2ee00c8a6b5e79504f41f13145450af79",
+      "sha256": "eba48c1b5c2320658cf2193ca16478ffb998ae57c03d6d1cfa80e44c0998d31c",
+      "patch": [
+        "the module-level try/except ImportError statement around the xformers import replaced by the dedented statements of its except branch, which assign XFORMERS_AVAILABLE",
+        "modification notice added after the 5-line leading comment header"
+      ]
+    },
+    {
+      "path": "models/transformer/layers/dino_head.py",
+      "upstream_path": "romatch/models/transformer/layers/dino_head.py",
+      "upstream_blob": "7212db92a4fd8d4c7230e284e551a0234e9d8623",
+      "sha256": "1a8dfb966458a85ba4807604a0842ed22e3ee69e0c20cebcdac99559cbd838a0",
+      "patch": []
+    },
+    {
+      "path": "models/transformer/layers/drop_path.py",
+      "upstream_path": "romatch/models/transformer/layers/drop_path.py",
+      "upstream_blob": "af05625984dd14682cc96a63bf0c97bab1f123b1",
+      "sha256": "949100aac4d9c19c9d65319dbd362886c5d46a72d7586ba4fd500e9f1d51570c",
+      "patch": []
+    },
+    {
+      "path": "models/transformer/layers/layer_scale.py",
+      "upstream_path": "romatch/models/transformer/layers/layer_scale.py",
+      "upstream_blob": "ca5daa52bd81d3581adeb2198ea5b7dba2a3aea1",
+      "sha256": "356817b5d1390737128cbcc03a5333fd3060b73beae478772282ccb851d0ef85",
+      "patch": []
+    },
+    {
+      "path": "models/transformer/layers/mlp.py",
+      "upstream_path": "romatch/models/transformer/layers/mlp.py",
+      "upstream_blob": "5e4b315f972f9a9f54aef1e4ef4e81b52976f018",
+      "sha256": "c18c5b3f021408597a473bb710070ec3fb3b39f5a2e42e88ae83ced425a608b5",
+      "patch": []
+    },
+    {
+      "path": "models/transformer/layers/patch_embed.py",
+      "upstream_path": "romatch/models/transformer/layers/patch_embed.py",
+      "upstream_blob": "574abe41175568d700a389b8b96d1ba554914779",
+      "sha256": "b3f82e19926c9cfb63f10136aca5e8a723bde1ad62dae1d04f90d405f9439baf",
+      "patch": []
+    },
+    {
+      "path": "models/transformer/layers/swiglu_ffn.py",
+      "upstream_path": "romatch/models/transformer/layers/swiglu_ffn.py",
+      "upstream_blob": "b3324b266fb0a50ccf8c3a0ede2ae10ac4dfa03e",
+      "sha256": "f7d734a8fc6200aa42c429cffec310c92295f17ecb0b549eb3b35cf952e235d3",
+      "patch": [
+        "the module-level try/except ImportError statement around the xformers import replaced by the dedented statements of its except branch, which assign SwiGLU, XFORMERS_AVAILABLE",
+        "modification notice added after the 5-line leading comment header"
+      ]
+    },
+    {
+      "path": "utils/__init__.py",
+      "upstream_path": "romatch/utils/__init__.py",
+      "upstream_blob": "2709f5e586150289085a4e2cbd458bc443fab7f3",
+      "sha256": "6ce7552ac6803781b286089d0aa50d6db36129b5f931ca6a882134bc47f63256",
+      "patch": [
+        "estimate_pose, estimate_pose_uncalibrated, recover_pose dropped from the import from .utils",
+        "modification notice added at line 1"
+      ]
+    },
+    {
+      "path": "utils/kde.py",
+      "upstream_path": "romatch/utils/kde.py",
+      "upstream_blob": "46ed2e5e106bbca93e703f39f3ad3af350666e34",
+      "sha256": "d904f813141c42d2a123f21bfcb85bee03d34ef2a3c9d07fe7667b828cce1a6f",
+      "patch": []
+    },
+    {
+      "path": "utils/local_correlation.py",
+      "upstream_path": "romatch/utils/local_correlation.py",
+      "upstream_blob": "5c43be4389b77d68233ca652b60a66f4b5e8fffa",
+      "sha256": "96fae5665a555b52316d3720e7b78c7bf33f5364901420e5bf7ba713e92a0fd2",
+      "patch": []
+    },
+    {
+      "path": "utils/utils.py",
+      "upstream_path": "romatch/utils/utils.py",
+      "upstream_blob": "4b68f3248488fb1bafcb2793471a7b40687e64ef",
+      "sha256": "52bb642422485469ac3475d558c77f9e35546fc189f98aa560c6921ae806ca24",
+      "patch": [
+        "the module-level import of cv2 (upstream line 3) removed",
+        "upstream lines 11-75 removed: the functions recover_pose, estimate_pose, estimate_pose_uncalibrated and only blank or comment lines between them; blank lines at the cut kept to at most two",
+        "modification notice added at line 1"
+      ]
+    }
+  ]
+}

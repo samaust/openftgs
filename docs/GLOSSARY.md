@@ -275,7 +275,7 @@ _Avoid_: metrics (reserved for E16), history, training record
 ### Initialization
 
 **Init frame slot**:
-A nominal time t_k = k·Δt_f for every k_stride-th k, admitting at most one image per training camera, the one within Δt_f/2 of t_k; a camera with none sits the slot out. §1.3 step 1, D-47
+A nominal time t_k = k·Δt_f for every k_stride-th k, admitting at most one image per training camera: the closest of its images that lie within Δt_f/2 of t_k and have this slot as their nearest (a tie between two slots goes to the lower); a camera with none sits the slot out. §1.3 step 1, D-47, Q-109
 _Avoid_: keyframe, init time, frame index, slot (when the images or points are meant)
 
 **Init frame**:
@@ -283,15 +283,15 @@ The images admitted to one init frame slot together with the points triangulated
 _Avoid_: initialization frame, keyframe, frame (unqualified)
 
 **Camera pair**:
-Two training cameras matched at an init frame: each camera with the training camera whose optical axis is angularly closest, every unordered pair matched once as (A, B) in manifest order. D-22
+Two training cameras matched at an init frame: each camera with the training camera whose optical axis is angularly closest, every unordered pair matched once as (A, B) in the order of the manifest's `cameras` object. D-22, Q-108
 _Avoid_: image pair, stereo pair, view pair
 
 **Match**:
-One pixel correspondence between the two images of a camera pair, taken from RoMa's dense warp with certainty at least 0.5, up to 5,000 per pair drawn in proportion to certainty from the pair's own generator. D-22, D-56, D-58
+One pixel correspondence between the two images of a camera pair, taken from the dense matcher's warp (RoMa's by default) with certainty at least 0.5, up to 5,000 per pair drawn in proportion to certainty from the pair's own generator. D-22, D-56, D-58, Q-106
 _Avoid_: correspondence, keypoint, feature match, sample (RoMa's `sample()` is not used)
 
 **Certainty**:
-RoMa's raw per-pixel confidence that a warp is correct, used both as the admission threshold for matches and as their sampling weight. D-58
+The dense matcher's raw per-pixel confidence that a warp is correct (RoMa's sigmoid certainty by default), used both as the admission threshold for matches and as their sampling weight. D-58, Q-106
 _Avoid_: confidence, score, probability
 
 **Triangulation**:
@@ -315,8 +315,16 @@ The 4D point set training starts from: positions, colors and raw timestamps, wit
 _Avoid_: point cloud, seed points, 4D points, initial Gaussians, SfM points
 
 **Vendored RoMa**:
-The copy of RoMa's inference code at commit 77f8d68 inside `openftgs._vendor.romatch`, with its OpenCV and xformers imports removed, that the `[init]` extra matches with. D-65
+The copy of RoMa's inference code at commit 77f8d68 inside `openftgs._vendor.romatch`, with its OpenCV import, its three pose-estimation helpers and the xformers imports of its DINOv2 layers removed, that the `[init]` extra matches with. D-65, Q-113, Q-114
 _Avoid_: romatch (the upstream package), RoMa package, the matcher
+
+**Dense matcher**:
+What matches the two images of a camera pair at every pixel, giving a dense warp and a certainty per match: RoMa (roma_outdoor or Tiny RoMa) by default, or one supplied to `roma_init`. §2.1 `roma_init`, D-58, Q-106
+_Avoid_: matcher model, feature matcher, RoMa (when any dense matcher is meant), the matcher (unqualified)
+
+**Shard**:
+One share of `roma_init`'s camera pairs, matched on one device by its own dense matcher; the init points don't depend on how the pairs are spread over shards. D-54, D-56, Q-106
+_Avoid_: rank (reserved for multi-GPU training), worker, partition
 
 ### Rendering
 

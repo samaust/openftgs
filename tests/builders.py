@@ -393,3 +393,96 @@ def shortened_config(iterations: int, base: TrainConfig) -> TrainConfig:
             cfg.optim, iterations=iterations, sh_interval=scaled(cfg.optim.sh_interval)
         ),
     )
+
+
+# A textured plane that a dense matcher can match (#137): RoMa's tests need real images, which
+# the coordinate-encoded scenes of the init tests are not. The plane y = y₀ + v_y·τ carries a
+# seeded multi-octave value-noise texture that moves with it by (v_x, v_z)·τ; each pixel is the
+# mean of a grid of exact ray–plane hits inside it, so no image is resampled.
+
+
+@dataclasses.dataclass(frozen=True)
+class TexturedPlane:
+    """The plane y = y0 + velocity[1]·τ, its texture at (x − velocity[0]·τ, z − velocity[2]·τ)."""
+
+    seed: int
+    y0: float = 0.0
+    velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    cells: tuple[float, ...] = (0.5, 0.25, 0.12, 0.06, 0.03)  # octave cell sizes, world units
+
+    def texture(self, a: Tensor, b: Tensor) -> Tensor:
+        """RGB in [0, 1] at plane coordinates (a, b), float64 [..., 3]: smoothstep value noise,
+        one 64 × 64 periodic grid per octave and channel, octaves weighted by √(cell size),
+        then stretched about ½ for contrast."""
+        generator = torch.Generator().manual_seed(self.seed)
+        total = torch.zeros(*a.shape, 3, dtype=torch.float64)
+        for cell in self.cells:
+            grid = torch.rand(64, 64, 3, generator=generator, dtype=torch.float64)
+            p, q = a / cell, b / cell
+            i, j = torch.floor(p), torch.floor(q)
+            fp, fq = p - i, q - j
+            fp, fq = fp * fp * (3 - 2 * fp), fq * fq * (3 - 2 * fq)  # smoothstep
+            i0, j0 = i.long() % 64, j.long() % 64
+            i1, j1 = (i0 + 1) % 64, (j0 + 1) % 64
+            top = grid[i0, j0] * (1 - fp)[..., None] + grid[i1, j0] * fp[..., None]
+            bottom = grid[i0, j1] * (1 - fp)[..., None] + grid[i1, j1] * fp[..., None]
+            total += math.sqrt(cell) * (top * (1 - fq)[..., None] + bottom * fq[..., None])
+        mean = total / sum(math.sqrt(cell) for cell in self.cells)
+        return (0.5 + 2.5 * (mean - 0.5)).clamp(0.0, 1.0)
+
+    def render(self, camera: Camera, tau: float, *, supersample: int = 3) -> Tensor:
+        """The camera's 8-bit RGB image [H, W, 3] at raw τ; rays that miss the plane are grey."""
+        w2c = camera.world_to_camera.to(torch.float64)
+        rotation, t = w2c[:3, :3], w2c[:3, 3]
+        center = -rotation.T @ t
+        offsets = (torch.arange(supersample, dtype=torch.float64) + 0.5) / supersample
+        u = (torch.arange(camera.width, dtype=torch.float64)[:, None] + offsets).reshape(-1)
+        v = (torch.arange(camera.height, dtype=torch.float64)[:, None] + offsets).reshape(-1)
+        vv, uu = torch.meshgrid(v, u, indexing="ij")
+        pixels = torch.stack([uu, vv, torch.ones_like(uu)], dim=-1)
+        rays = pixels @ torch.linalg.inv(camera.K.to(torch.float64)).T @ rotation
+        y = self.y0 + self.velocity[1] * tau
+        s = (y - center[1]) / rays[..., 1]
+        hits = center + s[..., None] * rays
+        color = self.texture(
+            hits[..., 0] - self.velocity[0] * tau, hits[..., 2] - self.velocity[2] * tau
+        )
+        color = torch.where((s > 0)[..., None], color, torch.full_like(color, 0.5))
+        h, w, n = camera.height, camera.width, supersample
+        color = color.reshape(h, n, w, n, 3).mean(dim=(1, 3))
+        return (color * 255.0).round().to(torch.uint8)
+
+
+def write_plane_scene(
+    root: Path, plane: TexturedPlane, images: Sequence[tuple[Camera, float, str]]
+) -> Path:
+    """A scene manifest and its images in `root`, laid out as `write_scene` writes them, each
+    (camera, raw τ, data split) image rendered from `plane`. Cameras are keyed by name, in the
+    order they first appear."""
+    root.mkdir(parents=True, exist_ok=True)
+    cameras: dict[str, dict[str, Any]] = {}
+    entries: list[dict[str, Any]] = []
+    for k, (camera, tau, split) in enumerate(images):
+        cameras.setdefault(camera.name, _camera_json(camera))
+        entry: dict[str, Any] = {
+            "camera": camera.name,
+            "timestamp": tau,
+            "frame_index": k,
+            "path": f"images/{camera.name}/{k:06d}.png",
+            "split": split,
+        }
+        target = root / entry["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(plane.render(camera, tau).numpy(), "RGB").save(target)
+        entries.append(entry)
+    manifest = {
+        "format": "ftgs-scene",
+        "version": 1,
+        "time_unit": "s",
+        "cameras": cameras,
+        "images": entries,
+        "metadata": {"source": "synthetic"},
+    }
+    path = root / "scene.json"
+    path.write_text(json.dumps(manifest, indent=1))
+    return path

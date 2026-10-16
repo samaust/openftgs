@@ -615,6 +615,30 @@ def test_u19_missing_frame_ids_become_the_nearest_slot() -> None:
     )
 
 
+def test_u19_supplied_unsynchronized_points_get_s0_and_nearest_slot_groups() -> None:
+    """U-19, §1.3 paragraph after step 9, D-21, D-47: supplied points from unsynchronized
+    cameras, without durations or frame ids, get s₀ = Δt_f and are grouped by their nearest
+    slot (ties to the lower slot, Q-21), on the same points.
+
+    Δt_f = 0.1 and T_τ = 10: times 1.3, 0.7, 2.5 and 1.8 lie at t = 0.13, 0.07, 0.25 (a tie)
+    and 0.18, so points 0 and 1 share slot 1 (distance 1) and points 2 and 3 slot 2 (distance
+    4), and every log duration is log 0.1."""
+    pts = _points(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        [1.3, 0.7, 2.5, 1.8],
+    )
+    model = _init(pts, SPAN, 0.1)
+    torch.testing.assert_close(
+        model.log_durations.detach(), torch.full((4,), math.log(0.1)), rtol=1e-6, atol=0
+    )
+    torch.testing.assert_close(
+        torch.exp(model.log_scales.detach()[:, 0]),
+        torch.tensor([1.0, 1.0, 4.0, 4.0]),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+
 def test_u19_budget_keeps_a_seeded_ordered_subset_of_f_times_b_points() -> None:
     """§1.3 step 7 and D-24: at most F·B points in total, F = round(1/Δt_f) + 1, as a seeded
     uniform subset kept in file order; the same seed gives the same subset (Q-21)."""

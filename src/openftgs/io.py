@@ -166,9 +166,28 @@ def validate_init_points(points: InitPoints) -> None:
         _fail(where, "durations must be positive")
 
 
-def write_init_points(points: InitPoints, path: Path, *, time_unit: str, producer: str) -> None:
-    """Write a ftgs-init v1 file (§2.2; Q-22), validating first."""
+_INIT_RESERVED = ("format", "version", "time_unit", "producer")  # §2.2 ftgs-init metadata
+
+
+def write_init_points(
+    points: InitPoints,
+    path: Path,
+    *,
+    time_unit: str,
+    producer: str,
+    metadata: Mapping[str, str] | None = None,  # Q-107
+) -> None:
+    """Write a ftgs-init v1 file (§2.2; Q-22), validating first. `metadata` adds string keys
+    and values beside §2.2's own, such as `roma_init`'s provenance (Q-107); a reserved key or a
+    key or value that isn't a string raises ValueError."""
     validate_init_points(points)
+    extra = dict(metadata or {})
+    for key, value in extra.items():
+        # Q-107: safetensors metadata is a string-to-string map (§2.2 introduction).
+        if not isinstance(key, str) or not isinstance(value, str):
+            _fail("ftgs-init", f"metadata must map strings to strings, got {key!r}: {value!r}")
+        if key in _INIT_RESERVED:
+            _fail("ftgs-init", f"metadata key {key!r} is reserved")
     tensors = {
         name: value
         for name in ("positions", "colors", "timestamps", "velocities", "durations", "frame_ids")
@@ -179,6 +198,7 @@ def write_init_points(points: InitPoints, path: Path, *, time_unit: str, produce
         "version": str(_VERSION),
         "time_unit": time_unit,
         "producer": producer,
+        **extra,
     }
     _write_safetensors(tensors, Path(path), meta)
 
@@ -826,7 +846,8 @@ def _relative_path(value: Any, what: str, where: str) -> Path:
 def read_scene_manifest(path: Path) -> SceneManifest:
     """Read and validate a ftgs-scene file (§2.2; Q-64): the image records in file order, with
     paths resolved against the manifest's directory, the test images' masks, the metadata, the
-    time unit and the SHA-256 of the file's bytes as read. Cameras are checked as a render
+    time unit, the SHA-256 of the file's bytes as read and the camera names in the key order of
+    the `cameras` object (Q-108). Cameras are checked as a render
     request's (Q-56); unknown keys are ignored. Whether the files exist is not checked here."""
     path = Path(path)
     where = f"scene manifest {path}"
@@ -896,6 +917,7 @@ def read_scene_manifest(path: Path) -> SceneManifest:
         records=tuple(records),
         masks=tuple(masks),
         metadata=metadata,
+        camera_names=tuple(cameras),  # Q-108: JSON objects are read in file order
     )
 
 

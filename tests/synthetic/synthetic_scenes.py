@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared setup of the §3.2 synthetic-scene recovery tests (M11, PRD #99): the camera rigs, the
-ground truth drawn from committed seeds (stored as ftgs-if files in `data/`), the initial models
-derived from it, the scenes written to disk, the training runs and the recovery measures.
+"""Shared setup of the §3.2 synthetic-scene recovery tests (M11, PRD #99; S-4 in M13, PRD #133):
+the camera rigs, the ground truth drawn from committed seeds (stored as ftgs-if files in
+`data/`), the initial models and init points derived from it, the scenes written to disk, the
+training runs and the recovery measures.
 
 The ground truth lives in raw time τ, with frames at τ = k/30 s. A model is rebuilt under each
 dataset's own time normalizer (`model_under`), since the trainer refuses a model whose normalizer
@@ -22,11 +23,12 @@ from torch import Tensor
 from openftgs.config import TrainConfig
 from openftgs.data import MultiViewVideo
 from openftgs.eval import psnr
+from openftgs.init import knn_velocities
 from openftgs.io import read_exchange
-from openftgs.model import FreeTimeGaussians
+from openftgs.model import FreeTimeGaussians, rotation_matrix
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer
-from openftgs.types import Camera, ExchangeModel, TimeNormalizer
+from openftgs.types import Camera, ExchangeModel, InitPoints, TimeNormalizer
 
 DATA = Path(__file__).parent / "data"
 SEEDS_FILE = DATA / "seeds.json"
@@ -176,7 +178,14 @@ def sh_of(color: Tensor) -> Tensor:
     return ((color - 0.5) / C0).reshape(-1, 1, 3)
 
 
-def exchange(arrays: dict[str, Tensor], *, tau0: float, tau1: float, degree: int) -> ExchangeModel:
+def exchange(
+    arrays: dict[str, Tensor],
+    *,
+    tau0: float,
+    tau1: float,
+    degree: int,
+    producer: str = "openftgs tests (M11 ground truth)",
+) -> ExchangeModel:
     """ftgs-if contents in the dtypes §2.2 fixes, from float64 arrays."""
     dtypes = {"time_center": F64, "duration": F64}
     return ExchangeModel(
@@ -185,7 +194,7 @@ def exchange(arrays: dict[str, Tensor], *, tau0: float, tau1: float, degree: int
         tau0=tau0,
         tau1=tau1,
         time_unit="s",
-        producer="openftgs tests (M11 ground truth)",
+        producer=producer,
     )
 
 
@@ -294,6 +303,94 @@ def _gt_s3(seed: int) -> ExchangeModel:
     return exchange(arrays, tau0=0.0, tau1=span, degree=0)
 
 
+# S-4 (Q-119): three spheres translating linearly over 10 frames, on the hemisphere rig. §3.2's
+# precondition, a displacement per frame below half the sampling spacing, binds the init
+# lattice: 14 points per sphere leave a spacing of about 0.08, so a step of up to 0.025
+# (about 1.5 px at the rig's focal length) stays below 0.63 of half of it.
+S4_FRAMES = 10
+S4_RADIUS = 0.1  # about 12 px across at the hemisphere rig's focal length and radius
+S4_GT_POINTS = 80  # ground-truth Gaussians per sphere, on a Fibonacci lattice
+S4_GT_SCALE = 0.45  # their isotropic scale, × the lattice's smallest spacing (about 1 px)
+S4_GT_OPACITY = 0.9
+S4_GT_DURATION = 10.0  # long durations (S-1's s = 10): present at every frame
+S4_INIT_POINTS = 14  # init points per sphere and frame, on a rotated, jittered lattice
+S4_INIT_JITTER = 0.05  # the largest jitter of an init point, × the lattice's smallest spacing
+S4_STEP = (0.018, 0.025)  # displacement per frame (|v|/30 per τ), in world units
+S4_CENTER_RADIUS = 0.2  # sphere centers at the middle time within this of the origin
+S4_CLEARANCE = 0.06  # surfaces this far apart at every frame: more than twice the largest step,
+# so a sphere's points can't find their k-NN partner on another sphere
+
+
+def fibonacci_sphere(n: int) -> Tensor:
+    """n points [n, 3] of the Fibonacci lattice on the unit sphere, in float64: z_i = 1 −
+    (2i + 1)/n and azimuth i·π(3 − √5) (the golden angle)."""
+    i = torch.arange(n, dtype=F64)
+    z = 1.0 - (2.0 * i + 1.0) / n
+    r = torch.sqrt(1.0 - z * z)
+    azimuth = i * math.pi * (3.0 - math.sqrt(5.0))
+    return torch.stack([r * torch.cos(azimuth), r * torch.sin(azimuth), z], dim=1)
+
+
+def smallest_spacing(points: Tensor) -> float:
+    """The smallest distance between two of `points` [n, 3] (n ≥ 2), in float64."""
+    d = torch.cdist(points.to(F64), points.to(F64))
+    d.fill_diagonal_(math.inf)
+    return float(d.min())
+
+
+def _gt_s4(seed: int) -> ExchangeModel:
+    """S-4 (Q-119): three spheres of radius S4_RADIUS translating linearly, each S4_GT_POINTS
+    Gaussians on a Fibonacci lattice that share its velocity, with isotropic scales, opacity
+    0.9, long durations, time centers at the sequence's middle time, half its span (between
+    frames 4 and 5 of 10), and uniform random colors in [0.2, 0.9] (a texture that shows the
+    motion). A sphere's center at the middle time lies within S4_CENTER_RADIUS of the origin
+    and its step per frame is uniform in S4_STEP, in a uniform random direction; each is drawn
+    again until its surface stays in view of every hemisphere camera at every frame and
+    S4_CLEARANCE from the others'. Rows are sphere by sphere, S4_GT_POINTS each."""
+    g = torch.Generator().manual_seed(seed)
+    taus = frame_taus(S4_FRAMES)
+    span = tau(S4_FRAMES - 1)
+    middle = span / 2
+    rig = hemisphere_rig()
+    cameras = rig.train + rig.test
+    unit = fibonacci_sphere(S4_GT_POINTS)
+    centers: list[Tensor] = []
+    velocities: list[Tensor] = []
+    tracks: list[Tensor] = []
+    while len(centers) < 3:
+        center = _uniform(g, -S4_CENTER_RADIUS, S4_CENTER_RADIUS, 3)
+        direction = torch.randn(3, generator=g, dtype=F64)
+        direction = direction / torch.linalg.vector_norm(direction)
+        velocity = direction * _uniform(g, *S4_STEP, 1) * FPS  # world units per τ
+        if float(torch.linalg.vector_norm(center)) > S4_CENTER_RADIUS:
+            continue
+        track = center + velocity * (taus[:, None] - middle)  # [frames, 3]
+        surface = (track[:, None, :] + S4_RADIUS * unit).reshape(-1, 3)
+        if not in_view(cameras, surface):
+            continue
+        apart = 2.0 * S4_RADIUS + S4_CLEARANCE
+        if any(float(torch.linalg.vector_norm(track - t, dim=1).min()) < apart for t in tracks):
+            continue
+        centers.append(center)
+        velocities.append(velocity)
+        tracks.append(track)
+    n = 3 * S4_GT_POINTS
+    scale = S4_GT_SCALE * S4_RADIUS * smallest_spacing(unit)
+    arrays = {
+        "position": torch.cat([c + S4_RADIUS * unit for c in centers]),
+        "time_center": torch.full((n,), middle, dtype=F64),
+        "duration": torch.full((n,), S4_GT_DURATION * span, dtype=F64),
+        "velocity": torch.cat([v.expand(S4_GT_POINTS, 3) for v in velocities]),
+        "scale": torch.full((n, 3), scale, dtype=F64),
+        "rotation": torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=F64).repeat(n, 1),
+        "opacity": torch.full((n,), S4_GT_OPACITY, dtype=F64),
+        "sh": sh_of(_uniform(g, 0.2, 0.9, n, 3)),
+    }
+    return exchange(
+        arrays, tau0=0.0, tau1=span, degree=0, producer="openftgs tests (M13 ground truth)"
+    )
+
+
 CLUTTER_COUNT = 2_000
 CLUTTER_SCALES = (0.005, 0.015)  # Q-78: smaller than the objects', the "small" Gaussians
 CLUTTER_OPACITY = (0.3, 0.99)  # Q-78: up to about 1, so an unregularized fit can saturate
@@ -355,20 +452,22 @@ GROUND_TRUTH_FILES = {
     "s1": "s1_gt.safetensors",
     "s2": "s2_gt.safetensors",
     "s3": "s3_gt.safetensors",
+    "s4": "s4_gt.safetensors",
     "s5": "s5_gt.safetensors",
     "s6": "s6_gt.safetensors",
 }
 
 
 def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, ExchangeModel]:
-    """The ground truth of S-1, S-2, S-3, S-5 and S-6 from the committed seeds: S-5's is S-2's 8
-    Gaussians (its first rows) followed by 2,000 small ones (Q-78); S-6's is S-2's objects as
-    clusters of three (Q-83); S-7 and S-8 reuse S-2's."""
+    """The ground truth of S-1 to S-6 from the committed seeds: S-4's is three spheres of
+    Gaussians (Q-119); S-5's is S-2's 8 Gaussians (its first rows) followed by 2,000 small ones
+    (Q-78); S-6's is S-2's objects as clusters of three (Q-83); S-7 and S-8 reuse S-2's."""
     s2 = _gt_s2(seeds["s2"]["ground_truth"])
     return {
         "s1": _gt_s1(seeds["s1"]["ground_truth"]),
         "s2": s2,
         "s3": _gt_s3(seeds["s3"]["ground_truth"]),
+        "s4": _gt_s4(seeds["s4"]["ground_truth"]),
         "s5": concatenated(s2, _gt_clutter(seeds["s5"]["clutter"], s2)),
         "s6": _gt_s6(seeds["s6"]["ground_truth"], s2),
     }
@@ -452,6 +551,81 @@ def draw_taus(seed: int, choices: Sequence[float], n: int) -> Tensor:
     return torch.tensor(choices, dtype=F64)[index]
 
 
+@dataclasses.dataclass(frozen=True)
+class S4Init:
+    points: InitPoints  # on the CPU, frame by frame, then sphere by sphere
+    sphere: Tensor  # [N] int64: each point's sphere, whose rows in the ground truth start there
+    spacing: float  # the smallest spacing of the jittered lattices: §3.2's sampling spacing
+
+
+def _s4_lattice(g: torch.Generator) -> Tensor:
+    """Q-119: one init lattice on the unit sphere, other than the ground truth's: the Fibonacci
+    lattice of S4_INIT_POINTS points under a uniform random rotation, each point moved by up to
+    S4_INIT_JITTER of the lattice's smallest spacing in a uniform random direction and put back
+    on the sphere."""
+    base = fibonacci_sphere(S4_INIT_POINTS)
+    turned = base @ rotation_matrix(_rotations(g, 1))[0].T
+    direction = torch.randn(S4_INIT_POINTS, 3, generator=g, dtype=F64)
+    direction = direction / torch.linalg.vector_norm(direction, dim=1, keepdim=True)
+    amount = S4_INIT_JITTER * smallest_spacing(base) * torch.rand(S4_INIT_POINTS, 1, generator=g)
+    moved = turned + amount.to(F64) * direction
+    lattice: Tensor = moved / torch.linalg.vector_norm(moved, dim=1, keepdim=True)
+    return lattice
+
+
+def s4_init(gt: ExchangeModel, seed: int, device: str) -> S4Init:
+    """Q-119: S-4's init points from its ground truth. Each sphere gets one fixed lattice
+    (`_s4_lattice`, seeded), scaled to S4_RADIUS and translated with the sphere to each of the
+    S4_FRAMES frames, so the same material points persist; the positions are rounded to float32,
+    the values `InitPoints` holds, before E15 runs on them. A point's color is that of the
+    ground-truth Gaussian nearest it on its sphere, as colors taken from the images would be.
+    Timestamps are the frames' τ and frame ids the frame index; durations are left to
+    `from_init_points` (s₀ = Δt_f, D-21). Velocities are E15's: `knn_velocities` on `device`
+    against the next frame's points, the last frame against the previous one's (D-23)."""
+    g = torch.Generator().manual_seed(seed)
+    a = gt.arrays
+    taus = frame_taus(S4_FRAMES)
+    unit_gt = fibonacci_sphere(S4_GT_POINTS)
+    shells: list[Tensor] = []  # per sphere, [P, 3] at frame 0
+    motions: list[Tensor] = []  # per sphere, its velocity [3] in world units per τ
+    colors: list[Tensor] = []
+    lattices: list[Tensor] = []
+    for s in range(3):
+        rows = slice(s * S4_GT_POINTS, (s + 1) * S4_GT_POINTS)
+        # The ground truth's rows are center + S4_RADIUS·unit_gt at their time center.
+        center = a["position"][rows].to(F64).mean(dim=0) - S4_RADIUS * unit_gt.mean(dim=0)
+        velocity = a["velocity"][rows][0].to(F64)
+        start = center + velocity * (taus[0] - a["time_center"][rows][0])
+        lattice = _s4_lattice(g)
+        lattices.append(lattice)
+        shells.append(start + S4_RADIUS * lattice)
+        motions.append(velocity)
+        nearest = (lattice @ unit_gt.T).argmax(dim=1)
+        colors.append((C0 * a["sh"][rows][nearest, 0] + 0.5).clamp(0.0, 1.0))
+    frames = [
+        torch.cat([shell + v * (t - taus[0]) for shell, v in zip(shells, motions, strict=True)])
+        .to(F32)
+        .to(device)
+        for t in taus
+    ]
+    velocities: list[Tensor] = []
+    for k in range(S4_FRAMES):
+        other = k + 1 if k + 1 < S4_FRAMES else k - 1  # D-23: backward on the last frame
+        dt = float(taus[other] - taus[k])
+        velocities.append(knn_velocities(frames[k], frames[other], dt).cpu())  # E15
+    per_frame = 3 * S4_INIT_POINTS
+    points = InitPoints(
+        positions=torch.cat(frames).cpu(),
+        colors=torch.cat(colors).to(F32).repeat(S4_FRAMES, 1),
+        timestamps=taus.repeat_interleave(per_frame),
+        velocities=torch.cat(velocities),
+        frame_ids=torch.arange(S4_FRAMES).repeat_interleave(per_frame),
+    )
+    sphere = torch.arange(3).repeat_interleave(S4_INIT_POINTS).repeat(S4_FRAMES)
+    spacing = min(S4_RADIUS * smallest_spacing(lattice) for lattice in lattices)
+    return S4Init(points=points, sphere=sphere, spacing=spacing)
+
+
 # Scenes on disk.
 
 
@@ -489,11 +663,12 @@ def synthetic_config(iterations: int, base: TrainConfig) -> TrainConfig:
 def train(
     cfg: TrainConfig,
     video: MultiViewVideo,
-    init: FreeTimeGaussians,
+    init: FreeTimeGaussians | InitPoints,
     device: str,
     callbacks: Sequence[Callable[[Trainer, StepLog], bool | None]] = (),
 ) -> tuple[Trainer, list[StepLog]]:
-    """A full run of `cfg` from `init`, with its step logs."""
+    """A full run of `cfg` from `init` (a model, or init points the trainer builds one from),
+    with its step logs."""
     trainer = Trainer(cfg, video, init, device=device)
     logs: list[StepLog] = []
 
@@ -527,18 +702,24 @@ def trajectory_error(model: FreeTimeGaussians, gt: ExchangeModel, taus: Tensor) 
     return float(torch.linalg.vector_norm(ours - theirs, dim=-1).max())
 
 
-def velocity_errors(model: FreeTimeGaussians, gt: ExchangeModel) -> dict[str, float]:
-    """Per primitive, in world units per τ, each a max over primitives: the relative magnitude
-    error, the angle in degrees and the relative vector error."""
-    v = physical(model)["velocity"].to(F64)
-    v_gt = gt.arrays["velocity"].to(F64)
+def velocity_error_rows(velocity: Tensor, velocity_gt: Tensor) -> dict[str, Tensor]:
+    """Q-80's velocity errors of each row of [N, 3] velocities against [N, 3] true ones, in
+    float64: the relative magnitude error, the angle in degrees and the relative vector error."""
+    v, v_gt = velocity.to(F64), velocity_gt.to(F64)
     norm, norm_gt = torch.linalg.vector_norm(v, dim=1), torch.linalg.vector_norm(v_gt, dim=1)
     cosine = (v * v_gt).sum(dim=1) / (norm * norm_gt)
     return {
-        "magnitude": float(((norm - norm_gt).abs() / norm_gt).max()),
-        "angle_deg": float(torch.rad2deg(torch.arccos(cosine.clamp(-1.0, 1.0))).max()),
-        "vector": float((torch.linalg.vector_norm(v - v_gt, dim=1) / norm_gt).max()),
+        "magnitude": (norm - norm_gt).abs() / norm_gt,
+        "angle_deg": torch.rad2deg(torch.arccos(cosine.clamp(-1.0, 1.0))),
+        "vector": torch.linalg.vector_norm(v - v_gt, dim=1) / norm_gt,
     }
+
+
+def velocity_errors(model: FreeTimeGaussians, gt: ExchangeModel) -> dict[str, float]:
+    """Per primitive, in world units per τ, each a max over primitives: the relative magnitude
+    error, the angle in degrees and the relative vector error."""
+    errors = velocity_error_rows(physical(model)["velocity"], gt.arrays["velocity"])
+    return {name: float(value.max()) for name, value in errors.items()}
 
 
 def mean_psnr(model: FreeTimeGaussians, video: MultiViewVideo, indices: Iterable[int]) -> float:
