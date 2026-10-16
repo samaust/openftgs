@@ -1754,7 +1754,8 @@ class FrameCache:
     """The uint8 copy of every training image (D-51; Q-84, Q-98): one safetensors file per
     camera beside the scene manifest, keyed by its SHA-256, held in GPU memory ("gpu") or
     memory-mapped and read one frame at a time ("mmap"). `open` builds it when missing or
-    stale."""
+    stale. Instances come from `FrameCache.open` only: the constructor takes internal
+    structures and may change without notice (Q-84)."""
 
     def __init__(
         self,
