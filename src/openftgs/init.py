@@ -15,6 +15,8 @@ from torch import Tensor
 
 __all__ = ["knn_velocities"]  # Q-106
 
+_KNN_TILE = 1 << 24  # distances held at once by the tiled k-NN search (query rows × points)
+
 
 def _fail(reason: str) -> NoReturn:
     raise ValueError(reason)
@@ -54,9 +56,30 @@ def _nearest_kdtree(query: Tensor, data: Tensor) -> Tensor:
     return torch.from_numpy(out).to(query.device)
 
 
+def _nearest_tiled(query: Tensor, data: Tensor) -> Tensor:
+    """The CUDA path of `_nearest_indices`: brute force over tiles of query rows, on explicit
+    coordinate differences rather than ‖a‖² + ‖b‖² − 2a·b (D-56)."""
+    n, m = int(query.shape[0]), int(data.shape[0])
+    out = torch.empty(n, dtype=torch.long, device=query.device)
+    columns = torch.arange(m, device=query.device)
+    rows = max(1, _KNN_TILE // m)
+    for start in range(0, n, rows):
+        stop = min(n, start + rows)
+        d = torch.cdist(query[start:stop], data, compute_mode="donot_use_mm_for_euclid_dist")
+        # The lowest index among the columns at the nearest distance, whatever order a
+        # reduction kernel would pick among ties.
+        at_nearest = d == d.amin(dim=1, keepdim=True)
+        out[start:stop] = torch.where(at_nearest, columns, m).amin(dim=1)
+    return out
+
+
 def _nearest_indices(query: Tensor, data: Tensor) -> Tensor:
     """For each row of `query` [N, 3], the index in `data` [M, 3] (M ≥ 1) of its exact nearest
-    neighbour, ties to the lower index (D-56). Both float64 on one device; long [N] there."""
+    neighbour, ties to the lower index (D-56). Both float64 and finite, on one device; returns
+    long [N] there."""
+    query, data = query.detach(), data.detach()
+    if query.device.type == "cuda":
+        return _nearest_tiled(query, data)
     return _nearest_kdtree(query, data)
 
 

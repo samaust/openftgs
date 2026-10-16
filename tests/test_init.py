@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from openftgs.init import knn_velocities
+from openftgs.init import _nearest_indices, knn_velocities
 
 
 def _lattice(shape: tuple[int, int, int], spacing: float, dtype: torch.dtype) -> torch.Tensor:
@@ -93,6 +93,74 @@ def test_knn_velocities_refuses_non_finite_coordinates(bad: float, which: str) -
     (points if which == "points" else next_points)[2, 1] = bad
     with pytest.raises(ValueError, match=rf"^{which}\b.*finite"):
         knn_velocities(points, next_points, 0.1)
+
+
+_DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+
+
+def _brute_force_nearest(query: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+    """The test's own float64 oracle: squared distances from explicit differences, by blocks."""
+    out = []
+    for block in torch.split(query, 256):
+        d2 = ((block[:, None, :] - data[None, :, :]) ** 2).sum(dim=-1)
+        out.append(d2.argmin(dim=1))
+    return torch.cat(out)
+
+
+def _clusters() -> tuple[torch.Tensor, torch.Tensor]:
+    """Three clusters 10³·S from the origin (S = 1). Each holds a 13³ lattice 10⁻⁴·S apart,
+    every point jittered by up to ±0.3·10⁻⁴, and 3,000 query points drawn in the same box."""
+    gen = torch.Generator().manual_seed(33)
+    spacing, n = 1e-4, 13
+    centers = torch.tensor(
+        [[1e3, 0.0, 0.0], [0.0, -1e3, 0.0], [577.35, 577.35, -577.35]], dtype=torch.float64
+    )
+    axis = torch.arange(n, dtype=torch.float64) * spacing
+    lattice = torch.stack(torch.meshgrid(axis, axis, axis, indexing="ij"), dim=-1).reshape(-1, 3)
+    points, next_points = [], []
+    for c in centers:
+        jitter = (torch.rand(lattice.shape, generator=gen, dtype=torch.float64) - 0.5) * 0.6
+        next_points.append(c + lattice + jitter * spacing)
+        box = torch.rand(3000, 3, generator=gen, dtype=torch.float64) * (n - 1) * spacing
+        points.append(c + box)
+    return torch.cat(points), torch.cat(next_points)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_u33_knn_velocities_match_a_float64_brute_force(device: str) -> None:
+    """U-33: on clustered points 10⁻⁴·S apart and 10³·S from the origin, `knn_velocities`
+    finds the neighbours of an in-test float64 brute force: its velocities are
+    (next[nn(i)] − pᵢ)/dt for the brute force's nn. A different neighbour would be off by
+    about 10⁻⁴/dt; the tolerance is far below that.
+
+    9,000 points against 6,591 make the CUDA path run several tiles."""
+    points, next_points = _clusters()
+    dt = 0.5
+    nn = _brute_force_nearest(points, next_points)
+    expected = (next_points[nn] - points) / dt
+    v = knn_velocities(points.to(device), next_points.to(device), dt)
+    torch.testing.assert_close(v.cpu(), expected, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_nearest_indices_ties_go_to_the_lower_index(device: str) -> None:
+    """D-56: among points at the nearest distance, the lowest index wins, on both paths.
+
+    40 copies of one point (first at index 3) make the CPU path query again several times;
+    one query row has a unique nearest point, so only some rows are queried again; two distinct
+    points exactly 1 apart from the origin tie by distance alone."""
+    a = torch.tensor([0.25, -0.5, 1.0], dtype=torch.float64)
+    others = torch.tensor(
+        [[5.0, 5.0, 5.0], [-1.0, 0.0, 0.0], [9.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float64
+    )
+    data = torch.cat([others[:3], a.expand(40, 3), others[3:]])  # a at 3 … 42, (1, 0, 0) at 43
+    order = torch.randperm(40, generator=torch.Generator().manual_seed(3))
+    data[3:43] = data[3:43][order]  # the copies are identical, so shuffling them is a no-op
+    query = torch.stack([a, a + 1e-3, torch.tensor([8.9, 0.0, 0.0]), torch.zeros(3)])
+    expected = torch.tensor([3, 3, 2, 1])
+    got = _nearest_indices(query.to(device), data.to(device))
+    assert got.device.type == device
+    assert torch.equal(got.cpu(), expected)
 
 
 @pytest.mark.gpu
