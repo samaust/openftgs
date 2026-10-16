@@ -719,6 +719,109 @@ def test_u19_initial_durations_are_stride_times_the_frame_interval(
     torch.testing.assert_close(points.durations, expected, rtol=1e-12, atol=0.0)
 
 
+def _crafted(
+    a: Camera, b: Camera, X: Sequence[float], *, shift_b: float = 0.0, certainty: float = 1.0
+) -> tuple[float, float, float, float, float]:
+    """The match of point X between cameras a and b, with B's pixel moved by `shift_b` pixels
+    along y, across the rectified rig's horizontal epipolar lines."""
+    point = torch.tensor([X], dtype=torch.float64)
+    (xa, ya), (xb, yb) = _project_points(a, point)[0][0], _project_points(b, point)[0][0]
+    return (float(xa), float(ya), float(xb), float(yb) + shift_b, certainty)
+
+
+def _matched(got: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    """`got` reordered to match `expected` row for row, nearest first; the pairing must be one
+    to one."""
+    order = torch.cdist(expected, got).argmin(dim=1)
+    assert sorted(order.tolist()) == list(range(len(got)))
+    return got[order]
+
+
+def test_u19_filters_keep_exactly_the_expected_matches(tmp_path: Path) -> None:
+    """§1.3 steps 2–3, D-22, D-58; Q-110, Q-120: of the stand-in's crafted matches between the
+    rectified rig's two cameras, the output holds exactly the exact matches, the matches whose
+    B pixel is 1 px off the epipolar line, and a distant point seen at 1.4°. Dropped: points
+    behind both cameras, an 8 px offset, a distant point seen under 1°, the principal point in
+    both views (parallel rays: `triangulate_dlt` gives a non-finite row, which is dropped
+    explicitly), a NaN coordinate, a match outside image B, and a certainty below 0.5."""
+    dataset = _rig_scene(tmp_path, [0.0])
+    a, b = dataset.records[0].camera, dataset.records[1].camera
+    exact = [
+        (-0.5, -0.2, 2.0),
+        (0.3, 0.1, 2.5),
+        (0.0, 0.25, 3.0),
+        (0.6, -0.3, 1.8),
+        (-0.2, 0.0, 2.2),
+        (0.1, 0.2, 4.0),
+    ]
+    one_px = [((0.4, 0.15, 2.0), 1.0), ((-0.1, -0.2, 3.0), -1.0)]
+    far, control = (0.25, 0.0, 100.0), (0.25, 0.0, 20.0)
+    crafted = [_crafted(a, b, X) for X in exact]
+    crafted += [_crafted(a, b, X, shift_b=shift) for X, shift in one_px]
+    crafted += [_crafted(a, b, control)]
+    expected = torch.tensor(exact + [X for X, _ in one_px] + [control], dtype=torch.float64)
+    crafted += [
+        _crafted(a, b, (0.3, 0.2, -2.0)),  # behind both cameras
+        _crafted(a, b, (-0.4, -0.1, -3.0)),
+        _crafted(a, b, (0.2, -0.1, 2.0), shift_b=8.0),  # 8 px off
+        _crafted(a, b, (-0.3, 0.05, 2.5), shift_b=-8.0),
+        _crafted(a, b, far),  # seen under 1°
+        (_CX, _CY, _CX, _CY, 1.0),  # parallel rays, the point at infinity
+        (float("nan"), 16.0, 30.0, 16.0, 1.0),
+        _crafted(a, b, (-1.6, 0.0, 2.0)),  # outside image B
+        _crafted(a, b, (0.0, -0.1, 2.0), certainty=0.3),
+    ]
+    assert crafted[-2][2] < 0  # the match outside image B is exact otherwise
+
+    # The distant point passes every filter but the angle: positive depths and reprojection
+    # errors under 2 px, by an independent check of what triangulate_dlt returns for it.
+    pa = torch.tensor([crafted[-5][:2]], dtype=torch.float64)
+    pb = torch.tensor([crafted[-5][2:4]], dtype=torch.float64)
+    P = [_projection_of(camera) for camera in (a, b)]
+    X = triangulate_dlt(pa, pb, P[0], P[1])
+    assert torch.isfinite(X).all()
+    for camera, pixels in ((a, pa), (b, pb)):
+        reprojected, depth = _project_points(camera, X)
+        assert depth.item() > 0
+        assert torch.linalg.vector_norm(reprojected - pixels).item() < 2.0
+    centers = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]], dtype=torch.float64)
+    rays = X - centers
+    angle = torch.atan2(
+        torch.linalg.vector_norm(torch.linalg.cross(rays[0], rays[1])), rays[0] @ rays[1]
+    )
+    assert math.degrees(angle.item()) < 1.0
+    assert math.degrees(math.atan2(0.25, 20.0) * 2) > 1.0  # the control is seen at 1.4°
+
+    stand_in = _StandIn(dataset, crafted={("A", "B"): crafted})
+    points = _run(dataset, stand_in)
+    got = _matched(points.positions.to(torch.float64), expected)
+    torch.testing.assert_close(got[:6], expected[:6], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(got[6:8], expected[6:8], rtol=0.0, atol=0.05)
+    torch.testing.assert_close(got[8:], expected[8:], rtol=1e-6, atol=0.0)
+
+
+def _projection_of(camera: Camera) -> torch.Tensor:
+    w2c = camera.world_to_camera.to(torch.float64)
+    return camera.K.to(torch.float64) @ w2c[:3, :]
+
+
+def test_u19_colors_are_the_mean_of_the_two_source_pixels(tmp_path: Path) -> None:
+    """§1.3 step 3, D-22; Q-110: each color is the mean of the two source pixels, each the
+    pixel holding the match's continuous coordinate. The images encode (u, v) as (R, G); the
+    rectified rig sees the plane's points at the pixel centers (u + ½, v + ½) in A and
+    (u − 8 + ½, v + ½) in B, so the expected color is computed from the image files' values."""
+    dataset = _rig_scene(tmp_path, [0.0])
+    points = _run(dataset, _StandIn(dataset, points=_static()))
+    assert len(points.positions) == len(_plane(2.0))
+    xa, _ = _project_points(dataset.records[0].camera, points.positions.to(torch.float64))
+    u, v = torch.floor(xa[:, 0]).long(), torch.floor(xa[:, 1]).long()
+    image_a = torch.from_numpy(_encoded_image(0).astype(np.float32)) / 255.0
+    image_b = torch.from_numpy(_encoded_image(1).astype(np.float32)) / 255.0
+    expected = (image_a[v, u] + image_b[v, u - 8]) / 2
+    assert len(torch.unique(expected, dim=0)) == len(expected)
+    torch.testing.assert_close(points.colors, expected, rtol=0.0, atol=1e-6)
+
+
 def test_u19_initial_durations_with_a_single_timestamp_are_the_stride(tmp_path: Path) -> None:
     """§1.3 step 6 with D-70: for a single timestamp Δt_f := 1 and the time unit is 1, so
     d = k_stride."""
