@@ -35,6 +35,7 @@ from openftgs.init import (
     _nearest_indices,
     _pil,
     _roma_matchers,
+    _TinyRomaMatcher,
     knn_velocities,
     roma_init,
     roma_provenance,
@@ -1471,22 +1472,17 @@ def test_pil_gives_roma_the_8_bit_values_back() -> None:
     assert torch.equal(torch.from_numpy(np.array(image)), pixels)
 
 
-# XFeat's weights at the pinned commit, as source log row 136 hashed them (Q-123).
-_XFEAT_SHA256 = "0f5187fd7bedd26c7fe6acc9685444493a165a35ecc087b33c2db3627f3ea10b"
-
-
 @pytest.mark.weights
-def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(tmp_path: Path) -> None:
-    """Q-116, Q-123: into an empty torch.hub folder, the Tiny RoMa adapter downloads XFeat at
-    the pinned commit and nothing at any other ref; it builds XFeat without XFeat's own
-    weights, which its loader would download from the repository's `main` as
-    checkpoints/xfeat.pt (source log row 136), and loads the pinned commit's weights instead,
-    saved as xfeat-0f5187fd.pt with row 136's SHA-256. Real downloads, into a fresh folder so
-    that no cached file hides one (mocking.md).
-
-    Tiny RoMa's own checkpoint then sets every XFeat weight a shard keeps (source log row
-    138), so the weights checked here are those `_roma_matchers` builds XFeat with, read from
-    the builder it returns."""
+def test_roma_matchers_take_xfeats_code_at_its_commit_and_its_weights_from_tiny_roma(
+    tmp_path: Path,
+) -> None:
+    """Q-116, Q-123: into an empty torch.hub folder, the Tiny RoMa adapter downloads XFeat's
+    code at the pinned commit and nothing at any other ref, and Tiny RoMa's checkpoint as the
+    only checkpoint: no XFeat weights, neither those XFeat's own loader would take from the
+    repository's `main` as checkpoints/xfeat.pt (source log row 136) nor the pinned commit's.
+    A shard's model holds exactly the XFeat weights of Tiny RoMa's checkpoint, which replaces
+    every XFeat weight a shard keeps (source log row 138). Real downloads, into a fresh folder
+    so that no cached file hides one (mocking.md)."""
     previous = torch.hub.get_dir()
     hub = tmp_path / "hub"
     torch.hub.set_dir(str(hub))
@@ -1497,15 +1493,16 @@ def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(tmp_path: Path
     repos = sorted(path.name for path in hub.iterdir() if path.is_dir())
     assert repos == ["checkpoints", f"verlab_accelerated_features_{_XFEAT_COMMIT}"]
     checkpoints = sorted(path.name for path in (hub / "checkpoints").iterdir())
-    assert checkpoints == ["tiny_roma_v1_outdoor.pth", "xfeat-0f5187fd.pt"]
-    weights = hub / "checkpoints" / "xfeat-0f5187fd.pt"
-    assert hashlib.sha256(weights.read_bytes()).hexdigest() == _XFEAT_SHA256
-    pinned = torch.load(weights, map_location="cpu", weights_only=True)
-    cells = [cell.cell_contents for cell in build.__closure__ or ()]
-    (xfeat,) = [cell for cell in cells if isinstance(cell, torch.nn.Module)]
-    state = xfeat.state_dict()
-    assert state.keys() == pinned.keys()
-    assert all(torch.equal(value.cpu(), pinned[name]) for name, value in state.items())
+    assert checkpoints == ["tiny_roma_v1_outdoor.pth"]
+    tiny = torch.load(
+        hub / "checkpoints" / "tiny_roma_v1_outdoor.pth", map_location="cpu", weights_only=True
+    )
+    matcher = build(torch.device("cpu"))
+    assert isinstance(matcher, _TinyRomaMatcher)
+    state = matcher._model.state_dict()
+    xfeat = sorted(name for name in state if name.startswith("xfeat."))
+    assert xfeat and xfeat == sorted(name for name in tiny if name.startswith("xfeat."))
+    assert all(torch.equal(state[name].cpu(), tiny[name]) for name in xfeat)
 
 
 # Real RoMa (#137): `roma_init` with its default dense matchers on the vendored copy (D-58,
