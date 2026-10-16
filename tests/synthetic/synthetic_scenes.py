@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared setup of the §3.2 synthetic-scene recovery tests (M11, PRD #99): the camera rigs, the
-ground truth drawn from committed seeds (stored as ftgs-if files in `data/`), the initial models
-derived from it, the scenes written to disk, the training runs and the recovery measures.
+"""Shared setup of the §3.2 synthetic-scene recovery tests (M11, PRD #99; S-4 in M13, PRD #133):
+the camera rigs, the ground truth drawn from committed seeds (stored as ftgs-if files in
+`data/`), the initial models and init points derived from it, the scenes written to disk, the
+training runs and the recovery measures.
 
 The ground truth lives in raw time τ, with frames at τ = k/30 s. A model is rebuilt under each
 dataset's own time normalizer (`model_under`), since the trainer refuses a model whose normalizer
@@ -662,11 +663,12 @@ def synthetic_config(iterations: int, base: TrainConfig) -> TrainConfig:
 def train(
     cfg: TrainConfig,
     video: MultiViewVideo,
-    init: FreeTimeGaussians,
+    init: FreeTimeGaussians | InitPoints,
     device: str,
     callbacks: Sequence[Callable[[Trainer, StepLog], bool | None]] = (),
 ) -> tuple[Trainer, list[StepLog]]:
-    """A full run of `cfg` from `init`, with its step logs."""
+    """A full run of `cfg` from `init` (a model, or init points the trainer builds one from),
+    with its step logs."""
     trainer = Trainer(cfg, video, init, device=device)
     logs: list[StepLog] = []
 
