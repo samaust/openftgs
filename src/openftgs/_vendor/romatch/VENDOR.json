@@ -53,6 +53,15 @@
       "license": "Apache-2.0",
       "source": "https://raw.githubusercontent.com/kornia/kornia/542752eff7dc9c41917302c22afc7cdf4a69d13b/LICENSE",
       "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+    },
+    {
+      "path": "LICENSES/InLoc.txt",
+      "project": "InLoc",
+      "license": "MIT",
+      "source": "https://raw.githubusercontent.com/HajimeTaira/InLoc_demo/b4c42de09d288f35e65ec0156608c704d6176b4f/README.md",
+      "sha256": "95970e9a4ee8a54762a380de6b09b2909af819eda7324428dd9c023c8bc1a0ef",
+      "source_sha256": "b35cbfd4a05b4e6d2a3a34c2f8447c72867d5eeeabe9b50ef201d5cafc6bfab1",
+      "extract": "lines 141-147 of the source: the fenced block under the heading '### LICENSE' (lines 140-168), from its first line through the end of the paragraph that begins 'THE SOFTWARE IS PROVIDED', byte for byte, joined by LF with one final LF; the request to cite two papers and their BibTeX entries, which follow in the block, are left out"
     }
   ],
   "files": [
