@@ -829,3 +829,146 @@ def test_u19_initial_durations_with_a_single_timestamp_are_the_stride(tmp_path: 
     points = _run(dataset, _StandIn(dataset, points=_static()), stride=3)
     assert points.durations is not None
     assert torch.equal(points.durations, torch.full_like(points.durations, 3.0))
+
+
+_FRAME = 1 / 30  # the frame period of the unsynchronized scenes, in seconds
+# Three cameras of one orientation in a row: axis ties everywhere, so partners follow the
+# center distance, and Q's tie between P and S follows the manifest's camera order.
+_ROW: dict[str, CameraSpec] = {
+    "S": (0.0, (1.0, 0.0, 0.0)),
+    "Q": (0.0, (0.5, 0.0, 0.0)),
+    "P": (0.0, (0.0, 0.0, 0.0)),
+}
+
+
+def _by_camera(dataset: MultiViewVideo, calls: Sequence[tuple[int, int]]) -> list[tuple[str, str]]:
+    return [(dataset.records[a].camera.name, dataset.records[b].camera.name) for a, b in calls]
+
+
+def test_u19_unsynchronized_cameras_fill_frame_slots_with_their_nearest_images(
+    tmp_path: Path,
+) -> None:
+    """§1.3 steps 1–4, D-47; Q-109: cameras offset by less than half a frame (0, 0.1 and 0.35
+    frames) each give a slot their image nearest to t_k, and P's extra image 0.45 frames from
+    t_2 loses to its image at t_2. Each pair is matched once per slot, (Q, P) and (S, Q) in the
+    manifest's camera order (S, Q, P); each point's timestamp is the mean raw τ of its pair's
+    two images, and its frame id the slot."""
+    offsets = {"P": 0.0, "Q": 0.1, "S": 0.35}
+    shots: list[Shot] = [
+        (camera, (n + offset) * _FRAME, "train")
+        for n in range(5)
+        for camera, offset in offsets.items()
+    ]
+    shots.insert(7, ("P", 2.45 * _FRAME, "train"))
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, _ROW, shots))
+    stand_in = _StandIn(dataset, points=_static())
+    points = _run(dataset, stand_in)
+
+    index = {(camera, round(tau / _FRAME, 6)): i for i, (camera, tau, _) in enumerate(shots)}
+
+    def image(camera: str, n: int) -> int:
+        return index[camera, round(n + offsets[camera], 6)]
+
+    expected = {(image(a, n), image(b, n)) for n in range(5) for a, b in [("Q", "P"), ("S", "Q")]}
+    assert len(stand_in.calls) == len(expected)
+    assert set(stand_in.calls) == expected
+    means = {
+        (n, (shots[a][1] + shots[b][1]) / 2)
+        for n in range(5)
+        for a, b in [(image("Q", n), image("P", n)), (image("S", n), image("Q", n))]
+    }
+    assert points.frame_ids is not None
+    got = set(zip(points.frame_ids.tolist(), points.timestamps.tolist(), strict=True))
+    assert got == means
+
+
+def test_u19_a_camera_without_an_image_near_the_slot_sits_it_out(tmp_path: Path) -> None:
+    """§1.3 step 1, D-47: near the ends of an unsynchronized rig, a camera with no image within
+    Δt_f/2 of t_k sits the slot out. S's first image comes 0.6 frames after τ₀, so it joins
+    slot 1, not slot 0; T's images stop a frame before τ₁, so it sits out slot 4. The log shows
+    every slot's cameras, each with its image nearest to t_k."""
+    cameras: dict[str, CameraSpec] = {**_ROW, "T": (0.0, (1.5, 0.0, 0.0))}
+    frames = {"P": range(5), "Q": range(5), "S": range(4), "T": range(4)}
+    offsets = {"P": 0.0, "Q": 0.1, "S": 0.6, "T": 0.0}
+    shots: list[Shot] = [
+        (camera, (n + offsets[camera]) * _FRAME, "train")
+        for camera in cameras
+        for n in frames[camera]
+    ]
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, cameras, shots))
+    assert dataset.frame_dt * (dataset.time.tau1 - dataset.time.tau0) == pytest.approx(_FRAME)
+    stand_in = _StandIn(dataset, points=_static())
+    _run(dataset, stand_in)
+
+    slot_cameras: dict[int, set[str]] = {}
+    for a, b in stand_in.calls:
+        slots = {round(shots[i][1] / _FRAME) for i in (a, b)}  # the nearest frame
+        assert len(slots) == 1  # both images of a pair belong to one slot
+        slot_cameras.setdefault(slots.pop(), set()).update((shots[a][0], shots[b][0]))
+    assert slot_cameras == {
+        0: {"P", "Q", "T"},
+        1: {"P", "Q", "S", "T"},
+        2: {"P", "Q", "S", "T"},
+        3: {"P", "Q", "S", "T"},
+        4: {"P", "Q", "S"},
+    }
+
+
+# Five cameras turned about the vertical axis, all facing a plane at depth 3. X faces it; L
+# and R are turned by ∓20°, so X's axis ties between them exactly; L′ and R′, turned by ∓25°,
+# are the partners of L and R, so the pair X takes is visible in the log.
+def _fan(r_center: float) -> dict[str, CameraSpec]:
+    return {
+        "X": (0.0, (0.0, 0.0, 0.0)),
+        "L": (-20.0, (-0.5, 0.0, 0.0)),
+        "Lp": (-25.0, (-1.0, 0.0, 0.0)),
+        "R": (20.0, (r_center, 0.0, 0.0)),
+        "Rp": (25.0, (r_center + 0.5, 0.0, 0.0)),
+    }
+
+
+@pytest.mark.parametrize(
+    ("r_center", "order", "expected"),
+    [
+        (1.0, ["R", "Rp", "X", "L", "Lp"], [("R", "Rp"), ("X", "L"), ("L", "Lp")]),
+        (0.5, ["R", "Rp", "X", "L", "Lp"], [("R", "Rp"), ("R", "X"), ("L", "Lp")]),
+        (0.5, ["L", "Lp", "X", "R", "Rp"], [("L", "Lp"), ("L", "X"), ("R", "Rp")]),
+    ],
+    ids=["distance-decides", "tie-to-first-in-manifest", "tie-to-first-in-manifest-swapped"],
+)
+def test_u19_a_pair_chosen_by_both_cameras_is_matched_once(
+    tmp_path: Path, r_center: float, order: list[str], expected: list[tuple[str, str]]
+) -> None:
+    """§1.3 step 2, D-22; Q-108, Q-109: each camera pairs with the camera whose optical axis is
+    angularly closest; a tie goes to the smaller center distance, then to the earlier camera
+    in the manifest's `cameras` object. A pair chosen by both cameras, such as (L, L′), is
+    matched once, oriented (A, B) by that order."""
+    fan = _fan(r_center)
+    cameras = {name: fan[name] for name in order}
+    shots: list[Shot] = [(name, 0.0, "train") for name in ["X", "L", "Lp", "R", "Rp"]]
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, cameras, shots))
+    assert dataset.manifest.camera_names == tuple(order)
+    stand_in = _StandIn(dataset, points=_static(3.0))
+    _run(dataset, stand_in)
+    assert sorted(_by_camera(dataset, stand_in.calls)) == sorted(expected)
+
+
+def test_u19_initialization_reads_no_test_image(tmp_path: Path) -> None:
+    """§1.3 step 1, D-66: test-split images take no part in slots, pairs, matches or colors. A
+    test camera T sits between A and B, nearer to each than they are to each other, and A has
+    a test image of its own; once the dataset is built, every test image's file is deleted,
+    `roma_init` still succeeds, and no matcher call receives a test image."""
+    cameras = {**_RIG, "T": (0.0, (0.25, 0.0, 0.0))}
+    shots: list[Shot] = []
+    for tau in (0.0, _FRAME):
+        shots += [("T", tau, "test"), ("A", tau, "train"), ("A", tau + 1e-3, "test")]
+        shots += [("B", tau, "train")]
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, cameras, shots))
+    stand_in = _StandIn(dataset, points=_static())
+    tests = [i for i, record in enumerate(dataset.records) if record.split == "test"]
+    for i in tests:
+        dataset.records[i].image_path.unlink()
+    points = _run(dataset, stand_in)
+    assert len(points.positions) > 0
+    assert sorted(_by_camera(dataset, stand_in.calls)) == [("A", "B"), ("A", "B")]
+    assert not {i for call in stand_in.calls for i in call} & set(tests)
