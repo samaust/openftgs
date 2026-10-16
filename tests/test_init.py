@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from openftgs.init import _nearest_indices, knn_velocities
+from openftgs.init import _nearest_indices, knn_velocities, triangulate_dlt
 
 
 def _lattice(shape: tuple[int, int, int], spacing: float, dtype: torch.dtype) -> torch.Tensor:
@@ -168,3 +168,136 @@ def test_knn_velocities_refuses_two_devices() -> None:
     """Q-T135.1: `points` and `next_points` must sit on one device."""
     with pytest.raises(ValueError, match="device|sit on"):
         knn_velocities(_cloud(5, 0), _cloud(4, 1).cuda(), 0.1)
+
+
+_K = torch.tensor(
+    [[1200.0, 0.0, 640.0], [0.0, 1180.0, 360.0], [0.0, 0.0, 1.0]], dtype=torch.float64
+)
+
+
+def _look_at(center: list[float]) -> torch.Tensor:
+    """P = K[R_w | t_w] (§1.4) for a camera at `center` whose z axis points at the origin."""
+    o = torch.tensor(center, dtype=torch.float64)
+    z = -o / torch.linalg.vector_norm(o)
+    x = torch.linalg.cross(torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64), z)
+    x = x / torch.linalg.vector_norm(x)
+    rot = torch.stack([x, torch.linalg.cross(z, x), z])  # rows x, y, z with x × y = z
+    return _K @ torch.cat([rot, (-rot @ o)[:, None]], dim=1)
+
+
+def _project(P: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """Pixels in §1.4's continuous convention: u = (P·X̃)₀/(P·X̃)₂, v = (P·X̃)₁/(P·X̃)₂."""
+    h = (P[..., :3] @ X[..., :, None])[..., 0] + P[..., 3]
+    return h[..., :2] / h[..., 2:]
+
+
+def _max_relative_error(got: torch.Tensor, want: torch.Tensor) -> float:
+    err = torch.linalg.vector_norm(got - want, dim=-1) / torch.linalg.vector_norm(want, dim=-1)
+    return float(err.max())
+
+
+def _scene(n: int, seed: int) -> torch.Tensor:
+    X = torch.rand(n, 3, generator=torch.Generator().manual_seed(seed), dtype=torch.float64)
+    return 2 * X - 1 + torch.tensor([0.0, 0.0, 0.5], dtype=torch.float64)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_u19_noise_free_dlt_recovers_the_points(device: str) -> None:
+    """U-19: exact projections into two views give back the points within 1e-6 relative, as
+    float64 [N, 3], with one shared P per view (§1.3 step 3)."""
+    X = _scene(2000, 19)
+    P1, P2 = _look_at([-1.0, 0.2, -5.0]), _look_at([1.5, -0.1, -4.5])
+    x1, x2 = _project(P1, X), _project(P2, X)
+    got = triangulate_dlt(x1.to(device), x2.to(device), P1.to(device), P2.to(device))
+    assert got.dtype == torch.float64
+    assert got.shape == (2000, 3)
+    assert got.device.type == device
+    assert _max_relative_error(got.cpu(), X) <= 1e-6
+
+
+def test_u19_noise_free_dlt_broadcasts_the_cameras() -> None:
+    """U-19 with Q-106's shapes: pixels [..., 2] and cameras [3, 4] or [..., 3, 4] broadcast
+    together, here per batch entry [2, 1, 3, 4] against a shared [3, 4], and per row [N, 3, 4]."""
+    X = _scene(100, 7).reshape(2, 50, 3)
+    P1 = torch.stack([_look_at([-1.0, 0.2, -5.0]), _look_at([0.3, -2.0, -4.0])])[:, None]
+    P2 = _look_at([1.5, -0.1, -4.5])
+    got = triangulate_dlt(_project(P1, X), _project(P2, X), P1, P2)
+    assert got.shape == (2, 50, 3)
+    assert _max_relative_error(got, X) <= 1e-6
+
+    rows = X[0, :6]
+    centers = [[-1.0, 0.2, -5.0], [0.3, -2.0, -4.0], [4.0, 0.5, -3.0]]
+    P1 = torch.stack([_look_at(centers[i % 3]) for i in range(6)])
+    P2 = torch.stack([_look_at(centers[(i + 1) % 3]) for i in range(6)])
+    got = triangulate_dlt(_project(P1, rows), _project(P2, rows), P1, P2)
+    assert got.shape == (6, 3)
+    assert _max_relative_error(got, rows) <= 1e-6
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_dlt_rows_with_a_non_finite_input_come_out_nan(device: str, bad: float) -> None:
+    """Q-106, Q-T135.1: no filtering; a row with a non-finite pixel comes out NaN, and the other
+    rows of the batch are still solved within U-19's 1e-6."""
+    X = _scene(64, 5)
+    P1, P2 = _look_at([-1.0, 0.2, -5.0]), _look_at([1.5, -0.1, -4.5])
+    x1, x2 = _project(P1, X), _project(P2, X)
+    x1[3, 0] = bad
+    x2[40, 1] = bad
+    got = triangulate_dlt(x1.to(device), x2.to(device), P1.to(device), P2.to(device)).cpu()
+    broken = torch.zeros(64, dtype=torch.bool)
+    broken[[3, 40]] = True
+    assert torch.isnan(got[broken]).all()
+    assert _max_relative_error(got[~broken], X[~broken]) <= 1e-6
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_dlt_rays_meeting_at_infinity_come_out_non_finite(device: str) -> None:
+    """Q-106, Q-T135.1: two cameras with one orientation, 0.7 apart, seeing the same principal
+    point have parallel rays; the solution is the point at infinity (h₄ = 0), which the
+    division leaves non-finite instead of filtering it."""
+    eye = torch.eye(3, dtype=torch.float64)
+    P1 = _K @ torch.cat([eye, torch.zeros(3, 1, dtype=torch.float64)], dim=1)
+    P2 = _K @ torch.cat([eye, torch.tensor([[-0.7], [0.0], [0.0]], dtype=torch.float64)], dim=1)
+    x = torch.tensor([[640.0, 360.0]], dtype=torch.float64)
+    got = triangulate_dlt(x.to(device), x.to(device), P1.to(device), P2.to(device))
+    assert not torch.isfinite(got).any()
+
+
+def _views() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    X = _scene(5, 1)
+    P1, P2 = _look_at([-1.0, 0.2, -5.0]), _look_at([1.5, -0.1, -4.5])
+    return _project(P1, X), _project(P2, X), P1, P2
+
+
+@pytest.mark.parametrize(
+    ("position", "replacement", "message"),
+    [
+        (0, torch.zeros(5, 3, dtype=torch.float64), r"x1 must be \[\.\.\., 2\]"),
+        (1, torch.tensor(1.0, dtype=torch.float64), r"x2 must be \[\.\.\., 2\]"),
+        (2, torch.zeros(3, 3, dtype=torch.float64), r"P1 must be \[\.\.\., 3, 4\]"),
+        (3, torch.zeros(12, dtype=torch.float64), r"P2 must be \[\.\.\., 3, 4\]"),
+        (1, torch.zeros(4, 2, dtype=torch.float64), "broadcast"),
+        (3, torch.zeros(2, 3, 4, dtype=torch.float64), "broadcast"),
+        (0, torch.zeros(5, 2, dtype=torch.int64), "x1 must be floating point"),
+        (2, torch.zeros(3, 4, dtype=torch.int32), "P1 must be floating point"),
+    ],
+    ids=["x1-3", "x2-scalar", "P1-3x3", "P2-flat", "rows", "cameras", "x1-int", "P1-int"],
+)
+def test_triangulate_dlt_refuses_malformed_inputs(
+    position: int, replacement: torch.Tensor, message: str
+) -> None:
+    """Q-T135.1: pixels must be floating-point [..., 2] and cameras floating-point [..., 3, 4],
+    with batch shapes that broadcast."""
+    args = list(_views())
+    args[position] = replacement
+    with pytest.raises(ValueError, match=message):
+        triangulate_dlt(*args)
+
+
+@pytest.mark.gpu
+def test_triangulate_dlt_refuses_two_devices() -> None:
+    """Q-T135.1: the four inputs must sit on one device."""
+    x1, x2, P1, P2 = _views()
+    with pytest.raises(ValueError, match="device"):
+        triangulate_dlt(x1, x2, P1.cuda(), P2)

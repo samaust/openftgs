@@ -13,7 +13,7 @@ import torch
 from scipy.spatial import cKDTree
 from torch import Tensor
 
-__all__ = ["knn_velocities"]  # Q-106
+__all__ = ["knn_velocities", "triangulate_dlt"]  # Q-106
 
 _KNN_TILE = 1 << 24  # distances held at once by the tiled k-NN search (query rows × points)
 
@@ -104,3 +104,47 @@ def knn_velocities(points: Tensor, next_points: Tensor, dt: float) -> Tensor:
     nxt = next_points.to(torch.float64)
     idx = _nearest_indices(p, nxt)
     return ((nxt[idx] - p) / dt).to(points.dtype)
+
+
+def triangulate_dlt(x1: Tensor, x2: Tensor, P1: Tensor, P2: Tensor) -> Tensor:
+    """Two-view linear DLT (§1.3 step 3): the point X whose projections by `P1` and `P2` are the
+    pixels `x1` and `x2`, solved by SVD in float64 (D-56).
+
+    `x1`, `x2` [..., 2] are pixels in §1.4's continuous convention, the one P's cx and cy use, so
+    no half-pixel shift is applied. `P1`, `P2` are [3, 4] or broadcastable [..., 3, 4]. Each
+    view gives the rows x·P₂ − P₀ and y·P₂ − P₁ of A [..., 4, 4]; X is the right singular vector
+    of A's smallest singular value, dehomogenized. Returns float64 [..., 3] (Q-T135.1)."""
+    # Q-T135.1: the shapes, dtypes and device the contract states.
+    named = {"x1": x1, "x2": x2, "P1": P1, "P2": P2}
+    for name, value in named.items():
+        trailing = (2,) if name.startswith("x") else (3, 4)
+        if tuple(value.shape[-len(trailing) :]) != trailing:
+            shape = ", ".join(["...", *map(str, trailing)])
+            _fail(f"{name} must be [{shape}], got {list(value.shape)}")
+        if not value.is_floating_point():
+            _fail(f"{name} must be floating point, got {value.dtype}")
+    if len({value.device for value in named.values()}) > 1:
+        devices = ", ".join(f"{name} on {value.device}" for name, value in named.items())
+        _fail(f"x1, x2, P1 and P2 must sit on one device, got {devices}")
+    try:
+        batch = torch.broadcast_shapes(  # type: ignore[no-untyped-call]
+            x1.shape[:-1], x2.shape[:-1], P1.shape[:-2], P2.shape[:-2]
+        )
+    except RuntimeError as error:
+        _fail(f"the batch shapes of x1, x2, P1 and P2 don't broadcast: {error}")
+    rows = []
+    for x, P in ((x1, P1), (x2, P2)):
+        x = x.to(torch.float64).expand(*batch, 2)
+        P = P.to(torch.float64).expand(*batch, 3, 4)
+        rows += [
+            x[..., 0:1] * P[..., 2, :] - P[..., 0, :],
+            x[..., 1:2] * P[..., 2, :] - P[..., 1, :],
+        ]
+    A = torch.stack(rows, dim=-2)
+    # Q-T135.1: one non-finite system makes a whole CPU batch raise and gives finite vectors on
+    # CUDA (source log T135.3), so such rows are solved as the identity and then set to NaN.
+    finite = torch.isfinite(A).all(dim=-1).all(dim=-1)
+    A = torch.where(finite[..., None, None], A, torch.eye(4, dtype=A.dtype, device=A.device))
+    h = torch.linalg.svd(A).Vh[..., -1, :]
+    X = h[..., :3] / h[..., 3:]
+    return torch.where(finite[..., None], X, torch.nan)
