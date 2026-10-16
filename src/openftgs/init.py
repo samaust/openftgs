@@ -143,8 +143,12 @@ def _check_point_set(name: str, value: Tensor) -> None:
 
 def _nearest_kdtree(query: Tensor, data: Tensor) -> Tensor:
     """The CPU path of `_nearest_indices`: SciPy's cKDTree, whose tie order is undocumented, so
-    each row's candidates are re-sorted by (distance, index) and a row is queried again with
-    twice the neighbours while its last candidate still ties the nearest distance (D-56)."""
+    each row's candidates are re-sorted by (distance, index), "with extra neighbours queried
+    while the last two distances are equal" (§2.4 "Initialization and conversion", D-56; Q-106).
+    A row is queried again with twice the neighbours while its last candidate still ties the
+    nearest distance: since the distances come sorted, that tie means the last two are equal,
+    and a tie farther out than the nearest distance can't change the lowest index at it, so
+    this stricter condition gives the results the spec's does."""
     q = query.detach().cpu().numpy()
     d = data.detach().cpu().numpy()
     m = d.shape[0]
