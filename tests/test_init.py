@@ -16,6 +16,7 @@ import sys
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -32,6 +33,7 @@ from openftgs.init import (
     DenseMatcher,
     RomaInitConfig,
     _nearest_indices,
+    _roma_matchers,
     _RomaMatcher,
     _TinyRomaMatcher,
     knn_velocities,
@@ -1277,3 +1279,40 @@ def test_tiny_roma_matcher_calls_tiny_roma_in_inference_mode() -> None:
     assert warp.shape == (_H * _W, 4) and certainty.shape == (_H * _W,)
     assert warp.dtype == certainty.dtype == torch.float32
     assert not warp.is_inference() and not certainty.is_inference()
+
+
+def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-116, Q-T137.1: the Tiny RoMa adapter builds XFeat from the pinned commit without its
+    own weights, which XFeat's loader would take from the repository's `main`, and loads the
+    weights of that commit, whose SHA-256 begins 0f5187fd (source log row T137.5), checked by
+    torch.hub. torch.hub is stood in for, so nothing is downloaded."""
+    net = torch.nn.Linear(2, 1)
+    pinned = {name: torch.full_like(value, 0.25) for name, value in net.state_dict().items()}
+    hub: list[tuple[str, str, dict[str, Any]]] = []
+    fetched: list[tuple[str, dict[str, Any]]] = []
+
+    def load(repo: str, model: str, **kwargs: Any) -> Any:
+        hub.append((repo, model, kwargs))
+        return SimpleNamespace(net=net)
+
+    def fetch(url: str, **kwargs: Any) -> dict[str, Tensor]:
+        fetched.append((url, kwargs))
+        return pinned if "accelerated_features" in url else {}
+
+    monkeypatch.setattr(torch.hub, "load", load)
+    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", fetch)
+    _roma_matchers(RomaInitConfig(model="tiny_roma_v1_outdoor"))
+    assert hub == [
+        (
+            f"verlab/accelerated_features:{_XFEAT_COMMIT}",
+            "XFeat",
+            {"pretrained": False, "top_k": 4096, "trust_repo": True, "skip_validation": True},
+        )
+    ]
+    url = f"https://github.com/verlab/accelerated_features/raw/{_XFEAT_COMMIT}/weights/xfeat.pt"
+    options = {"map_location": "cpu", "file_name": "xfeat-0f5187fd.pt", "check_hash": True}
+    assert (url, options) in fetched
+    for name, value in net.state_dict().items():
+        assert torch.equal(value, pinned[name])
