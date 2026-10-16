@@ -32,11 +32,11 @@ SelfCap's protocol undistorts with COLMAP instead (D-60, Q-97): the converter wr
 
 Neural3DV frame k has τ = k/30; the YAML converter's frame k has τ = k/fps. SelfCap's `frame_index` is the decode index n, and τ = n/60 minus the camera's sync offset, read as seconds from `optimized/sync.json` (an object of camera name → offset; Q-101), unless `use_sync=False`.
 
-`masks=DIR` supplies one mask per test image, `DIR/<n:06d>.png`, at the converted image's size, with a `DIR/masks.json` giving the masks' source and whether they are approximate (D-64, Q-87). A folder missing any test image's mask is refused, since §1.4 needs one per test image. openftgs-synth ships true background images and dynamic masks, the ground truth that D-64 lacks for SelfCap.
+`masks=DIR` supplies one mask per test image, `DIR/<n:06d>.png`, at the converted image's size, with a `DIR/masks.json` giving the masks' source and whether they are approximate (D-64, Q-87). A folder missing any test image's mask is refused, since §1.4 needs one per test image (Q-104). openftgs-synth ships true background images and dynamic masks, the ground truth that D-64 lacks for SelfCap.
 
 ## Checks
 
-U-27 and U-37 run on clips that ffmpeg generates from its lavfi sources, with a stub COLMAP and with the real one. G-1 to G-7 compare the converters with openftgs-synth's ground truth, locally, where `$OPENFTGS_DATASETS/synth` exists (D-79, Q-102). C-1 to C-5 are written from §3.1 and skip without the paper's datasets, apart from C-4's Gaussian-dot part, which needs only COLMAP.
+U-27 and U-37 run on clips that ffmpeg generates from its lavfi sources, with a stub COLMAP and with the real one. G-1 to G-7 compare the converters with openftgs-synth's ground truth, locally, where `$OPENFTGS_DATASETS/synth` exists (D-79). C-1 to C-5 are written from §3.1 and skip without the paper's datasets, apart from C-4's Gaussian-dot part, which needs only COLMAP.
 
 ## What stays unverified
 
