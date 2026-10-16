@@ -68,7 +68,7 @@ def test_u38_every_vendored_file_has_the_sha256_of_vendor_json() -> None:
 
 
 def test_u38_license_files_have_the_sha256_of_vendor_json() -> None:
-    # Q-115: RoMa's license at the copy's root, the others in LICENSES beside it.
+    # Q-115, Q-118: RoMa's license at the copy's root, the others in LICENSES beside it.
     record = _vendor_json()
     listed = {entry["path"]: entry["sha256"] for entry in record["licenses"]}
     assert {entry["project"] for entry in record["licenses"]} == {
@@ -79,12 +79,34 @@ def test_u38_license_files_have_the_sha256_of_vendor_json() -> None:
         "LoFTR",
         "Patch2Pix",
         "Kornia",
+        "InLoc",
     }
     assert "LICENSE" in listed
     on_disk = {path.relative_to(VENDORED).as_posix() for path in (VENDORED / "LICENSES").iterdir()}
     assert set(listed) == on_disk | {"LICENSE"}
     actual = {path: hashlib.sha256((VENDORED / path).read_bytes()).hexdigest() for path in listed}
     assert actual == listed
+
+
+def test_u38_inloc_license_is_the_mit_text_of_its_readme() -> None:
+    # Q-118: InLoc's demo has no license file; its MIT text comes from the LICENSE section
+    # of its README at a pinned commit, whose SHA-256 VENDOR.json records (source log row 139).
+    record = _vendor_json()
+    (entry,) = [e for e in record["licenses"] if e["project"] == "InLoc"]
+    assert entry["path"] == "LICENSES/InLoc.txt"
+    assert entry["license"] == "MIT"
+    assert entry["source"] == (
+        "https://raw.githubusercontent.com/HajimeTaira/InLoc_demo/"
+        "b4c42de09d288f35e65ec0156608c704d6176b4f/README.md"
+    )
+    assert entry["source_sha256"] == (
+        "b35cbfd4a05b4e6d2a3a34c2f8447c72867d5eeeabe9b50ef201d5cafc6bfab1"
+    )
+    text = (VENDORED / entry["path"]).read_text(encoding="utf-8")
+    assert text.startswith("Copyright (c) 2017 Hajime Taira\n")
+    # The MIT text only: it ends with the warranty paragraph, one final newline.
+    assert text.endswith("OTHER DEALINGS IN THE SOFTWARE.\n")
+    assert not text.endswith("\n\n")
 
 
 # Runs in a subprocess, since other tests import cv2 into the pytest process (Q-117).

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Vendor RoMa's inference code into ``openftgs._vendor.romatch`` (D-65; Q-113, Q-114, Q-115).
+"""Vendor RoMa's inference code into ``openftgs._vendor.romatch`` (D-65; Q-113 to Q-115, Q-118).
 
 Usage::
 
@@ -10,6 +10,13 @@ Usage::
 CLONE is a git clone of https://github.com/Parskatt/RoMa that holds commit 77f8d68 (a
 blobless clone works: git fetches blobs on demand). The license texts are fetched from
 raw.githubusercontent.com at pinned commits and checked against their SHA-256.
+
+InLoc's demo has no license file, so its text is extracted from its README.md (Q-118): the
+fenced block under the heading ``### LICENSE``, from the block's first line through the end
+of the paragraph that begins ``THE SOFTWARE IS PROVIDED`` (the MIT license, its copyright
+line first), byte for byte, joined by LF with one final LF. The request to cite two papers
+and their BibTeX entries, which follow in the same block, are left out. The README and the
+extracted text are each checked against their SHA-256.
 
 The script reads RoMa's 22 inference files (D-65) with git, checks each blob id against
 the commit's tree, locates every change with ast and edits the text only where ast points:
@@ -99,17 +106,35 @@ XFORMERS_FILES = (
 
 
 @dataclass(frozen=True)
+class _Extract:
+    """Q-118: how a license text is taken from a fetched file that holds more than it.
+
+    The text is the first fenced block after the line ``heading``, with only blank lines
+    between them, from the block's first line through the end of the paragraph that begins
+    with ``last_paragraph`` (up to the next blank line or the closing fence), byte for byte,
+    joined by LF with one final LF.
+    """
+
+    source_sha256: str  # of the fetched file
+    heading: str
+    last_paragraph: str
+    left_out: str  # what the block holds after the text, in words, for VENDOR.json
+
+
+@dataclass(frozen=True)
 class _License:
     path: str
     project: str
     spdx: str
     source: str
-    sha256: str
+    sha256: str  # of the license file in the copy, which is the fetched file unless extracted
+    extract: _Extract | None = None
 
 
 _RAW = "https://raw.githubusercontent.com"
 
-# Q-115: license texts at pinned commits, with the SHA-256 of source log rows 106 and 108-113.
+# Q-115, Q-118: license texts at pinned commits, with the SHA-256 of source log rows 106,
+# 108-113 and 139.
 LICENSES: tuple[_License, ...] = (
     _License(
         "LICENSE",
@@ -159,6 +184,20 @@ LICENSES: tuple[_License, ...] = (
         "Apache-2.0",
         f"{_RAW}/kornia/kornia/542752eff7dc9c41917302c22afc7cdf4a69d13b/LICENSE",
         "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+    ),
+    # Q-118: the approach credited at upstream utils/utils.py line 379; no license file.
+    _License(
+        "LICENSES/InLoc.txt",
+        "InLoc",
+        "MIT",
+        f"{_RAW}/HajimeTaira/InLoc_demo/b4c42de09d288f35e65ec0156608c704d6176b4f/README.md",
+        "95970e9a4ee8a54762a380de6b09b2909af819eda7324428dd9c023c8bc1a0ef",
+        _Extract(
+            "b35cbfd4a05b4e6d2a3a34c2f8447c72867d5eeeabe9b50ef201d5cafc6bfab1",
+            "### LICENSE",
+            "THE SOFTWARE IS PROVIDED",
+            "the request to cite two papers and their BibTeX entries",
+        ),
     ),
 )
 
@@ -568,17 +607,100 @@ def _fetch(url: str) -> bytes:
     return data
 
 
-def _licenses(source_tree_license: str) -> dict[str, bytes]:
+_FENCE = "```"
+
+
+def _extract(project: str, data: bytes, rule: _Extract) -> tuple[bytes, str]:
+    """Q-118: the license text ``rule`` locates, and its source lines in words.
+
+    Failures report line numbers and counts, never the source's text.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise VendorError(f"{project} license source: not UTF-8") from None
+    if "\r" in text:
+        raise VendorError(f"{project} license source: carriage returns are not handled")
+    lines = text.split("\n")
+    headings = [i for i, line in enumerate(lines) if line == rule.heading]
+    if len(headings) != 1:
+        raise VendorError(f"{project} license source: {len(headings)} section headings, not 1")
+    opening = headings[0] + 1
+    while opening < len(lines) and lines[opening].strip() == "":
+        opening += 1
+    if opening == len(lines) or lines[opening] != _FENCE:
+        raise VendorError(f"{project} license source: line {opening + 1} does not open a block")
+    closing = opening + 1
+    while closing < len(lines) and lines[closing] != _FENCE:
+        closing += 1
+    if closing == len(lines):
+        raise VendorError(f"{project} license source: the block opened at line {opening + 1} ends")
+    block = lines[opening + 1 : closing]
+    if not block or block[0].strip() == "":
+        raise VendorError(f"{project} license source: the block starts with a blank line")
+    starts = [
+        i
+        for i, line in enumerate(block)
+        if line.startswith(rule.last_paragraph) and (i == 0 or block[i - 1].strip() == "")
+    ]
+    if len(starts) != 1:
+        raise VendorError(f"{project} license source: {len(starts)} last paragraphs, not 1")
+    end = starts[0]
+    while end < len(block) and block[end].strip() != "":
+        end += 1
+    kept = block[:end]
+    first, last = opening + 2, opening + 1 + end
+    where = (
+        f"lines {first}-{last} of the source: the fenced block under the heading "
+        f"'{rule.heading}' (lines {opening + 1}-{closing + 1}), from its first line through "
+        f"the end of the paragraph that begins '{rule.last_paragraph}', byte for byte, joined "
+        f"by LF with one final LF; {rule.left_out}, which follow in the block, are left out"
+    )
+    return ("\n".join(kept) + "\n").encode("utf-8"), where
+
+
+def _licenses(source_tree_license: str) -> tuple[dict[str, bytes], dict[str, str]]:
+    """The license texts by path, and for each extracted one how it was extracted."""
     texts: dict[str, bytes] = {}
+    extracts: dict[str, str] = {}
     for license_ in LICENSES:
         data = _fetch(license_.source)
+        rule = license_.extract
+        expected = license_.sha256 if rule is None else rule.source_sha256
         digest = hashlib.sha256(data).hexdigest()
-        if digest != license_.sha256:
-            raise VendorError(f"{license_.project} license: sha256 {digest} != {license_.sha256}")
+        if digest != expected:
+            what = "license" if rule is None else "license source"
+            raise VendorError(f"{license_.project} {what}: sha256 {digest} != {expected}")
         if license_.project == "RoMa" and _blob_id(data) != source_tree_license:
             raise VendorError("RoMa license: not the LICENSE blob of the commit's tree")
+        if rule is not None:
+            data, extracts[license_.path] = _extract(license_.project, data, rule)
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != license_.sha256:
+                raise VendorError(
+                    f"{license_.project} license: extracted sha256 {digest} != {license_.sha256}"
+                )
+            lines = data.count(b"\n")
+            print(
+                f"{license_.path}: extracted from its source (sha256 {expected[:16]}), "
+                f"{lines} lines, sha256 {digest[:16]}"
+            )
         texts[license_.path] = data
-    return texts
+    return texts, extracts
+
+
+def _license_entry(license_: _License, extracts: dict[str, str]) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "path": license_.path,
+        "project": license_.project,
+        "license": license_.spdx,
+        "source": license_.source,
+        "sha256": license_.sha256,
+    }
+    if license_.extract is not None:
+        entry["source_sha256"] = license_.extract.source_sha256
+        entry["extract"] = extracts[license_.path]
+    return entry
 
 
 # ---------------------------------------------------------------------------------------
@@ -630,7 +752,7 @@ def build(source: Path, out: Path) -> None:
             f"romatch imports: {module_level} at module level and {len(functions)} in functions"
         )
     _check_patched({path: p.data for path, p in patched.items()})
-    licenses = _licenses(blobs["LICENSE"])
+    licenses, extracts = _licenses(blobs["LICENSE"])
 
     for path, result in patched.items():
         target = out / path
@@ -646,16 +768,7 @@ def build(source: Path, out: Path) -> None:
         "script": SCRIPT,
         "package": PACKAGE,
         "notice": NOTICE,
-        "licenses": [
-            {
-                "path": lic.path,
-                "project": lic.project,
-                "license": lic.spdx,
-                "source": lic.source,
-                "sha256": lic.sha256,
-            }
-            for lic in LICENSES
-        ],
+        "licenses": [_license_entry(lic, extracts) for lic in LICENSES],
         "files": entries,
     }
     (out / "VENDOR.json").write_bytes(_dump(record))
