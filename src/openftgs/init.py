@@ -6,20 +6,69 @@ Spec: §1.3, E15, D-58, D-65. Band: Foundation (§2.1).
 """
 
 import math
-from typing import NoReturn
+from dataclasses import dataclass
+from typing import Literal, NoReturn
 
 import numpy as np
 import torch
 from scipy.spatial import cKDTree
 from torch import Tensor
 
-__all__ = ["knn_velocities", "triangulate_dlt"]  # Q-106
+__all__ = ["RomaInitConfig", "knn_velocities", "triangulate_dlt"]  # Q-106
 
 _KNN_TILE = 1 << 24  # distances held at once by the tiled k-NN search (query rows × points)
+_MODELS = ("roma_outdoor", "tiny_roma_v1_outdoor")  # §2.1 RomaInitConfig.model, D-58
+_BACKBONE_PATCH = 14  # RoMa asserts coarse resolutions divisible by DINOv2's patch (Q-106)
 
 
 def _fail(reason: str) -> NoReturn:
     raise ValueError(reason)
+
+
+@dataclass
+class RomaInitConfig:  # D-21, D-22, D-24, D-56, D-58
+    """`roma_init`'s settings (§2.1), checked on construction (Q-106)."""
+
+    model: Literal["roma_outdoor", "tiny_roma_v1_outdoor"] = "roma_outdoor"
+    coarse_res: int = 560
+    upsample_res: int = 864
+    upsample_preds: bool = True  # False: match at coarse_res only
+    matches_per_pair: int = 5000
+    min_certainty: float = 0.5  # on match()'s raw certainty
+    stride: int = 1
+    # B, D-24; the trainer applies InitConfig.points_per_frame again, as the total cap F·B (D-74)
+    points_per_frame: int = 1_000
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        _check_config(self)
+
+
+def _check_config(cfg: RomaInitConfig) -> None:
+    """Q-106's rules, with the type checks of Q-T136.2: integers in the integer fields, a bool
+    in `upsample_preds`, a finite number in `min_certainty` (an int becomes a float, as in
+    openftgs.config, Q-10), and no bool in a numeric field."""
+    # Q-106, Q-T136.2
+    if not isinstance(cfg.model, str) or cfg.model not in _MODELS:
+        _fail(f"RomaInitConfig.model must be one of {_MODELS}, got {cfg.model!r}")
+    for name in ("coarse_res", "upsample_res", "matches_per_pair", "stride", "points_per_frame"):
+        value = getattr(cfg, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            _fail(f"RomaInitConfig.{name} must be an integer ≥ 1, got {value!r}")
+    if cfg.coarse_res % _BACKBONE_PATCH:
+        _fail(f"RomaInitConfig.coarse_res must be a multiple of 14, got {cfg.coarse_res!r}")
+    if isinstance(cfg.seed, bool) or not isinstance(cfg.seed, int):
+        _fail(f"RomaInitConfig.seed must be an integer, got {cfg.seed!r}")
+    if not isinstance(cfg.upsample_preds, bool):
+        _fail(f"RomaInitConfig.upsample_preds must be true or false, got {cfg.upsample_preds!r}")
+    certainty = cfg.min_certainty
+    if (
+        isinstance(certainty, bool)
+        or not isinstance(certainty, (int, float))
+        or not 0.0 <= certainty <= 1.0
+    ):
+        _fail(f"RomaInitConfig.min_certainty must be a number in [0, 1], got {certainty!r}")
+    cfg.min_certainty = float(certainty)
 
 
 def _check_point_set(name: str, value: Tensor) -> None:

@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from openftgs.init import _nearest_indices, knn_velocities, triangulate_dlt
+from openftgs.init import RomaInitConfig, _nearest_indices, knn_velocities, triangulate_dlt
 
 
 def _lattice(shape: tuple[int, int, int], spacing: float, dtype: torch.dtype) -> torch.Tensor:
@@ -302,3 +302,62 @@ def test_triangulate_dlt_refuses_two_devices() -> None:
     x1, x2, P1, P2 = _views()
     with pytest.raises(ValueError, match="device"):
         triangulate_dlt(x1, x2, P1.cuda(), P2)
+
+
+# RomaInitConfig (§2.1; Q-106)
+
+
+def test_roma_init_config_defaults_are_the_spec_values() -> None:
+    """§2.1 and D-21, D-22, D-24, D-58: roma_outdoor at 560 px upsampled to 864 px, 5,000
+    matches per pair at certainty ≥ 0.5, stride 1, B = 1,000 and seed 0; the edges of each
+    range are accepted."""
+    cfg = RomaInitConfig()
+    assert (cfg.model, cfg.coarse_res, cfg.upsample_res, cfg.upsample_preds) == (
+        "roma_outdoor",
+        560,
+        864,
+        True,
+    )
+    assert (cfg.matches_per_pair, cfg.min_certainty, cfg.stride) == (5000, 0.5, 1)
+    assert (cfg.points_per_frame, cfg.seed) == (1000, 0)
+    RomaInitConfig(model="tiny_roma_v1_outdoor", coarse_res=14, upsample_res=1, min_certainty=0)
+    RomaInitConfig(min_certainty=1, seed=-5, upsample_preds=False)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"model": "roma_indoor"},
+        {"model": None},
+        {"coarse_res": 0},
+        {"coarse_res": -14},
+        {"coarse_res": 561},
+        {"upsample_res": 0},
+        {"matches_per_pair": 0},
+        {"stride": 0},
+        {"points_per_frame": 0},
+        {"min_certainty": -0.01},
+        {"min_certainty": 1.01},
+        {"min_certainty": float("nan")},
+        {"coarse_res": True},
+        {"upsample_res": True},
+        {"matches_per_pair": True},
+        {"min_certainty": True},
+        {"stride": True},
+        {"points_per_frame": True},
+        {"seed": False},
+        {"stride": 1.0},
+        {"coarse_res": 560.0},
+        {"seed": 0.5},
+        {"upsample_preds": 1},
+    ],
+    ids=lambda field: "-".join(f"{k}={v!r}" for k, v in field.items()),
+)
+def test_roma_init_config_rejects_each_invalid_value(field: dict[str, object]) -> None:
+    """Q-106: a `model` outside its two values, a `coarse_res` that isn't a positive multiple
+    of 14, `upsample_res` < 1, `matches_per_pair`, `stride` or `points_per_frame` < 1,
+    `min_certainty` outside [0, 1] and a bool in a numeric field raise ValueError; so do a
+    non-integer in an integer field and a non-bool `upsample_preds` (Q-T136.2)."""
+    name = next(iter(field))
+    with pytest.raises(ValueError, match=name):
+        RomaInitConfig(**field)  # type: ignore[arg-type]
