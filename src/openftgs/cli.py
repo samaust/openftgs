@@ -50,7 +50,9 @@ _BENCHMARKS = (
     "init",
     "convert",
 )
-_CAMERA_TOLERANCE = 1e-6  # Q-137: K and world_to_camera of a supplied render's item, absolute
+# Q-137: K and world_to_camera of a supplied render's item, relative (absolute near zero), so a
+# producer's own float32 rounding of pixel intrinsics still matches.
+_CAMERA_TOLERANCE = 1e-6
 
 
 class _Failure(Exception):
@@ -73,6 +75,16 @@ def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
     try:
         yield
     except caught as error:
+        raise _Failure(_INPUT, f"{what}: {error}") from error
+
+
+@contextlib.contextmanager
+def _environment(what: str) -> Iterator[None]:
+    """Q-142: an OSError of a run-time download (the LPIPS weights, §2.3 notes) is an
+    environment error, exit code 2."""
+    try:
+        yield
+    except OSError as error:
         raise _Failure(_INPUT, f"{what}: {error}") from error
 
 
@@ -131,7 +143,8 @@ def _pair(text: str) -> tuple[int, int]:
 
 # -- convert -------------------------------------------------------------------------------------
 
-# The options each converter takes (§2.1 CLI line; Q-85 adds --test-camera and --window), by
+# The options each converter takes (§2.1 CLI line; Q-85 adds --test-camera and --window, the CLI
+# part of that row, which D-80 left out of the spec), by
 # the keyword they map to; anything else given for a kind is exit code 2.
 _CONVERT_OPTIONS: dict[str, tuple[str, ...]] = {
     "n3dv": ("frames", "resize", "ffmpeg", "ffprobe", "hwaccel", "jobs"),
@@ -221,7 +234,10 @@ def _cache(args: argparse.Namespace) -> int:
             device = _device()
             if device != "cuda":
                 _fail("--placement gpu needs a CUDA device")
-        with _as_input_error(f"frame cache, placement {args.placement}"):
+        import torch
+
+        # Q-142: a cache that doesn't fit in GPU memory is an environment error.
+        with _as_input_error(f"frame cache, placement {args.placement}", torch.OutOfMemoryError):
             cache = FrameCache.open(video, placement=args.placement, device=device)
         print(f"opened in placement {args.placement}: {cache.nbytes} bytes")
     return 0
@@ -292,6 +308,19 @@ def _flat(tree: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
         else:
             out[f"{prefix}{key}"] = value
     return out
+
+
+def _check_resume_dir(run_dir: Path, config: Mapping[str, Any]) -> None:
+    """Q-134: a resumed run writes into an absent or empty directory, or into the run directory
+    of its own configuration (its config.json)."""
+    if not run_dir.exists() or (run_dir.is_dir() and not any(run_dir.iterdir())):
+        return
+    try:
+        recorded = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        recorded = None
+    if recorded != json.loads(json.dumps(config)):
+        _fail(f"run directory {run_dir} isn't this run's: its config.json differs or is missing")
 
 
 def _check_masks(video: MultiViewVideo, split: str) -> None:
@@ -396,6 +425,8 @@ def _train(args: argparse.Namespace) -> int:
             differ = sorted(k for k in want.keys() | have.keys() if want.get(k) != have.get(k))
             if differ:
                 _fail(f"--resume continues the checkpoint's configuration; these differ: {differ}")
+    if args.resume is not None:  # Q-134: the run being resumed, or a new run directory
+        _check_resume_dir(run_dir, config_to_dict(cfg))
     if cfg.perf.deterministic:  # Q-131 (Q-73 note 2), before any CUDA call
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     device = _device()
@@ -453,7 +484,7 @@ def _train(args: argparse.Namespace) -> int:
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
         save_checkpoint(state, run_dir / "checkpoint")
-    if signals.received is not None:  # Q-133
+    if signals.received is not None and trainer.iteration < last:  # Q-133; a finished run goes on
         print(
             f"stopped by signal {signals.received} at iteration {trainer.iteration}; "
             f"checkpoint in {run_dir / 'checkpoint'}",
@@ -461,7 +492,8 @@ def _train(args: argparse.Namespace) -> int:
         )
         return 128 + signals.received
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
-        trainer.evaluate("test", out_dir=run_dir)
+        with _environment("LPIPS networks"):
+            trainer.evaluate("test", out_dir=run_dir)
     return 0
 
 
@@ -593,13 +625,13 @@ def _match_renders(
             and torch.allclose(
                 item.camera.K.double(),
                 cam.K.double(),
-                rtol=0.0,
+                rtol=_CAMERA_TOLERANCE,
                 atol=_CAMERA_TOLERANCE,
             )
             and torch.allclose(
                 item.camera.world_to_camera.double(),
                 cam.world_to_camera.double(),
-                rtol=0.0,
+                rtol=_CAMERA_TOLERANCE,
                 atol=_CAMERA_TOLERANCE,
             )
         ]
@@ -631,7 +663,8 @@ def _eval(args: argparse.Namespace) -> int:
     supplied, entry = (None, None)
     if args.renders_dir is not None:
         supplied, entry = _match_renders(video, args.split, args.renders_dir)
-    evaluator = Evaluator(device=device)
+    with _environment("LPIPS networks"):
+        evaluator = Evaluator(device=device)
     images = evaluate_images(
         loaded.model,
         video,

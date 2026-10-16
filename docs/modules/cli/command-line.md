@@ -1,6 +1,6 @@
 # The command line in `openftgs.cli`
 
-How `ftgs` meets §2.1's CLI block: what each command calls, the exit codes, the run directory, signals and resume. The module's one public name is `main(argv=None) -> int`, which the `ftgs` console script and `python -m openftgs.cli` both run (Q-124). The choices the spec leaves open are Q-124 to Q-142.
+How `ftgs` meets §2.1's CLI block: what each command calls, the exit codes, the run directory, signals and resume. The module's one public name is `main(argv=None) -> int`, which the `ftgs` console script and `python -m openftgs.cli` both run (Q-124). The choices the spec leaves open are Q-124 to Q-144.
 
 ## Commands
 
@@ -27,7 +27,7 @@ Single-file outputs replace an existing file; directory outputs, a converter's O
 | --- | --- |
 | 0 | success |
 | 1 | an unexpected exception, with its traceback; `ftgs bench` until M15 |
-| 2 | invalid input or environment: a usage error, a file that fails validation, a missing ffmpeg, ffprobe or COLMAP, a configuration this build can't run, a missing `[init]` extra |
+| 2 | invalid input or environment: a usage error, a file that fails validation, a missing ffmpeg, ffprobe or COLMAP, a configuration this build can't run, a missing `[init]` extra, LPIPS weights that can't be downloaded, a frame cache that doesn't fit in GPU memory |
 | 3 | a numerical failure: training diverged, or a render isn't finite |
 | 130, 143 | `ftgs train` stopped by SIGINT or SIGTERM, after saving its checkpoint |
 
@@ -49,8 +49,8 @@ With `perf.deterministic`, `ftgs train` sets `CUBLAS_WORKSPACE_CONFIG` before CU
 
 While training runs, SIGINT and SIGTERM are recorded rather than acted on at once. The trainer stops after the current iteration, so the saved state is whole (Q-69). The checkpoint is saved atomically (Q-25), and the command exits with 128 plus the signal number (Q-133). A divergence saves nothing, so the last good checkpoint survives: the trainer checks at its log reads and events (Q-69), and the command checks the model once more before it saves, so a model that turned non-finite since is exit 3 too.
 
-`--resume CKPT` continues the run on the checkpoint's own configuration. A `--config` or `--seed` given beside it must give exactly that configuration, performance settings included. A manifest that changed since the checkpoint was made needs `--force` (Q-70, Q-134). D-24's check of the start budget F·B against N_max happens when the trainer builds the model, so `ftgs init` can't make it (Q-128).
+`--resume CKPT` continues the run on the checkpoint's own configuration. A `--config` or `--seed` given beside it must give exactly that configuration, performance settings included. A manifest that changed since the checkpoint was made needs `--force` (Q-70, Q-134). The run directory must be the run's own (its `config.json` equal to the checkpoint's configuration), or absent or empty. A signal that comes once the run has reached T_it doesn't stop it: the run is complete and goes on to its evaluation. D-24's check of the start budget F·B against N_max happens when the trainer builds the model, so `ftgs init` can't make it (Q-128).
 
 ## Evaluation
 
-`ftgs eval MODEL SCENE.json` renders the split (`--split test`, the default, or `train`; Q-143) with the model and scores it. A checkpoint is rendered against its configuration's background, an exchange model against black, since readers ignore `render_conventions` (§2.2, Q-141). With `--renders-dir DIR` it instead scores the renders in DIR (`request.json` and `renders.safetensors`), matching each image of the split to one request item by timestamp and camera (Q-137). `ftgs render --backend reference` followed by `ftgs eval --renders-dir` scores the reference backend. A split with masks on some images but not all is refused (Q-135).
+`ftgs eval MODEL SCENE.json` renders the split (`--split test`, the default, or `train`; Q-143) with the model and scores it. A checkpoint is rendered against its configuration's background, an exchange model against black, since readers ignore `render_conventions` (§2.2, Q-141). With `--renders-dir DIR` it instead scores the renders in DIR (`request.json` and `renders.safetensors`), matching each image of the split to one request item by timestamp, image size and camera, the camera within a relative 1e-6 (Q-137). `ftgs render --backend reference` followed by `ftgs eval --renders-dir` scores the reference backend. A split with masks on some images but not all is refused (Q-135).

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-142): a smoke test of
+"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-144): a smoke test of
 every command on a small synthetic scene, the CLI round trips of U-26, U-22's rejections with
 exit code 2, U-27's exit code, and the train, resume, render, eval and export behaviour.
 
@@ -30,7 +30,9 @@ from builders import (
     n3dv_source,
     random_model,
     ring,
+    selfcap_archives,
     shortened_config,
+    stub_colmap,
     write_plane_scene,
     write_render_request,
     write_scene,
@@ -295,6 +297,33 @@ def test_a_model_that_turns_non_finite_after_the_last_check_is_not_saved(
     out = tmp_path / "run"
     assert _train(run, out, "--config", cfg) == 3
     assert not (out / "checkpoint").exists()
+
+
+def test_a_signal_in_the_last_iteration_finishes_the_run(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-133: a run that reached T_it when the signal came is complete: exit 0."""
+    _sigterm_at(monkeypatch, ITERATIONS)
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", run["config"]) == 0
+    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+
+
+def test_resume_writes_only_into_its_own_run_directory(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-134: --resume writes into the run directory of its configuration, or an absent or
+    empty one; another non-empty directory is exit 2 and left as it was."""
+    with monkeypatch.context() as m:
+        _sigterm_at(m, 10)
+        _train(run, tmp_path / "cut", "--config", run["config"])
+    checkpoint = tmp_path / "cut" / "checkpoint"
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "notes.txt").write_text("x")
+    assert _train(run, other, "--resume", checkpoint) == 2
+    assert sorted(p.name for p in other.iterdir()) == ["notes.txt"]
+    assert _train(run, tmp_path / "fresh", "--resume", checkpoint) == 0
 
 
 def test_resume_refuses_a_changed_manifest_unless_forced(
@@ -812,6 +841,27 @@ def test_eval_refuses_supplied_renders_that_do_not_match_the_split(tmp_path: Pat
     assert not out.exists()
 
 
+def test_unavailable_lpips_weights_are_exit_code_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-142: a download of the LPIPS weights that fails (an OSError) is an environment error,
+    in ftgs eval and in ftgs train's final evaluation, which runs after the checkpoint is saved
+    (Q-132)."""
+    import openftgs.eval
+
+    def offline(*args: Any, **kwargs: Any) -> None:
+        raise OSError("no network")
+
+    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", offline)
+    scene, checkpoint = _trained(tmp_path)
+    assert _ftgs("eval", checkpoint, scene, "--out", tmp_path / "m.json") == 2
+    init = _init(tmp_path / "again.safetensors")
+    cfg = _config_file(tmp_path / "cfg.json")
+    out = tmp_path / "run"
+    assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 2
+    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+
+
 def test_eval_refuses_a_partial_mask_set_and_an_empty_split(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -856,6 +906,19 @@ def test_cache_builds_the_frame_cache(run: dict[str, Path], tmp_path: Path) -> N
     assert _ftgs("cache", tmp_path / "none.json") == 2
 
 
+def test_a_cache_that_does_not_fit_the_gpu_is_exit_code_2(
+    run: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-142: out of GPU memory while opening --placement gpu is an environment error."""
+
+    def full(*args: Any, **kwargs: Any) -> Any:
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(FrameCache, "open", full)
+    assert _ftgs("cache", run["scene"], "--placement", "gpu") == 2
+
+
 @pytest.mark.gpu
 def test_cache_opens_on_the_gpu(run: dict[str, Path]) -> None:
     """Q-127: --placement gpu opens the cache in GPU memory when it fits."""
@@ -877,6 +940,39 @@ def test_convert_n3dv(tmp_path: Path) -> None:
     manifest = read_scene_manifest(out / "scene.json")
     assert len(manifest.records) == 8
     assert _ftgs(*args) == 2
+
+
+@needs_ffmpeg
+def test_convert_selfcap_with_a_stub_colmap(tmp_path: Path) -> None:
+    """§2.1, Q-85: ftgs convert selfcap on a generated mini-archive (U-37's), with --window,
+    --test-camera and a stub COLMAP: frames 4 ≤ n < 8 of three cameras, the test camera's
+    images in the test split, and COLMAP called."""
+    src = selfcap_archives(tmp_path, "mini")
+    colmap, log = stub_colmap(tmp_path)
+    out = tmp_path / "out"
+    args = (
+        "convert",
+        "selfcap",
+        src,
+        out,
+        "--scene",
+        "mini",
+        "--window",
+        "4:8",
+        "--test-camera",
+        "0002",
+        "--colmap",
+        colmap,
+        "--jobs",
+        1,
+    )
+    assert _ftgs(*args) == 0
+    from openftgs.io import read_scene_manifest
+
+    manifest = read_scene_manifest(out / "scene.json")
+    assert {r.frame_index for r in manifest.records} == {4, 5, 6, 7}
+    assert {r.camera.name for r in manifest.records if r.split == "test"} == {"0002"}
+    assert (log / "calls.jsonl").is_file()
 
 
 @needs_ffmpeg

@@ -12,9 +12,7 @@ it, as U-27 says; CI installs none (#108, item 4).
 import hashlib
 import json
 import shutil
-import stat
 import subprocess
-import sys
 import tarfile
 from pathlib import Path
 from typing import Any, Literal
@@ -23,7 +21,17 @@ import cv2
 import numpy as np
 import pytest
 import torch
-from builders import ffmpeg_video, n3dv_source
+from builders import (
+    SELFCAP_OFFSETS,
+    YAML_D,
+    YAML_K,
+    ffmpeg_video,
+    n3dv_source,
+    rodrigues,
+    selfcap_archives,
+    stub_colmap,
+    write_opencv_calibration,
+)
 from PIL import Image
 
 from openftgs.data import (
@@ -187,53 +195,11 @@ def test_u27_hardware_decoding_is_within_one_level_of_cpu_decoding(tmp_path: Pat
 
 # OpenCV-style YAML converter (D-61, D-63, D-80; Q-96).
 
-_YAML_K = np.array([[60.0, 0.0, 31.5], [0.0, 60.0, 23.5], [0.0, 0.0, 1.0]])  # OpenCV convention
-_YAML_D = np.array([[-0.12], [0.03], [0.0005], [-0.0004], [0.0]])
-
-
-def _rodrigues(vector: np.ndarray) -> np.ndarray:
-    matrix, _ = cv2.Rodrigues(vector)
-    return np.asarray(matrix)
-
-
-def _write_calibration(
-    root: Path,
-    names: list[str],
-    *,
-    rot_error: float = 0.0,
-    ccm: np.ndarray | None = None,
-    distortion: np.ndarray = _YAML_D,
-    sizes: tuple[int, int] | None = (64, 48),
-) -> None:
-    """intri.yml and extri.yml as OpenCV's FileStorage writes them, in the SelfCap key family
-    (D-63): names, K_, D_, H_, W_, (ccm_), R_ (Rodrigues), Rot_, T_."""
-    root.mkdir(parents=True, exist_ok=True)
-    intri = cv2.FileStorage(str(root / "intri.yml"), cv2.FILE_STORAGE_WRITE)
-    extri = cv2.FileStorage(str(root / "extri.yml"), cv2.FILE_STORAGE_WRITE)
-    intri.write("names", names)
-    extri.write("names", names)
-    for k, name in enumerate(names):
-        intri.write(f"K_{name}", _YAML_K)
-        intri.write(f"D_{name}", distortion)
-        if sizes is not None:
-            intri.write(f"W_{name}", sizes[0])
-            intri.write(f"H_{name}", sizes[1])
-        if ccm is not None:
-            intri.write(f"ccm_{name}", ccm)
-        vector = np.array([[0.0], [0.1 * k], [0.0]])
-        rot = _rodrigues(vector)
-        rot[0, 0] += rot_error
-        extri.write(f"R_{name}", vector)
-        extri.write(f"Rot_{name}", rot)
-        extri.write(f"T_{name}", np.array([[0.2 * k], [0.0], [3.0]]))
-    intri.release()
-    extri.release()
-
 
 def _yaml_source(
     root: Path, names: list[str], *, images: bool = False, frames: int = 4, **calibration: Any
 ) -> Path:
-    _write_calibration(root, names, **calibration)
+    write_opencv_calibration(root, names, **calibration)
     for name in names:
         video = ffmpeg_video(root / "videos" / f"{name}.mp4", frames=frames, smooth=True)
         if images:
@@ -266,8 +232,8 @@ def test_opencv_yaml_undistorts_shifts_and_times_frames(tmp_path: Path, images: 
         assert record.timestamp == record.frame_index / 60.0
     record = next(r for r in manifest.records if r.camera.name == "0001" and r.frame_index == 2)
     want = camera_from_opencv(
-        _YAML_K,
-        _rodrigues(np.array([[0.0], [0.1], [0.0]])),
+        YAML_K,
+        rodrigues(np.array([[0.0], [0.1], [0.0]])),
         np.array([0.2, 0.0, 3.0]),
         width=64,
         height=48,
@@ -282,10 +248,8 @@ def test_opencv_yaml_undistorts_shifts_and_times_frames(tmp_path: Path, images: 
         if not images
         else [np.asarray(Image.open(src / "images" / "0001" / f"{k:03d}.png")) for k in (1, 2, 3)]
     )
-    oracle = cv2.undistort(frames[2], _YAML_K, _YAML_D)
-    map_x, map_y = cv2.initUndistortRectifyMap(
-        _YAML_K, _YAML_D, None, _YAML_K, (64, 48), cv2.CV_32FC1
-    )
+    oracle = cv2.undistort(frames[2], YAML_K, YAML_D)
+    map_x, map_y = cv2.initUndistortRectifyMap(YAML_K, YAML_D, None, YAML_K, (64, 48), cv2.CV_32FC1)
     inside = (map_x >= 1) & (map_x <= 62) & (map_y >= 1) & (map_y <= 46)
     got = np.asarray(Image.open(record.image_path)).astype(int)
     assert np.abs(got - oracle.astype(int))[inside].max() <= 1
@@ -340,90 +304,6 @@ def test_opencv_yaml_accepts_an_identity_ccm(tmp_path: Path) -> None:
 
 # U-37 · SelfCap converter logic (D-59, D-60, D-63; Q-86, Q-87, Q-97, Q-101).
 
-_NAMES = ["0000", "0001", "0002"]
-_OFFSETS = {"0000": 0.004, "0001": -0.0125, "0002": 0.02}  # seconds, as sync.json holds them
-
-
-def _selfcap_archives(
-    root: Path,
-    seq: str,
-    *,
-    calib_archive: bool = False,
-    sync: bool = True,
-    frames: int = 12,
-    distortion: np.ndarray | None = None,
-    **calibration: Any,
-) -> Path:
-    """A generated mini-archive in SelfCap's layout (D-63, Q-101): `<seq>-release.tar.gz` with
-    `<seq>-release/videos/<name>.mp4` and `<seq>-release/optimized/{intri.yml, extri.yml,
-    sync.json}`, sync.json an object of camera name → seconds; with `calib_archive`, the
-    calibration goes to `<seq>-calib.tar.gz` instead (as hair-calib does)."""
-    staging = root / f"staging-{seq}"
-    release, optimized = staging / f"{seq}-release", staging / "calib"
-    zero = np.zeros((5, 1)) if distortion is None else distortion
-    _write_calibration(optimized, _NAMES, distortion=zero, **calibration)
-    if sync:
-        (optimized / "sync.json").write_text(json.dumps(_OFFSETS))
-    for name in _NAMES:
-        ffmpeg_video(release / "videos" / f"{name}.mp4", frames=frames)
-    src = root / "src"
-    src.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(src / f"{seq}-release.tar.gz", "w:gz") as tar:
-        tar.add(release / "videos", arcname=f"{seq}-release/videos")
-        if not calib_archive:
-            tar.add(optimized, arcname=f"{seq}-release/optimized")
-    if calib_archive:
-        with tarfile.open(src / f"{seq}-calib.tar.gz", "w:gz") as tar:
-            tar.add(optimized, arcname=f"{seq}-calib/optimized")
-    return src
-
-
-_STUB = """#!{python}
-# A stub COLMAP (U-37): records its arguments and input model, undistorts by copying, and
-# writes a PINHOLE model with the FULL_OPENCV camera's intrinsics.
-import json, pathlib, shutil, sys
-args = sys.argv[1:]
-log = pathlib.Path({log!r})
-log.mkdir(parents=True, exist_ok=True)
-if not args or args[0] == "help":
-    print("COLMAP stub -- for tests")
-    sys.exit(0)
-opts = {{args[i]: args[i + 1] for i in range(1, len(args) - 1, 2)}}
-with open(log / "calls.jsonl", "a") as f:
-    f.write(json.dumps(args) + "\\n")
-if args[0] == "image_undistorter":
-    model, out = pathlib.Path(opts["--input_path"]), pathlib.Path(opts["--output_path"])
-    shutil.copytree(model, log / "input_model", dirs_exist_ok=True)
-    text = [l for l in (model / "images.txt").read_text().splitlines() if not l.startswith("#")]
-    for line in text[::2]:
-        [float(v) for v in line.split()[1:8]]  # COLMAP parses QW … TZ as numbers
-    shutil.copytree(opts["--image_path"], out / "images", dirs_exist_ok=True)
-    (out / "sparse").mkdir(parents=True, exist_ok=True)
-    lines = []
-    for line in (model / "cameras.txt").read_text().splitlines():
-        if line and not line.startswith("#"):
-            p = line.split()
-            lines.append(" ".join([p[0], "PINHOLE", p[2], p[3], *p[4:8]]))
-    (out / "sparse" / "cameras.txt").write_text("\\n".join(lines) + "\\n")
-    shutil.copy(model / "images.txt", out / "sparse" / "images.txt")
-    (out / "sparse" / "points3D.txt").write_text("")
-elif args[0] == "model_converter":
-    out = pathlib.Path(opts["--output_path"])
-    out.mkdir(parents=True, exist_ok=True)
-    for name in ("cameras.txt", "images.txt", "points3D.txt"):
-        shutil.copy(pathlib.Path(opts["--input_path"]) / name, out / name)
-else:
-    sys.exit(f"unknown command {{args[0]}}")
-"""
-
-
-def _stub_colmap(root: Path) -> tuple[Path, Path]:
-    path, log = root / "bin" / "colmap", root / "colmap-log"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_STUB.format(python=sys.executable, log=str(log)))
-    path.chmod(path.stat().st_mode | stat.S_IEXEC)
-    return path, log
-
 
 def _frames_at(video: Path, out: Path, indices: list[int]) -> list[np.ndarray]:
     """ffmpeg's own decode of the given decode indices, as the oracle for window selection."""
@@ -441,8 +321,8 @@ def test_u37_selects_the_window_times_frames_and_holds_out_the_test_camera(
     frame, resized by 0.5 as INTER_AREA would); τ = n/60 minus the camera's offset; the test
     camera excluded from training; with COLMAP, its model gets FULL_OPENCV with cx, cy + 0.5,
     and the read-back PINHOLE camera is used without a shift."""
-    src = _selfcap_archives(tmp_path, "mini")
-    colmap, log = _stub_colmap(tmp_path)
+    src = selfcap_archives(tmp_path, "mini")
+    colmap, log = stub_colmap(tmp_path)
     manifest = read_scene_manifest(
         convert_selfcap(
             src,
@@ -458,7 +338,7 @@ def test_u37_selects_the_window_times_frames_and_holds_out_the_test_camera(
     assert len(manifest.records) == 12
     for record in manifest.records:
         assert record.frame_index is not None and record.frame_index in range(4, 8)
-        assert record.timestamp == record.frame_index / 60 - _OFFSETS[record.camera.name]
+        assert record.timestamp == record.frame_index / 60 - SELFCAP_OFFSETS[record.camera.name]
         assert record.split == ("test" if record.camera.name == "0002" else "train")
         assert (record.camera.width, record.camera.height) == (32, 24)
     staging_video = tmp_path / "staging-mini" / "mini-release" / "videos" / "0001.mp4"
@@ -469,8 +349,8 @@ def test_u37_selects_the_window_times_frames_and_holds_out_the_test_camera(
         want = cv2.resize(frame, (32, 24), interpolation=cv2.INTER_AREA).astype(int)
         assert np.abs(np.asarray(Image.open(record.image_path)).astype(int) - want).max() <= 1
     full = camera_from_opencv(
-        _YAML_K,
-        _rodrigues(np.array([[0.0], [0.1], [0.0]])),
+        YAML_K,
+        rodrigues(np.array([[0.0], [0.1], [0.0]])),
         np.array([0.2, 0.0, 3.0]),
         width=64,
         height=48,
@@ -505,7 +385,7 @@ def test_u37_selects_the_window_times_frames_and_holds_out_the_test_camera(
 @needs_ffmpeg
 def test_u37_no_sync_uses_the_frame_index_time(tmp_path: Path) -> None:
     """U-37, D-59: with use_sync=False, τ = n/60."""
-    src = _selfcap_archives(tmp_path, "mini")
+    src = selfcap_archives(tmp_path, "mini")
     manifest = read_scene_manifest(
         convert_selfcap(
             src,
@@ -525,7 +405,7 @@ def test_u37_no_sync_uses_the_frame_index_time(tmp_path: Path) -> None:
 def test_selfcap_dance_takes_its_calibration_from_hair_calib(tmp_path: Path) -> None:
     """§1.4, D-63, Q-86: dance1 reads hair-release for its videos and hair-calib for its
     calibration and sync offsets, and records both archives' SHA-256."""
-    src = _selfcap_archives(tmp_path, "hair", calib_archive=True)
+    src = selfcap_archives(tmp_path, "hair", calib_archive=True)
     shutil.move(tmp_path / "src" / "hair-calib.tar.gz", src / "hair-calib.tar.gz")
     manifest = read_scene_manifest(
         convert_selfcap(
@@ -541,7 +421,7 @@ def test_selfcap_dance_takes_its_calibration_from_hair_calib(tmp_path: Path) -> 
     assert manifest.metadata["calibration"] == "hair-calib.tar.gz"
     assert manifest.metadata["source"] == "selfcap/dance1"
     assert all(
-        r.timestamp == r.frame_index / 60 - _OFFSETS[r.camera.name]  # type: ignore[operator]
+        r.timestamp == r.frame_index / 60 - SELFCAP_OFFSETS[r.camera.name]  # type: ignore[operator]
         for r in manifest.records
     )
     assert "fastest_10" not in manifest.metadata  # a 4-frame window holds no 10 frames
@@ -559,7 +439,7 @@ def test_u37_refusals(tmp_path: Path, case: str) -> None:
         kwargs["rot_error"] = 1e-5
     elif case == "ccm":
         kwargs["ccm"] = np.diag([1.0, 2.0, 1.0])
-    src = _selfcap_archives(tmp_path, "mini", **kwargs)
+    src = selfcap_archives(tmp_path, "mini", **kwargs)
     call: dict[str, Any] = {
         "scene": "mini",
         "window": (4, 8),
@@ -591,7 +471,7 @@ def test_selfcap_records_a_bad_gzip_trailer_as_a_warning(tmp_path: Path, damage:
     """§1.4 Integrity, Q-86: an archive whose gzip trailer fails (a bad CRC, as the hosted corgi
     archive has, or a truncated trailer) after every member came out whole converts with a
     warning in the manifest; the hash is of the bytes as they are."""
-    src = _selfcap_archives(tmp_path, "mini")
+    src = selfcap_archives(tmp_path, "mini")
     archive = src / "mini-release.tar.gz"
     data = bytearray(archive.read_bytes())
     if damage == "crc":
@@ -620,7 +500,7 @@ def test_u37_masks_with_their_sidecar(tmp_path: Path) -> None:
     """D-64, Q-87: one mask per test image, DIR/<n:06d>.png at the converted size, with
     masks.json, gives each test image a mask and the two metadata keys; a missing mask is
     refused."""
-    src = _selfcap_archives(tmp_path, "mini")
+    src = selfcap_archives(tmp_path, "mini")
     masks = tmp_path / "masks"
     masks.mkdir()
     for n in range(4, 8):
@@ -665,7 +545,7 @@ def test_u37_with_the_real_colmap(tmp_path: Path) -> None:
     size and keeps the focal lengths, and the converter uses the read-back PINHOLE camera, so the
     manifest's fx is the calibration's times the realized ratio; the run is recorded."""
     distortion = np.array([[-0.12], [0.03], [0.0005], [-0.0004], [0.0]])
-    src = _selfcap_archives(tmp_path, "mini", distortion=distortion)
+    src = selfcap_archives(tmp_path, "mini", distortion=distortion)
     manifest = read_scene_manifest(
         convert_selfcap(
             src,
@@ -697,7 +577,7 @@ def test_u37_with_the_real_colmap(tmp_path: Path) -> None:
 @needs_ffmpeg
 def test_u37_internal_undistortion_needs_no_colmap(tmp_path: Path) -> None:
     """U-37: with undistort='internal' a missing COLMAP is no error."""
-    src = _selfcap_archives(tmp_path, "mini")
+    src = selfcap_archives(tmp_path, "mini")
     path = convert_selfcap(
         src,
         tmp_path / "out",
@@ -729,7 +609,7 @@ def test_a_failed_conversion_leaves_out_as_it_found_it(tmp_path: Path, start: st
     """Q-88 (owner answer): a conversion that fails after writing frames removes everything it
     wrote, so OUT is absent or empty again and the same command can run again. A mask of the
     wrong size fails only once the frames exist."""
-    src = _selfcap_archives(tmp_path, "mini")
+    src = selfcap_archives(tmp_path, "mini")
     masks = tmp_path / "masks"
     masks.mkdir()
     for n in range(4, 6):
@@ -760,7 +640,7 @@ def test_selfcap_resize_overrides_the_default_ratio(tmp_path: Path) -> None:
     """D-80: `resize` sets the ratio; a scene outside the card's table is
     otherwise resized by 0.5. At 1.0 the 64×48 videos keep their size and the manifest records
     the ratio."""
-    src = _selfcap_archives(tmp_path, "mini")
+    src = selfcap_archives(tmp_path, "mini")
     call: dict[str, Any] = {
         "scene": "mini",
         "window": (4, 6),
