@@ -675,11 +675,14 @@ class _StandIn:
         return torch.cat(rows), torch.cat(weights)
 
 
-def _plane(z: float, step: int = 2, *, u0: int = 9) -> torch.Tensor:
-    """Points at depth z whose projections into a camera at the origin facing +z are the pixel
-    centers (u + ½, v + ½) for u ≥ u0 and v ≥ 1, every `step` pixels."""
-    u = torch.arange(u0, _W, step, dtype=torch.float64) + 0.5
-    v = torch.arange(1, _H, step, dtype=torch.float64) + 0.5
+def _plane(
+    z: float, step: int = 2, *, u0: int = 9, offset: tuple[float, float] = (0.5, 0.5)
+) -> torch.Tensor:
+    """Points at depth z whose projections into a camera at the origin facing +z are
+    (u + δu, v + δv) for u ≥ u0 and v ≥ 1, every `step` pixels, with (δu, δv) = `offset`: the
+    pixel centers (u + ½, v + ½) by default."""
+    u = torch.arange(u0, _W, step, dtype=torch.float64) + offset[0]
+    v = torch.arange(1, _H, step, dtype=torch.float64) + offset[1]
     uu, vv = torch.meshgrid(u, v, indexing="ij")
     X = torch.stack([(uu - _CX) / _FOCAL * z, (vv - _CY) / _FOCAL * z, torch.full_like(uu, z)])
     return X.reshape(3, -1).T.contiguous()
@@ -997,14 +1000,38 @@ def test_u19_filters_drop_a_point_behind_one_camera_only(tmp_path: Path) -> None
     torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
 
 
-def test_u19_colors_are_the_mean_of_the_two_source_pixels(tmp_path: Path) -> None:
+def _bilinear(image: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """The test's bilinear sampling of an [H, W, 3] image at continuous pixel coordinates x
+    [n, 2] (§1.4: pixel i spans [i, i + 1), its center at i + ½), by `grid_sample` with
+    align_corners=False and the borders clamped."""
+    size = torch.tensor([image.shape[1], image.shape[0]], dtype=torch.float64)
+    grid = (x / size * 2 - 1).to(image.dtype)[None, None]  # [1, 1, n, 2]
+    sampled = torch.nn.functional.grid_sample(
+        image.permute(2, 0, 1)[None],
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )
+    return sampled[0, :, 0].T
+
+
+@pytest.mark.parametrize(
+    "offset", [(0.5, 0.5), (0.25, 0.75), (0.9, 0.1)], ids=["centers", "off-centers", "near-edges"]
+)
+def test_u19_colors_are_the_mean_of_the_two_source_pixels(
+    tmp_path: Path, offset: tuple[float, float]
+) -> None:
     """§1.3 step 3, D-22; Q-110: each color is the mean of the two source pixels, each the
     pixel holding the match's continuous coordinate. The images encode (u, v) as (R, G); the
-    rectified rig sees the plane's points at the pixel centers (u + ½, v + ½) in A and
-    (u − 8 + ½, v + ½) in B, so the expected color is computed from the image files' values."""
+    rectified rig sees the plane's points at (u + δu, v + δv) in A and (u − 8 + δu, v + δv)
+    in B, so the expected color is computed from the image files' values. Off the pixel
+    centers, bilinear sampling of the same images gives another color for every point, so
+    the floor pixel and bilinear sampling can't be confused."""
     dataset = _rig_scene(tmp_path, [0.0])
-    points = _run(dataset, _StandIn(dataset, points=_static()))
-    assert len(points.positions) == len(_plane(2.0))
+    X = _plane(2.0, offset=offset)
+    points = _run(dataset, _StandIn(dataset, points=lambda tau: X))
+    assert len(points.positions) == len(X)
     xa, _ = _project_points(dataset.records[0].camera, points.positions.to(torch.float64))
     u, v = torch.floor(xa[:, 0]).long(), torch.floor(xa[:, 1]).long()
     image_a = torch.from_numpy(_encoded_image(0).astype(np.float32)) / 255.0
@@ -1012,6 +1039,10 @@ def test_u19_colors_are_the_mean_of_the_two_source_pixels(tmp_path: Path) -> Non
     expected = (image_a[v, u] + image_b[v, u - 8]) / 2
     assert len(torch.unique(expected, dim=0)) == len(expected)
     torch.testing.assert_close(points.colors, expected, rtol=0.0, atol=1e-6)
+    if offset != (0.5, 0.5):
+        xb = xa - torch.tensor([8.0, 0.0], dtype=torch.float64)
+        bilinear = (_bilinear(image_a, xa) + _bilinear(image_b, xb)) / 2
+        assert bool(((bilinear - expected).abs().amax(dim=1) > 0.05 / 255).all())
 
 
 def test_u19_initial_durations_with_a_single_timestamp_are_the_stride(tmp_path: Path) -> None:
