@@ -9,7 +9,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | Command | Library calls |
 | --- | --- |
 | `convert` | `data.convert_n3dv`, `convert_opencv_yaml` or `convert_selfcap`, one option per keyword; `--test-camera` and `--window N0:N1` are Q-85's |
-| `cache` | `MultiViewVideo.from_manifest`, `FrameCache.build`, and for `gpu` or `mmap` `FrameCache.open` in that placement (Q-127) |
+| `cache` | `MultiViewVideo.from_manifest`, `FrameCache.build`, and for `gpu` or `mmap` `FrameCache.open` in that placement, which shows the cache fits on its own, not beside a training run (Q-127, Q-99) |
 | `init roma` | `RomaInitConfig`, `roma_init`, `io.write_init_points` with `roma_provenance(cfg)` as metadata (Q-107) |
 | `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.save_checkpoint`, `Trainer.evaluate` |
 | `render` | the model as `FreeTimeGaussians.load` reads it, `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
