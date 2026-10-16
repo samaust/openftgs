@@ -109,7 +109,7 @@ def _use_custom_corr() -> bool:
 def _roma_commit() -> str:
     """The upstream commit of the vendored RoMa, from its VENDOR.json (D-65), read without
     importing the vendored package, so it works without the [init] extra."""
-    vendor = importlib.resources.files("openftgs._vendor").joinpath("romatch", "VENDOR.json")
+    vendor = importlib.resources.files("openftgs._vendor") / "romatch" / "VENDOR.json"
     return str(json.loads(vendor.read_text(encoding="utf-8"))["commit"])
 
 
@@ -676,12 +676,16 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
         return build_roma
     weights = fetch(urls["tiny_roma_v1"]["outdoor"], map_location="cpu")
     # Q-116: XFeat at the commit whose license was read, not the repository's moving default.
+    # torch.hub's validation accepts a commit only while it heads a branch or tag (it lists
+    # them through GitHub's API; source log T136.2), so Q-116's fallback applies: the
+    # validation is skipped, and the archive of that commit is downloaded as it is.
     xfeat = torch.hub.load(  # type: ignore[no-untyped-call]
         f"verlab/accelerated_features:{_XFEAT_COMMIT}",
         "XFeat",
         pretrained=True,
         top_k=4096,
         trust_repo=True,
+        skip_validation=True,
     ).net
 
     def build_tiny(device: torch.device) -> DenseMatcher:

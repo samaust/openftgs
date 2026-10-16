@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests of openftgs.init: k-NN velocities (E15, D-23, D-56) and two-view DLT triangulation
-(§1.3 step 3), U-19 and U-33 (§3.1), with the contracts of Q-106 and Q-120."""
+"""Tests of openftgs.init: k-NN velocities (E15, D-23, D-56), two-view DLT triangulation (§1.3
+step 3), `RomaInitConfig` and `roma_provenance`, and the `roma_init` pipeline (§1.3 steps 1–7)
+on the CPU through an analytic stand-in dense matcher; U-19 and U-33 (§3.1), with the
+contracts of Q-106 to Q-112, Q-120 and Q-T136.1, Q-T136.2."""
 
 import dataclasses
 import hashlib
