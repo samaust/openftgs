@@ -490,6 +490,39 @@ def write_plane_scene(
     return path
 
 
+# Render requests (§2.2 ftgs-render-request v1), written by hand for the CLI tests.
+
+
+def write_render_request(
+    path: Path, items: Sequence[tuple[str, float, Camera]], *, unit: str = "s"
+) -> Path:
+    """An ftgs-render-request v1 file of (id, raw τ, camera) items, black background, the
+    model's full SH degree."""
+    body = {
+        "format": "ftgs-render-request",
+        "version": 1,
+        "time_unit": unit,
+        "background": [0, 0, 0],
+        "sh_degree": None,
+        "items": [
+            {
+                "id": item_id,
+                "timestamp": tau,
+                "camera": {
+                    "width": camera.width,
+                    "height": camera.height,
+                    "K": camera.K.tolist(),
+                    "world_to_camera": camera.world_to_camera.tolist(),
+                },
+            }
+            for item_id, tau, camera in items
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body))
+    return path
+
+
 # ffmpeg-made clips and Neural3DV sources (from the converter tests; shared with the CLI tests).
 
 

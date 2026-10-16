@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 import raycast
 import torch
-from builders import look_at
+from builders import look_at, write_render_request
 from synthetic_scenes import load_seeds, synthetic_config
 
 from openftgs.cli import main
@@ -117,24 +117,9 @@ def _s9(
         == 0
     )
     video, tests = _test_records(scene)
-    items = [
-        {
-            "id": str(i),
-            "timestamp": video.records[i].timestamp,
-            "camera": {
-                "width": video.records[i].camera.width,
-                "height": video.records[i].camera.height,
-                "K": video.records[i].camera.K.tolist(),
-                "world_to_camera": video.records[i].camera.world_to_camera.tolist(),
-            },
-        }
-        for i in tests
-    ]
-    request = tmp_path / "request.json"
-    request.write_text(
-        json.dumps(
-            {"format": "ftgs-render-request", "version": 1, "time_unit": "s", "items": items}
-        )
+    request = write_render_request(
+        tmp_path / "request.json",
+        [(str(i), video.records[i].timestamp, video.records[i].camera) for i in tests],
     )
     out = tmp_path / "renders.safetensors"
     assert main(["render", str(exchange), "--request", str(request), "--out", str(out)]) == 0

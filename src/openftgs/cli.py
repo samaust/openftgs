@@ -50,7 +50,7 @@ _BENCHMARKS = (
     "init",
     "convert",
 )
-_CAMERA_TOLERANCE = 1e-6  # Q-137: K and world_to_camera of a supplied render's item
+_CAMERA_TOLERANCE = 1e-6  # Q-137: K and world_to_camera of a supplied render's item, absolute
 
 
 class _Failure(Exception):
@@ -66,7 +66,7 @@ def _fail(message: str, code: int = _INPUT) -> NoReturn:
 
 
 @contextlib.contextmanager
-def _input(what: str, *also: type[Exception]) -> Iterator[None]:
+def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
     """Q-26, Q-142: a ValueError (and the listed types) of a call that reads or checks user
     input is exit code 2; anywhere else it stays a bug with its traceback."""
     caught: tuple[type[Exception], ...] = (ValueError, *also)
@@ -107,7 +107,7 @@ def _json_text(value: Any) -> str:
 def _scene(path: Path) -> MultiViewVideo:
     from openftgs.data import MultiViewVideo
 
-    with _input(f"scene manifest {path}"):
+    with _as_input_error(f"scene manifest {path}"):
         return MultiViewVideo.from_manifest(path)
 
 
@@ -199,7 +199,7 @@ def _convert(args: argparse.Namespace) -> int:
         "opencv-yaml": data.convert_opencv_yaml,
         "selfcap": data.convert_selfcap,
     }
-    with _input(f"ftgs convert {args.kind}"):  # Q-88: input and environment errors
+    with _as_input_error(f"ftgs convert {args.kind}"):  # Q-88: input and environment errors
         manifest = converters[args.kind](args.src, args.out, **given)
     print(manifest)
     return 0
@@ -212,7 +212,7 @@ def _cache(args: argparse.Namespace) -> int:
     from openftgs.data import FrameCache
 
     video = _scene(args.scene)
-    with _input("frame cache"):
+    with _as_input_error("frame cache"):
         directory = FrameCache.build(video)
     print(f"{directory} ({FrameCache.size_of(video)} bytes)")
     if args.placement != "auto":  # Q-127: show that it fits or maps
@@ -221,7 +221,7 @@ def _cache(args: argparse.Namespace) -> int:
             device = _device()
             if device != "cuda":
                 _fail("--placement gpu needs a CUDA device")
-        with _input(f"frame cache, placement {args.placement}"):
+        with _as_input_error(f"frame cache, placement {args.placement}"):
             cache = FrameCache.open(video, placement=args.placement, device=device)
         print(f"opened in placement {args.placement}: {cache.nbytes} bytes")
     return 0
@@ -241,7 +241,7 @@ def _init(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "model": args.model,
     }
-    with _input("RoMa settings"):
+    with _as_input_error("RoMa settings"):
         cfg = RomaInitConfig(
             **{k: v for k, v in fields.items() if v is not None},
             upsample_preds=not args.no_upsample,
@@ -249,12 +249,12 @@ def _init(args: argparse.Namespace) -> int:
     if _device() != "cuda":  # Q-125: roma_init matches on every visible CUDA device
         _fail("RoMa initialization needs a CUDA device")
     try:
-        with _input("RoMa initialization"):
+        with _as_input_error("RoMa initialization"):
             points = roma_init(video, cfg)
     except ImportError as error:  # Q-142: the [init] extra is missing
         _fail(f"RoMa initialization needs the [init] extra (pip install 'openftgs[init]'): {error}")
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    with _input(f"init points {args.out}"):
+    with _as_input_error(f"init points {args.out}"):
         write_init_points(
             points,
             args.out,
@@ -273,13 +273,13 @@ def _read_config(path: Path | None, seed: int | None) -> TrainConfig:
     """§2.1: --config is a JSON TrainConfig (Q-10); --seed replaces its seed."""
     from openftgs.config import config_from_dict
 
-    with _input(f"configuration {path}", OSError):
+    with _as_input_error(f"configuration {path}", OSError):
         data = {} if path is None else json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("a TrainConfig file holds a JSON object")
         cfg = config_from_dict(data)
     if seed is not None:
-        with _input("--seed"):
+        with _as_input_error("--seed"):
             cfg = dataclasses.replace(cfg, seed=seed)
     return cfg
 
@@ -348,9 +348,16 @@ class _Profile:
             self._profiler.start()
             self._running = True
 
-    def after(self, iteration: int) -> None:
+    def step_done(self, iteration: int) -> None:
+        """After iteration `iteration`: start before the window's first, finish after its
+        last."""
         self.begin_if_due(iteration)
-        if iteration == self._last and self._running:
+        if iteration == self._last:
+            self.finish()
+
+    def finish(self) -> None:
+        """Stop and write the trace, if the window has started (Q-144)."""
+        if self._running:
             self._profiler.stop()
             self._running = False
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,7 +375,7 @@ def _train(args: argparse.Namespace) -> int:
     if args.resume is None:
         _empty_or_absent(run_dir, "run directory")  # Q-132
     video = _scene(args.scene)
-    with _input(f"init points {args.init}"):
+    with _as_input_error(f"init points {args.init}"):
         points = read_init_points(args.init, time_unit=video.manifest.time_unit)
     has_test = any(r.split == "test" for r in video.records)
     if has_test:
@@ -376,15 +383,15 @@ def _train(args: argparse.Namespace) -> int:
     if args.resume is None:
         cfg = _read_config(args.config, args.seed)
     else:
-        with _input(f"checkpoint {args.resume}"):
+        with _as_input_error(f"checkpoint {args.resume}"):
             stored = load_checkpoint(args.resume).config
             cfg = config_from_dict(stored)
         if args.config is not None or args.seed is not None:  # Q-134
-            given = config_to_dict(
-                _read_config(args.config, args.seed)
-                if args.config is not None
-                else dataclasses.replace(cfg, seed=args.seed)
-            )
+            if args.config is not None:
+                given = config_to_dict(_read_config(args.config, args.seed))
+            else:
+                with _as_input_error("--seed"):
+                    given = config_to_dict(dataclasses.replace(cfg, seed=args.seed))
             want, have = _flat(json.loads(json.dumps(stored))), _flat(given)
             differ = sorted(k for k in want.keys() | have.keys() if want.get(k) != have.get(k))
             if differ:
@@ -393,15 +400,16 @@ def _train(args: argparse.Namespace) -> int:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     device = _device()
     if args.resume is None:
-        with _input("training setup", NotImplementedError):
+        with _as_input_error("training setup", NotImplementedError):
             trainer = Trainer(cfg, video, points, device=device)
     else:
-        with _input(f"resume from {args.resume}", NotImplementedError):
+        with _as_input_error(f"resume from {args.resume}", NotImplementedError):
             trainer = Trainer.from_checkpoint(args.resume, video, device=device, force=args.force)
     last = cfg.optim.iterations
     profile = None
     if args.profile is not None:
         start, count = args.profile
+        # Q-144: the window lies inside the iterations this command runs.
         if start < 1 or count < 1 or start <= trainer.iteration or start + count - 1 > last:
             _fail(
                 f"--profile {start}:{count} must cover iterations in "
@@ -415,7 +423,7 @@ def _train(args: argparse.Namespace) -> int:
 
     def record(trainer: Trainer, log: StepLog) -> bool:
         if profile is not None:
-            profile.after(log.iteration)
+            profile.step_done(log.iteration)
         if log.mean_losses is not None:  # Q-132: read every log_every iterations, no extra sync
             row = {
                 "iteration": log.iteration,
@@ -433,12 +441,18 @@ def _train(args: argparse.Namespace) -> int:
 
     if profile is not None:
         profile.begin_if_due(trainer.iteration)
+    # Q-133: the guard stays on through the save, so a signal can't interrupt it.
     with _Signals() as signals:
         try:
             trainer.train(callbacks=[record])
         except FloatingPointError as error:  # Q-69: divergence; nothing is saved
             _fail(str(error), _NUMERIC)
-    save_checkpoint(trainer.state_dict(), run_dir / "checkpoint")
+        finally:
+            if profile is not None:
+                profile.finish()  # Q-144: a window cut short by a signal is still written
+        state = trainer.state_dict()
+        _check_finite(trainer, state.stats)
+        save_checkpoint(state, run_dir / "checkpoint")
     if signals.received is not None:  # Q-133
         print(
             f"stopped by signal {signals.received} at iteration {trainer.iteration}; "
@@ -449,6 +463,19 @@ def _train(args: argparse.Namespace) -> int:
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
         trainer.evaluate("test", out_dir=run_dir)
     return 0
+
+
+def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
+    """Q-133: the trainer checks for divergence at log reads and events (Q-69), so a model that
+    turned non-finite since then is caught here, and a diverged state is never saved."""
+    import torch
+
+    try:
+        trainer.model.validate()  # Q-55: §1.1's rules, finite values among them
+    except ValueError as error:
+        _fail(f"training diverged by iteration {trainer.iteration}: {error}", _NUMERIC)
+    if not all(bool(torch.isfinite(v).all()) for v in stats.values()):
+        _fail(f"training diverged by iteration {trainer.iteration}: statistics", _NUMERIC)
 
 
 # -- models --------------------------------------------------------------------------------------
@@ -467,7 +494,7 @@ def _load_model(path: Path, device: str) -> _Loaded:
     from openftgs.io import load_checkpoint, read_exchange
     from openftgs.model import FreeTimeGaussians
 
-    with _input(f"model {path}"):
+    with _as_input_error(f"model {path}"):
         if not path.is_dir():
             return _Loaded(
                 FreeTimeGaussians.from_exchange(read_exchange(path), device=device),
@@ -504,13 +531,18 @@ def _render(args: argparse.Namespace) -> int:
 
     device = _render_device(args.backend)
     loaded = _load_model(args.model, device)
-    with _input(f"render request {args.request}", OSError):
+    with _as_input_error(f"render request {args.request}", OSError):
         sha = _sha256(args.request)
         request = read_render_request(args.request)
     if request.time_unit != loaded.model.time_unit:
         _fail(
             f"the request's time unit {request.time_unit!r} isn't the model's "
             f"{loaded.model.time_unit!r}"
+        )
+    if request.sh_degree is not None and request.sh_degree > loaded.model.sh_degree:
+        _fail(
+            f"the request's sh_degree {request.sh_degree} is above the model's "
+            f"{loaded.model.sh_degree}"
         )
     renders = render_request(loaded.model, request, backend=args.backend)
     bad = [i for i, rgb in renders.rgb.items() if not bool(torch.isfinite(rgb).all())]
@@ -536,7 +568,7 @@ def _match_renders(
     from openftgs.io import read_render_request, read_renders
 
     request_path, renders_path = directory / "request.json", directory / "renders.safetensors"
-    with _input(f"--renders-dir {directory}", OSError):
+    with _as_input_error(f"--renders-dir {directory}", OSError):
         sha = _sha256(request_path)
         request: RenderRequest = read_render_request(request_path)
         renders = read_renders(renders_path, request_sha256=sha)
@@ -561,20 +593,23 @@ def _match_renders(
             and torch.allclose(
                 item.camera.K.double(),
                 cam.K.double(),
-                rtol=_CAMERA_TOLERANCE,
+                rtol=0.0,
                 atol=_CAMERA_TOLERANCE,
             )
             and torch.allclose(
                 item.camera.world_to_camera.double(),
                 cam.world_to_camera.double(),
-                rtol=_CAMERA_TOLERANCE,
+                rtol=0.0,
                 atol=_CAMERA_TOLERANCE,
             )
         ]
         name = record.image_path.relative_to(root).as_posix()
         if len(hits) != 1:
             _fail(f"--renders-dir: {len(hits)} request items match {name}; it needs exactly one")
-        found[i] = renders.rgb[hits[0].id]
+        rgb = renders.rgb.get(hits[0].id)
+        if rgb is None or tuple(rgb.shape) != (cam.height, cam.width, 3):
+            _fail(f"--renders-dir: no render of {cam.height}×{cam.width} for {name}")
+        found[i] = rgb
     entry = {"dir": str(directory), "request_sha256": sha, "producer": producer}
     return found, entry
 
@@ -630,7 +665,7 @@ def _export(args: argparse.Namespace) -> int:
     # Q-141: the file records the background the run was trained against.
     exchange = dataclasses.replace(loaded.model.to_exchange(), background=loaded.background)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    with _input(f"exchange model {args.out}"):
+    with _as_input_error(f"exchange model {args.out}"):
         write_exchange(exchange, args.out)
     return 0
 
@@ -722,7 +757,7 @@ def _parser() -> argparse.ArgumentParser:
     p = commands.add_parser("eval", help="evaluate a model on a scene")
     p.add_argument("model", type=Path, metavar="MODEL")
     p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--split", choices=("test", "train"), default="test")
+    p.add_argument("--split", choices=("test", "train"), default="test")  # Q-143
     p.add_argument("--out", type=Path, required=True, metavar="METRICS.json")
     p.add_argument("--renders-dir", dest="renders_dir", type=Path, metavar="DIR")
     p.set_defaults(run=_eval)

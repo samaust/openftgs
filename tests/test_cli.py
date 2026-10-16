@@ -32,6 +32,7 @@ from builders import (
     ring,
     shortened_config,
     write_plane_scene,
+    write_render_request,
     write_scene,
 )
 from safetensors import safe_open
@@ -55,6 +56,7 @@ from openftgs.io import (
     read_renders,
     save_checkpoint,
     write_init_points,
+    write_renders,
 )
 from openftgs.model import FreeTimeGaussians
 from openftgs.train import Trainer
@@ -217,36 +219,82 @@ def test_train_seed_overrides_the_configuration(run: dict[str, Path], tmp_path: 
     assert not all(torch.equal(a[k], c[k]) for k in a)
 
 
-def _sigterm_at(monkeypatch: pytest.MonkeyPatch, iteration: int) -> None:
+def _sigterm_at(
+    monkeypatch: pytest.MonkeyPatch, iteration: int, number: int = signal.SIGTERM
+) -> None:
     step = Trainer.step
 
     def stepping(self: Trainer) -> Any:
         log = step(self)
         if self.iteration == iteration:
-            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), number)
         return log
 
     monkeypatch.setattr(Trainer, "step", stepping)
 
 
+def _tensors(tree: Any, prefix: str = "") -> dict[str, torch.Tensor]:
+    """Every tensor of a nested dict, by its path."""
+    if isinstance(tree, torch.Tensor):
+        return {prefix: tree}
+    if isinstance(tree, dict):
+        return {
+            k: v
+            for key, value in tree.items()
+            for k, v in _tensors(value, f"{prefix}/{key}").items()
+        }
+    return {}
+
+
+@pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGTERM], ids=["SIGINT", "SIGTERM"])
 def test_a_signal_saves_a_checkpoint_from_which_resume_is_bitwise(
-    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, number: int
 ) -> None:
-    """§2.2, Q-133: SIGTERM stops training after the current iteration, saves the checkpoint and
-    exits 143 (128 + 15); --resume then continues to T_it, bitwise equal to a straight run on
-    the reference backend (§2.2 contract), appending to train_log.jsonl (Q-134)."""
+    """§2.2, Q-133: SIGINT or SIGTERM stops training after the current iteration, saves the
+    checkpoint and exits 128 + its number (130, 143); --resume then continues to T_it, bitwise
+    equal to a straight run on the reference backend in parameters, Adam moments and step
+    counters, gradient statistics and generator states (§2.2 contract), appending to
+    train_log.jsonl (Q-134). Iteration 12 is not a log read, so the stop doesn't wait for one."""
+    before = signal.getsignal(number)
     assert _train(run, tmp_path / "straight", "--config", run["config"]) == 0
     with monkeypatch.context() as m:
-        _sigterm_at(m, 12)
-        assert _train(run, tmp_path / "cut", "--config", run["config"]) == 128 + signal.SIGTERM
-    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+        _sigterm_at(m, 12, number)
+        assert _train(run, tmp_path / "cut", "--config", run["config"]) == 128 + number
+    assert signal.getsignal(number) == before
     checkpoint = tmp_path / "cut" / "checkpoint"
     assert load_checkpoint(checkpoint).iteration == 12
     assert _train(run, tmp_path / "cut", "--resume", checkpoint) == 0
-    straight, resumed = _params(tmp_path / "straight" / "checkpoint"), _params(checkpoint)
-    assert all(torch.equal(straight[k], resumed[k]) for k in straight)
+    straight = load_checkpoint(tmp_path / "straight" / "checkpoint")
+    resumed = load_checkpoint(checkpoint)
+    assert resumed.iteration == straight.iteration == ITERATIONS
+    for part in ("params", "optim", "stats", "rng"):
+        a, b = _tensors(getattr(straight, part)), _tensors(getattr(resumed, part))
+        assert a.keys() == b.keys() and a, part
+        assert all(torch.equal(a[k], b[k]) for k in a), part
+    assert straight.sampler == resumed.sampler
     rows = (tmp_path / "cut" / "train_log.jsonl").read_text().splitlines()
     assert [json.loads(r)["iteration"] for r in rows] == [5, 10, 15, 20]
+
+
+def test_a_model_that_turns_non_finite_after_the_last_check_is_not_saved(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-133: the trainer checks for divergence at log reads and events (Q-69); a NaN after the
+    last one is still caught before the save: exit code 3, no checkpoint."""
+    step = Trainer.step
+
+    def late(self: Trainer) -> Any:
+        log = step(self)
+        if self.iteration == ITERATIONS - 1:
+            with torch.no_grad():
+                self.model.means[0, 0] = float("nan")
+        return log
+
+    monkeypatch.setattr(Trainer, "step", late)
+    cfg = _config_file(tmp_path / "seven.json", _cfg(perf=PerfConfig(log_every=7)))
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", cfg) == 3
+    assert not (out / "checkpoint").exists()
 
 
 def test_resume_refuses_a_changed_manifest_unless_forced(
@@ -301,6 +349,8 @@ def test_profile_writes_a_trace_of_its_window(run: dict[str, Path], tmp_path: Pa
 def test_profile_window_starts_after_a_resumed_iteration(
     run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Q-144: after a resume at iteration 10 the window must start after it; a window that a
+    signal cuts short still writes the trace of the iterations it ran."""
     with monkeypatch.context() as m:
         _sigterm_at(m, 10)
         _train(run, tmp_path / "cut", "--config", run["config"])
@@ -308,6 +358,10 @@ def test_profile_window_starts_after_a_resumed_iteration(
     assert _train(run, tmp_path / "cut", "--resume", ckpt, "--profile", "8:2") == 2
     assert _train(run, tmp_path / "cut", "--resume", ckpt, "--profile", "11:2") == 0
     assert (tmp_path / "cut" / "profile" / "trace.json").is_file()
+    with monkeypatch.context() as m:
+        _sigterm_at(m, 4)
+        assert _train(run, tmp_path / "short", "--config", run["config"], "--profile", "3:5") == 143
+    assert json.loads((tmp_path / "short" / "profile" / "trace.json").read_text())["traceEvents"]
 
 
 @pytest.mark.parametrize(
@@ -325,7 +379,9 @@ def test_train_refuses_invalid_configurations(
     assert not (tmp_path / "out").exists()
 
 
-def test_train_refuses_invalid_inputs(run: dict[str, Path], tmp_path: Path) -> None:
+def test_train_refuses_invalid_inputs(
+    run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """§2.1 exit code 2 (Q-142): a broken init file, an init file in another time unit, a missing
     scene, a non-empty run directory (Q-132), F·B > N_max (D-24, Q-128), and a configuration this
     build can't run (bf16, until M15)."""
@@ -345,7 +401,9 @@ def test_train_refuses_invalid_inputs(run: dict[str, Path], tmp_path: Path) -> N
         tmp_path / "budget.json",
         _cfg(init=InitConfig(points_per_frame=10), growth=GrowthConfig(n_max=20)),
     )
+    capsys.readouterr()
     assert _train(run, tmp_path / "d", "--config", budget) == 2
+    assert "F·B" in capsys.readouterr().err  # D-24's own error
     bf16 = _config_file(tmp_path / "bf16.json", _cfg(perf=PerfConfig(perc_precision="bf16")))
     assert _train(run, tmp_path / "e", "--config", bf16) == 2
 
@@ -385,7 +443,9 @@ def test_deterministic_training_sets_the_cublas_workspace(
     assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
 
 
-def test_train_refuses_a_partial_mask_set(tmp_path: Path) -> None:
+def test_train_refuses_a_partial_mask_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Q-135 (#83): a test split with masks on some images but not all is exit 2 before any
     training."""
     scene = _scene(tmp_path / "scene", test=True, masks=True)
@@ -395,6 +455,7 @@ def test_train_refuses_a_partial_mask_set(tmp_path: Path) -> None:
     scene.write_text(json.dumps(data))
     init = _init(tmp_path / "init.safetensors")
     assert _ftgs("train", scene, "--init", init, "--out", tmp_path / "run") == 2
+    assert tests[0]["path"] in capsys.readouterr().err
     assert not (tmp_path / "run").exists()
 
 
@@ -435,30 +496,6 @@ def _trained(
     return scene, checkpoint
 
 
-def _camera(camera: Any) -> dict[str, Any]:
-    return {
-        "width": camera.width,
-        "height": camera.height,
-        "K": camera.K.tolist(),
-        "world_to_camera": camera.world_to_camera.tolist(),
-    }
-
-
-def _request(path: Path, items: list[tuple[str, float, Any]], *, unit: str = "s") -> Path:
-    """An ftgs-render-request v1 (§2.2), written by hand."""
-    body = {
-        "format": "ftgs-render-request",
-        "version": 1,
-        "time_unit": unit,
-        "background": [0, 0, 0],
-        "sh_degree": None,
-        "items": [{"id": i, "timestamp": tau, "camera": _camera(cam)} for i, tau, cam in items],
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(body))
-    return path
-
-
 def _test_items(scene: Path) -> list[tuple[str, float, Any]]:
     """One request item per test image of the scene, named after its frame index."""
     from openftgs.data import MultiViewVideo
@@ -475,7 +512,7 @@ def _test_items(scene: Path) -> list[tuple[str, float, Any]]:
 def test_render_answers_a_request(tmp_path: Path) -> None:
     """§2.2: rgb/<id> and alpha/<id> for every item, and the SHA-256 of the request's bytes."""
     scene, checkpoint = _trained(tmp_path)
-    request = _request(tmp_path / "req.json", _test_items(scene))
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
     out = tmp_path / "out" / "renders.safetensors"
     assert (
         _ftgs("render", checkpoint, "--request", request, "--out", out, "--backend", "reference")
@@ -492,19 +529,25 @@ def test_render_answers_a_request(tmp_path: Path) -> None:
 def test_render_refuses_invalid_requests_and_the_default_backend_without_cuda(
     tmp_path: Path,
 ) -> None:
-    """Q-125: gsplat (the default) without CUDA is exit 2; so are a request in another time unit
-    and a request that fails §2.2's schema."""
+    """Q-125: gsplat (the default) without CUDA is exit 2; so are a request in another time
+    unit, one that fails §2.2's schema, a missing one and one above the model's SH degree."""
     scene, checkpoint = _trained(tmp_path)
-    request = _request(tmp_path / "req.json", _test_items(scene))
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
     out = tmp_path / "r.safetensors"
     assert _ftgs("render", checkpoint, "--request", request, "--out", out) == 2
-    frames = _request(tmp_path / "frames.json", _test_items(scene), unit="frame")
+    frames = write_render_request(tmp_path / "frames.json", _test_items(scene), unit="frame")
     ref = ("--backend", "reference")
     assert _ftgs("render", checkpoint, "--request", frames, "--out", out, *ref) == 2
     broken = tmp_path / "broken.json"
     broken.write_text('{"format": "ftgs-render-request", "version": 1}')
     assert _ftgs("render", checkpoint, "--request", broken, "--out", out, *ref) == 2
     assert _ftgs("render", checkpoint, "--request", tmp_path / "none.json", "--out", out, *ref) == 2
+    above = json.loads(request.read_text())
+    above["sh_degree"] = 3  # the model is of degree 1
+    (tmp_path / "above.json").write_text(json.dumps(above))
+    assert (
+        _ftgs("render", checkpoint, "--request", tmp_path / "above.json", "--out", out, *ref) == 2
+    )
     assert not out.exists()
 
 
@@ -515,7 +558,7 @@ def test_renders_that_are_not_finite_are_exit_code_3(
     import openftgs.render
 
     scene, checkpoint = _trained(tmp_path)
-    request = _request(tmp_path / "req.json", _test_items(scene))
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
     original = openftgs.render.render_request
 
     def nan(*args: Any, **kwargs: Any) -> Any:
@@ -536,7 +579,7 @@ def test_renders_that_are_not_finite_are_exit_code_3(
 def test_render_with_gsplat(tmp_path: Path) -> None:
     """§2.1: the default backend on a CUDA device, close to the reference backend's renders."""
     scene, checkpoint = _trained(tmp_path)
-    request = _request(tmp_path / "req.json", _test_items(scene))
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
     gsplat, reference = tmp_path / "g.safetensors", tmp_path / "r.safetensors"
     assert _ftgs("render", checkpoint, "--request", request, "--out", gsplat) == 0
     assert (
@@ -547,7 +590,7 @@ def test_render_with_gsplat(tmp_path: Path) -> None:
     )
     a, b = read_renders(gsplat), read_renders(reference)
     for key in a.rgb:
-        torch.testing.assert_close(a.rgb[key], b.rgb[key], rtol=0.0, atol=2e-3)
+        torch.testing.assert_close(a.rgb[key], b.rgb[key], rtol=0.0, atol=1e-4)  # U-7
 
 
 # ftgs export (§2.1; Q-141) and U-22's rejections with exit code 2.
@@ -568,6 +611,8 @@ def test_export_writes_a_valid_exchange_model_with_the_runs_background(tmp_path:
 
 
 def test_export_needs_a_checkpoint_directory(tmp_path: Path) -> None:
+    """§2.1: ftgs export reads a checkpoint directory; an exchange model or a missing path is
+    exit 2."""
     _, checkpoint = _trained(tmp_path)
     exchange = tmp_path / "m.safetensors"
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
@@ -587,7 +632,7 @@ def test_u22_an_opacity_logit_of_20_exports_and_validates(tmp_path: Path) -> Non
     out = tmp_path / "m.safetensors"
     assert _ftgs("export", saturated, "--format", "ftgs-if", "--out", out) == 0
     opacity = read_exchange(out).arrays["opacity"]
-    assert opacity[0] == torch.tensor(1.0 - 1e-7, dtype=torch.float32)
+    assert torch.equal(opacity[0], torch.tensor(1.0 - 1e-7, dtype=torch.float32))
 
 
 @pytest.mark.parametrize("case", BAD_EXCHANGE_CASES)
@@ -598,21 +643,21 @@ def test_u22_invalid_exchange_models_are_exit_code_2(tmp_path: Path, case: str) 
     arrays, meta = bad_exchange(case)
     bad = tmp_path / "bad.safetensors"
     save_file(arrays, str(bad), metadata=meta)
-    request = _request(tmp_path / "req.json", _test_items(scene))
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
     out = tmp_path / "out.safetensors"
     assert _ftgs("render", bad, "--request", request, "--out", out, "--backend", "reference") == 2
     assert _ftgs("eval", bad, scene, "--out", tmp_path / "m.json") == 2
     assert not out.exists() and not (tmp_path / "m.json").exists()
 
 
-def test_u22_a_corrupted_checkpoint_is_exit_code_2(tmp_path: Path) -> None:
+def test_a_corrupted_checkpoint_is_exit_code_2(tmp_path: Path) -> None:
     """§2.2, Q-25: a checkpoint whose file no longer matches its SHA-256 is exit code 2."""
     scene, checkpoint = _trained(tmp_path)
     params = checkpoint / "params.safetensors"
     data = bytearray(params.read_bytes())
     data[-1] ^= 0xFF
     params.write_bytes(bytes(data))
-    request = _request(tmp_path / "req.json", _test_items(scene))
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
     out = tmp_path / "out.safetensors"
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", out) == 2
     assert (
@@ -650,7 +695,7 @@ def test_u26_cli_round_trips_for_each_sh_degree(tmp_path: Path, sh_degree: int) 
     assert written.sh_degree == sh_degree
     assert written.arrays["sh"].shape[1] == (sh_degree + 1) ** 2
     assert all(torch.equal(written.arrays[k], expected.arrays[k]) for k in expected.arrays)
-    request = _request(tmp_path / "req.json", _test_items(scene))
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
     ref = ("--backend", "reference")
     a, b = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
     assert _ftgs("render", checkpoint, "--request", request, "--out", a, *ref) == 0
@@ -671,7 +716,7 @@ def _body(report: dict[str, Any]) -> dict[str, Any]:
 def _renders_dir(tmp_path: Path, checkpoint: Path, items: list[tuple[str, float, Any]]) -> Path:
     """DIR of Q-137: request.json and its renders by the reference backend."""
     directory = tmp_path / "supplied"
-    request = _request(directory / "request.json", items)
+    request = write_render_request(directory / "request.json", items)
     out = directory / "renders.safetensors"
     assert (
         _ftgs("render", checkpoint, "--request", request, "--out", out, "--backend", "reference")
@@ -714,7 +759,9 @@ def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) ->
     trainer = Trainer.from_checkpoint(checkpoint, MultiViewVideo.from_manifest(scene), device="cpu")
     trainer.evaluate(out_dir=tmp_path / "trainer")
     want = json.loads((tmp_path / "trainer" / "METRICS.json").read_text())
-    assert _body(json.loads(out.read_text())) == _body(want)
+    got = json.loads(out.read_text())
+    assert _body(got) == _body(want)
+    assert set(got) == set(want) and set(got["model"]) == set(want["model"])  # Q-136
 
 
 @pytest.mark.weights
@@ -734,21 +781,40 @@ def test_eval_scores_supplied_renders_as_its_own(tmp_path: Path) -> None:
 
 
 def test_eval_refuses_supplied_renders_that_do_not_match_the_split(tmp_path: Path) -> None:
-    """Q-137: a renders file made for another request, a request missing a test image, and two
-    items matching one image are exit 2, before any weights are needed."""
+    """Q-137: a renders file made for another request, a request missing a test image, two items
+    matching one image, a renders file missing a matched item or holding it at another size, and
+    a missing DIR are exit 2, before any weights are needed."""
     scene, checkpoint = _trained(tmp_path)
     items = _test_items(scene)
     out = tmp_path / "m.json"
     stale = _renders_dir(tmp_path / "stale", checkpoint, items)
-    _request(stale / "request.json", items[::-1])  # the renders were made for the first one
+    write_render_request(
+        stale / "request.json", items[::-1]
+    )  # the renders were made for the first one
     missing = _renders_dir(tmp_path / "missing", checkpoint, items[:2])
     twice = _renders_dir(tmp_path / "twice", checkpoint, [*items, ("again", *items[0][1:])])
-    for directory in (stale, missing, twice, tmp_path / "absent"):
+    # Files another implementation could write: the right request hash, a render missing or of
+    # another size.
+    lacking = _renders_dir(tmp_path / "lacking", checkpoint, items)
+    small = _renders_dir(tmp_path / "small", checkpoint, items)
+    for directory, edit in ((lacking, "drop"), (small, "shrink")):
+        path = directory / "renders.safetensors"
+        sha = hashlib.sha256((directory / "request.json").read_bytes()).hexdigest()
+        renders = read_renders(path, request_sha256=sha)
+        if edit == "drop":
+            del renders.rgb["t9"], renders.alpha["t9"]
+        else:
+            renders.rgb["t9"] = renders.rgb["t9"][:-1].contiguous()
+            renders.alpha["t9"] = renders.alpha["t9"][:-1].contiguous()
+        write_renders(renders, path, producer="another", request_sha256=sha)
+    for directory in (stale, missing, twice, lacking, small, tmp_path / "absent"):
         assert _ftgs("eval", checkpoint, scene, "--out", out, "--renders-dir", directory) == 2
     assert not out.exists()
 
 
-def test_eval_refuses_a_partial_mask_set_and_an_empty_split(tmp_path: Path) -> None:
+def test_eval_refuses_a_partial_mask_set_and_an_empty_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Q-135 (#83): masks on some test images but not all is exit 2, naming the missing one; a
     split with no image is exit 2; both before the evaluator is built."""
     scene, checkpoint = _trained(tmp_path, masks=True)
@@ -757,7 +823,9 @@ def test_eval_refuses_a_partial_mask_set_and_an_empty_split(tmp_path: Path) -> N
     del tests[1]["mask"]
     scene.write_text(json.dumps(data))
     out = tmp_path / "m.json"
+    capsys.readouterr()
     assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert tests[1]["path"] in capsys.readouterr().err
     data["images"] = [e for e in data["images"] if e["split"] == "train"]
     scene.write_text(json.dumps(data))
     assert _ftgs("eval", checkpoint, scene, "--split", "test", "--out", out) == 2
@@ -790,6 +858,7 @@ def test_cache_builds_the_frame_cache(run: dict[str, Path], tmp_path: Path) -> N
 
 @pytest.mark.gpu
 def test_cache_opens_on_the_gpu(run: dict[str, Path]) -> None:
+    """Q-127: --placement gpu opens the cache in GPU memory when it fits."""
     assert _ftgs("cache", run["scene"], "--placement", "gpu") == 0
 
 

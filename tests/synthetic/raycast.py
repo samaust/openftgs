@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from builders import look_at
 from PIL import Image
-from synthetic_scenes import fibonacci_sphere, smallest_spacing
+from synthetic_scenes import fibonacci_sphere
 
 from openftgs.init import knn_velocities
 from openftgs.io import write_scene_manifest
@@ -282,7 +282,3 @@ def surface_samples(
         velocities=torch.cat(velocities),
         frame_ids=torch.arange(FRAMES).repeat_interleave(per_frame),
     )
-
-
-def lattice_spacing(per_sphere: int) -> float:
-    return RADIUS * smallest_spacing(fibonacci_sphere(per_sphere))
