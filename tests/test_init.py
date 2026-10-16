@@ -246,9 +246,12 @@ def _project(P: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     return h[..., :2] / h[..., 2:]
 
 
-def _max_relative_error(got: torch.Tensor, want: torch.Tensor) -> float:
-    err = torch.linalg.vector_norm(got - want, dim=-1) / torch.linalg.vector_norm(want, dim=-1)
-    return float(err.max())
+def _dlt_atol(X: torch.Tensor) -> float:
+    """The atol that goes with U-19's rtol = 1e-6 for the points X."""
+    # U-19's 1e-6 is relative to a point, not to each of its coordinates: `_scene` puts
+    # coordinates near 0, where rtol alone would allow an error far below 1e-6 of the
+    # point's size. So atol is 1e-6 of the largest distance of a point from the origin.
+    return 1e-6 * float(torch.linalg.vector_norm(X, dim=-1).max())
 
 
 def _scene(n: int, seed: int) -> torch.Tensor:
@@ -267,7 +270,7 @@ def test_u19_noise_free_dlt_recovers_the_points(device: str) -> None:
     assert got.dtype == torch.float64
     assert got.shape == (2000, 3)
     assert got.device.type == device
-    assert _max_relative_error(got.cpu(), X) <= 1e-6
+    torch.testing.assert_close(got.cpu(), X, rtol=1e-6, atol=_dlt_atol(X))
 
 
 def test_u19_noise_free_dlt_broadcasts_the_cameras() -> None:
@@ -278,7 +281,7 @@ def test_u19_noise_free_dlt_broadcasts_the_cameras() -> None:
     P2 = _look_at([1.5, -0.1, -4.5])
     got = triangulate_dlt(_project(P1, X), _project(P2, X), P1, P2)
     assert got.shape == (2, 50, 3)
-    assert _max_relative_error(got, X) <= 1e-6
+    torch.testing.assert_close(got, X, rtol=1e-6, atol=_dlt_atol(X))
 
     rows = X[0, :6]
     centers = [[-1.0, 0.2, -5.0], [0.3, -2.0, -4.0], [4.0, 0.5, -3.0]]
@@ -286,7 +289,7 @@ def test_u19_noise_free_dlt_broadcasts_the_cameras() -> None:
     P2 = torch.stack([_look_at(centers[(i + 1) % 3]) for i in range(6)])
     got = triangulate_dlt(_project(P1, rows), _project(P2, rows), P1, P2)
     assert got.shape == (6, 3)
-    assert _max_relative_error(got, rows) <= 1e-6
+    torch.testing.assert_close(got, rows, rtol=1e-6, atol=_dlt_atol(rows))
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -303,7 +306,8 @@ def test_dlt_rows_with_a_non_finite_input_come_out_nan(device: str, bad: float) 
     broken = torch.zeros(64, dtype=torch.bool)
     broken[[3, 40]] = True
     assert torch.isnan(got[broken]).all()
-    assert _max_relative_error(got[~broken], X[~broken]) <= 1e-6
+    kept = X[~broken]
+    torch.testing.assert_close(got[~broken], kept, rtol=1e-6, atol=_dlt_atol(kept))
 
 
 @pytest.mark.parametrize("device", _DEVICES)
