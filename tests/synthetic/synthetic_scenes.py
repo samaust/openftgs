@@ -176,7 +176,14 @@ def sh_of(color: Tensor) -> Tensor:
     return ((color - 0.5) / C0).reshape(-1, 1, 3)
 
 
-def exchange(arrays: dict[str, Tensor], *, tau0: float, tau1: float, degree: int) -> ExchangeModel:
+def exchange(
+    arrays: dict[str, Tensor],
+    *,
+    tau0: float,
+    tau1: float,
+    degree: int,
+    producer: str = "openftgs tests (M11 ground truth)",
+) -> ExchangeModel:
     """ftgs-if contents in the dtypes §2.2 fixes, from float64 arrays."""
     dtypes = {"time_center": F64, "duration": F64}
     return ExchangeModel(
@@ -185,7 +192,7 @@ def exchange(arrays: dict[str, Tensor], *, tau0: float, tau1: float, degree: int
         tau0=tau0,
         tau1=tau1,
         time_unit="s",
-        producer="openftgs tests (M11 ground truth)",
+        producer=producer,
     )
 
 
@@ -294,6 +301,94 @@ def _gt_s3(seed: int) -> ExchangeModel:
     return exchange(arrays, tau0=0.0, tau1=span, degree=0)
 
 
+# S-4 (Q-119): three spheres translating linearly over 10 frames, on the hemisphere rig. §3.2's
+# precondition, a displacement per frame below half the sampling spacing, binds the init
+# lattice: 14 points per sphere leave a spacing of about 0.08, so a step of up to 0.025
+# (about 1.5 px at the rig's focal length) stays below 0.63 of half of it.
+S4_FRAMES = 10
+S4_RADIUS = 0.1  # about 12 px across at the hemisphere rig's focal length and radius
+S4_GT_POINTS = 80  # ground-truth Gaussians per sphere, on a Fibonacci lattice
+S4_GT_SCALE = 0.45  # their isotropic scale, × the lattice's smallest spacing (about 1 px)
+S4_GT_OPACITY = 0.9
+S4_GT_DURATION = 10.0  # long durations (S-1's s = 10): present at every frame
+S4_INIT_POINTS = 14  # init points per sphere and frame, on a rotated, jittered lattice
+S4_INIT_JITTER = 0.05  # the largest jitter of an init point, × the lattice's smallest spacing
+S4_STEP = (0.018, 0.025)  # displacement per frame (|v|/30 per τ), in world units
+S4_CENTER_RADIUS = 0.2  # sphere centers at the middle time within this of the origin
+S4_CLEARANCE = 0.06  # surfaces this far apart at every frame: more than twice the largest step,
+# so a sphere's points can't find their k-NN partner on another sphere
+
+
+def fibonacci_sphere(n: int) -> Tensor:
+    """n points [n, 3] of the Fibonacci lattice on the unit sphere, in float64: z_i = 1 −
+    (2i + 1)/n and azimuth i·π(3 − √5) (the golden angle)."""
+    i = torch.arange(n, dtype=F64)
+    z = 1.0 - (2.0 * i + 1.0) / n
+    r = torch.sqrt(1.0 - z * z)
+    azimuth = i * math.pi * (3.0 - math.sqrt(5.0))
+    return torch.stack([r * torch.cos(azimuth), r * torch.sin(azimuth), z], dim=1)
+
+
+def smallest_spacing(points: Tensor) -> float:
+    """The smallest distance between two of `points` [n, 3] (n ≥ 2), in float64."""
+    d = torch.cdist(points.to(F64), points.to(F64))
+    d.fill_diagonal_(math.inf)
+    return float(d.min())
+
+
+def _gt_s4(seed: int) -> ExchangeModel:
+    """S-4 (Q-119): three spheres of radius S4_RADIUS translating linearly, each S4_GT_POINTS
+    Gaussians on a Fibonacci lattice that share its velocity, with isotropic scales, opacity
+    0.9, long durations, time centers at the middle frame and uniform random colors in
+    [0.2, 0.9] (a texture that shows the motion). A sphere's center at the middle time lies
+    within S4_CENTER_RADIUS of the origin and its step per frame is uniform in S4_STEP, in a
+    uniform random direction; each is drawn again until its surface stays in view of every
+    hemisphere camera at every frame and S4_CLEARANCE from the others'. Rows are sphere by
+    sphere, S4_GT_POINTS each."""
+    g = torch.Generator().manual_seed(seed)
+    taus = frame_taus(S4_FRAMES)
+    span = tau(S4_FRAMES - 1)
+    middle = span / 2
+    rig = hemisphere_rig()
+    cameras = rig.train + rig.test
+    unit = fibonacci_sphere(S4_GT_POINTS)
+    centers: list[Tensor] = []
+    velocities: list[Tensor] = []
+    tracks: list[Tensor] = []
+    while len(centers) < 3:
+        center = _uniform(g, -S4_CENTER_RADIUS, S4_CENTER_RADIUS, 3)
+        direction = torch.randn(3, generator=g, dtype=F64)
+        direction = direction / torch.linalg.vector_norm(direction)
+        velocity = direction * _uniform(g, *S4_STEP, 1) * FPS  # world units per τ
+        if float(torch.linalg.vector_norm(center)) > S4_CENTER_RADIUS:
+            continue
+        track = center + velocity * (taus[:, None] - middle)  # [frames, 3]
+        surface = (track[:, None, :] + S4_RADIUS * unit).reshape(-1, 3)
+        if not in_view(cameras, surface):
+            continue
+        apart = 2.0 * S4_RADIUS + S4_CLEARANCE
+        if any(float(torch.linalg.vector_norm(track - t, dim=1).min()) < apart for t in tracks):
+            continue
+        centers.append(center)
+        velocities.append(velocity)
+        tracks.append(track)
+    n = 3 * S4_GT_POINTS
+    scale = S4_GT_SCALE * S4_RADIUS * smallest_spacing(unit)
+    arrays = {
+        "position": torch.cat([c + S4_RADIUS * unit for c in centers]),
+        "time_center": torch.full((n,), middle, dtype=F64),
+        "duration": torch.full((n,), S4_GT_DURATION * span, dtype=F64),
+        "velocity": torch.cat([v.expand(S4_GT_POINTS, 3) for v in velocities]),
+        "scale": torch.full((n, 3), scale, dtype=F64),
+        "rotation": torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=F64).repeat(n, 1),
+        "opacity": torch.full((n,), S4_GT_OPACITY, dtype=F64),
+        "sh": sh_of(_uniform(g, 0.2, 0.9, n, 3)),
+    }
+    return exchange(
+        arrays, tau0=0.0, tau1=span, degree=0, producer="openftgs tests (M13 ground truth)"
+    )
+
+
 CLUTTER_COUNT = 2_000
 CLUTTER_SCALES = (0.005, 0.015)  # Q-78: smaller than the objects', the "small" Gaussians
 CLUTTER_OPACITY = (0.3, 0.99)  # Q-78: up to about 1, so an unregularized fit can saturate
@@ -355,20 +450,22 @@ GROUND_TRUTH_FILES = {
     "s1": "s1_gt.safetensors",
     "s2": "s2_gt.safetensors",
     "s3": "s3_gt.safetensors",
+    "s4": "s4_gt.safetensors",
     "s5": "s5_gt.safetensors",
     "s6": "s6_gt.safetensors",
 }
 
 
 def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, ExchangeModel]:
-    """The ground truth of S-1, S-2, S-3, S-5 and S-6 from the committed seeds: S-5's is S-2's 8
-    Gaussians (its first rows) followed by 2,000 small ones (Q-78); S-6's is S-2's objects as
-    clusters of three (Q-83); S-7 and S-8 reuse S-2's."""
+    """The ground truth of S-1 to S-6 from the committed seeds: S-4's is three spheres of
+    Gaussians (Q-119); S-5's is S-2's 8 Gaussians (its first rows) followed by 2,000 small ones
+    (Q-78); S-6's is S-2's objects as clusters of three (Q-83); S-7 and S-8 reuse S-2's."""
     s2 = _gt_s2(seeds["s2"]["ground_truth"])
     return {
         "s1": _gt_s1(seeds["s1"]["ground_truth"]),
         "s2": s2,
         "s3": _gt_s3(seeds["s3"]["ground_truth"]),
+        "s4": _gt_s4(seeds["s4"]["ground_truth"]),
         "s5": concatenated(s2, _gt_clutter(seeds["s5"]["clutter"], s2)),
         "s6": _gt_s6(seeds["s6"]["ground_truth"], s2),
     }
