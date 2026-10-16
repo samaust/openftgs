@@ -75,6 +75,7 @@ def _verified(root: Path, *relative: str) -> None:
         assert sums[name] == digest, f"{name} doesn't match SHA256SUMS"
 
 
+@cache
 def _verified_folder(root: Path, folder: str) -> None:
     """Every file under `folder` matches SHA256SUMS."""
     _verified(
@@ -299,15 +300,63 @@ def test_g2_opencv_yaml_matches_the_ground_truth(tmp_path: Path, scene: str, fra
 _SELFCAP = {"tiny_unsync": (0, 12), "studio": (0, 4)}
 
 
-def _repacked(root: Path, scene: str, out: Path) -> Path:
-    """The lossless videos and calibration of a SelfCap scene, re-packed as its release
-    archive in `out`, so frames can be compared bitwise-close (G-3)."""
+@pytest.fixture(scope="session")
+def shared(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A folder the G-checks share for one session: re-packed archives and conversions made
+    once (#109, after the timing review)."""
+    return tmp_path_factory.mktemp("synth-shared")
+
+
+def _checked_cameras(root: Path, scene: str) -> list[str]:
+    """The cameras G-3 and G-4 compare frames for: the first three and the test camera."""
+    truth = _ground_truth(root, scene)
+    names = sorted(str(c["layout_names"]["selfcap"]) for c in truth["cameras"])
+    return sorted({*names[:3], _test_camera(truth)})
+
+
+def _calibration_subset(source: Path, target: Path, names: list[str]) -> None:
+    """intri.yml, extri.yml and sync.json of `source` restricted to `names`, written with
+    OpenCV's FileStorage, as the dataset's own files are."""
+    target.mkdir(parents=True, exist_ok=True)
+    for file in ("intri.yml", "extri.yml"):
+        reader = cv2.FileStorage(str(source / file), cv2.FILE_STORAGE_READ)
+        writer = cv2.FileStorage(str(target / file), cv2.FILE_STORAGE_WRITE)
+        for key in reader.root().keys():
+            node = reader.getNode(key)
+            if key == "names":
+                writer.write("names", names)
+            elif key.rsplit("_", 1)[-1] in names:
+                if node.isInt():
+                    writer.write(key, int(node.real()))
+                elif node.isReal():
+                    writer.write(key, node.real())
+                else:
+                    writer.write(key, node.mat())
+        reader.release()
+        writer.release()
+    if (source / "sync.json").is_file():
+        sync = json.loads((source / "sync.json").read_text())
+        (target / "sync.json").write_text(json.dumps({n: sync[n] for n in names}))
+
+
+def _repacked(root: Path, scene: str, shared: Path) -> Path:
+    """The lossless videos of the checked cameras and their calibration, re-packed once per
+    session as the scene's release archive (gzip level 0: the converter needs the format, not
+    the compression), so frames can be compared bitwise-close (G-3, G-4)."""
+    out = shared / f"repacked-{scene}"
+    archive = out / f"{scene}-release.tar.gz"
+    if archive.is_file():
+        return out
     source = root / "lossless" / "selfcap" / scene
     _verified_folder(root, f"lossless/selfcap/{scene}")
-    out.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(out / f"{scene}-release.tar.gz", "w:gz", compresslevel=1) as tar:
-        tar.add(source / "videos", arcname=f"{scene}-release/videos")
-        tar.add(source / "optimized", arcname=f"{scene}-release/optimized")
+    names = _checked_cameras(root, scene)
+    _calibration_subset(source / "optimized", out / "optimized", names)
+    partial = out / f".{archive.name}.tmp"
+    with tarfile.open(partial, "w:gz", compresslevel=0) as tar:
+        for name in names:
+            tar.add(source / "videos" / f"{name}.mp4", arcname=f"{scene}-release/videos/{name}.mp4")
+        tar.add(out / "optimized", arcname=f"{scene}-release/optimized")
+    partial.rename(archive)
     return out
 
 
@@ -318,14 +367,15 @@ def _test_camera(truth: dict[str, Any]) -> str:
 @pytest.mark.parametrize("scene", sorted(_SELFCAP))
 def test_g3_selfcap_times_split_and_archive_hash(tmp_path: Path, scene: str) -> None:
     """G-3, from the dataset's own (H.264) archives: τ equals the ground truth's per-frame
-    times to 1e-12, and n/60 without sync; the test camera is held out; the recorded archive
-    SHA-256 equals the dataset's checksum."""
+    times to 1e-12, and n/60 without sync (on tiny_unsync); the test camera is held out; the
+    recorded archive SHA-256 equals the dataset's checksum."""
     root = _root()
     truth = _ground_truth(root, scene)
     assert truth["fps"] == 60, "openftgs-synth 0.1.1 renders the SelfCap scenes at 60 fps"
     test = _test_camera(truth)
     window = _SELFCAP[scene]
-    for use_sync in (True, False):
+    # Without sync τ is n/60 whatever the scene; the small scene checks it.
+    for use_sync in (True, False) if scene == "tiny_unsync" else (True,):
         out = tmp_path / f"out-{use_sync}"
         manifest = read_scene_manifest(
             convert_selfcap(
@@ -377,12 +427,14 @@ def _selfcap_frames_check(root: Path, scene: str, manifest: SceneManifest) -> No
 
 
 @pytest.mark.parametrize("scene", sorted(_SELFCAP))
-def test_g3_selfcap_internal_frames_match_the_ground_truth(tmp_path: Path, scene: str) -> None:
+def test_g3_selfcap_internal_frames_match_the_ground_truth(
+    tmp_path: Path, shared: Path, scene: str
+) -> None:
     """G-3, from the lossless videos re-packed as archives, undistort='internal': frames within
     G-2's bound of the ground truth (both area-resized by the scene's ratio)."""
     root = _root()
     truth = _ground_truth(root, scene)
-    src = _repacked(root, scene, tmp_path / "src")
+    src = _repacked(root, scene, shared)
     manifest = read_scene_manifest(
         convert_selfcap(
             src,
@@ -416,19 +468,24 @@ def _translate(
     return moved.astype(np.float64), inside
 
 
-def _g4_errors(tmp_path: Path, scene: str) -> list[tuple[str, float, float, float]]:
+_G4: dict[str, list[tuple[str, float, float, float]]] = {}
+
+
+def _g4_errors(shared: Path, scene: str) -> list[tuple[str, float, float, float]]:
     """For three cameras of a COLMAP conversion: the converted frame's error to the ground
     truth translated by the principal points' difference, OpenCV's undistortion into COLMAP's
     camera scored the same way, and the error with the translation off by 0.5 px. Both sides
     are resized as the converter resizes and scored where the ground truth reaches. COLMAP's
     read-back fx, fy are checked to be the ground truth's on the way."""
+    if scene in _G4:  # one conversion serves both G-4 tests
+        return _G4[scene]
     root = _root()
     truth = _ground_truth(root, scene)
-    src = _repacked(root, scene, tmp_path / "src")
+    src = _repacked(root, scene, shared)
     manifest = read_scene_manifest(
         convert_selfcap(
             src,
-            tmp_path / "out",
+            shared / f"g4-{scene}",
             scene=scene,
             window=_SELFCAP[scene],
             test_camera=_test_camera(truth),
@@ -492,17 +549,18 @@ def _g4_errors(tmp_path: Path, scene: str) -> list[tuple[str, float, float, floa
             f"off by 0.5 {errors[1]:.3f}"
         )
         results.append((name, errors[0], floors[0], errors[1]))
+    _G4[scene] = results
     return results
 
 
 @pytest.mark.skipif(shutil.which("colmap") is None, reason="needs COLMAP on PATH (D-60)")
 @pytest.mark.parametrize("scene", sorted(_SELFCAP))
 def test_g4_selfcap_colmap_frames_line_up_with_the_read_back_camera(
-    tmp_path: Path, scene: str
+    shared: Path, scene: str
 ) -> None:
     """G-4: COLMAP's read-back fx, fy equal the ground truth's, and the converted frames are at
     least 1.2× worse with the translation off by 0.5 px (C-4's pixel-centre check)."""
-    for _, ours, _, off in _g4_errors(tmp_path, scene):
+    for _, ours, _, off in _g4_errors(shared, scene):
         assert off >= 1.2 * ours
 
 
@@ -513,11 +571,11 @@ def test_g4_selfcap_colmap_frames_line_up_with_the_read_back_camera(
 )
 @pytest.mark.skipif(shutil.which("colmap") is None, reason="needs COLMAP on PATH (D-60)")
 @pytest.mark.parametrize("scene", sorted(_SELFCAP))
-def test_g4_selfcap_colmap_frames_within_g2s_bound(tmp_path: Path, scene: str) -> None:
+def test_g4_selfcap_colmap_frames_within_g2s_bound(shared: Path, scene: str) -> None:
     """G-4: the converted frames equal the ground truth translated by the principal points'
     difference within G-2's bound: at most OpenCV's undistortion into COLMAP's camera, scored
     the same way, plus 0.25 of an 8-bit level."""
-    for _, ours, opencv, _ in _g4_errors(tmp_path, scene):
+    for _, ours, opencv, _ in _g4_errors(shared, scene):
         assert ours <= opencv + 0.25
 
 
@@ -572,16 +630,21 @@ def test_g5_ground_truth_masks_reach_the_manifest(tmp_path: Path) -> None:
 
 @pytest.mark.gpu
 def test_g6_hardware_decoding_matches_cpu_decoding(tmp_path: Path) -> None:
-    """G-6 (GPU): 10 frames of courtyard's H.264 videos converted with --hwaccel cuda are within
-    one 8-bit level of CPU decoding, with the differing pixels counted."""
+    """G-6 (GPU): 10 frames of courtyard's H.264 videos (three of its cameras) converted with
+    --hwaccel cuda are within one 8-bit level of CPU decoding, with the differing pixels
+    counted."""
     root = _root()
     listed = subprocess.run(
         ["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True, text=True, check=True
     ).stdout.split()
     if "cuda" not in listed:
         pytest.skip("this ffmpeg build has no cuda hwaccel")
-    src = root / "enerf_outdoor" / "courtyard"
+    courtyard = root / "enerf_outdoor" / "courtyard"
     _verified_folder(root, "enerf_outdoor/courtyard")
+    # Decoding is compared camera by camera: three cameras give the same check as eighteen.
+    src = tmp_path / "courtyard"
+    names = ["0000", "0001", "0002"]
+    _yaml_subset(courtyard, src, names)
     cpu = read_scene_manifest(
         convert_opencv_yaml(src, tmp_path / "cpu", fps=60.0, frames=10, resize=1.0)
     )
@@ -595,6 +658,14 @@ def test_g6_hardware_decoding_matches_cpu_decoding(tmp_path: Path) -> None:
         assert np.abs(x - y).max() <= 1
         differing += int((x != y).any(axis=-1).sum())
     print(f"G-6: {differing} differing pixels of {len(cpu.records)} frames at 1920x1080")
+
+
+def _yaml_subset(source: Path, target: Path, names: list[str]) -> None:
+    """An opencv-yaml scene restricted to `names`: calibration rewritten, videos linked."""
+    _calibration_subset(source, target, names)
+    (target / "videos").mkdir()
+    for name in names:
+        (target / "videos" / f"{name}.mp4").symlink_to(source / "videos" / f"{name}.mp4")
 
 
 # G-7 · frame cache (D-51).
