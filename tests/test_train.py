@@ -1009,16 +1009,43 @@ def test_sampler_peek_matches_the_next_draws() -> None:
 
 def test_auto_placement_falls_back_when_no_cache_can_be_made(tmp_path: Path) -> None:
     """Q-99: when the cache directory can't be created, "auto" decodes PNGs with a warning,
-    and an explicit placement raises."""
+    and an explicit placement is a ValueError (Q-26)."""
     video = _scene(tmp_path / "scene")
     (tmp_path / "scene" / ".ftgs-cache").write_text("not a directory")
     with pytest.warns(UserWarning, match="frame cache"):
         trainer = Trainer(_no_perceptual(), video, _init_points(), device="cpu")
     trainer.step()
-    with pytest.raises(OSError):
+    with pytest.raises(ValueError, match="frame cache"):
         Trainer(
             _no_perceptual(perf=PerfConfig(frame_cache="mmap")), video, _init_points(), device="cpu"
         )
+
+
+def test_prefetcher_follows_the_samplers_order(tmp_path: Path) -> None:
+    """Q-72 note 3, Q-99: across epochs and a resume, every image comes from the prefetch
+    queue, scheduled at construction and after each take, so the prefetcher reads in the
+    sampler's order."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    trainer = _u21_trainer(video, _with_cache(ONE_EVENT, "mmap"))
+    _run(trainer, 40)  # 12 images an epoch: three epoch boundaries
+    assert trainer._frames is not None and trainer._frames._misses == 0
+    resumed = _u21_trainer(video, _with_cache(ONE_EVENT, "mmap"))
+    resumed.load_state_dict(trainer.state_dict())
+    _run(resumed, 60)
+    assert resumed._frames is not None and resumed._frames._misses == 0
+
+
+@pytest.mark.gpu
+def test_cuda_auto_placement_falls_back_after_the_first_iteration(tmp_path: Path) -> None:
+    """Q-99: on CUDA "auto" decides after the first iteration; a cache directory that can't be
+    created then gives a warning and PNG decoding, not an error."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    (tmp_path / "scene" / ".ftgs-cache").write_text("not a directory")
+    trainer = Trainer(_with_cache(ONE_EVENT, "auto"), video, _u21_model(video), device="cuda")
+    with pytest.warns(UserWarning, match="frame cache"):
+        trainer.step()
+    assert trainer._frames is None
+    trainer.step()
 
 
 @pytest.mark.gpu

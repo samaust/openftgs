@@ -13,6 +13,7 @@ import json
 import math
 import random
 import warnings
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -312,11 +313,11 @@ def _check_perf(perf: PerfConfig) -> None:
         raise NotImplementedError("images_per_step > 1 (D-54) comes with M15")
 
 
-def _bytes_per_row(sh_degree: int) -> int:
-    """Q-99: the bytes a primitive row takes during training: its floats (§1.1's nine tensors at
-    this SH degree) for the parameter, its gradient and Adam's two moments, plus the gradient
+def _bytes_per_row(model: FreeTimeGaussians) -> int:
+    """Q-99: the bytes a primitive row takes during training: its floats in the nine stored
+    tensors (§1.1) for the parameter, its gradient and Adam's two moments, plus the gradient
     statistics' two floats, all float32."""
-    floats = 3 + 1 + 1 + 3 + 3 + 4 + 1 + 3 + 3 * ((sh_degree + 1) ** 2 - 1)
+    floats = sum(tensor[0].numel() for tensor in _stored_tensors(model).values())
     return 4 * (4 * floats + 2)
 
 
@@ -505,38 +506,42 @@ class Trainer:
         self._window_count = 0
         self._schedule()  # Q-99: a restored sampler gets its own queue
 
-    def _open_frame_cache(self, placement: str) -> None:
+    def _open_frame_cache(self, placement: str, *, automatic: bool = False) -> None:
         """D-51, Q-99: "off" decodes PNGs; "gpu" and "mmap" open the cache now; "auto" is mmap on
         a CPU device and, on CUDA, decided after the first iteration. A cache directory that
-        can't be made turns "auto" into "off" with a warning, and an explicit placement raises."""
+        can't be made turns "auto" into "off" with a warning, and is a ValueError for an
+        explicit placement (Q-26)."""
         if placement == "off":
             return
         if placement == "auto" and self._device.type == "cuda":
             self._placement_pending = True
             return
+        automatic = automatic or placement == "auto"
         chosen: Literal["gpu", "mmap"] = "gpu" if placement == "gpu" else "mmap"
         try:
             cache = FrameCache.open(self._dataset, placement=chosen, device=self._device)
         except OSError as err:
-            if placement != "auto":
-                raise
+            if not automatic:
+                raise ValueError(f"the frame cache can't be made: {err}") from None
             warnings.warn(
                 f"no frame cache, decoding PNGs instead: {err}", UserWarning, stacklevel=3
             )
             return
         depth = 0 if chosen == "gpu" else self._cfg.perf.prefetch
         self._frames = Prefetcher(cache, device=self._device, depth=depth)
+        weakref.finalize(self, self._frames.close)  # the reader thread ends with the trainer
 
     def _choose_placement(self) -> None:
         """Q-99: after the first CUDA iteration, the cache goes to GPU memory when it fits in half
-        of what is free once growth to N_max is reserved, and is memory-mapped otherwise."""
+        the free memory minus what growth to N_max will add (D-51), and is memory-mapped
+        otherwise; a cache that can't be made falls back to PNGs with a warning."""
         self._placement_pending = False
         free, _ = torch.cuda.mem_get_info(self._device)
         free += torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(self._device)
-        growth = max(0, self._cfg.growth.n_max - self._run.model.num_gaussians)
-        growth *= _bytes_per_row(self._cfg.sh_degree)
-        fits = FrameCache.size_of(self._dataset) <= 0.5 * (free - growth)
-        self._open_frame_cache("gpu" if fits else "mmap")
+        model = self._run.model
+        growth = max(0, self._cfg.growth.n_max - model.num_gaussians) * _bytes_per_row(model)
+        fits = FrameCache.size_of(self._dataset) <= 0.5 * free - growth
+        self._open_frame_cache("gpu" if fits else "mmap", automatic=True)
         self._schedule()
 
     def _schedule(self) -> None:

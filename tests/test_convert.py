@@ -217,7 +217,8 @@ def test_n3dv_refuses_inconsistent_sources(tmp_path: Path, case: str) -> None:
 def test_u27_hardware_decoding_is_within_one_level_of_cpu_decoding(tmp_path: Path) -> None:
     """U-27 (GPU), Q-92: with --hwaccel cuda (when the build lists it) the frames are within
     one 8-bit level of CPU decoding, the differing pixels counted; the manifest records the
-    decoder that ran."""
+    decoder that ran. The clip is yuv420p H.264 rather than U-27's lossless RGB one, which
+    CUDA can't decode (Q-92 refuses gbrp)."""
     listed = subprocess.run(
         ["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True, text=True, check=True
     ).stdout.split()
@@ -639,14 +640,18 @@ def test_u37_refusals(tmp_path: Path, case: str) -> None:
 
 
 @needs_ffmpeg
-def test_selfcap_records_a_bad_gzip_trailer_as_a_warning(tmp_path: Path) -> None:
-    """§1.4 Integrity, Q-86: an archive whose gzip CRC fails after every member came out whole
-    (as the hosted corgi archive does) converts with a warning in the manifest; the hash is of
-    the bytes as they are."""
+@pytest.mark.parametrize("damage", ["crc", "truncated"])
+def test_selfcap_records_a_bad_gzip_trailer_as_a_warning(tmp_path: Path, damage: str) -> None:
+    """§1.4 Integrity, Q-86: an archive whose gzip trailer fails (a bad CRC, as the hosted corgi
+    archive has, or a truncated trailer) after every member came out whole converts with a
+    warning in the manifest; the hash is of the bytes as they are."""
     src = _selfcap_archives(tmp_path, "mini")
     archive = src / "mini-release.tar.gz"
     data = bytearray(archive.read_bytes())
-    data[-8] ^= 0xFF  # the CRC-32 of the gzip trailer
+    if damage == "crc":
+        data[-8] ^= 0xFF  # the CRC-32 of the gzip trailer
+    else:
+        del data[-4:]  # a truncated trailer: the size field cut off
     archive.write_bytes(bytes(data))
     manifest = read_scene_manifest(
         convert_selfcap(
@@ -659,7 +664,9 @@ def test_selfcap_records_a_bad_gzip_trailer_as_a_warning(tmp_path: Path) -> None
         )
     )
     assert manifest.metadata["archives"]["mini-release.tar.gz"] == hashlib.sha256(data).hexdigest()
-    assert any("CRC" in w for w in manifest.metadata["warnings"])
+    assert len(manifest.metadata["warnings"]) == 1
+    if damage == "crc":
+        assert "CRC" in manifest.metadata["warnings"][0]
 
 
 @needs_ffmpeg
@@ -738,3 +745,32 @@ def test_u37_with_the_real_colmap(tmp_path: Path) -> None:
             3,
         )
     assert manifest.metadata["colmap"]["version"].startswith("COLMAP")
+
+
+@needs_ffmpeg
+def test_u37_internal_undistortion_needs_no_colmap(tmp_path: Path) -> None:
+    """U-37: with undistort='internal' a missing COLMAP is no error."""
+    src = _selfcap_archives(tmp_path, "mini")
+    path = convert_selfcap(
+        src,
+        tmp_path / "out",
+        scene="mini",
+        window=(4, 6),
+        test_camera="0002",
+        undistort="internal",
+        colmap=str(tmp_path / "no" / "colmap"),
+    )
+    assert "colmap" not in read_scene_manifest(path).metadata
+
+
+@needs_ffmpeg
+def test_opencv_yaml_outputs_do_not_depend_on_jobs(tmp_path: Path) -> None:
+    """§2.4 rule 2: the number of parallel jobs changes no output byte of the YAML converter."""
+    src = _yaml_source(tmp_path / "s", ["0000", "0001", "0002"], frames=3)
+    one = convert_opencv_yaml(src, tmp_path / "one", fps=30.0, frames=3, resize=0.5, jobs=1)
+    two = convert_opencv_yaml(src, tmp_path / "two", fps=30.0, frames=3, resize=0.5, jobs=3)
+    files = sorted(p.relative_to(one.parent) for p in one.parent.rglob("*.png"))
+    assert files and files == sorted(p.relative_to(two.parent) for p in two.parent.rglob("*.png"))
+    for f in files:
+        assert (one.parent / f).read_bytes() == (two.parent / f).read_bytes()
+    assert json.loads(one.read_text())["images"] == json.loads(two.read_text())["images"]

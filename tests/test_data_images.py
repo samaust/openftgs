@@ -176,8 +176,13 @@ def _assert_same(got: Any, want: Any) -> None:
     if isinstance(want, np.ndarray):
         assert isinstance(got, np.ndarray)
         assert got.dtype == want.dtype and got.shape == want.shape
-        assert np.array_equal(got, want, equal_nan=np.issubdtype(want.dtype, np.floating))
-        assert got.tobytes() == want.tobytes() or np.isnan(want).any()
+        if np.issubdtype(want.dtype, np.floating):
+            # bitwise wherever the value is a number, NaN where OpenCV reads NaN
+            nan = np.isnan(want)
+            assert np.array_equal(np.isnan(got), nan)
+            assert got[~nan].tobytes() == want[~nan].tobytes()
+        else:
+            assert got.tobytes() == want.tobytes()
     elif isinstance(want, float) and math.isnan(want):
         assert isinstance(got, float) and math.isnan(got)
     else:
@@ -228,7 +233,7 @@ def test_u36_reads_what_opencv_writes(tmp_path: Path, header: str) -> None:
 def test_u36_reads_a_hand_written_calibration_in_the_selfcap_shape(tmp_path: Path) -> None:
     """U-36, D-63: a file in the shape of SelfCap's optimized/intri.yml and extri.yml (names,
     K_, D_ 5×1, H_, W_, ccm_, R_ as a Rodrigues vector, Rot_, T_), written by hand with the
-    `%YAML:1.0` header, reads back as OpenCV reads it."""
+    `%YAML:1.0` header and invented values, reads back as OpenCV reads it."""
     text = """%YAML:1.0
 ---
 names:
@@ -238,12 +243,12 @@ K_0000: !!opencv-matrix
    rows: 3
    cols: 3
    dt: d
-   data: [ 2.2048e+03, 0., 1.9195e+03, 0., 2.2049e+03, 1.0795e+03, 0., 0., 1. ]
+   data: [ 2000., 0., 1919.5, 0., 2001., 1079.5, 0., 0., 1. ]
 D_0000: !!opencv-matrix
    rows: 5
    cols: 1
    dt: d
-   data: [ -1.0e-01, 8.5e-02, 0., 0., 0. ]
+   data: [ -2.5e-01, 1.25e-01, 0., 0., 0. ]
 H_0000: 2160
 W_0000: 3840
 ccm_0000: !!opencv-matrix
@@ -298,5 +303,17 @@ def test_yaml_reader_rejects_files_that_are_not_calibration_maps(tmp_path: Path)
     with pytest.raises(ValueError):
         read_opencv_yaml(path)
     path.write_text("a: [1, 2\n")
+    with pytest.raises(ValueError):
+        read_opencv_yaml(path)
+
+
+def test_yaml_reader_rejects_a_malformed_matrix(tmp_path: Path) -> None:
+    """Q-91, Q-26: a matrix without rows and cols, or with data that aren't numbers, is a
+    ValueError (exit code 2 at M14), not a KeyError."""
+    path = tmp_path / "bad.yml"
+    path.write_text("%YAML:1.0\n---\nK: !!opencv-matrix\n   cols: 1\n   dt: d\n   data: [ 1. ]\n")
+    with pytest.raises(ValueError):
+        read_opencv_yaml(path)
+    path.write_text("K: !!opencv-matrix\n   rows: 1\n   cols: 1\n   dt: d\n   data: [ x ]\n")
     with pytest.raises(ValueError):
         read_opencv_yaml(path)

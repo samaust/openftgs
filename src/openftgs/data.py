@@ -7,6 +7,7 @@ Spec: §1.4, D-51, D-61, D-69. Band: Foundation (§2.1).
 """
 
 import concurrent.futures
+import contextlib
 import gzip
 import hashlib
 import importlib.metadata
@@ -22,7 +23,7 @@ import tarfile
 import threading
 import zlib
 from collections import deque
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Literal
@@ -480,10 +481,12 @@ def _opencv_matrix(loader: yaml.SafeLoader, node: yaml.MappingNode) -> np.ndarra
             None, None, f"unknown matrix dt {dt!r}", node.start_mark
         )
     channels = int(match.group(1) or 1)
-    if "sizes" in fields:  # opencv-nd-matrix
-        shape = tuple(int(n) for n in fields["sizes"])
-    else:
-        shape = (int(fields["rows"]), int(fields["cols"]))
+    try:
+        shape: tuple[int, ...] = (int(fields["rows"]), int(fields["cols"]))
+    except (KeyError, TypeError, ValueError) as err:
+        raise yaml.constructor.ConstructorError(
+            None, None, f"a matrix needs integer rows and cols: {err}", node.start_mark
+        ) from None
     if channels > 1:
         shape += (channels,)
     data = fields.get("data", [])
@@ -493,11 +496,15 @@ def _opencv_matrix(loader: yaml.SafeLoader, node: yaml.MappingNode) -> np.ndarra
         )
     dtype = _OPENCV_DTYPES[match.group(2)]
     wide = np.float64 if np.issubdtype(dtype, np.floating) else np.int64
-    return np.array(data, dtype=wide).astype(dtype).reshape(shape)
+    try:
+        return np.array(data, dtype=wide).astype(dtype).reshape(shape)
+    except (TypeError, ValueError) as err:
+        raise yaml.constructor.ConstructorError(
+            None, None, f"matrix data must be numbers: {err}", node.start_mark
+        ) from None
 
 
 _OpenCVLoader.add_constructor("tag:yaml.org,2002:opencv-matrix", _opencv_matrix)
-_OpenCVLoader.add_constructor("tag:yaml.org,2002:opencv-nd-matrix", _opencv_matrix)
 # OpenCV writes NaN as `.Nan`, which YAML 1.1's float pattern (`.nan`, `.NaN`, `.NAN`) misses.
 _OpenCVLoader.add_implicit_resolver(
     "tag:yaml.org,2002:float", re.compile(r"^[-+]?\.Nan$"), list("-+.")
@@ -677,7 +684,9 @@ def _read_exactly(stream: IO[bytes], size: int) -> bytes:
     return b"".join(chunks)
 
 
-def _decode(command: list[str], info: _VideoInfo, count: int, video: Path) -> Iterator[np.ndarray]:
+def _decode(
+    command: list[str], info: _VideoInfo, count: int, video: Path
+) -> Generator[np.ndarray, None, None]:
     """The frames ffmpeg writes, exactly W·H·3 bytes each (§1.4). Q-93: a short read, a
     nonzero exit or any message at `-v error` is a ValueError."""
     size = info.width * info.height * 3
@@ -700,6 +709,8 @@ def _decode(command: list[str], info: _VideoInfo, count: int, video: Path) -> It
             process.kill()
         process.wait()
         reader.join()
+        process.stdout.close()
+        process.stderr.close()
     message = errors[0].decode(errors="replace").strip() if errors else ""
     if read < count or process.returncode != 0 or message:
         raise ValueError(
@@ -741,11 +752,18 @@ def _write_frame(
 
 
 def _read_rgb(path: Path) -> np.ndarray:
-    """An 8-bit image file as [H, W, 3] uint8 (alpha dropped; §1.4 "Images")."""
-    with Image.open(path) as image:
-        if image.mode not in _IMAGE_MODES:
-            raise ValueError(f"{path}: mode must be one of {_IMAGE_MODES}, got {image.mode!r}")
-        return np.asarray(image)[..., :3]
+    """An 8-bit image file as [H, W, 3] uint8 (alpha dropped; §1.4 "Images"); 16-bit PNGs are
+    refused, as `MultiViewVideo.load_image` refuses them (Q-65)."""
+    try:
+        with Image.open(path) as image:
+            if image.mode not in _IMAGE_MODES:
+                raise ValueError(f"{path}: mode must be one of {_IMAGE_MODES}, got {image.mode!r}")
+            depth = _png_bit_depth(path)
+            if depth is not None and depth != 8:
+                raise ValueError(f"{path}: images must have 8 bits per channel, got {depth}")
+            return np.asarray(image)[..., :3]
+    except OSError as err:  # Pillow's UnidentifiedImageError included
+        raise ValueError(f"{path}: not a readable image: {err}") from None
 
 
 @dataclass
@@ -771,12 +789,12 @@ def _worker_count(jobs: int) -> int:
 
 
 def _run_jobs(
-    jobs: Sequence[_CameraJob], tools: _Tools | None, *, hwaccel: str, workers: int
+    camera_jobs: Sequence[_CameraJob], tools: _Tools | None, *, hwaccel: str, workers: int
 ) -> dict[str, list[str]]:
     """Decode up to `workers` cameras at once, each frame processed and written by a process
     pool (§2.4); outputs don't depend on `workers`. Returns each camera's ffmpeg command."""
     commands: dict[str, list[str]] = {}
-    total = sum(len(job.outputs) for job in jobs)
+    total = sum(len(job.outputs) for job in camera_jobs)
     pool_size = max(1, min(os.cpu_count() or 1, total))
     in_flight = threading.BoundedSemaphore(2 * pool_size)  # bounds decoded frames held in memory
     context = multiprocessing.get_context("spawn")
@@ -788,9 +806,13 @@ def _run_jobs(
             source: np.ndarray | str, job: _CameraJob, k: int
         ) -> concurrent.futures.Future[None]:
             in_flight.acquire()
-            future = pool.submit(
-                _write_frame, source, str(job.outputs[k]), job.size, job.K, job.dist
-            )
+            try:
+                future = pool.submit(
+                    _write_frame, source, str(job.outputs[k]), job.size, job.K, job.dist
+                )
+            except BaseException:
+                in_flight.release()
+                raise
             future.add_done_callback(lambda _: in_flight.release())
             return future
 
@@ -803,19 +825,20 @@ def _run_jobs(
                     tools, job.video, job.info, count=count, window=job.window, hwaccel=hwaccel
                 )
                 commands[job.name] = command
-                for k, frame in enumerate(_decode(command, job.info, count, job.video)):
-                    futures.append(submit(frame, job, k))
+                with contextlib.closing(_decode(command, job.info, count, job.video)) as frames:
+                    for k, frame in enumerate(frames):
+                        futures.append(submit(frame, job, k))
             else:
                 for k, image in enumerate(job.images):
                     futures.append(submit(str(image), job, k))
             return futures
 
-        with concurrent.futures.ThreadPoolExecutor(min(workers, len(jobs)) or 1) as threads:
-            per_camera = list(threads.map(camera, jobs))
+        with concurrent.futures.ThreadPoolExecutor(min(workers, len(camera_jobs)) or 1) as threads:
+            per_camera = list(threads.map(camera, camera_jobs))
         for futures in per_camera:
             for future in futures:
                 future.result()
-    return {job.name: commands[job.name] for job in jobs if job.name in commands}
+    return {job.name: commands[job.name] for job in camera_jobs if job.name in commands}
 
 
 def _prepare_out(dst: Path) -> Path:
@@ -944,7 +967,7 @@ def convert_n3dv(
 
 # OpenCV-style YAML calibrations (D-61, D-63; Q-96, Q-97).
 
-_ROT_TOLERANCE = 1e-6  # D-63: Rot against Rodrigues(R), max-abs
+_RODRIGUES_TOLERANCE = 1e-6  # D-63: Rot against Rodrigues(R), max-abs
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 
 
@@ -988,17 +1011,24 @@ def _calibration(intri_path: Path, extri_path: Path) -> list[_Calibrated]:
     def get(source: dict[str, Any], key: str, shape: tuple[int, ...], where: Path) -> np.ndarray:
         if key not in source:
             raise ValueError(f"{where}: no {key}")
-        return _matrix64(np.asarray(source[key], dtype=np.float64).reshape(shape), shape, key)
+        try:
+            values = np.asarray(source[key], dtype=np.float64).reshape(shape)
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"{where}: {key} must hold {shape} numbers: {err}") from None
+        return _matrix64(values, shape, key)
 
     cameras = []
     for name in names:
         K = get(intri, f"K_{name}", (3, 3), intri_path)
         dist_key = f"D_{name}" if f"D_{name}" in intri else f"dist_{name}"
-        dist = (
-            np.asarray(intri[dist_key], dtype=np.float64).reshape(-1)
-            if dist_key in intri
-            else np.zeros(0)
-        )
+        try:
+            dist = (
+                np.asarray(intri[dist_key], dtype=np.float64).reshape(-1)
+                if dist_key in intri
+                else np.zeros(0)
+            )
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"{intri_path}: {dist_key} must hold numbers: {err}") from None
         _coefficients(dist)
         ccm = intri.get(f"ccm_{name}")
         if ccm is not None and not np.array_equal(np.asarray(ccm, dtype=np.float64), np.eye(3)):
@@ -1007,19 +1037,21 @@ def _calibration(intri_path: Path, extri_path: Path) -> list[_Calibrated]:
         if f"Rot_{name}" in extri:
             rotations.append(get(extri, f"Rot_{name}", (3, 3), extri_path))
         if f"R_{name}" in extri:
-            vector = np.asarray(extri[f"R_{name}"], dtype=np.float64).reshape(-1)
-            rotations.append(_rodrigues(vector) if vector.size == 3 else vector.reshape(3, 3))
+            rotations.append(_rodrigues(get(extri, f"R_{name}", (3,), extri_path)))
         if not rotations:
             raise ValueError(f"{extri_path}: no Rot_{name} or R_{name}")
-        if len(rotations) == 2 and np.abs(rotations[0] - rotations[1]).max() > _ROT_TOLERANCE:
+        if len(rotations) == 2 and np.abs(rotations[0] - rotations[1]).max() > _RODRIGUES_TOLERANCE:
             raise ValueError(
                 f"{extri_path}: Rot_{name} and Rodrigues(R_{name}) differ by more than "
-                f"{_ROT_TOLERANCE} (D-63)"
+                f"{_RODRIGUES_TOLERANCE} (D-63)"
             )
         translation = get(extri, f"T_{name}", (3,), extri_path)
         size = None
         if f"W_{name}" in intri or f"H_{name}" in intri:
-            size = (int(intri.get(f"W_{name}", 0)), int(intri.get(f"H_{name}", 0)))
+            width, height = intri.get(f"W_{name}"), intri.get(f"H_{name}")
+            if not all(isinstance(v, int) and not isinstance(v, bool) for v in (width, height)):
+                raise ValueError(f"{intri_path}: W_{name} and H_{name} must both be integers")
+            size = (int(width), int(height))  # type: ignore[arg-type]
         cameras.append(_Calibrated(name, K, dist, rotations[0], translation, size))
     return cameras
 
@@ -1029,8 +1061,11 @@ def _image_files(folder: Path) -> list[Path]:
 
 
 def _image_size(path: Path) -> tuple[int, int]:
-    with Image.open(path) as image:
-        return image.size
+    try:
+        with Image.open(path) as image:
+            return image.size
+    except OSError as err:
+        raise ValueError(f"{path}: not a readable image: {err}") from None
 
 
 def convert_opencv_yaml(
@@ -1196,13 +1231,16 @@ def _extract_archive(
         raise ValueError(
             f"{archive}: archive not found (Q-86: SRC holds the archives as downloaded)"
         )
-    warnings: list[str] = []
+    notes: list[str] = []
     extracted: set[Path] = set()
+    current: Path | None = None  # the member being copied, if any
     with archive.open("rb") as raw:
         reader = _HashingReader(raw)
-        stream = gzip.GzipFile(fileobj=reader, mode="rb")  # type: ignore[call-overload]
         try:
-            with tarfile.open(fileobj=stream, mode="r|") as tar:
+            with (
+                gzip.GzipFile(fileobj=reader, mode="rb") as stream,  # type: ignore[call-overload]
+                tarfile.open(fileobj=stream, mode="r|") as tar,
+            ):
                 for member in tar:
                     parts = _safe_member(member)
                     if parts is None or len(parts) < 2:
@@ -1222,19 +1260,23 @@ def _extract_archive(
                     source = tar.extractfile(member)
                     assert source is not None
                     target.parent.mkdir(parents=True, exist_ok=True)
+                    current = target
                     with target.open("wb") as out:
                         shutil.copyfileobj(source, out)
+                    current = None
                     if target.stat().st_size != member.size:
                         raise ValueError(f"{archive}: member {member.name} is incomplete")
                     extracted.add(target)
-            stream.read()  # to the gzip trailer, where the CRC is checked
+                stream.read()  # to the gzip trailer, where the CRC is checked
         except (gzip.BadGzipFile, zlib.error, EOFError, tarfile.ReadError) as err:
-            if extracted or not (videos or calibration):
-                warnings.append(f"{archive.name}: {err} after its members were extracted (§1.4)")
-            else:
+            if current is not None:  # the error cut a needed member short: never use it
+                current.unlink(missing_ok=True)
+                raise ValueError(f"{archive}: {err} while extracting {current.name}") from None
+            if not extracted and (videos or calibration):
                 raise ValueError(f"{archive}: not a readable tar.gz archive: {err}") from None
+            notes.append(f"{archive.name}: {err} after its members were extracted (§1.4)")
         reader.drain()
-    return reader.digest.hexdigest(), warnings
+    return reader.digest.hexdigest(), notes
 
 
 def _sync_offsets(path: Path, names: Sequence[str]) -> dict[str, float]:
@@ -1318,7 +1360,12 @@ def _read_colmap_text(
     """PINHOLE cameras (id → (W, H, [fx, fy, cx, cy])) and image name → camera id of a text
     model (COLMAP's documented format)."""
     cameras: dict[int, tuple[int, int, np.ndarray]] = {}
-    for line in (folder / "cameras.txt").read_text().splitlines():
+    try:
+        camera_text = (folder / "cameras.txt").read_text()
+        image_text = (folder / "images.txt").read_text()
+    except OSError as err:
+        raise ValueError(f"{folder}: COLMAP wrote no readable text model: {err}") from None
+    for line in camera_text.splitlines():
         if not line.strip() or line.startswith("#"):
             continue
         parts = line.split()
@@ -1330,11 +1377,7 @@ def _read_colmap_text(
             np.array([float(v) for v in parts[4:8]]),
         )
     images: dict[str, int] = {}
-    lines = [
-        line
-        for line in (folder / "images.txt").read_text().splitlines()
-        if not line.startswith("#")
-    ]
+    lines = [line for line in image_text.splitlines() if not line.startswith("#")]
     for line in lines[::2]:
         parts = line.split()
         if len(parts) >= 10:
@@ -1423,7 +1466,7 @@ def _colmap_undistort(
 
 def _masks(folder: Path, indices: Sequence[int]) -> tuple[dict[int, Path], dict[str, Any]]:
     """D-64, Q-87: DIR/<n:06d>.png per test image and DIR/masks.json; a missing mask is
-    refused (§1.4: one mask per test image)."""
+    refused (§1.4: one mask per test image; Q-104)."""
     sidecar = folder / "masks.json"
     try:
         info = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -1446,7 +1489,11 @@ def _masks(folder: Path, indices: Sequence[int]) -> tuple[dict[int, Path], dict[
 
 
 def _copy_mask(source: Path, target: Path, size: tuple[int, int]) -> None:
-    with Image.open(source) as image:
+    try:
+        image = Image.open(source)
+    except OSError as err:
+        raise ValueError(f"{source}: not a readable mask: {err}") from None
+    with image:
         if image.mode not in _MASK_MODES:
             raise ValueError(
                 f"{source}: mask mode must be one of {_MASK_MODES}, got {image.mode!r}"
@@ -1507,14 +1554,14 @@ def convert_selfcap(
     try:
         tools = _tools(ffmpeg, ffprobe)
         archives: dict[str, str] = {}
-        warnings: list[str] = []
+        archive_warnings: list[str] = []
         release = src / f"{sequence}-release.tar.gz"
         calib_archive = src / "hair-calib.tar.gz" if sequence == "hair" and calib is None else None
         from_release = calib is None and calib_archive is None
         digest, found = _extract_archive(
             release, work / "release", videos=True, calibration=from_release
         )
-        archives[release.name], warnings = digest, warnings + found
+        archives[release.name], archive_warnings = digest, archive_warnings + found
         if calib is not None:
             folder = Path(calib)
             optimized = (
@@ -1525,7 +1572,7 @@ def convert_selfcap(
             digest, found = _extract_archive(
                 calib_archive, work / "calib", videos=False, calibration=True
             )
-            archives[calib_archive.name], warnings = digest, warnings + found
+            archives[calib_archive.name], archive_warnings = digest, archive_warnings + found
             optimized, calibration_source = work / "calib" / "optimized", calib_archive.name
         else:
             optimized, calibration_source = work / "release" / "optimized", release.name
@@ -1643,7 +1690,7 @@ def convert_selfcap(
             "sync": synced,
             "undistort": undistort,
             "ffmpeg": _ffmpeg_metadata(tools, hwaccel, commands),
-            "warnings": warnings,
+            "warnings": archive_warnings,
             **mask_metadata,
         }
         if undistort == "colmap":
@@ -1715,12 +1762,13 @@ class FrameCache:
         placement: str,
         where: dict[int, tuple[int, int]],
         frames: list[Any],
+        files: list[Any],
     ) -> None:
         self.directory = directory
         self.placement = placement
         self._where = where
         self._frames = frames  # GPU tensors, or safetensors slices of the memory-mapped files
-        self._files: list[Any] = []
+        self._files = files  # the open memory-mapped files the slices read from
 
     @staticmethod
     def default_directory(manifest: SceneManifest) -> Path:
@@ -1802,9 +1850,7 @@ class FrameCache:
                 file = safe_open(str(path), framework="pt")
                 files.append(file)
                 frames.append(file.get_slice("frames"))  # type: ignore[no-untyped-call]
-        cache = cls(directory, placement, where, frames)
-        cache._files = files
-        return cache
+        return cls(directory, placement, where, frames, files)
 
     @property
     def nbytes(self) -> int:
@@ -1851,6 +1897,7 @@ class Prefetcher:
         self._stream = torch.cuda.Stream(self._device) if self._cuda else None  # type: ignore[no-untyped-call]
         self._free: dict[tuple[int, ...], list[tuple[Tensor, Any]]] = {}
         self._lock = threading.Lock()
+        self._misses = 0
 
     def schedule(self, indices: Sequence[int]) -> None:
         """The upcoming record indices, in the order they will be taken."""
@@ -1870,6 +1917,7 @@ class Prefetcher:
             _, future = self._pending.popleft()
             item = future.result()
         else:
+            self._misses += 1  # read directly: not next in the schedule
             self._drop()
             self._plan.clear()
             item = self._load(index)

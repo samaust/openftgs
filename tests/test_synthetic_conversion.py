@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """G-1 to G-7: the converters and the frame cache against openftgs-synth's ground truth (§1.4
-"Validation data", §3.1, D-79; Q-100, Q-102).
+"Validation data", §3.1, D-79; Q-100).
 
 openftgs-synth (CC0-1.0, version 0.1.x) is the owner's rendered dataset, at
 $OPENFTGS_DATASETS/synth; these checks run only where it is present, never in CI (#108). Its
@@ -68,11 +68,18 @@ def _checksums(root: Path) -> dict[str, str]:
 
 
 def _verified(root: Path, *relative: str) -> None:
-    """The files a check reads match the dataset's SHA256SUMS (Q-102)."""
+    """The files a check reads match the dataset's SHA256SUMS (D-79)."""
     sums = _checksums(root)
     for name in relative:
         digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
         assert sums[name] == digest, f"{name} doesn't match SHA256SUMS"
+
+
+def _verified_folder(root: Path, folder: str) -> None:
+    """Every file under `folder` matches SHA256SUMS."""
+    _verified(
+        root, *(str(p.relative_to(root)) for p in sorted((root / folder).rglob("*")) if p.is_file())
+    )
 
 
 def _ground_truth(root: Path, scene: str) -> dict[str, Any]:
@@ -156,7 +163,10 @@ def _inside(K: np.ndarray, dist: np.ndarray, width: int, height: int) -> np.ndar
 # G-1 · Neural3DV converter (D-28, D-33, D-48).
 
 
-@pytest.mark.parametrize(("scene", "frames", "resize"), [("tiny", 12, 1.0), ("kitchen", 2, 0.5)])
+@pytest.mark.parametrize(
+    ("scene", "frames", "resize"),
+    [("tiny", 12, 1.0), ("tiny", 12, 0.5), ("kitchen", 2, 1.0), ("kitchen", 2, 0.5)],
+)
 def test_g1_n3dv_matches_the_ground_truth(
     tmp_path: Path, scene: str, frames: int, resize: float
 ) -> None:
@@ -166,7 +176,7 @@ def test_g1_n3dv_matches_the_ground_truth(
     its area resizing."""
     root = _root()
     src = root / "lossless" / "n3dv" / scene
-    _verified(root, f"lossless/n3dv/{scene}/poses_bounds.npy", f"lossless/n3dv/{scene}/cam00.mp4")
+    _verified_folder(root, f"lossless/n3dv/{scene}")
     manifest = read_scene_manifest(
         convert_n3dv(src, tmp_path / "out", frames=frames, resize=resize, jobs=4)
     )
@@ -203,6 +213,7 @@ def test_g1_n3dv_h264_error_is_recorded(tmp_path: Path) -> None:
     """G-1 (calibrated): the mean absolute difference between frames converted from the H.264
     videos and the ground truth, recorded for the Calibration data table."""
     root = _root()
+    _verified_folder(root, "n3dv/tiny")
     manifest = read_scene_manifest(
         convert_n3dv(root / "n3dv" / "tiny", tmp_path / "out", frames=12, resize=1.0)
     )
@@ -249,16 +260,13 @@ def test_g2_opencv_yaml_matches_the_ground_truth(tmp_path: Path, scene: str, fra
     principal point moved by 0.5 px; courtyard's identity ccm is accepted."""
     root = _root()
     src = root / "lossless" / "enerf_outdoor" / scene
-    _verified(
-        root,
-        f"lossless/enerf_outdoor/{scene}/intri.yml",
-        f"lossless/enerf_outdoor/{scene}/extri.yml",
-    )
+    _verified_folder(root, f"lossless/enerf_outdoor/{scene}")
     manifest = read_scene_manifest(
         convert_opencv_yaml(src, tmp_path / "out", fps=30.0, frames=frames, resize=1.0, jobs=4)
     )
     truth = _ground_truth(root, scene)
-    for name in sorted({r.camera.name for r in manifest.records})[:3]:
+    names = sorted({r.camera.name for r in manifest.records})
+    for name in names:  # every camera; frames for the first three
         gt = _gt_camera(truth, "enerf_outdoor", name)
         record = _records(manifest, name)[-1]
         torch.testing.assert_close(
@@ -273,6 +281,8 @@ def test_g2_opencv_yaml_matches_the_ground_truth(tmp_path: Path, scene: str, fra
             rtol=0.0,
             atol=1e-6,
         )
+        if name not in names[:3]:
+            continue
         K, dist = np.array(gt["K_opencv"]), np.array(gt["distortion"])
         distorted = _decode(src / "videos" / f"{name}.mp4", frames)[record.frame_index]
         truth_frame = _pinhole(root, scene, gt["name"], record.frame_index)
@@ -293,6 +303,7 @@ def _repacked(root: Path, scene: str, out: Path) -> Path:
     """The lossless videos and calibration of a SelfCap scene, re-packed as its release
     archive in `out`, so frames can be compared bitwise-close (G-3)."""
     source = root / "lossless" / "selfcap" / scene
+    _verified_folder(root, f"lossless/selfcap/{scene}")
     out.mkdir(parents=True, exist_ok=True)
     with tarfile.open(out / f"{scene}-release.tar.gz", "w:gz", compresslevel=1) as tar:
         tar.add(source / "videos", arcname=f"{scene}-release/videos")
@@ -355,9 +366,14 @@ def _selfcap_frames_check(root: Path, scene: str, manifest: SceneManifest) -> No
         inside = _inside(K, dist, gt["width"], gt["height"]).astype(np.float64)
         valid = resize_area(inside, width, height) >= 1.0
         got = _image(record.image_path)
+        shifted_full = _translate(
+            _pinhole(root, scene, gt["name"], n), 0.5, 0.5, (gt["width"], gt["height"])
+        )[0]
+        shifted = _mean_error(got, resize_area(shifted_full, width, height), valid)
         ours, opencv = _mean_error(got, want, valid), _mean_error(floor, want, valid)
-        print(f"G-3 {scene} {name}: ours {ours:.3f}, OpenCV {opencv:.3f}")
+        print(f"G-3 {scene} {name}: ours {ours:.3f}, OpenCV {opencv:.3f}, shifted {shifted:.3f}")
         assert ours <= opencv + 0.25
+        assert shifted >= 1.2 * ours
 
 
 @pytest.mark.parametrize("scene", sorted(_SELFCAP))
@@ -514,6 +530,7 @@ def test_g5_ground_truth_masks_reach_the_manifest(tmp_path: Path) -> None:
     reads them back."""
     root = _root()
     scene = "tiny_unsync"
+    _verified(root, f"selfcap/{scene}-release.tar.gz")
     truth = _ground_truth(root, scene)
     test = _test_camera(truth)
     gt = _gt_camera(truth, "selfcap", test)
@@ -564,6 +581,7 @@ def test_g6_hardware_decoding_matches_cpu_decoding(tmp_path: Path) -> None:
     if "cuda" not in listed:
         pytest.skip("this ffmpeg build has no cuda hwaccel")
     src = root / "enerf_outdoor" / "courtyard"
+    _verified_folder(root, "enerf_outdoor/courtyard")
     cpu = read_scene_manifest(
         convert_opencv_yaml(src, tmp_path / "cpu", fps=60.0, frames=10, resize=1.0)
     )
@@ -583,6 +601,7 @@ def test_g6_hardware_decoding_matches_cpu_decoding(tmp_path: Path) -> None:
 
 
 def _kitchen(tmp_path: Path) -> MultiViewVideo:
+    _verified_folder(_root(), "lossless/n3dv/kitchen")
     path = convert_n3dv(
         _root() / "lossless" / "n3dv" / "kitchen", tmp_path / "out", frames=2, resize=1.0, jobs=4
     )
