@@ -335,7 +335,7 @@ def test_c4_colmap_puts_gaussian_dots_where_the_pinhole_camera_projects_them(
     a known distorted camera and undistorted by COLMAP through the SelfCap converter: every dot's
     centroid lies within 0.1 px of where the read-back PINHOLE camera projects it (a wrong
     pixel-centre convention gives about 0.5 px; the scene is resized by ½, as any SelfCap scene
-    outside the card's table is (Q-97), so that error would be about 0.25 px, still well above the
+    outside the card's table is (D-80), so that error would be about 0.25 px, still well above the
     bound)."""
     width, height, sigma = 640, 480, 1.6
     K = np.array([[520.0, 0.0, 319.5], [0.0, 520.0, 239.5], [0.0, 0.0, 1.0]])  # OpenCV
