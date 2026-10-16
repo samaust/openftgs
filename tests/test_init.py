@@ -182,6 +182,23 @@ def test_u33_knn_velocities_match_a_float64_brute_force(device: str) -> None:
 
 
 @pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("lower", [1.0, -1.0], ids=["plus-first", "minus-first"])
+def test_u33_knn_velocities_ties_go_to_the_lower_index(device: str, lower: float) -> None:
+    """U-33, D-56: two distinct points of `next_points` at the same distance from a query,
+    (1, 0, 0) and (−1, 0, 0) from the origin, give the velocity of the one at the lower
+    index, whichever of the two comes first. The distances are exactly 1 and dt = 0.5, so
+    the velocity is exact."""
+    f64 = torch.float64
+    next_points = torch.tensor(
+        [[5.0, 5.0, 5.0], [lower, 0.0, 0.0], [-lower, 0.0, 0.0], [0.0, 3.0, 0.0]], dtype=f64
+    )
+    points = torch.tensor([[0.0, 0.0, 0.0], [0.0, 2.9, 0.0]], dtype=f64)
+    v = knn_velocities(points.to(device), next_points.to(device), 0.5)
+    expected = torch.tensor([[2 * lower, 0.0, 0.0], [0.0, 0.2, 0.0]], dtype=f64)
+    torch.testing.assert_close(v.cpu(), expected, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
 def test_nearest_indices_ties_go_to_the_lower_index(device: str) -> None:
     """D-56: among points at the nearest distance, the lowest index wins, on both paths.
 
