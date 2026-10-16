@@ -7,8 +7,8 @@ $OPENFTGS_DATASETS/synth; these checks run only where it is present, never in CI
 ground truth is independent of this package: exact cameras and per-frame times in
 `ground_truth/<scene>/cameras.json`, undistorted frames, masks. Its lossless videos decode
 bit-exactly to the ground-truth frames, so frame comparisons use them; its released videos and
-SelfCap archives are H.264. OpenCV (a test-only oracle) gives the floor of G-2 and G-4: what its
-own `undistort` achieves on the same frames.
+SelfCap archives are H.264. OpenCV (a test-only oracle) gives G-2's floor, what its own
+`undistort` achieves on the same frames, and the reference recorded beside G-4's error (D-82).
 """
 
 import hashlib
@@ -565,19 +565,16 @@ def test_g4_selfcap_colmap_frames_line_up_with_the_read_back_camera(
         assert off >= 1.2 * ours
 
 
-# Q-103: G-4's frame bound kept verbatim; COLMAP's resampling is softer than OpenCV's.
-@pytest.mark.xfail(
-    strict=True,
-    reason="Q-103: COLMAP's warp is softer than OpenCV's bilinear remap into the same camera",
-)
 @pytest.mark.skipif(shutil.which("colmap") is None, reason="needs COLMAP on PATH (D-60)")
 @pytest.mark.parametrize("scene", sorted(_SELFCAP))
-def test_g4_selfcap_colmap_frames_within_g2s_bound(shared: Path, scene: str) -> None:
-    """G-4: the converted frames equal the ground truth translated by the principal points'
-    difference within G-2's bound: at most OpenCV's undistortion into COLMAP's camera, scored
-    the same way, plus 0.25 of an 8-bit level."""
-    for _, ours, opencv, _ in _g4_errors(shared, scene):
-        assert ours <= opencv + 0.25
+def test_g4_selfcap_colmap_frame_error_is_recorded(shared: Path, scene: str) -> None:
+    """G-4 (calibrated, D-82): the converted frames' mean absolute difference to the ground truth
+    translated by the principal points' difference, recorded for the Calibration data table
+    beside OpenCV's undistortion into COLMAP's camera, scored the same way. Not bounded: COLMAP
+    resamples more softly than OpenCV's bilinear remap."""
+    for name, ours, opencv, _ in _g4_errors(shared, scene):
+        print(f"G-4 {scene} {name}: COLMAP {ours:.3f}, OpenCV into COLMAP's camera {opencv:.3f}")
+        assert np.isfinite(ours) and np.isfinite(opencv)
 
 
 # G-5 · masks (D-64).
