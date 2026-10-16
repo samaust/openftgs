@@ -205,6 +205,45 @@ def test_ftgs_init_reader_rejects_another_time_unit(tmp_path: Path) -> None:
         read_init_points(path, time_unit="frame")
 
 
+def test_ftgs_init_writer_adds_extra_metadata(tmp_path: Path) -> None:
+    """Q-107: `metadata` keys are written as given beside §2.2's own keys, and the reader, which
+    ignores unknown keys (§2.2 introduction), still reads the file."""
+    points = _init_points()
+    path = tmp_path / "init.safetensors"
+    extra = {"roma_init": '{"seed":3}', "note": ""}
+    write_init_points(points, path, time_unit="s", producer="test", metadata=extra)
+    with safe_open(str(path), framework="pt") as f:
+        meta = f.metadata()
+    assert meta == {**_init_metadata(), **extra}
+    back = read_init_points(path, time_unit="s")
+    assert torch.equal(back.positions, points.positions)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"format": "other"},
+        {"version": "2"},
+        {"time_unit": "frame"},
+        {"producer": "someone else"},
+        {"seed": 3},
+        {"seed": None},
+        {"flag": True},
+        {7: "seven"},
+    ],
+    ids=["format", "version", "time_unit", "producer", "int", "none", "bool", "int-key"],
+)
+def test_ftgs_init_writer_refuses_reserved_or_non_string_metadata(
+    tmp_path: Path, extra: dict[Any, Any]
+) -> None:
+    """Q-107: a reserved key (`format`, `version`, `time_unit`, `producer`) or a key or value
+    that isn't a string raises ValueError, and no file is written."""
+    path = tmp_path / "init.safetensors"
+    with pytest.raises(ValueError, match="metadata"):
+        write_init_points(_init_points(), path, time_unit="s", producer="test", metadata=extra)
+    assert not path.exists()
+
+
 def test_ftgs_init_writer_validates_before_writing(tmp_path: Path) -> None:
     """Q-22: invalid init points are refused, and no file is written."""
     p = _init_points()

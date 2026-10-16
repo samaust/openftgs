@@ -166,9 +166,28 @@ def validate_init_points(points: InitPoints) -> None:
         _fail(where, "durations must be positive")
 
 
-def write_init_points(points: InitPoints, path: Path, *, time_unit: str, producer: str) -> None:
-    """Write a ftgs-init v1 file (§2.2; Q-22), validating first."""
+_INIT_RESERVED = ("format", "version", "time_unit", "producer")  # §2.2 ftgs-init metadata
+
+
+def write_init_points(
+    points: InitPoints,
+    path: Path,
+    *,
+    time_unit: str,
+    producer: str,
+    metadata: Mapping[str, str] | None = None,  # Q-107
+) -> None:
+    """Write a ftgs-init v1 file (§2.2; Q-22), validating first. `metadata` adds string keys
+    and values beside §2.2's own, such as `roma_init`'s provenance (Q-107); a reserved key or a
+    key or value that isn't a string raises ValueError."""
     validate_init_points(points)
+    extra = dict(metadata or {})
+    for key, value in extra.items():
+        # Q-107: safetensors metadata is a string-to-string map (§2.2 introduction).
+        if not isinstance(key, str) or not isinstance(value, str):
+            _fail("ftgs-init", f"metadata must map strings to strings, got {key!r}: {value!r}")
+        if key in _INIT_RESERVED:
+            _fail("ftgs-init", f"metadata key {key!r} is reserved")
     tensors = {
         name: value
         for name in ("positions", "colors", "timestamps", "velocities", "durations", "frame_ids")
@@ -179,6 +198,7 @@ def write_init_points(points: InitPoints, path: Path, *, time_unit: str, produce
         "version": str(_VERSION),
         "time_unit": time_unit,
         "producer": producer,
+        **extra,
     }
     _write_safetensors(tensors, Path(path), meta)
 
