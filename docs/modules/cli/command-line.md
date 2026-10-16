@@ -8,7 +8,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 
 | Command | Library calls |
 | --- | --- |
-| `convert` | `data.convert_n3dv`, `convert_opencv_yaml` or `convert_selfcap`, one option per keyword; `--test-camera` and `--window N0:N1` are Q-85's |
+| `convert` | `data.convert_n3dv`, `convert_opencv_yaml` or `convert_selfcap`, one option per keyword, `--test-camera` and `--window N0:N1` among them (D-80) |
 | `cache` | `MultiViewVideo.from_manifest`, `FrameCache.build`, and for `gpu` or `mmap` `FrameCache.open` in that placement (Q-127) |
 | `init roma` | `RomaInitConfig`, `roma_init`, `io.write_init_points` with `roma_provenance(cfg)` as metadata (Q-107) |
 | `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.save_checkpoint`, `Trainer.evaluate` |
