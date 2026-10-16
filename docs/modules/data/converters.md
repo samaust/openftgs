@@ -1,12 +1,12 @@
 # Dataset converters in `openftgs.data`
 
-How `convert_n3dv`, `convert_opencv_yaml` and `convert_selfcap` meet their §2.1 rows: each turns a released dataset into undistorted PNG frames and a scene manifest (§1.4 "Dataset protocols", §2.2). Their keyword additions (`ffprobe`, and `test_camera` on `convert_opencv_yaml`) are the owner's answer of Q-85.
+How `convert_n3dv`, `convert_opencv_yaml` and `convert_selfcap` meet their §2.1 rows: each turns a released dataset into undistorted PNG frames and a scene manifest (§1.4 "Dataset protocols", §2.2). Their keyword additions (`ffprobe` on all three, `test_camera` on `convert_opencv_yaml` and `resize` on `convert_selfcap`) are D-80.
 
 ## Inputs
 
 - **Neural3DV** (D-28, Q-95): SRC holds `poses_bounds.npy` and `camXX.mp4`. Row i of the array belongs to the i-th video in name order, and the counts must match. Each video's size, read with ffprobe, must equal its row's H and W. cam00 is the test view.
 - **OpenCV-style YAML** (D-61, Q-96): SRC holds `intri.yml` and `extri.yml` and either `images/<camera>/` or `videos/<camera>.mp4`. ENeRF-Outdoor's dataset page documents no layout, so this is the layout of the zju3dv family that SelfCap uses (D-63); C-2 would confirm it against the real files, and this project doesn't run C-2 (D-79). `test_camera` names the test view; without it every image is a training image.
-- **SelfCap** (D-59, D-60, D-63, Q-86, Q-97): SRC is a folder of the archives as downloaded. Each archive used is read once, hashed while it streams, and only its videos and calibration files are extracted, into `OUT/.work/`. Archives are untrusted data: only regular files are extracted, to paths the converter builds itself. A gzip CRC failure after whole members (the hosted corgi archive has one) becomes a warning in the manifest, not a failure. The card's table gives each scene's window, test view and resize ratio; a scene outside the table needs window and test view, and is resized by 0.5, the protocol's ratio for 4K video, unless `resize` sets another ratio (Q-97). openftgs-synth's `studio`, rendered at 1920×1080, converts at full size with `resize=1.0`.
+- **SelfCap** (D-59, D-60, D-63, Q-86, Q-97): SRC is a folder of the archives as downloaded. Each archive used is read once, hashed while it streams, and only its videos and calibration files are extracted, into `OUT/.work/`. Archives are untrusted data: only regular files are extracted, to paths the converter builds itself. A gzip CRC failure after whole members (the hosted corgi archive has one) becomes a warning in the manifest, not a failure. The card's table gives each scene's window, test view and resize ratio; a scene outside the table needs window and test view, and is resized by 0.5, the protocol's ratio for 4K video, unless `resize` sets another ratio (D-80). openftgs-synth's `studio`, rendered at 1920×1080, converts at full size with `resize=1.0`.
 
 ## Output
 
@@ -20,13 +20,13 @@ Frames come from the user's ffmpeg, run as a separate program (D-48); the packag
 
 Anything ffmpeg prints at `-v error`, a nonzero exit or a short read fails the conversion (Q-93). SelfCap windows decode the frames before the window too, and ffmpeg's messages carry no frame number, so an error before the window also fails; the message says so.
 
-`--hwaccel cuda` asks for CUDA decoding in a way that fails rather than silently falling back to the CPU, so the manifest's `decoder` says what ran (Q-92). The downloaded frames are converted back to the stream's own pixel format before the RGB conversion, so they go through the CPU path's conversion and come out identical to CPU decoding (G-6: no pixel differs).
+`--hwaccel cuda` asks for CUDA decoding in a way that fails rather than silently falling back to the CPU, so the manifest's `decoder` says what ran (D-81). The downloaded frames are converted back to the stream's own pixel format before the RGB conversion, so they go through the CPU path's conversion and come out identical to CPU decoding (G-6: no pixel differs).
 
 ## Undistortion and resizing
 
 The YAML calibrations hold K in OpenCV's integer-centre convention. Frames are undistorted with that K (`undistort_image`, K_new = K), then K gains +0.5 on cx and cy, then frames and K are resized (`images-and-cameras.md`). Undistortion passes float64 values to the resizing, which rounds to 8 bits once (Q-90).
 
-SelfCap's protocol undistorts with COLMAP instead (D-60, Q-97): the converter writes a text model with FULL_OPENCV cameras (cx, cy + 0.5 for COLMAP's pixel centres), runs `image_undistorter --blank_pixels 0`, converts COLMAP's binary output to text with `model_converter`, and reads the PINHOLE cameras back without any shift, since COLMAP's convention is the spec's. COLMAP changes the image size and principal point and keeps the focal lengths, so W, H and K come from the read-back camera. C-4's Gaussian-dot check confirms the convention to 0.026 px. COLMAP's resampling is softer than a bilinear remap into the same camera, which keeps G-4's frame bound open (Q-103). `undistort="internal"` uses the package's own undistortion instead, which is not protocol-exact.
+SelfCap's protocol undistorts with COLMAP instead (D-60, Q-97): the converter writes a text model with FULL_OPENCV cameras (cx, cy + 0.5 for COLMAP's pixel centres), runs `image_undistorter --blank_pixels 0`, converts COLMAP's binary output to text with `model_converter`, and reads the PINHOLE cameras back without any shift, since COLMAP's convention is the spec's. COLMAP changes the image size and principal point and keeps the focal lengths, so W, H and K come from the read-back camera. C-4's Gaussian-dot check confirms the convention to 0.026 px. COLMAP's resampling is softer than a bilinear remap into the same camera, so G-4 records the frames' error against the translated ground truth rather than bounding it (D-82). `undistort="internal"` uses the package's own undistortion instead, which is not protocol-exact.
 
 ## Timestamps and masks
 
