@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 import pytest
 import torch
+from builders import ffmpeg_video, n3dv_source
 from PIL import Image
 
 from openftgs.data import (
@@ -38,44 +39,6 @@ needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="needs ffmpeg and ffprobe on PATH (D-48)",
 )
-
-
-def _video(
-    path: Path,
-    *,
-    width: int = 64,
-    height: int = 48,
-    frames: int = 10,
-    lossless: bool = True,
-    smooth: bool = False,
-) -> Path:
-    """A lavfi testsrc clip; the lossless clips decode to exactly what ffmpeg's PNG decode
-    gives."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if lossless:
-        codec = ["-c:v", "libx264rgb", "-qp", "0"]
-    else:
-        codec = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
-    pattern = "gradients" if smooth else "testsrc"  # gradients: smooth content (U-35's oracle)
-    source = f"{pattern}=size={width}x{height}:rate=30"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            source,
-            "-frames:v",
-            str(frames),
-            *codec,
-            str(path),
-        ],
-        check=True,
-    )
-    return path
 
 
 def _ffmpeg_pngs(video: Path, out: Path, frames: int) -> list[np.ndarray]:
@@ -99,29 +62,11 @@ def _ffmpeg_pngs(video: Path, out: Path, frames: int) -> list[np.ndarray]:
     return [np.asarray(Image.open(out / f"{k + 1:03d}.png").convert("RGB")) for k in range(frames)]
 
 
-def _llff_row(centre_x: float, *, width: int, height: int, focal: float) -> np.ndarray:
-    """A poses_bounds.npy row (D-28) for a camera at (centre_x, 0, 0) looking down +z, with
-    OpenCV axes x right, y down: the LLFF columns are down, right, back."""
-    down, right, back = [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]
-    matrix = np.array([down, right, back, [centre_x, 0.0, 0.0], [height, width, focal]]).T
-    return np.concatenate([matrix.reshape(-1), [0.5, 50.0]])
-
-
-def _n3dv_source(root: Path, cameras: int = 2, **video: Any) -> Path:
-    width, height = video.get("width", 64), video.get("height", 48)
-    rows = [_llff_row(0.25 * k, width=width, height=height, focal=50.0) for k in range(cameras)]
-    root.mkdir(parents=True, exist_ok=True)
-    np.save(root / "poses_bounds.npy", np.stack(rows))
-    for k in range(cameras):
-        _video(root / f"cam{k:02d}.mp4", **video)
-    return root
-
-
 @needs_ffmpeg
 def test_u27_frames_come_through_in_order_and_equal_ffmpegs_decode(tmp_path: Path) -> None:
     """U-27, D-48: a 10-frame lavfi testsrc clip goes through the Neural3DV converter at resize
     1.0; its 10 frames come out in order, each equal to ffmpeg's own PNG decode."""
-    src = _n3dv_source(tmp_path / "flame_steak")
+    src = n3dv_source(tmp_path / "flame_steak")
     manifest_path = convert_n3dv(src, tmp_path / "out", frames=10, resize=1.0, jobs=1)
     assert manifest_path == tmp_path / "out" / "scene.json"
     manifest = read_scene_manifest(manifest_path)
@@ -137,7 +82,7 @@ def test_u27_frames_come_through_in_order_and_equal_ffmpegs_decode(tmp_path: Pat
 def test_u27_a_wrong_ffmpeg_or_ffprobe_path_is_refused(tmp_path: Path, which: str) -> None:
     """U-27, D-48, D-80: a wrong --ffmpeg or --ffprobe path stops the converter with a
     ValueError, which `ftgs convert` (M14) maps to exit code 2; nothing is left in OUT."""
-    src = _n3dv_source(tmp_path / "scene")
+    src = n3dv_source(tmp_path / "scene")
     tools = {which: str(tmp_path / "missing" / which)}
     with pytest.raises(ValueError, match=which):
         convert_n3dv(src, tmp_path / "out", frames=2, resize=1.0, **tools)  # type: ignore[arg-type]
@@ -149,7 +94,7 @@ def test_n3dv_manifest_holds_the_converted_cameras_times_and_metadata(tmp_path: 
     """D-28, D-33, Q-94, Q-95: cameras from the LLFF rows, resized by the realized ratios;
     frame k at k/30 s; cam00 is the test view; metadata names the source, the ffmpeg run and
     the bounds."""
-    src = _n3dv_source(tmp_path / "flame_steak", cameras=3, width=64, height=48, frames=4)
+    src = n3dv_source(tmp_path / "flame_steak", cameras=3, width=64, height=48, frames=4)
     manifest = read_scene_manifest(
         convert_n3dv(src, tmp_path / "out", frames=3, resize=0.5, jobs=2)
     )
@@ -179,7 +124,7 @@ def test_n3dv_manifest_holds_the_converted_cameras_times_and_metadata(tmp_path: 
 @needs_ffmpeg
 def test_n3dv_outputs_do_not_depend_on_jobs(tmp_path: Path) -> None:
     """§2.4 rule 2: the number of parallel jobs changes no output byte."""
-    src = _n3dv_source(tmp_path / "s", cameras=3, frames=3)
+    src = n3dv_source(tmp_path / "s", cameras=3, frames=3)
     one = convert_n3dv(src, tmp_path / "one", frames=3, resize=0.5, jobs=1)
     two = convert_n3dv(src, tmp_path / "two", frames=3, resize=0.5, jobs=3)
     files = sorted(p.relative_to(one.parent) for p in one.parent.rglob("*.png"))
@@ -197,12 +142,12 @@ def test_n3dv_outputs_do_not_depend_on_jobs(tmp_path: Path) -> None:
 def test_n3dv_refuses_inconsistent_sources(tmp_path: Path, case: str) -> None:
     """Q-88, Q-95: a row count different from the video count, a video size different from its
     row's H and W, a video shorter than `frames`, and a non-empty OUT are ValueErrors."""
-    src = _n3dv_source(tmp_path / "s", frames=3)
+    src = n3dv_source(tmp_path / "s", frames=3)
     frames = 3
     if case == "count":
         np.save(src / "poses_bounds.npy", np.load(src / "poses_bounds.npy")[:1])
     elif case == "size":
-        _video(src / "cam01.mp4", width=32, height=48, frames=3)
+        ffmpeg_video(src / "cam01.mp4", width=32, height=48, frames=3)
     elif case == "short":
         frames = 4
     elif case == "not_empty":
@@ -225,7 +170,7 @@ def test_u27_hardware_decoding_is_within_one_level_of_cpu_decoding(tmp_path: Pat
     ).stdout.split()
     if "cuda" not in listed:
         pytest.skip("this ffmpeg build has no cuda hwaccel")
-    src = _n3dv_source(tmp_path / "s", width=160, height=128, frames=10, lossless=False)
+    src = n3dv_source(tmp_path / "s", width=160, height=128, frames=10, lossless=False)
     cpu = read_scene_manifest(convert_n3dv(src, tmp_path / "cpu", frames=10, resize=1.0))
     gpu = read_scene_manifest(
         convert_n3dv(src, tmp_path / "gpu", frames=10, resize=1.0, hwaccel="cuda")
@@ -290,7 +235,7 @@ def _yaml_source(
 ) -> Path:
     _write_calibration(root, names, **calibration)
     for name in names:
-        video = _video(root / "videos" / f"{name}.mp4", frames=frames, smooth=True)
+        video = ffmpeg_video(root / "videos" / f"{name}.mp4", frames=frames, smooth=True)
         if images:
             pngs = _ffmpeg_pngs(video, root / "images" / name, frames)
             video.unlink()
@@ -420,7 +365,7 @@ def _selfcap_archives(
     if sync:
         (optimized / "sync.json").write_text(json.dumps(_OFFSETS))
     for name in _NAMES:
-        _video(release / "videos" / f"{name}.mp4", frames=frames)
+        ffmpeg_video(release / "videos" / f"{name}.mp4", frames=frames)
     src = root / "src"
     src.mkdir(parents=True, exist_ok=True)
     with tarfile.open(src / f"{seq}-release.tar.gz", "w:gz") as tar:

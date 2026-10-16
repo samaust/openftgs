@@ -11,10 +11,12 @@ independent expectation, not a duplicate to share.
 import dataclasses
 import json
 import math
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
@@ -486,3 +488,164 @@ def write_plane_scene(
     path = root / "scene.json"
     path.write_text(json.dumps(manifest, indent=1))
     return path
+
+
+# ffmpeg-made clips and Neural3DV sources (from the converter tests; shared with the CLI tests).
+
+
+def ffmpeg_video(
+    path: Path,
+    *,
+    width: int = 64,
+    height: int = 48,
+    frames: int = 10,
+    lossless: bool = True,
+    smooth: bool = False,
+) -> Path:
+    """A lavfi testsrc clip; the lossless clips decode to exactly what ffmpeg's PNG decode
+    gives."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if lossless:
+        codec = ["-c:v", "libx264rgb", "-qp", "0"]
+    else:
+        codec = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
+    pattern = "gradients" if smooth else "testsrc"  # gradients: smooth content (U-35's oracle)
+    source = f"{pattern}=size={width}x{height}:rate=30"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            source,
+            "-frames:v",
+            str(frames),
+            *codec,
+            str(path),
+        ],
+        check=True,
+    )
+    return path
+
+
+def llff_row(centre_x: float, *, width: int, height: int, focal: float) -> np.ndarray:
+    """A poses_bounds.npy row (D-28) for a camera at (centre_x, 0, 0) looking down +z, with
+    OpenCV axes x right, y down: the LLFF columns are down, right, back."""
+    down, right, back = [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]
+    matrix = np.array([down, right, back, [centre_x, 0.0, 0.0], [height, width, focal]]).T
+    return np.concatenate([matrix.reshape(-1), [0.5, 50.0]])
+
+
+def n3dv_source(root: Path, cameras: int = 2, **video: Any) -> Path:
+    width, height = video.get("width", 64), video.get("height", 48)
+    rows = [llff_row(0.25 * k, width=width, height=height, focal=50.0) for k in range(cameras)]
+    root.mkdir(parents=True, exist_ok=True)
+    np.save(root / "poses_bounds.npy", np.stack(rows))
+    for k in range(cameras):
+        ffmpeg_video(root / f"cam{k:02d}.mp4", **video)
+    return root
+
+
+# Invalid ftgs-if files (U-22; from the io tests, shared with the CLI tests).
+
+
+def exchange_arrays(n: int = 6, sh_degree: int = 3, seed: int = 0) -> dict[str, Tensor]:
+    g = torch.Generator().manual_seed(seed)
+    q = torch.randn(n, 4, generator=g)
+    q = q / q.norm(dim=-1, keepdim=True)
+    q = torch.where(q[:, :1] < 0, -q, q)
+    return {
+        "position": torch.randn(n, 3, generator=g),
+        "time_center": torch.rand(n, generator=g, dtype=torch.float64) * 10.0 + 2.0,
+        "duration": torch.rand(n, generator=g, dtype=torch.float64) + 0.05,
+        "velocity": torch.randn(n, 3, generator=g),
+        "scale": torch.rand(n, 3, generator=g) + 0.01,
+        "rotation": q,
+        "opacity": torch.rand(n, generator=g) * 0.98 + 0.01,
+        "sh": torch.randn(n, (sh_degree + 1) ** 2, 3, generator=g),
+    }
+
+
+def exchange_metadata(**override: str) -> dict[str, str]:
+    meta = {
+        "format": "ftgs-if",
+        "version": "1",
+        "sh_degree": "3",
+        "time_unit": "s",
+        "tau0": "2.0",
+        "tau1": "12.0",
+        "producer": "test",
+    }
+    meta.update(override)
+    return meta
+
+
+BAD_EXCHANGE_CASES = (
+    "nan position",
+    "inf sh",
+    "zero duration",
+    "negative duration",
+    "opacity 0",
+    "opacity 1",
+    "zero scale",
+    "zero rotation",
+    "rotation [N, 3]",
+    "sh of degree 2 for 3",
+    "velocity of another N",
+    "float32 time_center",
+    "float64 position",
+    "missing opacity",
+    "empty",
+    "version 2",
+    "sh_degree 4",
+    "tau1 < tau0",
+    "missing tau0",
+)
+
+
+def bad_exchange(case: str) -> tuple[dict[str, Tensor], dict[str, str]]:
+    a = exchange_arrays()
+    meta = exchange_metadata()
+    if case == "nan position":
+        a["position"][0, 0] = float("nan")
+    elif case == "inf sh":
+        a["sh"][1, 4, 2] = float("inf")
+    elif case == "zero duration":
+        a["duration"][2] = 0.0
+    elif case == "negative duration":
+        a["duration"][2] = -0.5
+    elif case == "opacity 0":
+        a["opacity"][3] = 0.0
+    elif case == "opacity 1":
+        a["opacity"][3] = 1.0
+    elif case == "zero scale":
+        a["scale"][0, 1] = 0.0
+    elif case == "zero rotation":
+        a["rotation"][4] = 0.0
+    elif case == "rotation [N, 3]":
+        a["rotation"] = a["rotation"][:, :3].contiguous()
+    elif case == "sh of degree 2 for 3":
+        a["sh"] = a["sh"][:, :9].contiguous()
+    elif case == "velocity of another N":
+        a["velocity"] = a["velocity"][:5].contiguous()
+    elif case == "float32 time_center":
+        a["time_center"] = a["time_center"].float()
+    elif case == "float64 position":
+        a["position"] = a["position"].double()
+    elif case == "missing opacity":
+        del a["opacity"]
+    elif case == "empty":
+        a = {k: v[:0] for k, v in a.items()}
+    elif case == "version 2":
+        meta["version"] = "2"
+    elif case == "sh_degree 4":
+        meta["sh_degree"] = "4"
+        a["sh"] = torch.zeros(6, 25, 3)
+    elif case == "tau1 < tau0":
+        meta["tau1"] = "1.0"
+    elif case == "missing tau0":
+        del meta["tau0"]
+    return a, meta
