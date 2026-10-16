@@ -246,6 +246,8 @@ def _init(args: argparse.Namespace) -> int:
             **{k: v for k, v in fields.items() if v is not None},
             upsample_preds=not args.no_upsample,
         )
+    if _device() != "cuda":  # Q-125: roma_init matches on every visible CUDA device
+        _fail("RoMa initialization needs a CUDA device")
     try:
         with _input("RoMa initialization"):
             points = roma_init(video, cfg)
