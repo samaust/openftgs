@@ -6,7 +6,6 @@ contracts of Q-106 to Q-112, Q-120 and Q-121, Q-122."""
 
 import dataclasses
 import hashlib
-import importlib
 import json
 import math
 import os
@@ -424,34 +423,75 @@ _REPO = Path(__file__).resolve().parents[1]
 _XFEAT_COMMIT = "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"  # Q-116, source log row 107
 
 
-def _local_corr_imports() -> bool:
-    try:
-        importlib.import_module("local_corr")
-    except (ImportError, OSError):
-        return False
-    return True
-
-
 @pytest.mark.parametrize("model", ["roma_outdoor", "tiny_roma_v1_outdoor"])
 def test_roma_provenance_records_the_settings_and_commits(model: str) -> None:
     """Q-107: one key, `roma_init`, holding compact JSON of every RomaInitConfig field, the
-    `use_custom_corr` that roma_init resolves (true only when `local_corr` imports, Q-112),
-    the vendored RoMa commit (VENDOR.json) and, for Tiny RoMa only, XFeat's commit (Q-116)."""
+    `use_custom_corr` that roma_init resolves (a bool, whose value the subprocess tests below
+    pin, Q-112), the vendored RoMa commit (VENDOR.json) and, for Tiny RoMa only, XFeat's
+    commit (Q-116)."""
     cfg = RomaInitConfig(model=model, stride=3, points_per_frame=7, seed=11)  # type: ignore[arg-type]
     meta = roma_provenance(cfg)
     assert list(meta) == ["roma_init"]
     text = meta["roma_init"]
     record = json.loads(text)
     assert text == json.dumps(record, separators=(",", ":"), sort_keys=True)
+    assert isinstance(record.pop("use_custom_corr"), bool)
     vendor = json.loads((_REPO / "src/openftgs/_vendor/romatch/VENDOR.json").read_text())
-    expected = {
-        **dataclasses.asdict(cfg),
-        "use_custom_corr": _local_corr_imports(),
-        "roma_commit": vendor["commit"],
-    }
+    expected = {**dataclasses.asdict(cfg), "roma_commit": vendor["commit"]}
     if model == "tiny_roma_v1_outdoor":
         expected["xfeat_commit"] = _XFEAT_COMMIT
     assert record == expected
+
+
+# Runs in a subprocess, so that the stand-in for `local_corr`, or the hook that blocks it,
+# stays out of the pytest process, as U-38 does with cv2 and xformers.
+_PROVENANCE_OF_LOCAL_CORR = """
+import importlib.abc
+import sys
+
+
+class _BlockLocalCorr(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "local_corr" or name.startswith("local_corr."):
+            raise ImportError("local_corr is blocked by the test's import hook")
+        return None
+
+
+if sys.argv[1] == "blocked":
+    sys.meta_path.insert(0, _BlockLocalCorr())
+from openftgs.init import RomaInitConfig, roma_provenance
+
+print(roma_provenance(RomaInitConfig())["roma_init"])
+"""
+
+
+@pytest.mark.parametrize(
+    ("local_corr", "expected"),
+    [("importable", True), ("blocked", False), ("oserror", False)],
+)
+def test_roma_provenance_records_whether_local_corr_imports(
+    tmp_path: Path, local_corr: str, expected: bool
+) -> None:
+    """D-58, Q-107, Q-112: `use_custom_corr` is true when fused-local-corr's `local_corr`
+    imports, here a stub package first on the path; it is false when an import hook blocks
+    `local_corr` (the stub still on the path), and when importing it raises OSError, as a
+    wheel built for another torch does."""
+    site = tmp_path / "site"
+    (site / "local_corr").mkdir(parents=True)
+    body = "raise OSError('built for another torch')\n" if local_corr == "oserror" else ""
+    (site / "local_corr" / "__init__.py").write_text(body, encoding="utf-8")
+    source_root = Path(openftgs.__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), str(source_root)])}
+    result = subprocess.run(
+        [sys.executable, "-c", _PROVENANCE_OF_LOCAL_CORR, local_corr],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.splitlines()[-1])["use_custom_corr"] is expected
 
 
 def test_init_imports_without_the_vendored_roma() -> None:
@@ -1404,7 +1444,8 @@ def test_u33_roma_outdoor_shards_and_pair_order_give_bitwise_identical_init_poin
         for p in (path, permuted)
     ]
     assert order[0] != order[1] and sorted(order[0]) == sorted(order[1])
-    record_property("use_custom_corr", _local_corr_imports())
+    resolved = json.loads(roma_provenance(RomaInitConfig())["roma_init"])
+    record_property("use_custom_corr", resolved["use_custom_corr"])
     outputs = [
         roma_init(MultiViewVideo.from_manifest(manifest), RomaInitConfig(), devices=devices)
         for manifest, devices in [
