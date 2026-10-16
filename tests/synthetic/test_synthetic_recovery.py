@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§3.2 synthetic-scene recovery tests S-1, S-2, S-3, S-5, S-6, S-7 and S-8 (M11, PRD #99).
+"""§3.2 synthetic-scene recovery tests S-1, S-2, S-3, S-5, S-6, S-7 and S-8 (M11, PRD #99), and
+S-4 (M13, PRD #133).
 
 Each scene trains from an initial model derived from committed ground truth and checks what was
 recovered against §3.2's pass criteria, on the CPU with the reference backend and on the GPU with
-gsplat (S-5 on the GPU only, Q-78). The setup choices §3.2 leaves open are Q-77 to Q-79, the
-measures Q-80; S-1, S-5 and S-6 depart from §3.2's rows where the owner decided (Q-81, Q-78,
-Q-83), and S-5's PSNR criterion stays verbatim under a strict xfail (Q-78). Every test records
-its measured values with `record_property`, for the Calibration data table of
+gsplat (S-5 on the GPU only, Q-78). S-4 instead starts from init points sampled on its moving
+spheres, with E15 velocities or none (Q-119). The setup choices §3.2 leaves open are Q-77 to
+Q-79 and Q-119, the measures Q-80; S-1, S-5 and S-6 depart from §3.2's rows where the owner
+decided (Q-81, Q-78, Q-83), and S-5's PSNR criterion stays verbatim under a strict xfail (Q-78).
+Every test records its measured values with `record_property`, for the Calibration data table of
 docs/clean-room/questions.md; no criterion is loosened there.
 """
 
@@ -24,6 +26,8 @@ from synthetic_scenes import (
     DATA,
     FPS,
     GROUND_TRUTH_FILES,
+    S4_FRAMES,
+    S4_GT_POINTS,
     SceneImage,
     assert_rows_matched,
     at_trajectory_points,
@@ -42,6 +46,7 @@ from synthetic_scenes import (
     replaced,
     ring_rig,
     rows,
+    s4_init,
     same_exchange,
     scene_video,
     split_indices,
@@ -49,6 +54,7 @@ from synthetic_scenes import (
     tau,
     train,
     trajectory_error,
+    velocity_error_rows,
     velocity_errors,
     with_degree,
 )
@@ -312,6 +318,81 @@ def test_s8_per_image_timestamps_recover_unsynchronized_cameras(
         {"velocity_vector": unsynchronized, "synchronized_velocity_vector": synchronized},
     )
     assert unsynchronized <= 1.2 * synchronized
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_s4_e15_init_recovers_the_spheres_velocities(device: str, record_property: Record) -> None:
+    """S-4: init points sampled on S-4's three moving spheres, one fixed jittered lattice per
+    sphere translated to each of the 10 frames (Q-119), with E15 velocities (`knn_velocities` on
+    `device`, a backward difference on the last frame, D-23): the median velocity error over the
+    init points is ≤ 5 %. The error is Q-80's relative vector error ‖v − v_gt‖/‖v_gt‖ (S-8's
+    single number, which bounds the relative magnitude error) against the velocity of the
+    point's sphere, in world units per τ. §3.2's precondition, a displacement per frame below
+    half the sampling spacing, is checked first."""
+    gt = ground_truth("s4")
+    init = s4_init(gt, load_seeds()["s4"]["init"], device)
+    v_gt = gt.arrays["velocity"].to(torch.float64)[init.sphere * S4_GT_POINTS]
+    largest_step = float(torch.linalg.vector_norm(v_gt, dim=1).max()) / FPS
+    assert largest_step < 0.5 * init.spacing  # §3.2 S-4
+    velocities = init.points.velocities
+    assert velocities is not None
+    errors = velocity_error_rows(velocities, v_gt)  # Q-80
+    _record(
+        record_property,
+        f"s4_{device}",
+        {
+            "median_velocity_vector": float(errors["vector"].median()),
+            "median_velocity_magnitude": float(errors["magnitude"].median()),
+            "median_velocity_angle_deg": float(errors["angle_deg"].median()),
+            "max_velocity_vector": float(errors["vector"].max()),
+            "largest_step_over_half_spacing": largest_step / (0.5 * init.spacing),
+        },
+    )
+    assert float(errors["vector"].median()) <= 0.05
+
+
+# Q-119: S-1's count. The gain of E15 shrinks as both runs converge (scratch probes on other
+# draws of this scene gave 0.9–1.6 dB at 1,000–2,000 iterations and about 0.5 dB at 3,000–5,000,
+# the CPU and the GPU within 0.01 dB), and 2,000 keeps the CPU variant under its 3-minute target.
+S4_ITERATIONS = 2_000
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_s4_zero_velocity_init_ends_below_e15_init(
+    device: str, tmp_path: Path, record_property: Record
+) -> None:
+    """S-4 (the direction of Table 4): with the same budget, the zero-velocity init ends with a
+    lower held-out PSNR than the E15 init. Both runs train from the same init points (Q-119),
+    once as made and once with `velocities=None` (v = 0, D-23's fallback), each for
+    S4_ITERATIONS on the shortened calendar (Q-75) with growth "none", relocation and λ_reg at
+    their defaults, SH degree 3 and λ_perc = 0 (Q-79), so N stays at the init's 420 rows in
+    both. PSNR is the mean over the 4 held-out hemisphere cameras at the 10 training frames
+    (Q-79, Q-80)."""
+    gt = ground_truth("s4")
+    rig = hemisphere_rig()
+    taus = [tau(k) for k in range(S4_FRAMES)]
+    video = scene_video(
+        tmp_path, gt, grid(rig.train, taus, "train") + grid(rig.test, taus, "test"), device
+    )
+    points = s4_init(gt, load_seeds()["s4"]["init"], device).points
+    n = int(points.positions.shape[0])
+    cfg = synthetic_config(S4_ITERATIONS, TrainConfig(growth=GrowthConfig(mode="none")))
+    held_out: dict[str, float] = {}
+    zero_velocity = dataclasses.replace(points, velocities=None)
+    for name, init in (("e15", points), ("zero_velocity", zero_velocity)):
+        trainer, logs = train(cfg, video, init, device)
+        assert all(log.num_gaussians == n for log in logs)  # the same budget
+        held_out[name] = _held_out_psnr(trainer, video)
+    _record(
+        record_property,
+        f"s4_{device}",
+        {
+            "e15_held_out_psnr": held_out["e15"],
+            "zero_velocity_held_out_psnr": held_out["zero_velocity"],
+            "e15_gain_db": held_out["e15"] - held_out["zero_velocity"],
+        },
+    )
+    assert held_out["zero_velocity"] < held_out["e15"]
 
 
 S3_ITERATIONS = 10_000  # Q-79, changed from 5,000 after the first measurement
