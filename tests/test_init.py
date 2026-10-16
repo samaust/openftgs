@@ -6,7 +6,6 @@ contracts of Q-106 to Q-112, Q-120 and Q-121, Q-122."""
 
 import dataclasses
 import hashlib
-import importlib
 import json
 import math
 import os
@@ -17,7 +16,6 @@ import sys
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -35,9 +33,8 @@ from openftgs.init import (
     DenseMatcher,
     RomaInitConfig,
     _nearest_indices,
+    _pil,
     _roma_matchers,
-    _RomaMatcher,
-    _TinyRomaMatcher,
     knn_velocities,
     roma_init,
     roma_provenance,
@@ -183,6 +180,23 @@ def test_u33_knn_velocities_match_a_float64_brute_force(device: str) -> None:
 
 
 @pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("lower", [1.0, -1.0], ids=["plus-first", "minus-first"])
+def test_u33_knn_velocities_ties_go_to_the_lower_index(device: str, lower: float) -> None:
+    """U-33, D-56: two distinct points of `next_points` at the same distance from a query,
+    (1, 0, 0) and (−1, 0, 0) from the origin, give the velocity of the one at the lower
+    index, whichever of the two comes first. The distances are exactly 1 and dt = 0.5, so
+    the velocity is exact."""
+    f64 = torch.float64
+    next_points = torch.tensor(
+        [[5.0, 5.0, 5.0], [lower, 0.0, 0.0], [-lower, 0.0, 0.0], [0.0, 3.0, 0.0]], dtype=f64
+    )
+    points = torch.tensor([[0.0, 0.0, 0.0], [0.0, 2.9, 0.0]], dtype=f64)
+    v = knn_velocities(points.to(device), next_points.to(device), 0.5)
+    expected = torch.tensor([[2 * lower, 0.0, 0.0], [0.0, 0.2, 0.0]], dtype=f64)
+    torch.testing.assert_close(v.cpu(), expected, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
 def test_nearest_indices_ties_go_to_the_lower_index(device: str) -> None:
     """D-56: among points at the nearest distance, the lowest index wins, on both paths.
 
@@ -232,9 +246,12 @@ def _project(P: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     return h[..., :2] / h[..., 2:]
 
 
-def _max_relative_error(got: torch.Tensor, want: torch.Tensor) -> float:
-    err = torch.linalg.vector_norm(got - want, dim=-1) / torch.linalg.vector_norm(want, dim=-1)
-    return float(err.max())
+def _dlt_atol(X: torch.Tensor) -> float:
+    """The atol that goes with U-19's rtol = 1e-6 for the points X."""
+    # U-19's 1e-6 is relative to a point, not to each of its coordinates: `_scene` puts
+    # coordinates near 0, where rtol alone would allow an error far below 1e-6 of the
+    # point's size. So atol is 1e-6 of the largest distance of a point from the origin.
+    return 1e-6 * float(torch.linalg.vector_norm(X, dim=-1).max())
 
 
 def _scene(n: int, seed: int) -> torch.Tensor:
@@ -253,7 +270,7 @@ def test_u19_noise_free_dlt_recovers_the_points(device: str) -> None:
     assert got.dtype == torch.float64
     assert got.shape == (2000, 3)
     assert got.device.type == device
-    assert _max_relative_error(got.cpu(), X) <= 1e-6
+    torch.testing.assert_close(got.cpu(), X, rtol=1e-6, atol=_dlt_atol(X))
 
 
 def test_u19_noise_free_dlt_broadcasts_the_cameras() -> None:
@@ -264,7 +281,7 @@ def test_u19_noise_free_dlt_broadcasts_the_cameras() -> None:
     P2 = _look_at([1.5, -0.1, -4.5])
     got = triangulate_dlt(_project(P1, X), _project(P2, X), P1, P2)
     assert got.shape == (2, 50, 3)
-    assert _max_relative_error(got, X) <= 1e-6
+    torch.testing.assert_close(got, X, rtol=1e-6, atol=_dlt_atol(X))
 
     rows = X[0, :6]
     centers = [[-1.0, 0.2, -5.0], [0.3, -2.0, -4.0], [4.0, 0.5, -3.0]]
@@ -272,7 +289,7 @@ def test_u19_noise_free_dlt_broadcasts_the_cameras() -> None:
     P2 = torch.stack([_look_at(centers[(i + 1) % 3]) for i in range(6)])
     got = triangulate_dlt(_project(P1, rows), _project(P2, rows), P1, P2)
     assert got.shape == (6, 3)
-    assert _max_relative_error(got, rows) <= 1e-6
+    torch.testing.assert_close(got, rows, rtol=1e-6, atol=_dlt_atol(rows))
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -289,7 +306,8 @@ def test_dlt_rows_with_a_non_finite_input_come_out_nan(device: str, bad: float) 
     broken = torch.zeros(64, dtype=torch.bool)
     broken[[3, 40]] = True
     assert torch.isnan(got[broken]).all()
-    assert _max_relative_error(got[~broken], X[~broken]) <= 1e-6
+    kept = X[~broken]
+    torch.testing.assert_close(got[~broken], kept, rtol=1e-6, atol=_dlt_atol(kept))
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -409,34 +427,75 @@ _REPO = Path(__file__).resolve().parents[1]
 _XFEAT_COMMIT = "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"  # Q-116, source log row 107
 
 
-def _local_corr_imports() -> bool:
-    try:
-        importlib.import_module("local_corr")
-    except (ImportError, OSError):
-        return False
-    return True
-
-
 @pytest.mark.parametrize("model", ["roma_outdoor", "tiny_roma_v1_outdoor"])
 def test_roma_provenance_records_the_settings_and_commits(model: str) -> None:
     """Q-107: one key, `roma_init`, holding compact JSON of every RomaInitConfig field, the
-    `use_custom_corr` that roma_init resolves (true only when `local_corr` imports, Q-112),
-    the vendored RoMa commit (VENDOR.json) and, for Tiny RoMa only, XFeat's commit (Q-116)."""
+    `use_custom_corr` that roma_init resolves (a bool, whose value the subprocess tests below
+    pin, Q-112), the vendored RoMa commit (VENDOR.json) and, for Tiny RoMa only, XFeat's
+    commit (Q-116)."""
     cfg = RomaInitConfig(model=model, stride=3, points_per_frame=7, seed=11)  # type: ignore[arg-type]
     meta = roma_provenance(cfg)
     assert list(meta) == ["roma_init"]
     text = meta["roma_init"]
     record = json.loads(text)
     assert text == json.dumps(record, separators=(",", ":"), sort_keys=True)
+    assert isinstance(record.pop("use_custom_corr"), bool)
     vendor = json.loads((_REPO / "src/openftgs/_vendor/romatch/VENDOR.json").read_text())
-    expected = {
-        **dataclasses.asdict(cfg),
-        "use_custom_corr": _local_corr_imports(),
-        "roma_commit": vendor["commit"],
-    }
+    expected = {**dataclasses.asdict(cfg), "roma_commit": vendor["commit"]}
     if model == "tiny_roma_v1_outdoor":
         expected["xfeat_commit"] = _XFEAT_COMMIT
     assert record == expected
+
+
+# Runs in a subprocess, so that the stand-in for `local_corr`, or the hook that blocks it,
+# stays out of the pytest process, as U-38 does with cv2 and xformers.
+_PROVENANCE_OF_LOCAL_CORR = """
+import importlib.abc
+import sys
+
+
+class _BlockLocalCorr(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "local_corr" or name.startswith("local_corr."):
+            raise ImportError("local_corr is blocked by the test's import hook")
+        return None
+
+
+if sys.argv[1] == "blocked":
+    sys.meta_path.insert(0, _BlockLocalCorr())
+from openftgs.init import RomaInitConfig, roma_provenance
+
+print(roma_provenance(RomaInitConfig())["roma_init"])
+"""
+
+
+@pytest.mark.parametrize(
+    ("local_corr", "expected"),
+    [("importable", True), ("blocked", False), ("oserror", False)],
+)
+def test_roma_provenance_records_whether_local_corr_imports(
+    tmp_path: Path, local_corr: str, expected: bool
+) -> None:
+    """D-58, Q-107, Q-112: `use_custom_corr` is true when fused-local-corr's `local_corr`
+    imports, here a stub package first on the path; it is false when an import hook blocks
+    `local_corr` (the stub still on the path), and when importing it raises OSError, as a
+    wheel built for another torch does."""
+    site = tmp_path / "site"
+    (site / "local_corr").mkdir(parents=True)
+    body = "raise OSError('built for another torch')\n" if local_corr == "oserror" else ""
+    (site / "local_corr" / "__init__.py").write_text(body, encoding="utf-8")
+    source_root = Path(openftgs.__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), str(source_root)])}
+    result = subprocess.run(
+        [sys.executable, "-c", _PROVENANCE_OF_LOCAL_CORR, local_corr],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.splitlines()[-1])["use_custom_corr"] is expected
 
 
 def test_init_imports_without_the_vendored_roma() -> None:
@@ -616,11 +675,14 @@ class _StandIn:
         return torch.cat(rows), torch.cat(weights)
 
 
-def _plane(z: float, step: int = 2, *, u0: int = 9) -> torch.Tensor:
-    """Points at depth z whose projections into a camera at the origin facing +z are the pixel
-    centers (u + ½, v + ½) for u ≥ u0 and v ≥ 1, every `step` pixels."""
-    u = torch.arange(u0, _W, step, dtype=torch.float64) + 0.5
-    v = torch.arange(1, _H, step, dtype=torch.float64) + 0.5
+def _plane(
+    z: float, step: int = 2, *, u0: int = 9, offset: tuple[float, float] = (0.5, 0.5)
+) -> torch.Tensor:
+    """Points at depth z whose projections into a camera at the origin facing +z are
+    (u + δu, v + δv) for u ≥ u0 and v ≥ 1, every `step` pixels, with (δu, δv) = `offset`: the
+    pixel centers (u + ½, v + ½) by default."""
+    u = torch.arange(u0, _W, step, dtype=torch.float64) + offset[0]
+    v = torch.arange(1, _H, step, dtype=torch.float64) + offset[1]
     uu, vv = torch.meshgrid(u, v, indexing="ij")
     X = torch.stack([(uu - _CX) / _FOCAL * z, (vv - _CY) / _FOCAL * z, torch.full_like(uu, z)])
     return X.reshape(3, -1).T.contiguous()
@@ -705,6 +767,37 @@ def test_u19_e15_forward_and_backward_on_the_last_slot(tmp_path: Path) -> None:
         offsets = _offsets_to_nearest(_frame(points, k), _frame(points, other))
         assert offsets.abs().amax() > 0.2  # the plane moved 0.25 in depth
         torch.testing.assert_close(v * (other - k) * step, offsets, rtol=1e-6, atol=0.0)
+
+
+def test_u19_e15_runs_against_the_full_point_set_of_the_other_init_frame(
+    tmp_path: Path,
+) -> None:
+    """E15, D-23, D-24, §1.3 steps 5 and 7; Q-111: velocities come from the other init
+    frame's full triangulated set, not from the subset it keeps. A plane moves by 1/64 along x
+    between two frames; B = 100 of its 448 points are kept per init frame. Each kept point's
+    velocity times dt equals the offset to its nearest point of the other frame's full set,
+    found by a float64 brute force on a run that keeps every point (the pairs' draws don't
+    depend on B, so its points are that full set). For some kept points, the nearest point
+    the other frame keeps is another one, so E15 against the kept subset would fail."""
+    plane = _plane(2.0)
+    shift = torch.tensor([1 / 64, 0.0, 0.0], dtype=torch.float64)
+    dataset = _rig_scene(tmp_path, [0.0, _FRAME])
+
+    def moving(tau: float) -> torch.Tensor:
+        return plane + shift * (tau / _FRAME)
+
+    full = _run(dataset, _StandIn(dataset, points=moving), points_per_frame=10_000)
+    kept = _run(dataset, _StandIn(dataset, points=moving), points_per_frame=100)
+    assert len(_frame(full, 0)) == len(_frame(full, 1)) == len(plane) == 448
+    assert len(_frame(kept, 0)) == len(_frame(kept, 1)) == 100
+    assert kept.velocities is not None and kept.frame_ids is not None
+    step = dataset.frame_dt * (dataset.time.tau1 - dataset.time.tau0)  # Δt_f·T_τ = 1/30
+    for k, other in [(0, 1), (1, 0)]:
+        v = kept.velocities[kept.frame_ids == k].to(torch.float64)
+        offsets = _offsets_to_nearest(_frame(kept, k), _frame(full, other))
+        torch.testing.assert_close(v * (other - k) * step, offsets, rtol=1e-6, atol=0.0)
+        to_kept = _offsets_to_nearest(_frame(kept, k), _frame(kept, other))
+        assert bool(((to_kept - offsets).abs().amax(dim=1) > 0.05).any())
 
 
 @pytest.mark.parametrize("taus", [[0.0], [0.0, 1 / 30]], ids=["one-timestamp", "stride-2"])
@@ -818,14 +911,127 @@ def _projection_of(camera: Camera) -> torch.Tensor:
     return camera.K.to(torch.float64) @ w2c[:3, :]
 
 
-def test_u19_colors_are_the_mean_of_the_two_source_pixels(tmp_path: Path) -> None:
+Measured = tuple[torch.Tensor, list[float], list[float], float]
+
+
+def _measured(a: Camera, b: Camera, match: Sequence[float]) -> Measured:
+    """What D-22's filters see for one match, computed here: the point `triangulate_dlt`
+    returns [3], its reprojection error (px) and depth in views A and B, and the angle (°)
+    between the rays from the two camera centers to it."""
+    pixels = [torch.tensor([match[0:2]], dtype=torch.float64)]
+    pixels.append(torch.tensor([match[2:4]], dtype=torch.float64))
+    X = triangulate_dlt(pixels[0], pixels[1], _projection_of(a), _projection_of(b))
+    errors, depths, rays = [], [], []
+    for camera, x in zip((a, b), pixels, strict=True):
+        reprojected, depth = _project_points(camera, X)
+        errors.append(torch.linalg.vector_norm(reprojected - x).item())
+        depths.append(depth.item())
+        w2c = camera.world_to_camera.to(torch.float64)
+        rays.append(X[0] + w2c[:3, :3].T @ w2c[:3, 3])  # X minus the camera's center
+    sine = torch.linalg.vector_norm(torch.linalg.cross(rays[0], rays[1]))
+    angle = math.degrees(math.atan2(sine.item(), (rays[0] @ rays[1]).item()))
+    return X[0], errors, depths, angle
+
+
+def test_u19_filters_hold_d22s_bounds_of_2_px_and_1_degree(tmp_path: Path) -> None:
+    """§1.3 step 3, D-22: a point is kept with a reprojection error of at most 2 px in both
+    views and a triangulation angle of at least 1°. On the rectified rig, B's pixel moved
+    across the epipolar line by 3.8 px gives errors of about 1.91 px in each view (kept) and
+    by 4.2 px about 2.11 px (dropped); by 4.0 px, for another point, about 2.02 px in A and
+    just under 2 px in B (dropped: the bound holds in both views). Exact matches of points on
+    the rig's plane of symmetry at depths 27.2 and 30 are seen at about 1.05° (kept) and 0.95°
+    (dropped). Each value is computed here from the point `triangulate_dlt` returns, and
+    every other filter passes."""
+    dataset = _rig_scene(tmp_path, [0.0])
+    a, b = dataset.records[0].camera, dataset.records[1].camera
+    matches = [
+        _crafted(a, b, (0.2, -0.1, 2.0), shift_b=3.8),
+        _crafted(a, b, (-0.3, 0.05, 2.5), shift_b=4.2),
+        _crafted(a, b, (0.1, 0.1, 2.2), shift_b=4.0),
+        _crafted(a, b, (0.25, 0.0, 27.2)),
+        _crafted(a, b, (0.25, 0.0, 30.0)),
+    ]
+    measured = [_measured(a, b, match) for match in matches]
+    errors = [errors for _, errors, _, _ in measured]
+    angles = [angle for _, _, _, angle in measured]
+    assert all(depth > 0 for _, _, depths, _ in measured for depth in depths)
+    assert all(1.9 < error < 1.95 for error in errors[0])
+    assert all(2.05 < error < 2.15 for error in errors[1])
+    assert 2.0 < errors[2][0] < 2.05 and 1.99 < errors[2][1] < 2.0
+    assert all(error < 1e-6 for error in errors[3] + errors[4])
+    assert all(angle > 5.0 for angle in angles[:3])
+    assert 1.04 < angles[3] < 1.06 and 0.94 < angles[4] < 0.96
+
+    points = _run(dataset, _StandIn(dataset, crafted={("A", "B"): matches}))
+    expected = torch.stack([measured[0][0], measured[3][0]])
+    got = _matched(points.positions.to(torch.float64), expected)
+    torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+
+# A rig that isn't rectified: B stands 1 in front of A and faces it, so a point can lie in
+# front of one camera and behind the other while projecting into both images.
+_FACING: dict[str, CameraSpec] = {"A": (0.0, (0.0, 0.0, 0.0)), "B": (180.0, (0.5, 0.0, 1.0))}
+
+
+def test_u19_filters_drop_a_point_behind_one_camera_only(tmp_path: Path) -> None:
+    """§1.3 step 3, D-22: a point is kept only with a positive depth in both views. On a rig
+    whose cameras face each other, exact matches of a point behind B only and of a point
+    behind A only are dropped, and a point between the cameras is kept. Each of the three
+    passes the other filters (reprojection error near 0, angle far above 1°), as computed
+    here from the point `triangulate_dlt` returns."""
+    shots: list[Shot] = [("A", 0.0, "train"), ("B", 0.0, "train")]
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, _FACING, shots))
+    a, b = dataset.records[0].camera, dataset.records[1].camera
+    behind_b, behind_a, between = (0.1, 0.05, 2.0), (0.4, -0.05, -1.0), (0.2, 0.05, 0.5)
+    matches = [_crafted(a, b, X) for X in (behind_b, behind_a, between)]
+    measured = [_measured(a, b, match) for match in matches]
+    depths = [depths for _, _, depths, _ in measured]
+    assert depths[0][0] > 0 > depths[0][1]
+    assert depths[1][1] > 0 > depths[1][0]
+    assert min(depths[2]) > 0
+    size = (float(_W), float(_H))
+    for match, (_, errors, _, angle) in zip(matches, measured, strict=True):
+        assert all(0 < match[i] < size[i % 2] for i in range(4))  # inside both images
+        assert max(errors) < 1e-6 and angle > 5.0
+
+    points = _run(dataset, _StandIn(dataset, crafted={("A", "B"): matches}))
+    expected = measured[2][0][None]
+    got = _matched(points.positions.to(torch.float64), expected)
+    torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+
+def _bilinear(image: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """The test's bilinear sampling of an [H, W, 3] image at continuous pixel coordinates x
+    [n, 2] (§1.4: pixel i spans [i, i + 1), its center at i + ½), by `grid_sample` with
+    align_corners=False and the borders clamped."""
+    size = torch.tensor([image.shape[1], image.shape[0]], dtype=torch.float64)
+    grid = (x / size * 2 - 1).to(image.dtype)[None, None]  # [1, 1, n, 2]
+    sampled = torch.nn.functional.grid_sample(
+        image.permute(2, 0, 1)[None],
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )
+    return sampled[0, :, 0].T
+
+
+@pytest.mark.parametrize(
+    "offset", [(0.5, 0.5), (0.25, 0.75), (0.9, 0.1)], ids=["centers", "off-centers", "near-edges"]
+)
+def test_u19_colors_are_the_mean_of_the_two_source_pixels(
+    tmp_path: Path, offset: tuple[float, float]
+) -> None:
     """§1.3 step 3, D-22; Q-110: each color is the mean of the two source pixels, each the
     pixel holding the match's continuous coordinate. The images encode (u, v) as (R, G); the
-    rectified rig sees the plane's points at the pixel centers (u + ½, v + ½) in A and
-    (u − 8 + ½, v + ½) in B, so the expected color is computed from the image files' values."""
+    rectified rig sees the plane's points at (u + δu, v + δv) in A and (u − 8 + δu, v + δv)
+    in B, so the expected color is computed from the image files' values. Off the pixel
+    centers, bilinear sampling of the same images gives another color for every point, so
+    the floor pixel and bilinear sampling can't be confused."""
     dataset = _rig_scene(tmp_path, [0.0])
-    points = _run(dataset, _StandIn(dataset, points=_static()))
-    assert len(points.positions) == len(_plane(2.0))
+    X = _plane(2.0, offset=offset)
+    points = _run(dataset, _StandIn(dataset, points=lambda tau: X))
+    assert len(points.positions) == len(X)
     xa, _ = _project_points(dataset.records[0].camera, points.positions.to(torch.float64))
     u, v = torch.floor(xa[:, 0]).long(), torch.floor(xa[:, 1]).long()
     image_a = torch.from_numpy(_encoded_image(0).astype(np.float32)) / 255.0
@@ -833,6 +1039,10 @@ def test_u19_colors_are_the_mean_of_the_two_source_pixels(tmp_path: Path) -> Non
     expected = (image_a[v, u] + image_b[v, u - 8]) / 2
     assert len(torch.unique(expected, dim=0)) == len(expected)
     torch.testing.assert_close(points.colors, expected, rtol=0.0, atol=1e-6)
+    if offset != (0.5, 0.5):
+        xb = xa - torch.tensor([8.0, 0.0], dtype=torch.float64)
+        bilinear = (_bilinear(image_a, xa) + _bilinear(image_b, xb)) / 2
+        assert bool(((bilinear - expected).abs().amax(dim=1) > 0.05 / 255).all())
 
 
 def test_u19_initial_durations_with_a_single_timestamp_are_the_stride(tmp_path: Path) -> None:
@@ -925,6 +1135,29 @@ def test_u19_a_camera_without_an_image_near_the_slot_sits_it_out(tmp_path: Path)
         3: {"P", "Q", "S", "T"},
         4: {"P", "Q", "S"},
     }
+
+
+def test_u19_at_stride_2_an_image_half_a_frame_before_a_slot_joins_it(tmp_path: Path) -> None:
+    """§1.3 step 1, D-21, D-47; Q-109: a slot holds each camera's image within Δt_f/2 of t_k,
+    also at k_stride = 2, where an image exactly Δt_f/2 before slot 2 has the non-slot frame 1
+    as its nearest frame (the tie to the lower frame). B has images at frames 0 to 4; A at
+    frames 0, 1, 1.5, 3 and 4 (whole seconds, frames 1 s apart, so every time is exact).
+    Slot 2 pairs A's image at 1.5 with B's at 2; A's images at 1 and 3, a whole frame from
+    every slot, are never read."""
+    shots: list[Shot] = [("B", float(n), "train") for n in range(5)]
+    shots += [("A", tau, "train") for tau in (0.0, 1.0, 1.5, 3.0, 4.0)]
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, _RIG, shots))
+    assert dataset.frame_dt == 0.25  # the median gap of each camera is 1 s, over T_τ = 4 s
+    stand_in = _StandIn(dataset, points=_static())
+    points = _run(dataset, stand_in, stride=2)
+
+    index = {(camera, tau): i for i, (camera, tau, _) in enumerate(shots)}
+    expected = {(index["A", a], index["B", b]) for a, b in [(0.0, 0.0), (1.5, 2.0), (4.0, 4.0)]}
+    assert len(stand_in.calls) == len(expected)
+    assert set(stand_in.calls) == expected
+    assert points.frame_ids is not None
+    got = set(zip(points.frame_ids.tolist(), points.timestamps.tolist(), strict=True))
+    assert got == {(0, 0.0), (2, 1.75), (4, 4.0)}
 
 
 # Five cameras turned about the vertical axis, all facing a plane at depth 3. X faces it; L
@@ -1223,101 +1456,56 @@ def test_roma_init_refuses_a_malformed_dense_matcher_output(
         roma_init(dataset, RomaInitConfig(), devices=["cpu"], matcher=matcher)
 
 
-# The RoMa adapters, with a fake model in place of RoMa: the real models need weights and
-# are exercised by the GPU and weights tests of #137.
+# The RoMa adapters themselves run only with the real models, in the weights tests below
+# (#137); RoMa is never stood in for (`.claude/skills/tdd/mocking.md`).
 
 
-class _FakeRoma:
-    """Records what `match` receives and returns a warp of RoMa's shapes, made in inference
-    mode as RoMa's are."""
-
-    def __init__(self, warp_shape: tuple[int, ...]) -> None:
-        self.warp_shape = warp_shape
-        self.inputs: list[Any] = []
-        self.inference: list[bool] = []
-
-    def match(self, im_a: Any, im_b: Any, **kwargs: Any) -> tuple[Tensor, Tensor]:
-        self.inputs.append((im_a, im_b, kwargs))
-        self.inference.append(torch.is_inference_mode_enabled())
-        with torch.inference_mode():
-            n = math.prod(self.warp_shape[:-1])
-            warp = torch.arange(4 * n, dtype=torch.float16).reshape(self.warp_shape)
-            certainty = torch.linspace(0, 1, n, dtype=torch.float16).reshape(self.warp_shape[:-1])
-        return warp, certainty
+def test_pil_gives_roma_the_8_bit_values_back() -> None:
+    """Q-110: RoMa's input is round(255·x) as uint8, so every 8-bit value that
+    `MultiViewVideo.load_image` returns as x = b/255 in float32 comes back as b exactly."""
+    values = torch.arange(256, dtype=torch.uint8)
+    pixels = values[torch.randperm(256, generator=torch.Generator().manual_seed(0))]
+    pixels = torch.cat([values, pixels, values.flip(0)]).reshape(16, 16, 3)
+    image = _pil(pixels.to(torch.float32) / 255.0)
+    assert image.mode == "RGB" and image.size == (16, 16)
+    assert torch.equal(torch.from_numpy(np.array(image)), pixels)
 
 
-def _image(seed: int) -> Tensor:
-    pixels = torch.randint(0, 256, (_H, _W, 3), generator=torch.Generator().manual_seed(seed))
-    return pixels.to(torch.float32) / 255.0
+# XFeat's weights at the pinned commit, as source log row 136 hashed them (Q-123).
+_XFEAT_SHA256 = "0f5187fd7bedd26c7fe6acc9685444493a165a35ecc087b33c2db3627f3ea10b"
 
 
-def test_roma_matcher_hands_roma_pil_images_and_flattens_its_warp() -> None:
-    """Q-106, Q-110: the roma_outdoor adapter gives RoMa PIL images of round(255·x) as uint8,
-    byte-exact for 8-bit images, with the shard's device, and returns the whole two-way warp
-    [1, H, 2W, 4] and its certainty flattened to [M, 4] and [M], float32 ordinary tensors on
-    the CPU."""
-    fake = _FakeRoma((1, 6, 2 * 5, 4))
-    matcher = _RomaMatcher(fake, torch.device("cpu"))
-    image_a, image_b = _image(0), _image(1)
-    warp, certainty = matcher(image_a, image_b)
-    pil_a, pil_b, kwargs = fake.inputs[0]
-    assert kwargs == {"device": torch.device("cpu")}
-    for pil, image in ((pil_a, image_a), (pil_b, image_b)):
-        assert pil.mode == "RGB" and pil.size == (_W, _H)
-        assert torch.equal(torch.from_numpy(np.array(pil)), (image * 255).round().to(torch.uint8))
-    assert warp.shape == (60, 4) and certainty.shape == (60,)
-    assert warp.dtype == certainty.dtype == torch.float32
-    assert not warp.is_inference() and not certainty.is_inference()
-    assert torch.equal(warp, torch.arange(240, dtype=torch.float32).reshape(60, 4))
+@pytest.mark.weights
+def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(tmp_path: Path) -> None:
+    """Q-116, Q-123: into an empty torch.hub folder, the Tiny RoMa adapter downloads XFeat at
+    the pinned commit and nothing at any other ref; it builds XFeat without XFeat's own
+    weights, which its loader would download from the repository's `main` as
+    checkpoints/xfeat.pt (source log row 136), and loads the pinned commit's weights instead,
+    saved as xfeat-0f5187fd.pt with row 136's SHA-256. Real downloads, into a fresh folder so
+    that no cached file hides one (mocking.md).
 
-
-def test_tiny_roma_matcher_calls_tiny_roma_in_inference_mode() -> None:
-    """Q-116: the Tiny RoMa adapter wraps the call in inference mode and flattens the one-way
-    warp [1, H, W, 4] to [M, 4], float32 ordinary tensors on the CPU."""
-    fake = _FakeRoma((1, _H, _W, 4))
-    warp, certainty = _TinyRomaMatcher(fake)(_image(0), _image(1))
-    assert fake.inference == [True]
-    assert fake.inputs[0][2] == {}
-    assert warp.shape == (_H * _W, 4) and certainty.shape == (_H * _W,)
-    assert warp.dtype == certainty.dtype == torch.float32
-    assert not warp.is_inference() and not certainty.is_inference()
-
-
-def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Q-116, Q-123: the Tiny RoMa adapter builds XFeat from the pinned commit without its
-    own weights, which XFeat's loader would take from the repository's `main`, and loads the
-    weights of that commit, whose SHA-256 begins 0f5187fd (source log row 136), checked by
-    torch.hub. torch.hub is stood in for, so nothing is downloaded."""
-    net = torch.nn.Linear(2, 1)
-    pinned = {name: torch.full_like(value, 0.25) for name, value in net.state_dict().items()}
-    hub: list[tuple[str, str, dict[str, Any]]] = []
-    fetched: list[tuple[str, dict[str, Any]]] = []
-
-    def load(repo: str, model: str, **kwargs: Any) -> Any:
-        hub.append((repo, model, kwargs))
-        return SimpleNamespace(net=net)
-
-    def fetch(url: str, **kwargs: Any) -> dict[str, Tensor]:
-        fetched.append((url, kwargs))
-        return pinned if "accelerated_features" in url else {}
-
-    monkeypatch.setattr(torch.hub, "load", load)
-    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", fetch)
-    _roma_matchers(RomaInitConfig(model="tiny_roma_v1_outdoor"))
-    assert hub == [
-        (
-            f"verlab/accelerated_features:{_XFEAT_COMMIT}",
-            "XFeat",
-            {"pretrained": False, "top_k": 4096, "trust_repo": True, "skip_validation": True},
-        )
-    ]
-    url = f"https://github.com/verlab/accelerated_features/raw/{_XFEAT_COMMIT}/weights/xfeat.pt"
-    options = {"map_location": "cpu", "file_name": "xfeat-0f5187fd.pt", "check_hash": True}
-    assert (url, options) in fetched
-    for name, value in net.state_dict().items():
-        assert torch.equal(value, pinned[name])
+    Tiny RoMa's own checkpoint then sets every XFeat weight a shard keeps (source log row
+    138), so the weights checked here are those `_roma_matchers` builds XFeat with, read from
+    the builder it returns."""
+    previous = torch.hub.get_dir()
+    hub = tmp_path / "hub"
+    torch.hub.set_dir(str(hub))
+    try:
+        build = _roma_matchers(RomaInitConfig(model="tiny_roma_v1_outdoor"))
+    finally:
+        torch.hub.set_dir(previous)
+    repos = sorted(path.name for path in hub.iterdir() if path.is_dir())
+    assert repos == ["checkpoints", f"verlab_accelerated_features_{_XFEAT_COMMIT}"]
+    checkpoints = sorted(path.name for path in (hub / "checkpoints").iterdir())
+    assert checkpoints == ["tiny_roma_v1_outdoor.pth", "xfeat-0f5187fd.pt"]
+    weights = hub / "checkpoints" / "xfeat-0f5187fd.pt"
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == _XFEAT_SHA256
+    pinned = torch.load(weights, map_location="cpu", weights_only=True)
+    cells = [cell.cell_contents for cell in build.__closure__ or ()]
+    (xfeat,) = [cell for cell in cells if isinstance(cell, torch.nn.Module)]
+    state = xfeat.state_dict()
+    assert state.keys() == pinned.keys()
+    assert all(torch.equal(value.cpu(), pinned[name]) for name, value in state.items())
 
 
 # Real RoMa (#137): `roma_init` with its default dense matchers on the vendored copy (D-58,
@@ -1434,7 +1622,8 @@ def test_u33_roma_outdoor_shards_and_pair_order_give_bitwise_identical_init_poin
         for p in (path, permuted)
     ]
     assert order[0] != order[1] and sorted(order[0]) == sorted(order[1])
-    record_property("use_custom_corr", _local_corr_imports())
+    resolved = json.loads(roma_provenance(RomaInitConfig())["roma_init"])
+    record_property("use_custom_corr", resolved["use_custom_corr"])
     outputs = [
         roma_init(MultiViewVideo.from_manifest(manifest), RomaInitConfig(), devices=devices)
         for manifest, devices in [

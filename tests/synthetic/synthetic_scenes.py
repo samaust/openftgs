@@ -341,12 +341,12 @@ def smallest_spacing(points: Tensor) -> float:
 def _gt_s4(seed: int) -> ExchangeModel:
     """S-4 (Q-119): three spheres of radius S4_RADIUS translating linearly, each S4_GT_POINTS
     Gaussians on a Fibonacci lattice that share its velocity, with isotropic scales, opacity
-    0.9, long durations, time centers at the middle frame and uniform random colors in
-    [0.2, 0.9] (a texture that shows the motion). A sphere's center at the middle time lies
-    within S4_CENTER_RADIUS of the origin and its step per frame is uniform in S4_STEP, in a
-    uniform random direction; each is drawn again until its surface stays in view of every
-    hemisphere camera at every frame and S4_CLEARANCE from the others'. Rows are sphere by
-    sphere, S4_GT_POINTS each."""
+    0.9, long durations, time centers at the sequence's middle time, half its span (between
+    frames 4 and 5 of 10), and uniform random colors in [0.2, 0.9] (a texture that shows the
+    motion). A sphere's center at the middle time lies within S4_CENTER_RADIUS of the origin
+    and its step per frame is uniform in S4_STEP, in a uniform random direction; each is drawn
+    again until its surface stays in view of every hemisphere camera at every frame and
+    S4_CLEARANCE from the others'. Rows are sphere by sphere, S4_GT_POINTS each."""
     g = torch.Generator().manual_seed(seed)
     taus = frame_taus(S4_FRAMES)
     span = tau(S4_FRAMES - 1)

@@ -100,6 +100,6 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 # D-65: the vendored RoMa is third-party code, kept as upstream wrote it.
-module = ["openftgs._vendor.*"]
+module = ["openftgs._vendor.romatch.*"]
 follow_imports = "skip"
 ignore_errors = true

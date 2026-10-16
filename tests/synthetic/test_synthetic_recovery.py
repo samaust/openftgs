@@ -351,9 +351,10 @@ def test_s4_e15_init_recovers_the_spheres_velocities(device: str, record_propert
     assert float(errors["vector"].median()) <= 0.05
 
 
-# Q-119: S-1's count. The gain of E15 shrinks as both runs converge (scratch probes on other
-# draws of this scene gave 0.9–1.6 dB at 1,000–2,000 iterations and about 0.5 dB at 3,000–5,000,
-# the CPU and the GPU within 0.01 dB), and 2,000 keeps the CPU variant under its 3-minute target.
+# Q-119: S-4's iteration count, the same as S-1's. The gain of E15 shrinks as both runs
+# converge (scratch probes on other draws of this scene gave 0.9–1.6 dB at 1,000–2,000
+# iterations and about 0.5 dB at 3,000–5,000, the CPU and the GPU within 0.01 dB), and 2,000
+# keeps the CPU variant under its 3-minute target.
 S4_ITERATIONS = 2_000
 
 
