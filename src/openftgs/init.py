@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """InitPoints to tensors, k-NN velocities, DLT triangulation, and the optional RoMa pipeline on the
-vendored copy in openftgs._vendor.romatch.
+vendored copy in openftgs._vendor.romatch, which is imported only when RoMa is used.
 
-Spec: §1.3, E15, D-58, D-65. Band: Foundation (§2.1).
+Spec: §1.3, E15, D-21 to D-25, D-47, D-54, D-56, D-58, D-65, D-66, D-70, D-74; Q-106 to Q-112,
+Q-116, Q-120; docs/modules/init/roma-pipeline.md. Band: Foundation (§2.1).
 """
 
 import contextlib
