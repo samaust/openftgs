@@ -807,3 +807,24 @@ def test_a_failed_conversion_leaves_out_as_it_found_it(tmp_path: Path, start: st
     else:
         assert out.is_dir() and list(out.iterdir()) == []
     assert convert_selfcap(src, out, **call).is_file()  # the rerun works
+
+
+@needs_ffmpeg
+def test_selfcap_resize_overrides_the_default_ratio(tmp_path: Path) -> None:
+    """Q-97 (owner answer): `resize` sets the ratio; a scene outside the card's table is
+    otherwise resized by 0.5. At 1.0 the 64×48 videos keep their size and the manifest records
+    the ratio."""
+    src = _selfcap_archives(tmp_path, "mini")
+    call: dict[str, Any] = {
+        "scene": "mini",
+        "window": (4, 6),
+        "test_camera": "0002",
+        "undistort": "internal",
+    }
+    full = read_scene_manifest(convert_selfcap(src, tmp_path / "full", resize=1.0, **call))
+    half = read_scene_manifest(convert_selfcap(src, tmp_path / "half", **call))
+    assert {(r.camera.width, r.camera.height) for r in full.records} == {(64, 48)}
+    assert {(r.camera.width, r.camera.height) for r in half.records} == {(32, 24)}
+    assert (full.metadata["resize"], half.metadata["resize"]) == (1.0, 0.5)
+    with pytest.raises(ValueError):
+        convert_selfcap(src, tmp_path / "bad", resize=0.0, **call)

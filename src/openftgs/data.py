@@ -1542,10 +1542,12 @@ def convert_selfcap(
     hwaccel: Literal["none", "cuda"] = "none",
     jobs: int = 0,
     ffprobe: str | None = None,
+    resize: float | None = None,
 ) -> Path:
     """Convert a SelfCap scene (§1.4, D-59, D-60, D-63, D-64; Q-86, Q-87, Q-97, Q-101): SRC
     holds the archives as downloaded; dance1 … bike2 take window and test camera from the
-    card's table, other names need both. Frames N0 ≤ n < N1 of every camera, undistorted by
+    card's table, other names need both. `resize` sets the ratio; None takes the table's, or
+    0.5 for other names (Q-97). Frames N0 ≤ n < N1 of every camera, undistorted by
     COLMAP (or the package with undistort='internal'), area-resized, with τ = n/60 minus the
     camera's sync offset. Returns the path of OUT/scene.json."""
     src = Path(src)
@@ -1563,6 +1565,9 @@ def convert_selfcap(
                 f"scene {scene!r} isn't in the card's table: pass window and test_camera"
             )
         sequence, ratio = scene, _SELFCAP_DEFAULT_RESIZE
+    if resize is not None:
+        resized_size(1, 1, resize)  # a finite ratio > 0
+        ratio = float(resize)
     n0, n1 = (int(window[0]), int(window[1]))
     if not 0 <= n0 < n1:
         raise ValueError(f"window must be (N0, N1) with 0 <= N0 < N1, got {window!r}")
