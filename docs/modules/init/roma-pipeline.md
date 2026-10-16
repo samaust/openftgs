@@ -25,7 +25,7 @@ k is the slot's frame index, a multiple of k_stride. No draw depends on another'
 
 ## Determinism and precision
 
-For the whole call, matcher building included, `roma_init` sets the float32 matmul precision RoMa requires, turns cuDNN autotuning off and deterministic cuDNN and strict deterministic algorithms on, and restores the previous settings afterwards, after a failure too (D-56, §2.4 "Precision"; Q-112). RoMa keeps its own float16 autocast. Triangulation, the filters and E15 run in float64; the k-NN of E15 is exact, ties to the lower index (D-56).
+For the whole call, matcher building included, `roma_init` sets the float32 matmul precision RoMa requires, turns cuDNN autotuning off and deterministic cuDNN and strict deterministic algorithms on, and restores the previous settings afterwards, after a failure too (D-56, §2.4 "Precision"; Q-112). No op of RoMa's or Tiny RoMa's forward pass raises in strict mode (torch 2.14.1, CUDA 13.0), and real RoMa gives bitwise identical init points however the pairs are sharded on one GPU or listed in the manifest, with `use_custom_corr` off (U-33, #137). RoMa keeps its own float16 autocast. Triangulation, the filters and E15 run in float64; the k-NN of E15 is exact, ties to the lower index (D-56).
 
 ## The dense-matcher port
 
