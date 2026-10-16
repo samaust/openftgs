@@ -746,13 +746,17 @@ def roma_init(
     unit = span if span > 0 else 1.0  # D-70: a time unit of 1 for a single timestamp
     frame_dt = float(dataset.frame_dt)
     e15_device = shard_devices[0]
-    kept: list[tuple[_Slot, Tensor]] = []
+    # The finished init frames: (slot, its kept points' velocities). A slot's full set is
+    # dropped once it is finished and no longer needed by E15 (the PRD's job order).
+    finished: list[tuple[_Slot, Tensor]] = []
 
-    def velocities(slot: _Slot, other: _Slot) -> Tensor:
-        # E15, D-23; Q-111: against the other slot's full set, dt from the slot times.
-        dt = (other.k - slot.k) * frame_dt * unit
-        v = knn_velocities(slot.positions.to(e15_device), other.full.to(e15_device), dt)
-        return v.cpu()
+    def finish(slot: _Slot, other: _Slot | None) -> None:
+        if other is None:  # §1.3 step 5: a single init frame gives v = 0
+            v = torch.zeros_like(slot.positions)
+        else:  # E15, D-23; Q-111: against the other slot's full set, dt from the slot times
+            dt = (other.k - slot.k) * frame_dt * unit
+            v = knn_velocities(slot.positions.to(e15_device), other.full.to(e15_device), dt)
+        finished.append((dataclasses.replace(slot, full=slot.full.new_empty(0, 3)), v.cpu()))
 
     with _deterministic():
         build = matcher if matcher is not None else _roma_matchers(cfg)
@@ -769,28 +773,25 @@ def roma_init(
                 if current is None:
                     continue
                 if previous is not None:
-                    kept.append((previous, velocities(previous, current)))  # forward
+                    finish(previous, current)  # the next init frame
                 before, previous = previous, current
         if previous is None:
             _fail("roma_init: no point survived matching and the filters of D-22")
-        if before is None:  # §1.3 step 5: a single init frame gives v = 0
-            kept.append((previous, torch.zeros_like(previous.positions)))
-        else:  # D-23: the last init frame uses the previous one
-            kept.append((previous, velocities(previous, before)))
+        finish(previous, before)  # D-23: the last init frame uses the previous one
 
     duration = cfg.stride * frame_dt * unit  # §1.3 step 6, D-21, D-70
-    counts = [int(slot.positions.shape[0]) for slot, _ in kept]
+    counts = [int(slot.positions.shape[0]) for slot, _ in finished]
     points = InitPoints(
-        positions=torch.cat([slot.positions for slot, _ in kept]),
-        colors=torch.cat([slot.colors for slot, _ in kept]),
-        timestamps=torch.cat([slot.timestamps for slot, _ in kept]),
-        velocities=torch.cat([v for _, v in kept]),
+        positions=torch.cat([slot.positions for slot, _ in finished]),
+        colors=torch.cat([slot.colors for slot, _ in finished]),
+        timestamps=torch.cat([slot.timestamps for slot, _ in finished]),
+        velocities=torch.cat([v for _, v in finished]),
         durations=torch.full((sum(counts),), duration, dtype=torch.float64),
         # Q-111: the slot index, the label from_init_points gives supplied points.
         frame_ids=torch.cat(
             [
                 torch.full((n,), slot.k, dtype=torch.int64)
-                for (slot, _), n in zip(kept, counts, strict=True)
+                for (slot, _), n in zip(finished, counts, strict=True)
             ]
         ),
     )
