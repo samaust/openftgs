@@ -12,6 +12,8 @@ import importlib.metadata
 import json
 import math
 import random
+import warnings
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +24,7 @@ import torch
 from torch import Tensor
 
 from openftgs.config import PerfConfig, TrainConfig, config_from_dict, config_to_dict
-from openftgs.data import MultiViewVideo
+from openftgs.data import FrameCache, MultiViewVideo, Prefetcher
 from openftgs.density import (
     OPACITY_RESET_EVERY,
     GradStats,
@@ -177,6 +179,18 @@ class _Sampler:
         self.cursor += 1
         return index
 
+    def peek(self, count: int) -> list[int]:
+        """Up to `count` upcoming indices: the rest of this permutation and the next epoch's,
+        drawn on a copy of the generator's state, so the stream doesn't move (Q-72 note 3,
+        Q-99)."""
+        upcoming = self.permutation[self.cursor : self.cursor + count]
+        if len(upcoming) < count:
+            clone = torch.Generator()
+            clone.set_state(self.generator.get_state())
+            order = torch.randperm(len(self._indices), generator=clone).tolist()
+            upcoming += [self._indices[k] for k in order][: count - len(upcoming)]
+        return upcoming
+
     def state_dict(self) -> dict[str, Any]:
         return {"epoch": self.epoch, "cursor": self.cursor, "permutation": list(self.permutation)}
 
@@ -297,8 +311,14 @@ def _check_perf(perf: PerfConfig) -> None:
         raise NotImplementedError("perc_precision='bf16' (D-52) comes with M15")
     if perf.images_per_step != 1:
         raise NotImplementedError("images_per_step > 1 (D-54) comes with M15")
-    if perf.frame_cache in ("gpu", "mmap"):
-        raise NotImplementedError(f"frame_cache={perf.frame_cache!r} (D-51) comes with M12")
+
+
+def _bytes_per_row(model: FreeTimeGaussians) -> int:
+    """Q-99: the bytes a primitive row takes during training: its floats in the nine stored
+    tensors (§1.1) for the parameter, its gradient and Adam's two moments, plus the gradient
+    statistics' two floats, all float32."""
+    floats = sum(tensor[0].numel() for tensor in _stored_tensors(model).values())
+    return 4 * (4 * floats + 2)
 
 
 def _stored_tensors(model: FreeTimeGaussians) -> dict[str, Tensor]:
@@ -449,6 +469,9 @@ class Trainer:
         if cfg.loss.lambda_perc > 0.0:
             self._perceptual = LPIPSLoss(cfg.loss.perc_net).to(self._device)
         self._evaluator: Evaluator | None = None
+        self._frames: Prefetcher | None = None  # D-51: training images through the frame cache
+        self._placement_pending = False
+        self._open_frame_cache(cfg.perf.frame_cache)
         # §2.4 rule 3: every training record's camera is copied to the device here, once, so a
         # training iteration's render copies no camera from the host; records share camera
         # objects, so they are keyed by identity (Camera's == compares tensors).
@@ -481,6 +504,58 @@ class Trainer:
         self._run = run
         self._window: dict[str, Tensor] = {}  # loss sums since the last read (§2.4 rule 3)
         self._window_count = 0
+        self._schedule()  # Q-99: a restored sampler gets its own queue
+
+    def _open_frame_cache(self, placement: str, *, automatic: bool = False) -> None:
+        """D-51, Q-99: "off" decodes PNGs; "gpu" and "mmap" open the cache now; "auto" is mmap on
+        a CPU device and, on CUDA, decided after the first iteration. A cache directory that
+        can't be made turns "auto" into "off" with a warning, and is a ValueError for an
+        explicit placement (Q-26)."""
+        if placement == "off":
+            return
+        if placement == "auto" and self._device.type == "cuda":
+            self._placement_pending = True
+            return
+        automatic = automatic or placement == "auto"
+        chosen: Literal["gpu", "mmap"] = "gpu" if placement == "gpu" else "mmap"
+        try:
+            cache = FrameCache.open(self._dataset, placement=chosen, device=self._device)
+        except OSError as err:
+            if not automatic:
+                raise ValueError(f"the frame cache can't be made: {err}") from None
+            warnings.warn(
+                f"no frame cache, decoding PNGs instead: {err}", UserWarning, stacklevel=3
+            )
+            return
+        depth = 0 if chosen == "gpu" else self._cfg.perf.prefetch
+        self._frames = Prefetcher(cache, device=self._device, depth=depth)
+        weakref.finalize(self, self._frames.close)  # the reader thread ends with the trainer
+
+    def _choose_placement(self) -> None:
+        """Q-99: after the first CUDA iteration, the cache goes to GPU memory when it fits in half
+        the free memory minus what growth to N_max will add (D-51), and is memory-mapped
+        otherwise; a cache that can't be made falls back to PNGs with a warning."""
+        self._placement_pending = False
+        free, _ = torch.cuda.mem_get_info(self._device)
+        free += torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(self._device)
+        model = self._run.model
+        growth = max(0, self._cfg.growth.n_max - model.num_gaussians) * _bytes_per_row(model)
+        fits = FrameCache.size_of(self._dataset) <= 0.5 * free - growth
+        self._open_frame_cache("gpu" if fits else "mmap", automatic=True)
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if self._frames is not None:
+            self._frames.schedule(self._run.sampler.peek(self._cfg.perf.prefetch))
+
+    def _image(self, index: int) -> Tensor:
+        """Training image `index` on the device: from the frame cache when there is one, bitwise
+        what `MultiViewVideo.load_image` decodes (D-51)."""
+        if self._frames is None:
+            return self._dataset.load_image(index).to(self._device)
+        image = self._frames.take(index)
+        self._schedule()
+        return image
 
     # -- training -------------------------------------------------------------------------------
 
@@ -508,7 +583,7 @@ class Trainer:
             # Steps 1–2: the next image of the sampler, its normalized time and L_active.
             index = run.sampler.next()
             record = self._dataset.records[index]
-            gt = self._dataset.load_image(index).to(self._device)
+            gt = self._image(index)
             t = float(run.time.to_t(record.timestamp))
             # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
             out = render(
@@ -549,6 +624,8 @@ class Trainer:
             # Step 7: the event.
             growth, relocation, pruned = self._event(entry, it)
         run.iteration = it
+        if self._placement_pending:
+            self._choose_placement()
         return StepLog(
             iteration=it,
             image_index=index,

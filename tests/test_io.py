@@ -36,8 +36,17 @@ from openftgs.io import (
     write_exchange,
     write_init_points,
     write_renders,
+    write_scene_manifest,
 )
-from openftgs.types import ExchangeModel, InitPoints, Renders, TimeNormalizer, TrainerState
+from openftgs.types import (
+    Camera,
+    ExchangeModel,
+    ImageRecord,
+    InitPoints,
+    Renders,
+    TimeNormalizer,
+    TrainerState,
+)
 
 F32 = torch.float32
 F64 = torch.float64
@@ -1517,3 +1526,85 @@ def test_scene_manifest_rejects_non_finite_timestamps(tmp_path: Path) -> None:
     path.write_text(json.dumps(_scene()).replace('"timestamp": 0.1', '"timestamp": NaN'))
     with pytest.raises(ValueError, match="finite"):
         read_scene_manifest(path)
+
+
+# Scene-manifest writer (§2.2; Q-64, Q-84).
+
+
+def _camera(name: str, *, fx: float = 676.1, tx: float = 0.0) -> Camera:
+    K = torch.tensor([[fx, 0.0, 400.5], [0.0, fx, 300.25], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    w2c = torch.eye(4, dtype=torch.float32)
+    w2c[0, 3] = tx
+    return Camera(K=K, world_to_camera=w2c, width=800, height=600, name=name)
+
+
+def test_scene_manifest_writer_round_trips_through_the_reader(tmp_path: Path) -> None:
+    a, b = _camera("cam00"), _camera("cam01", fx=512.3, tx=-0.7)
+    records = [
+        ImageRecord(a, 0.0, tmp_path / "images/cam00/000000.png", "test", 0),
+        ImageRecord(a, 1 / 30, tmp_path / "images/cam00/000001.png", "test", 1),
+        ImageRecord(b, 0.1 + 0.2, tmp_path / "images/cam01/000000.png", "train", None),
+    ]
+    masks = [tmp_path / "masks/cam00/000000.png", None, None]
+    metadata = {"source": "n3dv/flame_steak", "resize": 0.5, "nested": {"k": [1, 2]}}
+    manifest = write_scene_manifest(
+        tmp_path / "scene.json", records, time_unit="s", masks=masks, metadata=metadata
+    )
+    data = (tmp_path / "scene.json").read_bytes()
+    assert manifest.sha256 == hashlib.sha256(data).hexdigest()
+    assert read_scene_manifest(tmp_path / "scene.json").sha256 == manifest.sha256
+    assert manifest.time_unit == "s" and manifest.metadata == metadata
+    assert manifest.masks == tuple(masks)
+    for got, want in zip(manifest.records, records, strict=True):
+        assert got.image_path == want.image_path and got.split == want.split
+        assert got.frame_index == want.frame_index and got.timestamp == want.timestamp
+        assert got.camera.name == want.camera.name
+        assert (got.camera.width, got.camera.height) == (want.camera.width, want.camera.height)
+        assert torch.equal(got.camera.K, want.camera.K)
+        assert torch.equal(got.camera.world_to_camera, want.camera.world_to_camera)
+    raw = json.loads(data)
+    assert raw["format"] == "ftgs-scene" and raw["version"] == 1
+    assert set(raw["cameras"]) == {"cam00", "cam01"}
+    # Q-84: the shortest decimal that reads back to the same float32.
+    assert raw["cameras"]["cam00"]["K"][0][0] == 676.1
+    assert raw["images"][0]["path"] == "images/cam00/000000.png"
+    assert "frame_index" not in raw["images"][2]
+
+
+def test_scene_manifest_writer_writes_a_changed_pose_as_an_override(tmp_path: Path) -> None:
+    still, moved = _camera("cam00"), _camera("cam00", tx=0.25)
+    records = [
+        ImageRecord(still, 0.0, tmp_path / "a.png", "train", 0),
+        ImageRecord(moved, 1.0, tmp_path / "b.png", "train", 1),
+    ]
+    manifest = write_scene_manifest(tmp_path / "scene.json", records)
+    raw = json.loads((tmp_path / "scene.json").read_text())
+    assert "world_to_camera" in raw["images"][1] and "K" not in raw["images"][1]
+    assert "world_to_camera" not in raw["images"][0]
+    assert torch.equal(manifest.records[1].camera.world_to_camera, moved.world_to_camera)
+    assert torch.equal(manifest.records[0].camera.world_to_camera, still.world_to_camera)
+
+
+@pytest.mark.parametrize("case", ["outside", "mask_on_train", "size", "metadata", "no_train"])
+def test_scene_manifest_writer_rejects_what_the_reader_would_refuse(
+    tmp_path: Path, case: str
+) -> None:
+    camera = _camera("cam00")
+    records = [ImageRecord(camera, 0.0, tmp_path / "a.png", "train", 0)]
+    masks: list[Path | None] | None = None
+    metadata: dict[str, Any] = {}
+    if case == "outside":
+        records = [ImageRecord(camera, 0.0, tmp_path.parent / "a.png", "train", 0)]
+    elif case == "mask_on_train":
+        masks = [tmp_path / "m.png"]
+    elif case == "size":
+        other = Camera(camera.K, camera.world_to_camera, 640, 480, "cam00")
+        records.append(ImageRecord(other, 1.0, tmp_path / "b.png", "train", 1))
+    elif case == "metadata":
+        metadata = {"bad": float("nan")}
+    elif case == "no_train":
+        records = [ImageRecord(camera, 0.0, tmp_path / "a.png", "test", 0)]
+    with pytest.raises(ValueError):
+        write_scene_manifest(tmp_path / "scene.json", records, masks=masks, metadata=metadata)
+    assert not (tmp_path / "scene.json").exists()
+    assert list(tmp_path.iterdir()) == []

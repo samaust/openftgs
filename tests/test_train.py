@@ -14,6 +14,7 @@ import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
 import pytest
 import torch
@@ -37,12 +38,12 @@ from openftgs.config import (
     RelocConfig,
     TrainConfig,
 )
-from openftgs.data import MultiViewVideo
+from openftgs.data import FrameCache, MultiViewVideo
 from openftgs.eval import METRIC_NAMES
 from openftgs.io import load_checkpoint, save_checkpoint
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
-from openftgs.train import StepLog, Trainer, calendar_entry
+from openftgs.train import StepLog, Trainer, _Sampler, calendar_entry
 from openftgs.types import Camera, InitPoints, TimeNormalizer, TrainerState
 
 F64 = torch.float64
@@ -276,13 +277,11 @@ def test_the_ablation_turns_relocation_off(tmp_path: Path) -> None:
     [
         PerfConfig(perc_precision="bf16"),
         PerfConfig(images_per_step=2),
-        PerfConfig(frame_cache="gpu"),
-        PerfConfig(frame_cache="mmap"),
     ],
 )
 def test_options_of_later_milestones_are_refused(tmp_path: Path, perf: PerfConfig) -> None:
-    """Q-73: bf16 LPIPS and several images per step (M15), and the GPU or memory-mapped frame
-    cache (M12), fail at construction rather than being ignored."""
+    """Q-73: bf16 LPIPS and several images per step (M15) fail at construction rather than
+    being ignored; the frame cache's placements arrived with M12 (Q-99)."""
     video = _scene(tmp_path)
     with pytest.raises(NotImplementedError):
         Trainer(_no_perceptual(perf=perf), video, _init_points(), device="cpu")
@@ -958,3 +957,111 @@ def test_an_evaluation_between_steps_leaves_the_run_unchanged(tmp_path: Path) ->
     evaluated.train(callbacks=[lambda _, log: logs.append(log), evaluate_at_5])
     _assert_logs_equal(plain_logs, logs)
     _assert_states_equal(plain.state_dict(), evaluated.state_dict(), global_rng=False)
+
+
+# The frame cache and the prefetcher in training (U-30, D-51; Q-99).
+
+
+def _with_cache(cfg: TrainConfig, placement: Literal["auto", "gpu", "mmap", "off"]) -> TrainConfig:
+    return dataclasses.replace(cfg, perf=dataclasses.replace(cfg.perf, frame_cache=placement))
+
+
+def test_u30_cached_training_is_bitwise_the_png_training(tmp_path: Path) -> None:
+    """U-30, D-51: a run reading its images from the memory-mapped cache through the prefetcher
+    gives bitwise the logs and state of a run decoding every PNG; resumed in mid-epoch (an
+    epoch is 12 images; 65 is 5 into the sixth), it gives the same images, in the same order,
+    and the same final state."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    png = _u21_trainer(video, _with_cache(ONE_EVENT, "off"))
+    cached = _u21_trainer(video, _with_cache(ONE_EVENT, "mmap"))
+    png_logs, cached_logs = _run(png), _run(cached)
+    _assert_logs_equal(png_logs, cached_logs)
+    # The states differ only in the configuration's frame_cache, which they record.
+    cached_state = dataclasses.replace(cached.state_dict(), config=png.state_dict().config)
+    _assert_states_equal(png.state_dict(), cached_state, global_rng=False)
+    assert FrameCache.default_directory(video.manifest).is_dir()
+    first = _u21_trainer(video, _with_cache(ONE_EVENT, "mmap"))
+    before = _run(first, 65)
+    state = first.state_dict()
+    assert 0 < state.sampler["cursor"] < len(state.sampler["permutation"])
+    resumed = _u21_trainer(video, _with_cache(ONE_EVENT, "mmap"))
+    resumed.load_state_dict(state)
+    after = _run(resumed)
+    _assert_logs_equal(png_logs[:65], before)
+    _assert_logs_equal(png_logs[65:], after, mean_losses=False)
+    resumed_state = dataclasses.replace(resumed.state_dict(), config=png.state_dict().config)
+    _assert_states_equal(png.state_dict(), resumed_state, global_rng=False)
+
+
+def test_sampler_peek_matches_the_next_draws() -> None:
+    """Q-72 note 3, Q-99: `peek` returns the rest of the permutation and the next epoch's,
+    drawn on a copy of the generator, so the stream doesn't move and `next` then returns the
+    same indices."""
+    sampler = _Sampler([3, 5, 8, 13], torch.Generator().manual_seed(7))
+    for _ in range(3):
+        sampler.next()
+    state = sampler.generator.get_state()
+    upcoming = sampler.peek(6)
+    assert torch.equal(sampler.generator.get_state(), state)
+    assert upcoming == [sampler.next() for _ in range(6)][: len(upcoming)]
+    assert len(upcoming) == 5  # one left of this epoch, four of the next
+
+
+def test_auto_placement_falls_back_when_no_cache_can_be_made(tmp_path: Path) -> None:
+    """Q-99: when the cache directory can't be created, "auto" decodes PNGs with a warning,
+    and an explicit placement is a ValueError (Q-26)."""
+    video = _scene(tmp_path / "scene")
+    (tmp_path / "scene" / ".ftgs-cache").write_text("not a directory")
+    with pytest.warns(UserWarning, match="frame cache"):
+        trainer = Trainer(_no_perceptual(), video, _init_points(), device="cpu")
+    trainer.step()
+    with pytest.raises(ValueError, match="frame cache"):
+        Trainer(
+            _no_perceptual(perf=PerfConfig(frame_cache="mmap")), video, _init_points(), device="cpu"
+        )
+
+
+def test_prefetcher_follows_the_samplers_order(tmp_path: Path) -> None:
+    """Q-72 note 3, Q-99: across epochs and a resume, every image comes from the prefetch
+    queue, scheduled at construction and after each take, so the prefetcher reads in the
+    sampler's order."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    trainer = _u21_trainer(video, _with_cache(ONE_EVENT, "mmap"))
+    _run(trainer, 40)  # 12 images an epoch: three epoch boundaries
+    assert trainer._frames is not None and trainer._frames._misses == 0
+    resumed = _u21_trainer(video, _with_cache(ONE_EVENT, "mmap"))
+    resumed.load_state_dict(trainer.state_dict())
+    _run(resumed, 60)
+    assert resumed._frames is not None and resumed._frames._misses == 0
+
+
+@pytest.mark.gpu
+def test_cuda_auto_placement_falls_back_after_the_first_iteration(tmp_path: Path) -> None:
+    """Q-99: on CUDA "auto" decides after the first iteration; a cache directory that can't be
+    created then gives a warning and PNG decoding, not an error."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    (tmp_path / "scene" / ".ftgs-cache").write_text("not a directory")
+    trainer = Trainer(_with_cache(ONE_EVENT, "auto"), video, _u21_model(video), device="cuda")
+    with pytest.warns(UserWarning, match="frame cache"):
+        trainer.step()
+    assert trainer._frames is None
+    trainer.step()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("placement", ["gpu", "mmap", "auto"])
+def test_u30_cuda_training_reads_from_each_placement(
+    tmp_path: Path, placement: Literal["auto", "gpu", "mmap"]
+) -> None:
+    """U-30 (GPU), Q-99: training on CUDA reads its images from the cache in GPU memory, from
+    the memory-mapped cache through the CUDA prefetcher, or, with "auto", from whichever the
+    free memory allows after the first iteration; the losses stay finite."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    cfg = _with_cache(
+        dataclasses.replace(ONE_EVENT, optim=dataclasses.replace(ONE_EVENT.optim, iterations=30)),
+        placement,
+    )
+    trainer = Trainer(cfg, video, _u21_model(video), device="cuda")
+    logs = _run(trainer)
+    assert len(logs) == 30 and _all_finite(logs)
+    assert FrameCache.default_directory(video.manifest).is_dir()
