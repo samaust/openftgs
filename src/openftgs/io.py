@@ -826,7 +826,8 @@ def _relative_path(value: Any, what: str, where: str) -> Path:
 def read_scene_manifest(path: Path) -> SceneManifest:
     """Read and validate a ftgs-scene file (§2.2; Q-64): the image records in file order, with
     paths resolved against the manifest's directory, the test images' masks, the metadata, the
-    time unit and the SHA-256 of the file's bytes as read. Cameras are checked as a render
+    time unit, the SHA-256 of the file's bytes as read and the camera names in the key order of
+    the `cameras` object (Q-108). Cameras are checked as a render
     request's (Q-56); unknown keys are ignored. Whether the files exist is not checked here."""
     path = Path(path)
     where = f"scene manifest {path}"
@@ -896,6 +897,7 @@ def read_scene_manifest(path: Path) -> SceneManifest:
         records=tuple(records),
         masks=tuple(masks),
         metadata=metadata,
+        camera_names=tuple(cameras),  # Q-108: JSON objects are read in file order
     )
 
 

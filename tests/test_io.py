@@ -1419,6 +1419,23 @@ def test_scene_manifest_reads_records_in_file_order(tmp_path: Path) -> None:
     assert torch.equal(third.camera.K, first.camera.K)
 
 
+def test_scene_manifest_keeps_the_key_order_of_its_cameras(tmp_path: Path) -> None:
+    """Q-108: `camera_names` holds the keys of the manifest's `cameras` object in file order,
+    the "manifest's camera order" of D-22, which neither sorted names nor the order of first
+    appearance in `images` gives; a camera without images is listed too."""
+    raw = _scene()
+    raw["cameras"] = {
+        "zeta": _scene_camera(),
+        "cam01": _scene_camera(5, 4),
+        "alpha": _scene_camera(),
+        "cam00": _scene_camera(),
+    }
+    raw["images"][0]["camera"] = "alpha"
+    manifest = read_scene_manifest(_write_json(tmp_path / "scene.json", raw))
+    assert manifest.camera_names == ("zeta", "cam01", "alpha", "cam00")
+    assert [r.camera.name for r in manifest.records] == ["alpha", "cam01", "cam00"]
+
+
 def test_scene_manifest_defaults_and_unknown_keys(tmp_path: Path) -> None:
     """§2.2: readers ignore unknown optional keys; an absent camera model is pinhole, absent
     metadata is empty, a null frame index is None and a "major.minor" version is read (Q-64)."""

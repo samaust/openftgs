@@ -190,6 +190,8 @@ class SceneManifest:
     records: tuple[ImageRecord, ...]  # in file order; image paths resolved against path.parent
     masks: tuple[Path | None, ...]  # aligned with records; only test images carry one
     metadata: dict[str, Any]
+    # Q-108: the keys of the `cameras` object in file order, D-22's "manifest's camera order".
+    camera_names: tuple[str, ...]
 
 
 def frame_interval(camera_timestamps: Mapping[str, Sequence[float]], time: TimeNormalizer) -> float:
