@@ -1914,6 +1914,10 @@ class Prefetcher:
             raise ValueError(f"depth must be an int >= 0, got {depth!r}")
         self._cache = cache
         self._device = torch.device(device)
+        if self._device.type == "cuda" and self._device.index is None:
+            # "cuda" != "cuda:0": name the index, so a cache already on the device is used in
+            # place rather than copied through the host (D-51, §2.4 rule 3).
+            self._device = torch.device("cuda", torch.cuda.current_device())
         self._depth = depth
         self._cuda = self._device.type == "cuda"
         # On CUDA, x / <python float> multiplies by the reciprocal, which isn't bitwise the CPU's
