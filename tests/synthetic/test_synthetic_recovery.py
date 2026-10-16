@@ -24,6 +24,7 @@ from synthetic_scenes import (
     DATA,
     FPS,
     GROUND_TRUTH_FILES,
+    S4_GT_POINTS,
     SceneImage,
     assert_rows_matched,
     at_trajectory_points,
@@ -42,6 +43,7 @@ from synthetic_scenes import (
     replaced,
     ring_rig,
     rows,
+    s4_init,
     same_exchange,
     scene_video,
     split_indices,
@@ -49,6 +51,7 @@ from synthetic_scenes import (
     tau,
     train,
     trajectory_error,
+    velocity_error_rows,
     velocity_errors,
     with_degree,
 )
@@ -312,6 +315,37 @@ def test_s8_per_image_timestamps_recover_unsynchronized_cameras(
         {"velocity_vector": unsynchronized, "synchronized_velocity_vector": synchronized},
     )
     assert unsynchronized <= 1.2 * synchronized
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_s4_e15_init_recovers_the_spheres_velocities(device: str, record_property: Record) -> None:
+    """S-4: init points sampled on S-4's three moving spheres, one fixed jittered lattice per
+    sphere translated to each of the 10 frames (Q-119), with E15 velocities (`knn_velocities` on
+    `device`, a backward difference on the last frame, D-23): the median velocity error over the
+    init points is ≤ 5 %. The error is Q-80's relative vector error ‖v − v_gt‖/‖v_gt‖ (S-8's
+    single number, which bounds the relative magnitude error) against the velocity of the
+    point's sphere, in world units per τ. §3.2's precondition, a displacement per frame below
+    half the sampling spacing, is checked first."""
+    gt = ground_truth("s4")
+    init = s4_init(gt, load_seeds()["s4"]["init"], device)
+    v_gt = gt.arrays["velocity"].to(torch.float64)[init.sphere * S4_GT_POINTS]
+    largest_step = float(torch.linalg.vector_norm(v_gt, dim=1).max()) / FPS
+    assert largest_step < 0.5 * init.spacing  # §3.2 S-4
+    velocities = init.points.velocities
+    assert velocities is not None
+    errors = velocity_error_rows(velocities, v_gt)  # Q-80
+    _record(
+        record_property,
+        f"s4_{device}",
+        {
+            "median_velocity_vector": float(errors["vector"].median()),
+            "median_velocity_magnitude": float(errors["magnitude"].median()),
+            "median_velocity_angle_deg": float(errors["angle_deg"].median()),
+            "max_velocity_vector": float(errors["vector"].max()),
+            "largest_step_over_half_spacing": largest_step / (0.5 * init.spacing),
+        },
+    )
+    assert float(errors["vector"].median()) <= 0.05
 
 
 S3_ITERATIONS = 10_000  # Q-79, changed from 5,000 after the first measurement

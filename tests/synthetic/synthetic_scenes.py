@@ -22,11 +22,12 @@ from torch import Tensor
 from openftgs.config import TrainConfig
 from openftgs.data import MultiViewVideo
 from openftgs.eval import psnr
+from openftgs.init import knn_velocities
 from openftgs.io import read_exchange
-from openftgs.model import FreeTimeGaussians
+from openftgs.model import FreeTimeGaussians, rotation_matrix
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer
-from openftgs.types import Camera, ExchangeModel, TimeNormalizer
+from openftgs.types import Camera, ExchangeModel, InitPoints, TimeNormalizer
 
 DATA = Path(__file__).parent / "data"
 SEEDS_FILE = DATA / "seeds.json"
@@ -549,6 +550,81 @@ def draw_taus(seed: int, choices: Sequence[float], n: int) -> Tensor:
     return torch.tensor(choices, dtype=F64)[index]
 
 
+@dataclasses.dataclass(frozen=True)
+class S4Init:
+    points: InitPoints  # on the CPU, frame by frame, then sphere by sphere
+    sphere: Tensor  # [N] int64: each point's sphere, whose rows in the ground truth start there
+    spacing: float  # the smallest spacing of the jittered lattices: §3.2's sampling spacing
+
+
+def _s4_lattice(g: torch.Generator) -> Tensor:
+    """Q-119: one init lattice on the unit sphere, other than the ground truth's: the Fibonacci
+    lattice of S4_INIT_POINTS points under a uniform random rotation, each point moved by up to
+    S4_INIT_JITTER of the lattice's smallest spacing in a uniform random direction and put back
+    on the sphere."""
+    base = fibonacci_sphere(S4_INIT_POINTS)
+    turned = base @ rotation_matrix(_rotations(g, 1))[0].T
+    direction = torch.randn(S4_INIT_POINTS, 3, generator=g, dtype=F64)
+    direction = direction / torch.linalg.vector_norm(direction, dim=1, keepdim=True)
+    amount = S4_INIT_JITTER * smallest_spacing(base) * torch.rand(S4_INIT_POINTS, 1, generator=g)
+    moved = turned + amount.to(F64) * direction
+    lattice: Tensor = moved / torch.linalg.vector_norm(moved, dim=1, keepdim=True)
+    return lattice
+
+
+def s4_init(gt: ExchangeModel, seed: int, device: str) -> S4Init:
+    """Q-119: S-4's init points from its ground truth. Each sphere gets one fixed lattice
+    (`_s4_lattice`, seeded), scaled to S4_RADIUS and translated with the sphere to each of the
+    S4_FRAMES frames, so the same material points persist; the positions are rounded to float32,
+    the values `InitPoints` holds, before E15 runs on them. A point's color is that of the
+    ground-truth Gaussian nearest it on its sphere, as colors taken from the images would be.
+    Timestamps are the frames' τ and frame ids the frame index; durations are left to
+    `from_init_points` (s₀ = Δt_f, D-21). Velocities are E15's: `knn_velocities` on `device`
+    against the next frame's points, the last frame against the previous one's (D-23)."""
+    g = torch.Generator().manual_seed(seed)
+    a = gt.arrays
+    taus = frame_taus(S4_FRAMES)
+    unit_gt = fibonacci_sphere(S4_GT_POINTS)
+    shells: list[Tensor] = []  # per sphere, [P, 3] at frame 0
+    motions: list[Tensor] = []  # per sphere, its velocity [3] in world units per τ
+    colors: list[Tensor] = []
+    lattices: list[Tensor] = []
+    for s in range(3):
+        rows = slice(s * S4_GT_POINTS, (s + 1) * S4_GT_POINTS)
+        # The ground truth's rows are center + S4_RADIUS·unit_gt at their time center.
+        center = a["position"][rows].to(F64).mean(dim=0) - S4_RADIUS * unit_gt.mean(dim=0)
+        velocity = a["velocity"][rows][0].to(F64)
+        start = center + velocity * (taus[0] - a["time_center"][rows][0])
+        lattice = _s4_lattice(g)
+        lattices.append(lattice)
+        shells.append(start + S4_RADIUS * lattice)
+        motions.append(velocity)
+        nearest = (lattice @ unit_gt.T).argmax(dim=1)
+        colors.append((C0 * a["sh"][rows][nearest, 0] + 0.5).clamp(0.0, 1.0))
+    frames = [
+        torch.cat([shell + v * (t - taus[0]) for shell, v in zip(shells, motions, strict=True)])
+        .to(F32)
+        .to(device)
+        for t in taus
+    ]
+    velocities: list[Tensor] = []
+    for k in range(S4_FRAMES):
+        other = k + 1 if k + 1 < S4_FRAMES else k - 1  # D-23: backward on the last frame
+        dt = float(taus[other] - taus[k])
+        velocities.append(knn_velocities(frames[k], frames[other], dt).cpu())  # E15
+    per_frame = 3 * S4_INIT_POINTS
+    points = InitPoints(
+        positions=torch.cat(frames).cpu(),
+        colors=torch.cat(colors).to(F32).repeat(S4_FRAMES, 1),
+        timestamps=taus.repeat_interleave(per_frame),
+        velocities=torch.cat(velocities),
+        frame_ids=torch.arange(S4_FRAMES).repeat_interleave(per_frame),
+    )
+    sphere = torch.arange(3).repeat_interleave(S4_INIT_POINTS).repeat(S4_FRAMES)
+    spacing = min(S4_RADIUS * smallest_spacing(lattice) for lattice in lattices)
+    return S4Init(points=points, sphere=sphere, spacing=spacing)
+
+
 # Scenes on disk.
 
 
@@ -624,18 +700,24 @@ def trajectory_error(model: FreeTimeGaussians, gt: ExchangeModel, taus: Tensor) 
     return float(torch.linalg.vector_norm(ours - theirs, dim=-1).max())
 
 
-def velocity_errors(model: FreeTimeGaussians, gt: ExchangeModel) -> dict[str, float]:
-    """Per primitive, in world units per τ, each a max over primitives: the relative magnitude
-    error, the angle in degrees and the relative vector error."""
-    v = physical(model)["velocity"].to(F64)
-    v_gt = gt.arrays["velocity"].to(F64)
+def velocity_error_rows(velocity: Tensor, velocity_gt: Tensor) -> dict[str, Tensor]:
+    """Q-80's velocity errors of each row of [N, 3] velocities against [N, 3] true ones, in
+    float64: the relative magnitude error, the angle in degrees and the relative vector error."""
+    v, v_gt = velocity.to(F64), velocity_gt.to(F64)
     norm, norm_gt = torch.linalg.vector_norm(v, dim=1), torch.linalg.vector_norm(v_gt, dim=1)
     cosine = (v * v_gt).sum(dim=1) / (norm * norm_gt)
     return {
-        "magnitude": float(((norm - norm_gt).abs() / norm_gt).max()),
-        "angle_deg": float(torch.rad2deg(torch.arccos(cosine.clamp(-1.0, 1.0))).max()),
-        "vector": float((torch.linalg.vector_norm(v - v_gt, dim=1) / norm_gt).max()),
+        "magnitude": (norm - norm_gt).abs() / norm_gt,
+        "angle_deg": torch.rad2deg(torch.arccos(cosine.clamp(-1.0, 1.0))),
+        "vector": torch.linalg.vector_norm(v - v_gt, dim=1) / norm_gt,
     }
+
+
+def velocity_errors(model: FreeTimeGaussians, gt: ExchangeModel) -> dict[str, float]:
+    """Per primitive, in world units per τ, each a max over primitives: the relative magnitude
+    error, the angle in degrees and the relative vector error."""
+    errors = velocity_error_rows(physical(model)["velocity"], gt.arrays["velocity"])
+    return {name: float(value.max()) for name, value in errors.items()}
 
 
 def mean_psnr(model: FreeTimeGaussians, video: MultiViewVideo, indices: Iterable[int]) -> float:
