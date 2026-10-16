@@ -1,6 +1,6 @@
 # The vendored RoMa in `openftgs._vendor.romatch`
 
-How D-65 is met, as Q-113, Q-114 and Q-115 amend it: RoMa's inference code at commit 77f8d68, copied into the package so that no install needs OpenCV, xformers or RoMa's training dependencies, and so that matching stays reproducible across RoMa releases.
+How D-65 is met, as Q-113, Q-114, Q-115 and Q-118 amend it: RoMa's inference code at commit 77f8d68, copied into the package so that no install needs OpenCV, xformers or RoMa's training dependencies, and so that matching stays reproducible across RoMa releases.
 
 ## The file set
 
@@ -21,7 +21,9 @@ No one reads `romatch/utils/utils.py` upstream above line 77 (`def unnormalize_c
 
 ## VENDOR.json and the license files
 
-VENDOR.json records the upstream URL and commit, the script, each license file with its source and SHA-256, and per vendored file its upstream git blob id, the SHA-256 of the vendored bytes and its patch as a plain description. RoMa's MIT license sits at the copy's root as `LICENSE`; a `LICENSES` folder beside it holds the texts of DINOv2, DINO, timm, LoFTR, Patch2Pix and Kornia, one `<project>.txt` each, which the script fetches from raw.githubusercontent.com at pinned commits and checks against the SHA-256 of source log rows 106 and 108–113. NOTICE names them all (Q-115). The files ship in the wheel, and CI's wheel job checks for them.
+VENDOR.json records the upstream URL and commit, the script, each license file with its source and SHA-256, and per vendored file its upstream git blob id, the SHA-256 of the vendored bytes and its patch as a plain description. RoMa's MIT license sits at the copy's root as `LICENSE`; a `LICENSES` folder beside it holds the texts of DINOv2, DINO, timm, LoFTR, Patch2Pix, Kornia and InLoc, one `<project>.txt` each, eight license texts in all, which the script fetches from raw.githubusercontent.com at pinned commits and checks against the SHA-256 of source log rows 106, 108–113 and 139. NOTICE names them all (Q-115, Q-118). The files ship in the wheel, and CI's wheel job checks for them.
+
+InLoc, whose approach `utils/utils.py` credits, has no license file: its MIT license is stated in its README.md. The script fetches the README at a pinned commit, checks its SHA-256, and keeps from the fenced block under its `### LICENSE` heading the lines from the first through the end of the paragraph that begins `THE SOFTWARE IS PROVIDED`, byte for byte, with one final newline; the request to cite two papers and their BibTeX entries, which follow in the block, are left out. It checks the extracted text against a SHA-256 of its own, and InLoc's entry in VENDOR.json records the README's SHA-256 as `source_sha256` and the rule as `extract` beside the usual fields (Q-118).
 
 ## U-38
 
@@ -39,4 +41,4 @@ This copies upstream's `utils/utils.py` whole, the lines above 77 included, so n
 
 ## Updating
 
-Only by re-running the script at a new commit, after the attribution scan and license checks that this copy had (source log rows 106–120), and passing U-38 again (D-65).
+Only by re-running the script at a new commit, after the attribution scan and license checks that this copy had (source log rows 106–120 and 139), and passing U-38 again (D-65).
