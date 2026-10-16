@@ -44,12 +44,6 @@ _MODELS = ("roma_outdoor", "tiny_roma_v1_outdoor")  # §2.1 RomaInitConfig.model
 _BACKBONE_PATCH = 14  # RoMa asserts coarse resolutions divisible by DINOv2's patch (Q-106)
 # Q-116: the XFeat commit whose LICENSE (Apache-2.0) was read (source log row 107).
 _XFEAT_COMMIT = "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"
-# Q-123: XFeat's weights at that commit, cached under a name that carries the prefix of
-# their SHA-256, which torch.hub checks (0f5187fd…, source log row 136).
-_XFEAT_WEIGHTS = (
-    f"https://github.com/verlab/accelerated_features/raw/{_XFEAT_COMMIT}/weights/xfeat.pt"
-)
-_XFEAT_WEIGHTS_NAME = "xfeat-0f5187fd.pt"
 
 
 def _fail(reason: str) -> NoReturn:
@@ -122,8 +116,9 @@ def _roma_commit() -> str:
 def roma_provenance(cfg: RomaInitConfig) -> dict[str, str]:
     """The ftgs-init metadata that records how `roma_init` ran (D-58; Q-107): one key,
     `roma_init`, holding compact JSON of every RomaInitConfig field, `use_custom_corr` as
-    `roma_init` resolves it (Q-112), the vendored RoMa's commit and, for Tiny RoMa, XFeat's
-    commit (Q-116). For `write_init_points(..., metadata=roma_provenance(cfg))`."""
+    `roma_init` resolves it (Q-112), the vendored RoMa's commit and, for Tiny RoMa, the commit
+    of XFeat's code (Q-116; its weights come from Tiny RoMa's checkpoint, Q-123). For
+    `write_init_points(..., metadata=roma_provenance(cfg))`."""
     _check_config(cfg)
     # Q-107; Q-122: the keys sorted, so the string depends only on the values.
     record: dict[str, object] = {
@@ -688,18 +683,17 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
     # torch.hub's validation accepts a commit only while it heads a branch or tag (it lists
     # them through GitHub's API; source log row 131), so Q-116's fallback applies: the
     # validation is skipped, and the archive of that commit is downloaded as it is.
+    # Q-123: XFeat is built without weights, since its own loader would take them from the
+    # repository's moving `main`, and none are loaded into it: Tiny RoMa's checkpoint replaces
+    # every XFeat weight a shard keeps (source log row 138).
     xfeat = torch.hub.load(  # type: ignore[no-untyped-call]
         f"verlab/accelerated_features:{_XFEAT_COMMIT}",
         "XFeat",
-        pretrained=False,  # Q-123: XFeat's own loader takes its weights from `main`
+        pretrained=False,
         top_k=4096,
         trust_repo=True,
         skip_validation=True,
     ).net
-    # Q-123: the weights of the same commit, their SHA-256 prefix checked by torch.hub.
-    xfeat.load_state_dict(
-        fetch(_XFEAT_WEIGHTS, map_location="cpu", file_name=_XFEAT_WEIGHTS_NAME, check_hash=True)
-    )
 
     def build_tiny(device: torch.device) -> DenseMatcher:
         # Tiny RoMa deletes XFeat's unused heads when built, so each shard gets its own copy.
