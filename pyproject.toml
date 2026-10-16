@@ -54,6 +54,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 openftgs = ["py.typed"]
+# D-65, Q-115: the vendored RoMa's license texts and its patch record ship with it.
+"openftgs._vendor.romatch" = ["LICENSE", "LICENSES/*", "VENDOR.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -68,7 +70,7 @@ markers = [
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-extend-exclude = [".claude", "docs", "src/openftgs/_vendor"]
+extend-exclude = [".claude", "docs", "src/openftgs/_vendor/romatch"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
@@ -80,7 +82,7 @@ known-first-party = ["openftgs", "ftgs_harness"]
 python_version = "3.11"
 strict = true
 files = ["src/openftgs", "harness/src/ftgs_harness", "tests", "scripts"]
-exclude = ["^src/openftgs/_vendor/"]
+exclude = ["^src/openftgs/_vendor/romatch/"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -95,3 +97,9 @@ module = [
     "torchmetrics.*",
 ]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# D-65: the vendored RoMa is third-party code, kept as upstream wrote it.
+module = ["openftgs._vendor.*"]
+follow_imports = "skip"
+ignore_errors = true

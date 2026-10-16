@@ -33,7 +33,8 @@ def _source_files() -> list[Path]:
     files: list[Path] = []
     for top in ("src", "harness/src", "tests", "scripts"):
         files.extend((ROOT / top).rglob("*.py"))
-    return sorted(p for p in files if "_vendor" not in p.parts)
+    # D-65: the vendored RoMa keeps its upstream headers; openftgs._vendor's own __init__ doesn't.
+    return sorted(p for p in files if not p.is_relative_to(PACKAGE_DIR / "_vendor" / "romatch"))
 
 
 def _package_of(path: Path) -> list[str]:
