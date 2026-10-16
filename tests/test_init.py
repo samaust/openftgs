@@ -3,24 +3,36 @@
 (§1.3 step 3), U-19 and U-33 (§3.1), with the contracts of Q-106 and Q-120."""
 
 import dataclasses
+import hashlib
 import importlib
 import json
+import math
 import os
 import subprocess
 import sys
+import threading
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
+from torch import Tensor
 
 import openftgs
+from openftgs.data import MultiViewVideo
 from openftgs.init import (
+    DenseMatcher,
     RomaInitConfig,
     _nearest_indices,
     knn_velocities,
+    roma_init,
     roma_provenance,
     triangulate_dlt,
 )
+from openftgs.types import Camera, InitPoints
 
 
 def _lattice(shape: tuple[int, int, int], spacing: float, dtype: torch.dtype) -> torch.Tensor:
@@ -427,3 +439,220 @@ def test_init_imports_without_the_vendored_roma() -> None:
     )
     env = {**os.environ, "PYTHONPATH": str(Path(openftgs.__file__).parents[1])}
     subprocess.run([sys.executable, "-c", code], check=True, env=env, timeout=120)
+
+
+# The analytic stand-in dense matcher and its scenes (PRD #133, "Test helpers"). The images
+# encode each pixel's (u, v) as its red and green values and carry one marker pixel, so that
+# the stand-in identifies the record behind an image by a hash of its pixels. The stand-in
+# knows the scene's geometry (material points at each raw τ) and the cameras, returns the
+# exact correspondences of the points both images see, plus crafted matches per camera pair,
+# and records every call.
+
+_W, _H = 64, 32  # dyadic, so pixel centers have exact normalized coordinates
+_FOCAL = 32.0
+_CX, _CY = 32.0, 16.0
+CameraSpec = tuple[float, tuple[float, float, float]]  # yaw about the world y axis (°), center
+
+
+def _rotation(yaw: float) -> list[list[float]]:
+    """R_w of a camera turned by `yaw` degrees about the world y axis: its forward axis is
+    (sin, 0, cos). ±yaw give exactly mirrored entries."""
+    c, s = math.cos(math.radians(abs(yaw))), math.sin(math.radians(abs(yaw)))
+    s = math.copysign(s, yaw)
+    return [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]]
+
+
+def _camera_json(spec: CameraSpec) -> dict[str, Any]:
+    yaw, center = spec
+    R = _rotation(yaw)
+    t = [-sum(R[i][j] * center[j] for j in range(3)) for i in range(3)]
+    return {
+        "width": _W,
+        "height": _H,
+        "K": [[_FOCAL, 0.0, _CX], [0.0, _FOCAL, _CY], [0.0, 0.0, 1.0]],
+        "world_to_camera": [[*R[i], t[i]] for i in range(3)] + [[0.0, 0.0, 0.0, 1.0]],
+    }
+
+
+def _encoded_image(index: int) -> np.ndarray:
+    pixels = np.zeros((_H, _W, 3), dtype=np.uint8)
+    pixels[:, :, 0] = np.arange(_W, dtype=np.uint8)[None, :]
+    pixels[:, :, 1] = np.arange(_H, dtype=np.uint8)[:, None]
+    pixels[0, 0, 2] = 1 + index  # the marker
+    return pixels
+
+
+Shot = tuple[str, float, str]  # camera, raw τ, split
+
+
+def _write_scene(
+    root: Path, cameras: dict[str, CameraSpec], shots: Sequence[Shot], *, name: str = "scene"
+) -> Path:
+    """A scene manifest with `cameras` in the given key order and `shots` in the given order,
+    each image encoded as `_encoded_image(i)`."""
+    root.mkdir(parents=True, exist_ok=True)
+    images = []
+    for i, (camera, tau, split) in enumerate(shots):
+        image = f"images/{i:03d}.png"
+        (root / "images").mkdir(exist_ok=True)
+        Image.fromarray(_encoded_image(i), "RGB").save(root / image)
+        images.append({"camera": camera, "timestamp": tau, "path": image, "split": split})
+    manifest = {
+        "format": "ftgs-scene",
+        "version": 1,
+        "time_unit": "s",
+        "cameras": {key: _camera_json(spec) for key, spec in cameras.items()},
+        "images": images,
+    }
+    path = root / f"{name}.json"
+    path.write_text(json.dumps(manifest))
+    return path
+
+
+def _digest(image: torch.Tensor) -> str:
+    return hashlib.sha256(image.contiguous().numpy().tobytes()).hexdigest()
+
+
+def _project_points(camera: Camera, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pixels (§1.4's continuous convention) and depths of X [P, 3] in float64."""
+    w2c = camera.world_to_camera.to(torch.float64)
+    in_camera = X @ w2c[:3, :3].T + w2c[:3, 3]
+    h = in_camera @ camera.K.to(torch.float64).T
+    return h[:, :2] / h[:, 2:], in_camera[:, 2]
+
+
+def _normalized(x: torch.Tensor) -> torch.Tensor:
+    """§1.3 step 2 read backwards: pixels onto RoMa's [−1, 1]."""
+    return x / torch.tensor([_W / 2, _H / 2], dtype=torch.float64) - 1.0
+
+
+def _flags() -> tuple[object, ...]:
+    cudnn = torch.backends.cudnn
+    return (
+        torch.get_float32_matmul_precision(),
+        cudnn.benchmark,
+        cudnn.deterministic,
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+
+
+Crafted = list[tuple[float, float, float, float, float]]  # x_A, y_A, x_B, y_B (px), certainty
+
+
+class _StandIn:
+    """The stand-in at the dense-matcher port (Q-106). Called with a device, it returns that
+    shard's matcher; every shard's calls go to one log."""
+
+    def __init__(
+        self,
+        dataset: MultiViewVideo,
+        *,
+        points: Callable[[float], torch.Tensor] | None = None,
+        certainty: Callable[[int], float] | None = None,
+        crafted: dict[tuple[str, str], Crafted] | None = None,
+    ) -> None:
+        self._records = dataset.records
+        self._index = {_digest(dataset.load_image(i)): i for i in range(len(dataset.records))}
+        self._points = points
+        self._certainty = certainty
+        self._crafted = crafted or {}
+        self._lock = threading.Lock()
+        self.calls: list[tuple[int, int]] = []  # record indices of images A and B
+        self.devices: list[str] = []
+        self.flags: list[tuple[object, ...]] = []
+
+    def __call__(self, device: torch.device) -> DenseMatcher:
+        def match(image_a: torch.Tensor, image_b: torch.Tensor) -> tuple[Tensor, Tensor]:
+            return self._match(image_a, image_b, device)
+
+        return match
+
+    def _match(
+        self, image_a: torch.Tensor, image_b: torch.Tensor, device: torch.device
+    ) -> tuple[Tensor, Tensor]:
+        assert image_a.dtype == torch.float32 and image_a.shape == (_H, _W, 3)
+        a, b = self._index[_digest(image_a)], self._index[_digest(image_b)]
+        with self._lock:
+            self.calls.append((a, b))
+            self.devices.append(str(device))
+            self.flags.append(_flags())
+        record_a, record_b = self._records[a], self._records[b]
+        rows: list[torch.Tensor] = []
+        weights: list[torch.Tensor] = []
+        if self._points is not None:
+            xa, za = _project_points(record_a.camera, self._points(record_a.timestamp))
+            xb, zb = _project_points(record_b.camera, self._points(record_b.timestamp))
+            size = torch.tensor([_W, _H], dtype=torch.float64)
+            seen = (za > 0) & (zb > 0)
+            seen &= ((xa >= 0) & (xa <= size) & (xb >= 0) & (xb <= size)).all(dim=1)
+            index = torch.nonzero(seen).squeeze(1)
+            rows.append(torch.cat([_normalized(xa[seen]), _normalized(xb[seen])], dim=1))
+            if self._certainty is None:
+                weights.append(torch.ones(len(index), dtype=torch.float64))
+            else:
+                values = [self._certainty(int(i)) for i in index]
+                weights.append(torch.tensor(values, dtype=torch.float64))
+        crafted = self._crafted.get((record_a.camera.name, record_b.camera.name), [])
+        if crafted:
+            table = torch.tensor(crafted, dtype=torch.float64)
+            rows.append(torch.cat([_normalized(table[:, :2]), _normalized(table[:, 2:4])], 1))
+            weights.append(table[:, 4])
+        if not rows:
+            return torch.zeros(0, 4, dtype=torch.float64), torch.zeros(0, dtype=torch.float64)
+        return torch.cat(rows), torch.cat(weights)
+
+
+def _plane(z: float, step: int = 2, *, u0: int = 9) -> torch.Tensor:
+    """Points at depth z whose projections into a camera at the origin facing +z are the pixel
+    centers (u + ½, v + ½) for u ≥ u0 and v ≥ 1, every `step` pixels."""
+    u = torch.arange(u0, _W, step, dtype=torch.float64) + 0.5
+    v = torch.arange(1, _H, step, dtype=torch.float64) + 0.5
+    uu, vv = torch.meshgrid(u, v, indexing="ij")
+    X = torch.stack([(uu - _CX) / _FOCAL * z, (vv - _CY) / _FOCAL * z, torch.full_like(uu, z)])
+    return X.reshape(3, -1).T.contiguous()
+
+
+# A rectified rig: one orientation, baseline 0.5 along x, so the lattice at depth 2 projects to
+# pixel centers 8 px apart in A and B.
+_RIG: dict[str, CameraSpec] = {"A": (0.0, (0.0, 0.0, 0.0)), "B": (0.0, (0.5, 0.0, 0.0))}
+
+
+def _static(z: float = 2.0) -> Callable[[float], torch.Tensor]:
+    X = _plane(z)
+    return lambda tau: X
+
+
+def _rig_scene(root: Path, taus: Sequence[float]) -> MultiViewVideo:
+    shots = [(camera, tau, "train") for tau in taus for camera in ("A", "B")]
+    return MultiViewVideo.from_manifest(_write_scene(root, _RIG, shots))
+
+
+def _run(
+    dataset: MultiViewVideo, stand_in: _StandIn, devices: Sequence[str] = ("cpu",), **cfg: Any
+) -> InitPoints:
+    return roma_init(dataset, RomaInitConfig(**cfg), devices=list(devices), matcher=stand_in)
+
+
+def test_u19_exact_matches_of_one_synchronized_pair_give_back_the_points(
+    tmp_path: Path,
+) -> None:
+    """§1.3 steps 2–7 on a single timestamp: exact matches of a rectified pair triangulate back
+    to the scene's points within 1e-6 (U-19's tolerance), each pair matched once; a single init
+    frame gives v = 0 (step 5), the duration is k_stride with a time unit of 1 (D-70), frame
+    ids are the slot index 0 and timestamps the images' τ."""
+    dataset = _rig_scene(tmp_path, [0.0])
+    stand_in = _StandIn(dataset, points=_static())
+    points = _run(dataset, stand_in, points_per_frame=10_000)
+    expected = _plane(2.0)
+    assert stand_in.calls == [(0, 1)]
+    got = points.positions.to(torch.float64)
+    order = torch.cdist(got, expected).argmin(dim=1)
+    assert sorted(order.tolist()) == list(range(expected.shape[0]))
+    torch.testing.assert_close(got, expected[order], rtol=1e-6, atol=1e-6)
+    assert points.velocities is not None and not points.velocities.any()
+    assert points.durations is not None and torch.equal(
+        points.durations, torch.ones(len(got), dtype=torch.float64)
+    )
+    assert points.frame_ids is not None and not points.frame_ids.any()
+    assert not points.timestamps.any()
