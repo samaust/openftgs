@@ -230,7 +230,10 @@ def fastest_frames(frames: Iterable[Tensor], *, count: int = 10) -> int:
 
 # Cameras (§1.4 "World and camera frames", D-28, D-33; Q-84, Q-89).
 
-_ROTATION_TOLERANCE = 1e-6  # max |RᵀR − I| accepted from a calibration file
+# Q-105: max |RᵀR − I| accepted from a calibration file. A matrix within D-63's 1e-6 of a
+# rotation in every entry has |RᵀR − I| ≤ 2√3·1e-6 + 3e-12 ≈ 3.5e-6, so 1e-5 refuses only
+# matrices that are not rotations; R is stored as read.
+_ROTATION_TOLERANCE = 1e-5
 
 
 def _matrix64(value: Any, shape: tuple[int, ...], what: str) -> np.ndarray:
@@ -1914,6 +1917,10 @@ class Prefetcher:
             raise ValueError(f"depth must be an int >= 0, got {depth!r}")
         self._cache = cache
         self._device = torch.device(device)
+        if self._device.type == "cuda" and self._device.index is None:
+            # "cuda" != "cuda:0": name the index, so a cache already on the device is used in
+            # place rather than copied through the host (D-51, §2.4 rule 3).
+            self._device = torch.device("cuda", torch.cuda.current_device())
         self._depth = depth
         self._cuda = self._device.type == "cuda"
         # On CUDA, x / <python float> multiplies by the reciprocal, which isn't bitwise the CPU's

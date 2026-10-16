@@ -334,9 +334,8 @@ def test_c4_colmap_puts_gaussian_dots_where_the_pinhole_camera_projects_them(
     """C-4, needing only COLMAP: an image of Gaussian dots at known 3D points, rendered through
     a known distorted camera and undistorted by COLMAP through the SelfCap converter: every dot's
     centroid lies within 0.1 px of where the read-back PINHOLE camera projects it (a wrong
-    pixel-centre convention gives about 0.5 px; the scene is resized by ½, as any SelfCap scene
-    outside the card's table is (D-80), so that error would be about 0.25 px, still well above the
-    bound)."""
+    pixel-centre convention gives about 0.5 px). The scene is converted at full size (`resize`
+    1.0, D-80), so the bound applies at the undistorted image's own scale (M12 review F-3)."""
     width, height, sigma = 640, 480, 1.6
     K = np.array([[520.0, 0.0, 319.5], [0.0, 520.0, 239.5], [0.0, 0.0, 1.0]])  # OpenCV
     dist = np.array([-0.18, 0.05, 0.0006, -0.0004, 0.0])
@@ -399,16 +398,17 @@ def test_c4_colmap_puts_gaussian_dots_where_the_pinhole_camera_projects_them(
             window=(0, 1),
             test_camera="0001",
             undistort="colmap",
+            resize=1.0,
         )
     )
     camera, converted = _frame(manifest, "0000", 0)
-    Kc = camera.K.double().numpy()  # the read-back PINHOLE camera, resized; continuous convention
+    Kc = camera.K.double().numpy()  # the read-back PINHOLE camera; continuous convention
     expected = (points @ Kc.T)[:, :2] / points[:, 2:]
     gray = converted.astype(np.float64).mean(axis=-1)
     errors = []
     yy, xx = np.mgrid[0 : gray.shape[0], 0 : gray.shape[1]]
     for ex, ey in expected:
-        window = (np.abs(xx + 0.5 - ex) <= 4) & (np.abs(yy + 0.5 - ey) <= 4)
+        window = (np.abs(xx + 0.5 - ex) <= 8) & (np.abs(yy + 0.5 - ey) <= 8)  # 5 sigma
         weights = gray * window
         cx = float((weights * (xx + 0.5)).sum() / weights.sum())
         cy = float((weights * (yy + 0.5)).sum() / weights.sum())

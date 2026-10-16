@@ -148,3 +148,25 @@ def test_u30_gpu_placement_and_cuda_prefetch_equal_png_decoding(tmp_path: Path) 
     torch.cuda.synchronize()
     mapped.close()
     on_gpu.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+@pytest.mark.parametrize("device", ["cuda", "cuda:0"])
+def test_u30_gpu_placement_takes_frames_without_synchronizing(tmp_path: Path, device: str) -> None:
+    """D-51, §2.4 rule 3: a cache already in GPU memory is used in place, so taking a frame
+    makes no host–device synchronization, whether the device names its index or not (the
+    trainer's default is "cuda"; M12 review F-1)."""
+    video = _scene(tmp_path)
+    order = _training(video)
+    cache = FrameCache.open(video, placement="gpu", device=device)
+    prefetcher = Prefetcher(cache, device=device, depth=0)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        images = [prefetcher.take(index) for index in order]
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    for index, image in zip(order, images, strict=True):
+        assert torch.equal(image, video.load_image(index).cuda())
+    prefetcher.close()
