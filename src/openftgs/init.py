@@ -5,6 +5,10 @@ vendored copy in openftgs._vendor.romatch.
 Spec: §1.3, E15, D-58, D-65. Band: Foundation (§2.1).
 """
 
+import dataclasses
+import importlib
+import importlib.resources
+import json
 import math
 from dataclasses import dataclass
 from typing import Literal, NoReturn
@@ -14,11 +18,13 @@ import torch
 from scipy.spatial import cKDTree
 from torch import Tensor
 
-__all__ = ["RomaInitConfig", "knn_velocities", "triangulate_dlt"]  # Q-106
+__all__ = ["RomaInitConfig", "knn_velocities", "roma_provenance", "triangulate_dlt"]  # Q-106
 
 _KNN_TILE = 1 << 24  # distances held at once by the tiled k-NN search (query rows × points)
 _MODELS = ("roma_outdoor", "tiny_roma_v1_outdoor")  # §2.1 RomaInitConfig.model, D-58
 _BACKBONE_PATCH = 14  # RoMa asserts coarse resolutions divisible by DINOv2's patch (Q-106)
+# Q-116: the XFeat commit whose LICENSE (Apache-2.0) was read (source log row 107).
+_XFEAT_COMMIT = "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"
 
 
 def _fail(reason: str) -> NoReturn:
@@ -69,6 +75,40 @@ def _check_config(cfg: RomaInitConfig) -> None:
     ):
         _fail(f"RomaInitConfig.min_certainty must be a number in [0, 1], got {certainty!r}")
     cfg.min_certainty = float(certainty)
+
+
+def _use_custom_corr() -> bool:
+    """D-58, Q-112: RoMa's fused local correlation is used only when `local_corr` imports; a
+    wheel built for another torch fails with OSError and counts as absent."""
+    try:
+        importlib.import_module("local_corr")
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+def _roma_commit() -> str:
+    """The upstream commit of the vendored RoMa, from its VENDOR.json (D-65), read without
+    importing the vendored package, so it works without the [init] extra."""
+    vendor = importlib.resources.files("openftgs._vendor").joinpath("romatch", "VENDOR.json")
+    return str(json.loads(vendor.read_text(encoding="utf-8"))["commit"])
+
+
+def roma_provenance(cfg: RomaInitConfig) -> dict[str, str]:
+    """The ftgs-init metadata that records how `roma_init` ran (D-58; Q-107): one key,
+    `roma_init`, holding compact JSON of every RomaInitConfig field, `use_custom_corr` as
+    `roma_init` resolves it (Q-112), the vendored RoMa's commit and, for Tiny RoMa, XFeat's
+    commit (Q-116). For `write_init_points(..., metadata=roma_provenance(cfg))`."""
+    _check_config(cfg)
+    # Q-107; Q-T136.2: the keys sorted, so the string depends only on the values.
+    record: dict[str, object] = {
+        **dataclasses.asdict(cfg),
+        "use_custom_corr": _use_custom_corr(),
+        "roma_commit": _roma_commit(),
+    }
+    if cfg.model == "tiny_roma_v1_outdoor":
+        record["xfeat_commit"] = _XFEAT_COMMIT
+    return {"roma_init": json.dumps(record, separators=(",", ":"), sort_keys=True)}
 
 
 def _check_point_set(name: str, value: Tensor) -> None:

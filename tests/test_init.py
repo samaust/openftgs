@@ -2,10 +2,25 @@
 """Tests of openftgs.init: k-NN velocities (E15, D-23, D-56) and two-view DLT triangulation
 (§1.3 step 3), U-19 and U-33 (§3.1), with the contracts of Q-106 and Q-120."""
 
+import dataclasses
+import importlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
-from openftgs.init import RomaInitConfig, _nearest_indices, knn_velocities, triangulate_dlt
+import openftgs
+from openftgs.init import (
+    RomaInitConfig,
+    _nearest_indices,
+    knn_velocities,
+    roma_provenance,
+    triangulate_dlt,
+)
 
 
 def _lattice(shape: tuple[int, int, int], spacing: float, dtype: torch.dtype) -> torch.Tensor:
@@ -361,3 +376,54 @@ def test_roma_init_config_rejects_each_invalid_value(field: dict[str, object]) -
     name = next(iter(field))
     with pytest.raises(ValueError, match=name):
         RomaInitConfig(**field)  # type: ignore[arg-type]
+
+
+# roma_provenance (Q-107)
+
+_REPO = Path(__file__).resolve().parents[1]
+_XFEAT_COMMIT = "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"  # Q-116, source log row 107
+
+
+def _local_corr_imports() -> bool:
+    try:
+        importlib.import_module("local_corr")
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+@pytest.mark.parametrize("model", ["roma_outdoor", "tiny_roma_v1_outdoor"])
+def test_roma_provenance_records_the_settings_and_commits(model: str) -> None:
+    """Q-107: one key, `roma_init`, holding compact JSON of every RomaInitConfig field, the
+    `use_custom_corr` that roma_init resolves (true only when `local_corr` imports, Q-112),
+    the vendored RoMa commit (VENDOR.json) and, for Tiny RoMa only, XFeat's commit (Q-116)."""
+    cfg = RomaInitConfig(model=model, stride=3, points_per_frame=7, seed=11)  # type: ignore[arg-type]
+    meta = roma_provenance(cfg)
+    assert list(meta) == ["roma_init"]
+    text = meta["roma_init"]
+    record = json.loads(text)
+    assert text == json.dumps(record, separators=(",", ":"), sort_keys=True)
+    vendor = json.loads((_REPO / "src/openftgs/_vendor/romatch/VENDOR.json").read_text())
+    expected = {
+        **dataclasses.asdict(cfg),
+        "use_custom_corr": _local_corr_imports(),
+        "roma_commit": vendor["commit"],
+    }
+    if model == "tiny_roma_v1_outdoor":
+        expected["xfeat_commit"] = _XFEAT_COMMIT
+    assert record == expected
+
+
+def test_init_imports_without_the_vendored_roma() -> None:
+    """Q-106 and the PRD's imports decision: `openftgs.init` imports, and `roma_provenance`
+    runs, without importing the vendored RoMa, which only the RoMa adapters load. Run in a
+    subprocess, since other tests may import the copy."""
+    code = (
+        "import sys\n"
+        "from openftgs.init import RomaInitConfig, roma_provenance\n"
+        "roma_provenance(RomaInitConfig())\n"
+        "roma_provenance(RomaInitConfig(model='tiny_roma_v1_outdoor'))\n"
+        "assert not [m for m in sys.modules if m.startswith('openftgs._vendor.romatch')]\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(openftgs.__file__).parents[1])}
+    subprocess.run([sys.executable, "-c", code], check=True, env=env, timeout=120)
