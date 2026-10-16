@@ -354,6 +354,30 @@ def test_ftgs_if_metadata_follows_section_2_2(tmp_path: Path) -> None:
     }
 
 
+def test_ftgs_if_records_the_exchange_models_background(tmp_path: Path) -> None:
+    """Q-141 (Q-24): render_conventions records the exchange model's `background`, black by
+    default (D-34); readers ignore the block (§2.2), so the model read back is black."""
+    model = ExchangeModel(_exchange_arrays(), 3, 0.1, 1.0, "s", "t", background=(1.0, 0.5, 0.0))
+    path = tmp_path / "model.safetensors"
+    write_exchange(model, path)
+    with safe_open(str(path), framework="pt") as f:
+        conventions = json.loads(f.metadata()["render_conventions"])
+    assert conventions["background"] == [1.0, 0.5, 0.0]
+    assert read_exchange(path).background == (0.0, 0.0, 0.0)
+    assert ExchangeModel(_exchange_arrays(), 3, 0.1, 1.0, "s", "t").background == (0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    "background",
+    [(1.5, 0.0, 0.0), (-0.1, 0.0, 0.0), (math.nan, 0.0, 0.0), (0.0, 0.0), (True, 0.0, 0.0)],
+)
+def test_validate_exchange_needs_a_background_in_the_unit_interval(background: object) -> None:
+    """Q-141 (Q-11's range): three finite numbers in [0, 1], not bools."""
+    model = ExchangeModel(_exchange_arrays(), 3, 0.1, 1.0, "s", "t", background=background)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="background"):
+        validate_exchange(model)
+
+
 def _bad_exchange(case: str) -> tuple[dict[str, Tensor], dict[str, str]]:
     a = _exchange_arrays()
     meta = _exchange_metadata()
