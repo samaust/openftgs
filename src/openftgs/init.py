@@ -44,6 +44,12 @@ _MODELS = ("roma_outdoor", "tiny_roma_v1_outdoor")  # §2.1 RomaInitConfig.model
 _BACKBONE_PATCH = 14  # RoMa asserts coarse resolutions divisible by DINOv2's patch (Q-106)
 # Q-116: the XFeat commit whose LICENSE (Apache-2.0) was read (source log row 107).
 _XFEAT_COMMIT = "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"
+# Q-123: XFeat's weights at that commit, cached under a name that carries the prefix of
+# their SHA-256, which torch.hub checks (0f5187fd…, source log row 136).
+_XFEAT_WEIGHTS = (
+    f"https://github.com/verlab/accelerated_features/raw/{_XFEAT_COMMIT}/weights/xfeat.pt"
+)
+_XFEAT_WEIGHTS_NAME = "xfeat-0f5187fd.pt"
 
 
 def _fail(reason: str) -> NoReturn:
@@ -682,11 +688,15 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
     xfeat = torch.hub.load(  # type: ignore[no-untyped-call]
         f"verlab/accelerated_features:{_XFEAT_COMMIT}",
         "XFeat",
-        pretrained=True,
+        pretrained=False,  # Q-123: XFeat's own loader takes its weights from `main`
         top_k=4096,
         trust_repo=True,
         skip_validation=True,
     ).net
+    # Q-123: the weights of the same commit, their SHA-256 prefix checked by torch.hub.
+    xfeat.load_state_dict(
+        fetch(_XFEAT_WEIGHTS, map_location="cpu", file_name=_XFEAT_WEIGHTS_NAME, check_hash=True)
+    )
 
     def build_tiny(device: torch.device) -> DenseMatcher:
         # Tiny RoMa deletes XFeat's unused heads when built, so each shard gets its own copy.

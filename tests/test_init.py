@@ -11,27 +11,31 @@ import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
+from builders import TexturedPlane, look_at, write_plane_scene
 from PIL import Image
 from safetensors import safe_open
 from torch import Tensor
 
 import openftgs
 from openftgs.config import InitConfig
-from openftgs.data import MultiViewVideo
+from openftgs.data import MultiViewVideo, convert_selfcap
 from openftgs.init import (
     DenseMatcher,
     RomaInitConfig,
     _nearest_indices,
+    _roma_matchers,
     _RomaMatcher,
     _TinyRomaMatcher,
     knn_velocities,
@@ -39,7 +43,7 @@ from openftgs.init import (
     roma_provenance,
     triangulate_dlt,
 )
-from openftgs.io import read_init_points, write_init_points
+from openftgs.io import read_init_points, validate_init_points, write_init_points
 from openftgs.model import FreeTimeGaussians
 from openftgs.types import Camera, InitPoints
 
@@ -1277,3 +1281,249 @@ def test_tiny_roma_matcher_calls_tiny_roma_in_inference_mode() -> None:
     assert warp.shape == (_H * _W, 4) and certainty.shape == (_H * _W,)
     assert warp.dtype == certainty.dtype == torch.float32
     assert not warp.is_inference() and not certainty.is_inference()
+
+
+def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-116, Q-123: the Tiny RoMa adapter builds XFeat from the pinned commit without its
+    own weights, which XFeat's loader would take from the repository's `main`, and loads the
+    weights of that commit, whose SHA-256 begins 0f5187fd (source log row 136), checked by
+    torch.hub. torch.hub is stood in for, so nothing is downloaded."""
+    net = torch.nn.Linear(2, 1)
+    pinned = {name: torch.full_like(value, 0.25) for name, value in net.state_dict().items()}
+    hub: list[tuple[str, str, dict[str, Any]]] = []
+    fetched: list[tuple[str, dict[str, Any]]] = []
+
+    def load(repo: str, model: str, **kwargs: Any) -> Any:
+        hub.append((repo, model, kwargs))
+        return SimpleNamespace(net=net)
+
+    def fetch(url: str, **kwargs: Any) -> dict[str, Tensor]:
+        fetched.append((url, kwargs))
+        return pinned if "accelerated_features" in url else {}
+
+    monkeypatch.setattr(torch.hub, "load", load)
+    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", fetch)
+    _roma_matchers(RomaInitConfig(model="tiny_roma_v1_outdoor"))
+    assert hub == [
+        (
+            f"verlab/accelerated_features:{_XFEAT_COMMIT}",
+            "XFeat",
+            {"pretrained": False, "top_k": 4096, "trust_repo": True, "skip_validation": True},
+        )
+    ]
+    url = f"https://github.com/verlab/accelerated_features/raw/{_XFEAT_COMMIT}/weights/xfeat.pt"
+    options = {"map_location": "cpu", "file_name": "xfeat-0f5187fd.pt", "check_hash": True}
+    assert (url, options) in fetched
+    for name, value in net.state_dict().items():
+        assert torch.equal(value, pinned[name])
+
+
+# Real RoMa (#137): `roma_init` with its default dense matchers on the vendored copy (D-58,
+# D-65), downloading their weights. The scene is a textured plane, which RoMa can match: four
+# training cameras on an arc 3 units from it, 320 × 256 px, at three synchronized timestamps,
+# and a test camera in the middle of the arc, closer to the two inner cameras than they are to
+# each other, so that a test image wrongly admitted would be paired and read (D-66).
+
+_PLANE = TexturedPlane(seed=3, velocity=(0.6, 0.3, 0.0))
+_ARC = {"C0": -15.0, "C1": -5.0, "C2": 5.0, "C3": 15.0}  # yaw of each training camera (°)
+_ARC_TAUS = (0.0, 1 / 30, 2 / 30)
+
+
+def _arc_camera(name: str, yaw: float, height: float = 0.3) -> Camera:
+    theta = math.radians(yaw)
+    eye = (3.0 * math.sin(theta), -3.0 * math.cos(theta), height)
+    return look_at(eye, width=320, height=256, focal=280.0, name=name)
+
+
+def _plane_scene(root: Path) -> Path:
+    images: list[tuple[Camera, float, str]] = []
+    for tau in _ARC_TAUS:
+        images += [(_arc_camera(name, yaw), tau, "train") for name, yaw in _ARC.items()]
+        images.append((_arc_camera("T", 0.0, -0.2), tau, "test"))
+    return write_plane_scene(root, _PLANE, images)
+
+
+def _slot_counts(points: InitPoints) -> dict[int, int]:
+    assert points.frame_ids is not None
+    slots, counts = torch.unique(points.frame_ids, return_counts=True)
+    return dict(zip(slots.tolist(), counts.tolist(), strict=True))
+
+
+def _plane_distances(points: InitPoints) -> Tensor:
+    """Each point's distance to the plane at its timestamp (the plane moves along its normal)."""
+    y = _PLANE.y0 + _PLANE.velocity[1] * points.timestamps
+    return (points.positions[:, 1].to(torch.float64) - y).abs()
+
+
+# The depth of one pixel of disparity between neighbouring arc cameras at the plane, Z²/(f·b)
+# with Z = 3, f = 280 px and the baseline b = 6·sin 5°: about 0.061 units.
+_PIXEL_DEPTH = 9.0 / (280.0 * 6.0 * math.sin(math.radians(5.0)))
+
+
+def _smoke(
+    tmp_path: Path,
+    record_property: Callable[[str, object], None],
+    cfg: RomaInitConfig,
+    device: str,
+    pixels: float,
+) -> None:
+    """The RoMa smoke test (PRD #133, "Added"): `roma_init` with real weights on the textured
+    plane, the test images deleted once the dataset is built (D-66). The init points pass
+    `validate_init_points`; every slot is matched and holds exactly its cap k_stride·B (§1.3
+    step 7, D-24), since each of its pairs keeps more points than that; and the median point
+    lies within `pixels` of disparity of the plane (a check of the pixel conventions end to
+    end). The per-slot counts are recorded (the #37 evidence)."""
+    dataset = MultiViewVideo.from_manifest(_plane_scene(tmp_path))
+    tests = [record.image_path for record in dataset.records if record.split == "test"]
+    assert len(tests) == len(_ARC_TAUS)
+    for path in tests:
+        path.unlink()
+    points = roma_init(dataset, cfg, devices=[device])
+    validate_init_points(points)
+    counts = _slot_counts(points)
+    median = float(_plane_distances(points).median()) / _PIXEL_DEPTH
+    record_property("slot_counts", json.dumps(counts))
+    record_property("plane_distance_median_px", median)
+    print(f"{cfg.model} on {device}: per-slot counts {counts}, median distance to the plane")
+    print(f"  {median:.3g} px of disparity")
+    cap = cfg.stride * cfg.points_per_frame
+    assert counts == {k: cap for k in range(len(_ARC_TAUS))}
+    assert median < pixels
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_roma_init_with_roma_outdoor_on_a_textured_scene(
+    tmp_path: Path, record_property: Callable[[str, object], None]
+) -> None:
+    """The RoMa smoke test with roma_outdoor (D-58) on cuda:0, under the strict deterministic
+    algorithms of Q-112 over RoMa's whole forward pass; see `_smoke`. RoMa's matches are
+    sub-pixel: the median within a quarter pixel of disparity."""
+    _smoke(tmp_path, record_property, RomaInitConfig(), "cuda:0", pixels=0.25)
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_roma_init_with_tiny_roma_on_a_textured_scene(
+    tmp_path: Path, record_property: Callable[[str, object], None], device: str
+) -> None:
+    """The Tiny RoMa smoke test (D-58; Q-116): XFeat is downloaded through torch.hub at the
+    pinned commit e92685f, with torch.hub's validation skipped; see `_smoke`. Tiny RoMa, the
+    lighter matcher, is held to a median within one pixel of disparity."""
+    cfg = RomaInitConfig(model="tiny_roma_v1_outdoor")
+    _smoke(tmp_path, record_property, cfg, device, pixels=1.0)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_u33_roma_outdoor_shards_and_pair_order_give_bitwise_identical_init_points(
+    tmp_path: Path, record_property: Callable[[str, object], None]
+) -> None:
+    """U-33 (GPU, weights), D-54, D-56; Q-112: with real roma_outdoor, `devices=["cuda:0"]`,
+    `["cuda:0"] * 3`, and `["cuda:0"] * 3` on a copy of the manifest whose images are shuffled
+    give bitwise identical init points. Each pair's draw and each slot's subset bind (B is
+    below the points a slot keeps). Verified here with `use_custom_corr` as the import check
+    resolves it, off while fused-local-corr isn't installed on Python 3.14 (Q-6); the value is
+    recorded."""
+    path = _plane_scene(tmp_path)
+    permuted = _permuted_copy(path, 1)
+    order = [
+        [(r.camera.name, r.timestamp) for r in MultiViewVideo.from_manifest(p).records]
+        for p in (path, permuted)
+    ]
+    assert order[0] != order[1] and sorted(order[0]) == sorted(order[1])
+    record_property("use_custom_corr", _local_corr_imports())
+    outputs = [
+        roma_init(MultiViewVideo.from_manifest(manifest), RomaInitConfig(), devices=devices)
+        for manifest, devices in [
+            (path, ["cuda:0"]),
+            (path, ["cuda:0"] * 3),
+            (permuted, ["cuda:0"] * 3),
+        ]
+    ]
+    assert _slot_counts(outputs[0]) == {0: 1000, 1: 1000, 2: 1000}
+    assert _same(outputs[0], outputs[1])
+    assert _same(outputs[0], outputs[2])
+
+
+# The #37 evidence: per-slot counts on openftgs-synth's unsynchronized `studio` (CC0-1.0, #108),
+# converted by M12's SelfCap converter into pytest's temporary folder, outside the repository.
+
+_STUDIO_WINDOW = (0, 16)  # frames N0 ≤ n < N1 of every camera, at 60 fps
+_STUDIO_TEST_CAMERA = "0007"  # the dataset card's held-out camera
+
+
+def _synth_root() -> Path:
+    """$OPENFTGS_DATASETS/synth, version 0.1.x, or a skip naming the folder."""
+    root = Path(os.environ.get("OPENFTGS_DATASETS", "")) / "synth"
+    if not (root / "VERSION").is_file():
+        pytest.skip(f"openftgs-synth is not at {root}")
+    version = (root / "VERSION").read_text().strip()
+    if not version.startswith("0.1."):
+        pytest.skip(f"openftgs-synth {version} is not 0.1.x")
+    return root
+
+
+def _admitted_cameras(dataset: MultiViewVideo) -> dict[int, int]:
+    """Training cameras per frame slot at k_stride = 1, counted in the test from the records:
+    a camera joins slot k when one of its images has k as its nearest frame and lies within
+    Δt_f/2 of t_k (§1.3 step 1, D-47; Q-109). Recorded as evidence, not asserted."""
+    frame_dt = float(dataset.frame_dt)
+    cameras: dict[int, set[str]] = {}
+    for record in dataset.records:
+        if record.split != "train":
+            continue
+        t = float(dataset.time.to_t(float(record.timestamp)))
+        k = math.ceil(t / frame_dt - 0.5)
+        if abs(t - k * frame_dt) <= frame_dt / 2:
+            cameras.setdefault(k, set()).add(record.camera.name)
+    return {k: len(names) for k, names in sorted(cameras.items())}
+
+
+@pytest.mark.dataset
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="needs ffmpeg and ffprobe on PATH (D-48)",
+)
+def test_roma_init_per_slot_counts_on_studio(
+    tmp_path: Path, record_property: Callable[[str, object], None]
+) -> None:
+    """The #37 evidence (PRD #133, "Added"): `roma_init` with roma_outdoor on 16 frames of
+    `studio` (24 cameras, unsynchronized by up to ±0.03 s, about two frames at 60 fps), at its
+    defaults but for B = 20,000, above what D-47's thin end slots hold, so that their counts
+    are the points surviving D-22's filters. B is not unbounded, since E15 in float64 on the
+    GPU takes about 19 s for 75,000 points against 75,000 (a full slot here). Recorded per
+    slot: the training cameras admitted, the points kept at B = 20,000, and those B = 1000
+    would keep. The converted manifest records the archive's SHA-256 from SHA256SUMS (D-79),
+    and the init points pass `validate_init_points`."""
+    root = _synth_root()
+    manifest = convert_selfcap(
+        root / "selfcap",
+        tmp_path / "studio",
+        scene="studio",
+        window=_STUDIO_WINDOW,
+        test_camera=_STUDIO_TEST_CAMERA,
+        undistort="internal",
+        jobs=8,
+    )
+    lines = (root / "SHA256SUMS").read_text().splitlines()
+    sums = {line[66:]: line[:64] for line in lines}
+    dataset = MultiViewVideo.from_manifest(manifest)
+    archive = "studio-release.tar.gz"
+    assert dataset.manifest.metadata["archives"] == {archive: sums[f"selfcap/{archive}"]}
+    b = 20_000
+    points = roma_init(dataset, RomaInitConfig(points_per_frame=b), devices=["cuda:0"])
+    validate_init_points(points)
+    kept = _slot_counts(points)
+    cameras = _admitted_cameras(dataset)
+    table = {k: (cameras.get(k, 0), kept.get(k, 0), min(kept.get(k, 0), 1000)) for k in cameras}
+    record_property("studio_slots", json.dumps(table))
+    print(f"studio, slot: (training cameras admitted, points kept at B = {b}, at B = 1000)")
+    for k, row in table.items():
+        print(f"  {k}: {row}")
+    assert set(kept) <= set(cameras)
+    assert 0 < max(kept.values()) <= b

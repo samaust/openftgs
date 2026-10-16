@@ -1,20 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U-38 on the CPU: the vendored RoMa in ``openftgs._vendor.romatch`` (D-65; #134).
+"""U-38: the vendored RoMa in ``openftgs._vendor.romatch`` (D-65; #134, #137).
 
 D-65 as Q-113 and Q-114 amend it: RoMa's 22 inference files at commit 77f8d68, with the
 absolute ``romatch`` imports pointing to the vendored path, no OpenCV import, and no
-xformers import in the DINOv2 layers. The GPU comparison with upstream romatch is a
-separate test (Q-117).
+xformers import in the DINOv2 layers. The comparison of ``match()`` with upstream romatch
+at 77f8d68 runs on a GPU with downloaded weights, when upstream is importable (Q-117;
+``docs/modules/init/vendored-roma.md`` says how).
 """
 
 import ast
+import contextlib
 import hashlib
+import importlib
 import json
+import math
 import os
 import subprocess
 import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+
+import pytest
+import torch
+from builders import TexturedPlane, look_at
+from PIL import Image
 
 import openftgs
 
@@ -164,3 +174,109 @@ def test_u38_no_absolute_romatch_import_in_the_vendored_tree() -> None:
         if (lines := _absolute_romatch_imports(path))
     }
     assert found == {}
+
+
+# U-38's comparison with upstream (GPU, weights; Q-117).
+
+
+def _git_blob_id(data: bytes) -> str:
+    """The id git gives a file's bytes: SHA-1 of "blob <size>\\0" and the bytes."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _upstream_zoo() -> Any:
+    """Upstream romatch's model zoo, or a skip unless the importable romatch holds the files
+    of 77f8d68 that the copy was made from (their git blob ids, as VENDOR.json records them;
+    only paths are reported, never contents)."""
+    upstream = pytest.importorskip("romatch", reason="upstream romatch is not importable (Q-117)")
+    root = Path(upstream.__file__).resolve().parents[1]
+    differing = [
+        entry["upstream_path"]
+        for entry in _vendor_json()["files"]
+        if not (root / entry["upstream_path"]).is_file()
+        or _git_blob_id((root / entry["upstream_path"]).read_bytes()) != entry["upstream_blob"]
+    ]
+    if differing:
+        pytest.skip(f"the importable romatch isn't 77f8d68: {differing} differ")
+    return importlib.import_module("romatch.models.model_zoo")
+
+
+@contextlib.contextmanager
+def _strict() -> Iterator[None]:
+    """The flags `roma_init` runs RoMa under (Q-112), restored afterwards."""
+    cudnn = torch.backends.cudnn
+    saved = (
+        torch.get_float32_matmul_precision(),
+        cudnn.benchmark,
+        cudnn.deterministic,
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    try:
+        torch.set_float32_matmul_precision("highest")
+        cudnn.benchmark, cudnn.deterministic = False, True
+        torch.use_deterministic_algorithms(True)
+        yield
+    finally:
+        torch.set_float32_matmul_precision(saved[0])
+        cudnn.benchmark, cudnn.deterministic = saved[1], saved[2]
+        torch.use_deterministic_algorithms(saved[3], warn_only=saved[4])
+
+
+def _pair(seed: int) -> tuple[Image.Image, Image.Image]:
+    """A procedurally generated image pair: a textured plane (seeded) seen from two cameras.
+    Pair 0 is a small baseline at one size; pair 1 a wider one, at two sizes."""
+    plane = TexturedPlane(seed=100 + seed)
+    views = [((-8.0, 0.3), (320, 256)), ((8.0, 0.1), (320, 256))]
+    if seed == 1:
+        views = [((-20.0, 0.6), (384, 288)), ((15.0, -0.2), (256, 192))]
+    images = []
+    for (yaw, height), (width, rows) in views:
+        theta = math.radians(yaw)
+        eye = (3.0 * math.sin(theta), -3.0 * math.cos(theta), height)
+        camera = look_at(eye, width=width, height=rows, focal=0.875 * width)
+        images.append(Image.fromarray(plane.render(camera, 0.0).numpy(), "RGB"))
+    return images[0], images[1]
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_u38_vendored_match_agrees_with_upstream_romatch(
+    record_property: Callable[[str, object], None],
+) -> None:
+    """U-38 (GPU, weights): on two procedurally generated, seeded image pairs, the vendored and
+    upstream (77f8d68) roma_outdoor, built from the same weights with the same settings, give
+    `match()` warps and certainties within 1e-5. Both run under Q-112's flags, with
+    `use_custom_corr` off (Q-6)."""
+    upstream_zoo = _upstream_zoo()
+    vendored_zoo = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
+    urls = vendored_zoo.weight_urls
+    assert upstream_zoo.weight_urls == urls
+    weights = torch.hub.load_state_dict_from_url(urls["romatch"]["outdoor"], map_location="cpu")
+    dinov2 = torch.hub.load_state_dict_from_url(urls["dinov2"], map_location="cpu")
+    device = torch.device("cuda:0")
+    differences: dict[str, float] = {}
+    with _strict():
+        models = [
+            zoo.roma_outdoor(
+                device,
+                weights=dict(weights),
+                dinov2_weights=dict(dinov2),
+                coarse_res=560,
+                upsample_res=864,
+                use_custom_corr=False,
+            )
+            for zoo in (vendored_zoo, upstream_zoo)
+        ]
+        for seed in (0, 1):
+            image_a, image_b = _pair(seed)
+            (warp, certainty), (warp_up, certainty_up) = (
+                model.match(image_a, image_b, device=device) for model in models
+            )
+            differences[f"warp {seed}"] = float((warp - warp_up).abs().max())
+            differences[f"certainty {seed}"] = float((certainty - certainty_up).abs().max())
+            torch.testing.assert_close(warp, warp_up, rtol=0.0, atol=1e-5)
+            torch.testing.assert_close(certainty, certainty_up, rtol=0.0, atol=1e-5)
+            assert float(certainty.max()) > 0.5  # the pair is matched, not blank
+    record_property("max_abs_differences", json.dumps(differences))
+    print(f"U-38: largest differences {differences}")
