@@ -35,9 +35,8 @@ from openftgs.init import (
     DenseMatcher,
     RomaInitConfig,
     _nearest_indices,
+    _pil,
     _roma_matchers,
-    _RomaMatcher,
-    _TinyRomaMatcher,
     knn_velocities,
     roma_init,
     roma_provenance,
@@ -1223,64 +1222,19 @@ def test_roma_init_refuses_a_malformed_dense_matcher_output(
         roma_init(dataset, RomaInitConfig(), devices=["cpu"], matcher=matcher)
 
 
-# The RoMa adapters, with a fake model in place of RoMa: the real models need weights and
-# are exercised by the GPU and weights tests of #137.
+# The RoMa adapters themselves run only with the real models, in the weights tests below
+# (#137); RoMa is never stood in for (`.claude/skills/tdd/mocking.md`).
 
 
-class _FakeRoma:
-    """Records what `match` receives and returns a warp of RoMa's shapes, made in inference
-    mode as RoMa's are."""
-
-    def __init__(self, warp_shape: tuple[int, ...]) -> None:
-        self.warp_shape = warp_shape
-        self.inputs: list[Any] = []
-        self.inference: list[bool] = []
-
-    def match(self, im_a: Any, im_b: Any, **kwargs: Any) -> tuple[Tensor, Tensor]:
-        self.inputs.append((im_a, im_b, kwargs))
-        self.inference.append(torch.is_inference_mode_enabled())
-        with torch.inference_mode():
-            n = math.prod(self.warp_shape[:-1])
-            warp = torch.arange(4 * n, dtype=torch.float16).reshape(self.warp_shape)
-            certainty = torch.linspace(0, 1, n, dtype=torch.float16).reshape(self.warp_shape[:-1])
-        return warp, certainty
-
-
-def _image(seed: int) -> Tensor:
-    pixels = torch.randint(0, 256, (_H, _W, 3), generator=torch.Generator().manual_seed(seed))
-    return pixels.to(torch.float32) / 255.0
-
-
-def test_roma_matcher_hands_roma_pil_images_and_flattens_its_warp() -> None:
-    """Q-106, Q-110: the roma_outdoor adapter gives RoMa PIL images of round(255·x) as uint8,
-    byte-exact for 8-bit images, with the shard's device, and returns the whole two-way warp
-    [1, H, 2W, 4] and its certainty flattened to [M, 4] and [M], float32 ordinary tensors on
-    the CPU."""
-    fake = _FakeRoma((1, 6, 2 * 5, 4))
-    matcher = _RomaMatcher(fake, torch.device("cpu"))
-    image_a, image_b = _image(0), _image(1)
-    warp, certainty = matcher(image_a, image_b)
-    pil_a, pil_b, kwargs = fake.inputs[0]
-    assert kwargs == {"device": torch.device("cpu")}
-    for pil, image in ((pil_a, image_a), (pil_b, image_b)):
-        assert pil.mode == "RGB" and pil.size == (_W, _H)
-        assert torch.equal(torch.from_numpy(np.array(pil)), (image * 255).round().to(torch.uint8))
-    assert warp.shape == (60, 4) and certainty.shape == (60,)
-    assert warp.dtype == certainty.dtype == torch.float32
-    assert not warp.is_inference() and not certainty.is_inference()
-    assert torch.equal(warp, torch.arange(240, dtype=torch.float32).reshape(60, 4))
-
-
-def test_tiny_roma_matcher_calls_tiny_roma_in_inference_mode() -> None:
-    """Q-116: the Tiny RoMa adapter wraps the call in inference mode and flattens the one-way
-    warp [1, H, W, 4] to [M, 4], float32 ordinary tensors on the CPU."""
-    fake = _FakeRoma((1, _H, _W, 4))
-    warp, certainty = _TinyRomaMatcher(fake)(_image(0), _image(1))
-    assert fake.inference == [True]
-    assert fake.inputs[0][2] == {}
-    assert warp.shape == (_H * _W, 4) and certainty.shape == (_H * _W,)
-    assert warp.dtype == certainty.dtype == torch.float32
-    assert not warp.is_inference() and not certainty.is_inference()
+def test_pil_gives_roma_the_8_bit_values_back() -> None:
+    """Q-110: RoMa's input is round(255·x) as uint8, so every 8-bit value that
+    `MultiViewVideo.load_image` returns as x = b/255 in float32 comes back as b exactly."""
+    values = torch.arange(256, dtype=torch.uint8)
+    pixels = values[torch.randperm(256, generator=torch.Generator().manual_seed(0))]
+    pixels = torch.cat([values, pixels, values.flip(0)]).reshape(16, 16, 3)
+    image = _pil(pixels.to(torch.float32) / 255.0)
+    assert image.mode == "RGB" and image.size == (16, 16)
+    assert torch.equal(torch.from_numpy(np.array(image)), pixels)
 
 
 def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(
