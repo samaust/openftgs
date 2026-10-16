@@ -148,3 +148,16 @@ def test_camera_helpers_reject_malformed_input() -> None:
         camera_from_llff(np.zeros(16))
     with pytest.raises(ValueError):
         resized_size(10, 10, 0.0)
+
+
+def test_camera_from_opencv_accepts_a_rotation_d63_accepts() -> None:
+    """Q-105 (M12 review F-2): R = [[0.6, −0.8000009, 0], [0.8000009, 0.6, 0], [0, 0, 1]] is
+    within 9e-7 of the exact rotation in every entry, so D-63's 1e-6 check passes it, while
+    0.6² + 0.8000009² − 1 = 1.44e-6 > 1e-6; it is accepted and stored as read. R off by 1e-4
+    on the diagonal is still refused."""
+    K = np.array([[10.0, 0.0, 4.0], [0.0, 10.0, 3.0], [0.0, 0.0, 1.0]])
+    rotation = np.array([[0.6, -0.8000009, 0.0], [0.8000009, 0.6, 0.0], [0.0, 0.0, 1.0]])
+    camera = camera_from_opencv(K, rotation, np.zeros(3), width=8, height=6)
+    assert torch.equal(camera.world_to_camera[:3, :3], torch.from_numpy(rotation).to(torch.float32))
+    with pytest.raises(ValueError):
+        camera_from_opencv(K, np.diag([1.0001, 1.0, 1.0]), np.zeros(3), width=8, height=6)
