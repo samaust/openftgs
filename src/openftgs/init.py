@@ -303,11 +303,12 @@ class _PairPoints:
 
 
 @dataclass(frozen=True)
-class _Slot:
-    """One init frame: its full point set, for E15 against it, and its kept subset."""
+class _InitFrame:
+    """One init frame: the index k of its slot, its full point set, for E15 against it, and
+    its kept subset."""
 
     k: int
-    full: Tensor  # [n, 3] float32, every point of the slot's pairs in canonical order
+    full: Tensor  # [n, 3] float32, every point of the init frame's pairs in canonical order
     positions: Tensor  # the kept subset (§1.3 step 7), in canonical order
     colors: Tensor
     timestamps: Tensor  # [m] float64, raw τ
@@ -706,10 +707,11 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
     return build_tiny
 
 
-def _slot_points(k: int, parts: Sequence[_PairPoints], cfg: RomaInitConfig) -> _Slot | None:
-    """§1.3 step 7, D-24; Q-111: a slot's points in canonical pair order, of which at most
-    k_stride·B are kept, as a seeded uniform subset sorted back to that order; the slot's
-    generator is left untouched when everything fits."""
+def _init_frame(k: int, parts: Sequence[_PairPoints], cfg: RomaInitConfig) -> _InitFrame | None:
+    """§1.3 step 7, D-24; Q-111: the init frame of slot k, None when its pairs keep no point.
+    Its points come in canonical pair order, of which at most k_stride·B are kept, as a seeded
+    uniform subset sorted back to that order; the slot's generator is left untouched when
+    everything fits."""
     if not parts or sum(int(part.positions.shape[0]) for part in parts) == 0:
         return None
     positions = torch.cat([part.positions for part in parts])
@@ -722,10 +724,10 @@ def _slot_points(k: int, parts: Sequence[_PairPoints], cfg: RomaInitConfig) -> _
     )
     n, cap = int(positions.shape[0]), cfg.stride * cfg.points_per_frame
     if n <= cap:
-        return _Slot(k, positions, positions, colors, timestamps)
+        return _InitFrame(k, positions, positions, colors, timestamps)
     drawn = torch.randperm(n, generator=_generator("slot", cfg.seed, k))[:cap]  # Q-111
     keep = torch.sort(drawn).values
-    return _Slot(k, positions, positions[keep], colors[keep], timestamps[keep])
+    return _InitFrame(k, positions, positions[keep], colors[keep], timestamps[keep])
 
 
 def roma_init(
@@ -760,31 +762,31 @@ def roma_init(
     unit = span if span > 0 else 1.0  # D-70: a time unit of 1 for a single timestamp
     frame_dt = float(dataset.frame_dt)
     e15_device = shard_devices[0]
-    # The finished init frames: (slot, its kept points' velocities). A slot's full set is
-    # dropped once it is finished and no longer needed by E15 (the PRD's job order).
-    finished: list[tuple[_Slot, Tensor]] = []
+    # The finished init frames, each with its kept points' velocities. An init frame's full
+    # set is dropped once it is finished and no longer needed by E15 (the PRD's job order).
+    finished: list[tuple[_InitFrame, Tensor]] = []
 
-    def finish(slot: _Slot, other: _Slot | None) -> None:
+    def finish(frame: _InitFrame, other: _InitFrame | None) -> None:
         if other is None:  # §1.3 step 5: a single init frame gives v = 0
-            v = torch.zeros_like(slot.positions)
-        else:  # E15, D-23; Q-111: against the other slot's full set, dt from the slot times
-            dt = (other.k - slot.k) * frame_dt * unit
-            v = knn_velocities(slot.positions.to(e15_device), other.full.to(e15_device), dt)
-        finished.append((dataclasses.replace(slot, full=slot.full.new_empty(0, 3)), v.cpu()))
+            v = torch.zeros_like(frame.positions)
+        else:  # E15, D-23; Q-111: against the other init frame's full set, dt from slot times
+            dt = (other.k - frame.k) * frame_dt * unit
+            v = knn_velocities(frame.positions.to(e15_device), other.full.to(e15_device), dt)
+        finished.append((dataclasses.replace(frame, full=frame.full.new_empty(0, 3)), v.cpu()))
 
     with _deterministic():
         build = matcher if matcher is not None else _roma_matchers(cfg)
         matchers = [build(device) for device in shard_devices]
         with _Shards(jobs, matchers, shard_devices, work) as shards:
             results: dict[tuple[int, int, int], _PairPoints] = {}
-            previous: _Slot | None = None  # the last slot with points, not yet finished
-            before: _Slot | None = None  # the slot with points before it
+            previous: _InitFrame | None = None  # the last init frame, not yet finished
+            before: _InitFrame | None = None  # the init frame before it
             for k in slots:
                 while any(key not in results for key in by_slot[k]):
                     job, result = shards.next_result()
                     results[job.key] = result
-                current = _slot_points(k, [results.pop(key) for key in by_slot[k]], cfg)
-                if current is None:
+                current = _init_frame(k, [results.pop(key) for key in by_slot[k]], cfg)
+                if current is None:  # no point survived at slot k: it has no init frame
                     continue
                 if previous is not None:
                     finish(previous, current)  # the next init frame
@@ -794,18 +796,18 @@ def roma_init(
         finish(previous, before)  # D-23: the last init frame uses the previous one
 
     duration = cfg.stride * frame_dt * unit  # §1.3 step 6, D-21, D-70
-    counts = [int(slot.positions.shape[0]) for slot, _ in finished]
+    counts = [int(frame.positions.shape[0]) for frame, _ in finished]
     points = InitPoints(
-        positions=torch.cat([slot.positions for slot, _ in finished]),
-        colors=torch.cat([slot.colors for slot, _ in finished]),
-        timestamps=torch.cat([slot.timestamps for slot, _ in finished]),
+        positions=torch.cat([frame.positions for frame, _ in finished]),
+        colors=torch.cat([frame.colors for frame, _ in finished]),
+        timestamps=torch.cat([frame.timestamps for frame, _ in finished]),
         velocities=torch.cat([v for _, v in finished]),
         durations=torch.full((sum(counts),), duration, dtype=torch.float64),
         # Q-111: the slot index, the label from_init_points gives supplied points.
         frame_ids=torch.cat(
             [
-                torch.full((n,), slot.k, dtype=torch.int64)
-                for (slot, _), n in zip(finished, counts, strict=True)
+                torch.full((n,), frame.k, dtype=torch.int64)
+                for (frame, _), n in zip(finished, counts, strict=True)
             ]
         ),
     )
