@@ -287,11 +287,11 @@ Two training cameras matched at an init frame: each camera with the training cam
 _Avoid_: image pair, stereo pair, view pair
 
 **Match**:
-One pixel correspondence between the two images of a camera pair, taken from RoMa's dense warp with certainty at least 0.5, up to 5,000 per pair drawn in proportion to certainty from the pair's own generator. D-22, D-56, D-58
+One pixel correspondence between the two images of a camera pair, taken from the dense matcher's warp (RoMa's by default) with certainty at least 0.5, up to 5,000 per pair drawn in proportion to certainty from the pair's own generator. D-22, D-56, D-58, Q-106
 _Avoid_: correspondence, keypoint, feature match, sample (RoMa's `sample()` is not used)
 
 **Certainty**:
-RoMa's raw per-pixel confidence that a warp is correct, used both as the admission threshold for matches and as their sampling weight. D-58
+The dense matcher's raw per-pixel confidence that a warp is correct (RoMa's sigmoid certainty by default), used both as the admission threshold for matches and as their sampling weight. D-58, Q-106
 _Avoid_: confidence, score, probability
 
 **Triangulation**:
