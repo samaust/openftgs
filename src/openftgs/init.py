@@ -331,9 +331,11 @@ def _frame_count(dataset: MultiViewVideo) -> int:
 
 def _admitted(dataset: MultiViewVideo, cfg: RomaInitConfig) -> dict[int, dict[str, int]]:
     """§1.3 step 1, D-21, D-47, D-66; Q-109: for each slot k ∈ {0, s, 2s, …} ≤ F − 1, the record
-    index of each training camera's image there. An image joins slot k only when its nearest
-    frame ⌈t/Δt_f − ½⌉ is k (ties to the lower frame, Q-21) and |t − t_k| ≤ Δt_f/2; per camera
-    the closest image wins, then the earlier timestamp, then the lower record index."""
+    index of each training camera's image there. An image joins its nearest slot,
+    k = s·⌈t/(s·Δt_f) − ½⌉ (ties to the lower slot, as Q-21's frames), when |t − t_k| ≤ Δt_f/2;
+    per camera the closest image wins, then the earlier timestamp, then the lower record index.
+    At s = 1 the nearest slot is the nearest frame; at s > 1 an image within Δt_f/2 of a slot
+    has that slot as its nearest, whatever its nearest frame."""
     frame_dt = float(dataset.frame_dt)
     names = set(dataset.manifest.camera_names)
     slots: dict[int, dict[str, int]] = {k: {} for k in range(0, _frame_count(dataset), cfg.stride)}
@@ -345,7 +347,7 @@ def _admitted(dataset: MultiViewVideo, cfg: RomaInitConfig) -> dict[int, dict[st
         if name not in names:
             _fail(f"camera {name!r} of image {index} is missing from the manifest's cameras")
         t = float(dataset.time.to_t(float(record.timestamp)))
-        k = math.ceil(t / frame_dt - 0.5)  # Q-21, Q-109
+        k = cfg.stride * math.ceil(t / (cfg.stride * frame_dt) - 0.5)  # Q-21, Q-109
         offset = abs(t - k * frame_dt)
         if k not in slots or offset > frame_dt / 2:
             continue

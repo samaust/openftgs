@@ -275,7 +275,7 @@ _Avoid_: metrics (reserved for E16), history, training record
 ### Initialization
 
 **Init frame slot**:
-A nominal time t_k = k·Δt_f for every k_stride-th k, admitting at most one image per training camera, the one within Δt_f/2 of t_k whose nearest frame is k (ties to the lower frame); a camera with none sits the slot out. §1.3 step 1, D-47, Q-109
+A nominal time t_k = k·Δt_f for every k_stride-th k, admitting at most one image per training camera: the closest of its images that lie within Δt_f/2 of t_k and have this slot as their nearest (a tie between two slots goes to the lower); a camera with none sits the slot out. §1.3 step 1, D-47, Q-109
 _Avoid_: keyframe, init time, frame index, slot (when the images or points are meant)
 
 **Init frame**:

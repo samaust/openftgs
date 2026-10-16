@@ -986,6 +986,29 @@ def test_u19_a_camera_without_an_image_near_the_slot_sits_it_out(tmp_path: Path)
     }
 
 
+def test_u19_at_stride_2_an_image_half_a_frame_before_a_slot_joins_it(tmp_path: Path) -> None:
+    """§1.3 step 1, D-21, D-47; Q-109: a slot holds each camera's image within Δt_f/2 of t_k,
+    also at k_stride = 2, where an image exactly Δt_f/2 before slot 2 has the non-slot frame 1
+    as its nearest frame (the tie to the lower frame). B has images at frames 0 to 4; A at
+    frames 0, 1, 1.5, 3 and 4 (whole seconds, frames 1 s apart, so every time is exact).
+    Slot 2 pairs A's image at 1.5 with B's at 2; A's images at 1 and 3, a whole frame from
+    every slot, are never read."""
+    shots: list[Shot] = [("B", float(n), "train") for n in range(5)]
+    shots += [("A", tau, "train") for tau in (0.0, 1.0, 1.5, 3.0, 4.0)]
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, _RIG, shots))
+    assert dataset.frame_dt == 0.25  # the median gap of each camera is 1 s, over T_τ = 4 s
+    stand_in = _StandIn(dataset, points=_static())
+    points = _run(dataset, stand_in, stride=2)
+
+    index = {(camera, tau): i for i, (camera, tau, _) in enumerate(shots)}
+    expected = {(index["A", a], index["B", b]) for a, b in [(0.0, 0.0), (1.5, 2.0), (4.0, 4.0)]}
+    assert len(stand_in.calls) == len(expected)
+    assert set(stand_in.calls) == expected
+    assert points.frame_ids is not None
+    got = set(zip(points.frame_ids.tolist(), points.timestamps.tolist(), strict=True))
+    assert got == {(0, 0.0), (2, 1.75), (4, 4.0)}
+
+
 # Five cameras turned about the vertical axis, all facing a plane at depth 3. X faces it; L
 # and R are turned by ∓20°, so X's axis ties between them exactly; L′ and R′, turned by ∓25°,
 # are the partners of L and R, so the pair X takes is visible in the log.
