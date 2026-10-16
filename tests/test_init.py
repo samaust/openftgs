@@ -17,7 +17,6 @@ import sys
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -1254,41 +1253,41 @@ def test_pil_gives_roma_the_8_bit_values_back() -> None:
     assert torch.equal(torch.from_numpy(np.array(image)), pixels)
 
 
-def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Q-116, Q-123: the Tiny RoMa adapter builds XFeat from the pinned commit without its
-    own weights, which XFeat's loader would take from the repository's `main`, and loads the
-    weights of that commit, whose SHA-256 begins 0f5187fd (source log row 136), checked by
-    torch.hub. torch.hub is stood in for, so nothing is downloaded."""
-    net = torch.nn.Linear(2, 1)
-    pinned = {name: torch.full_like(value, 0.25) for name, value in net.state_dict().items()}
-    hub: list[tuple[str, str, dict[str, Any]]] = []
-    fetched: list[tuple[str, dict[str, Any]]] = []
+# XFeat's weights at the pinned commit, as source log row 136 hashed them (Q-123).
+_XFEAT_SHA256 = "0f5187fd7bedd26c7fe6acc9685444493a165a35ecc087b33c2db3627f3ea10b"
 
-    def load(repo: str, model: str, **kwargs: Any) -> Any:
-        hub.append((repo, model, kwargs))
-        return SimpleNamespace(net=net)
 
-    def fetch(url: str, **kwargs: Any) -> dict[str, Tensor]:
-        fetched.append((url, kwargs))
-        return pinned if "accelerated_features" in url else {}
+@pytest.mark.weights
+def test_roma_matchers_load_xfeat_with_its_pinned_commits_weights(tmp_path: Path) -> None:
+    """Q-116, Q-123: into an empty torch.hub folder, the Tiny RoMa adapter downloads XFeat at
+    the pinned commit and nothing at any other ref; it builds XFeat without XFeat's own
+    weights, which its loader would download from the repository's `main` as
+    checkpoints/xfeat.pt (source log row 136), and loads the pinned commit's weights instead,
+    saved as xfeat-0f5187fd.pt with row 136's SHA-256. Real downloads, into a fresh folder so
+    that no cached file hides one (mocking.md).
 
-    monkeypatch.setattr(torch.hub, "load", load)
-    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", fetch)
-    _roma_matchers(RomaInitConfig(model="tiny_roma_v1_outdoor"))
-    assert hub == [
-        (
-            f"verlab/accelerated_features:{_XFEAT_COMMIT}",
-            "XFeat",
-            {"pretrained": False, "top_k": 4096, "trust_repo": True, "skip_validation": True},
-        )
-    ]
-    url = f"https://github.com/verlab/accelerated_features/raw/{_XFEAT_COMMIT}/weights/xfeat.pt"
-    options = {"map_location": "cpu", "file_name": "xfeat-0f5187fd.pt", "check_hash": True}
-    assert (url, options) in fetched
-    for name, value in net.state_dict().items():
-        assert torch.equal(value, pinned[name])
+    Tiny RoMa's own checkpoint then sets every XFeat weight a shard keeps (source log row
+    TFIX.1), so the weights checked here are those `_roma_matchers` builds XFeat with, read
+    from the builder it returns."""
+    previous = torch.hub.get_dir()
+    hub = tmp_path / "hub"
+    torch.hub.set_dir(str(hub))
+    try:
+        build = _roma_matchers(RomaInitConfig(model="tiny_roma_v1_outdoor"))
+    finally:
+        torch.hub.set_dir(previous)
+    repos = sorted(path.name for path in hub.iterdir() if path.is_dir())
+    assert repos == ["checkpoints", f"verlab_accelerated_features_{_XFEAT_COMMIT}"]
+    checkpoints = sorted(path.name for path in (hub / "checkpoints").iterdir())
+    assert checkpoints == ["tiny_roma_v1_outdoor.pth", "xfeat-0f5187fd.pt"]
+    weights = hub / "checkpoints" / "xfeat-0f5187fd.pt"
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == _XFEAT_SHA256
+    pinned = torch.load(weights, map_location="cpu", weights_only=True)
+    cells = [cell.cell_contents for cell in build.__closure__ or ()]
+    (xfeat,) = [cell for cell in cells if isinstance(cell, torch.nn.Module)]
+    state = xfeat.state_dict()
+    assert state.keys() == pinned.keys()
+    assert all(torch.equal(value.cpu(), pinned[name]) for name, value in state.items())
 
 
 # Real RoMa (#137): `roma_init` with its default dense matchers on the vendored copy (D-58,
