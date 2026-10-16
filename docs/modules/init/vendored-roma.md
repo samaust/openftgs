@@ -25,7 +25,17 @@ VENDOR.json records the upstream URL and commit, the script, each license file w
 
 ## U-38
 
-U-38's CPU tests, in `tests/test_vendored_roma.py`, check the hashes against VENDOR.json, search the copy for absolute `romatch` imports, and import the copy in a subprocess with cv2 blocked and a stub xformers on the path (Q-117). Its comparison with upstream runs locally, on a GPU with the weights downloaded, against upstream romatch at 77f8d68 made importable beside the copy.
+U-38's CPU tests, in `tests/test_vendored_roma.py`, check the hashes against VENDOR.json, search the copy for absolute `romatch` imports, and import the copy in a subprocess with cv2 blocked and a stub xformers on the path (Q-117). Its comparison with upstream runs locally, on a GPU with the weights downloaded, against upstream romatch at 77f8d68 made importable beside the copy: the vendored and upstream `roma_outdoor`, built from the same weights with `use_custom_corr` off, match two seeded textured-plane pairs under the flags `roma_init` sets, and their warps and certainties must agree within 1e-5 (they were bitwise equal on the RTX 4090, #137).
+
+The test is skipped unless `import romatch` works and the files it finds have the upstream git blob ids VENDOR.json records, so another RoMa version can't stand in. Nothing needs installing; upstream's own package can go on pytest's path for that run only, from a clone of RoMa (a blobless one will do, and upstream needs OpenCV, which the dev environment has):
+
+```sh
+git -C CLONE archive -o romatch-77f8d68.tar 77f8d68 romatch
+mkdir UPSTREAM && tar -xf romatch-77f8d68.tar -C UPSTREAM
+OPENFTGS_ALLOW_DOWNLOADS=1 pytest -o "pythonpath=src UPSTREAM" tests/test_vendored_roma.py
+```
+
+This copies upstream's `utils/utils.py` whole, the lines above 77 included, so nobody opens that copy either; the test only hashes its bytes.
 
 ## Updating
 
