@@ -2,9 +2,9 @@ openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al.,
 
 # openftgs
 
-Python package `openftgs`, under the Apache-2.0 license. Its command-line tool, `ftgs`, arrives with milestone M14.
+Python package `openftgs`, under the Apache-2.0 license, with the command-line tool `ftgs`.
 
-**Status: pre-alpha.** The repository holds the package skeleton (milestone M0); the modules are empty and nothing runs yet.
+**Status: pre-alpha.** The library and its command line are built through milestone M14; the performance work, the differential harness and the validation runs follow (`docs/clean-room/milestones.md`).
 
 ## Clean-room process
 
@@ -41,6 +41,21 @@ Optional extras:
   Without it, the SSIM loss runs in plain PyTorch and gives the same values.
 
 The differential harness is a separate package in `harness/` (`pip install -e harness`).
+
+## Command line
+
+```bash
+ftgs convert n3dv SRC OUT                        # a dataset into a scene manifest (needs ffmpeg)
+ftgs cache OUT/scene.json                        # decode the training frames once (optional)
+ftgs init roma OUT/scene.json init.safetensors   # initial points with RoMa ([init], a CUDA device)
+ftgs train OUT/scene.json --init init.safetensors --out RUN_DIR [--config CFG.json] [--seed S]
+ftgs train OUT/scene.json --init init.safetensors --out RUN_DIR --resume RUN_DIR/checkpoint
+ftgs export RUN_DIR/checkpoint --format ftgs-if --out model.safetensors
+ftgs render model.safetensors --request request.json --out renders.safetensors
+ftgs eval RUN_DIR/checkpoint OUT/scene.json --split test --out METRICS.json
+```
+
+`ftgs <command> --help` lists every option. A run directory holds `config.json`, `train_log.jsonl`, `checkpoint/` and, when the scene has a test split, `METRICS.json`; Ctrl-C saves the checkpoint before stopping. Exit code 0 is success, 2 an invalid input or environment, 3 a numerical failure. See [`docs/modules/cli/command-line.md`](docs/modules/cli/command-line.md).
 
 ## Tests
 

@@ -26,6 +26,10 @@ dependencies = [
     "numpy>=1.23.2",
 ]
 
+# §2.1, D-62: the command line; Q-124: main returns the exit code.
+[project.scripts]
+ftgs = "openftgs.cli:main"
+
 [project.optional-dependencies]
 # §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1; fused-local-corr is a Linux-only speed-up.
 # Q-6: it has no wheels for Python 3.14; there it is built from source (README).

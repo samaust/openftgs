@@ -6,10 +6,13 @@ Spec: E16, App. B.1, D-29, D-52, D-55, D-64, D-67, D-68, D-69. Band: Orchestrati
 """
 
 import contextlib
+import importlib.metadata
+import json
 import math
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
@@ -19,7 +22,7 @@ from openftgs.data import MultiViewVideo
 from openftgs.losses import LPIPSLoss, ssim
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render_request
-from openftgs.types import RenderItem, RenderRequest
+from openftgs.types import RenderItem, RenderRequest, SceneManifest
 
 __all__ = [
     "METRIC_NAMES",
@@ -33,6 +36,7 @@ __all__ = [
     "metrics_report",
     "psnr",
     "ssim_k",
+    "write_metrics",
 ]
 
 # §2.1 CLI paragraph: the metrics METRICS.json reports, in this order (Q-60).
@@ -252,28 +256,41 @@ def evaluate_images(
     split: str = "test",
     backend: Literal["gsplat", "reference"] = "gsplat",
     background: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    renders: Mapping[int, Tensor] | None = None,
 ) -> list[ImageMetrics]:
     """The metrics of every image of one data split (E16, D-67): each record rendered at its
     raw timestamp with the model's full SH degree and `background`, through `render_request`
     one timestamp at a time, so cameras that share a time render together (D-55) and one
     time's renders are held at once, then evaluated by `evaluator` with the image's mask.
-    Results come in the manifest's order."""
+    Results come in the manifest's order. Given `renders`, a prediction [H, W, 3] for every
+    record of the split by record index, nothing is rendered and those are scored (Q-137)."""
     indices = [i for i, record in enumerate(dataset.records) if record.split == split]
     if not indices:
         raise ValueError(f"the data split {split!r} holds no images")
+    root = dataset.manifest.path.parent
+    if renders is not None:
+        absent = [i for i in indices if i not in renders]
+        if absent:
+            names = [dataset.records[i].image_path.relative_to(root).as_posix() for i in absent]
+            raise ValueError(f"no supplied render for {len(absent)} image(s): {names[:5]}")
     groups: dict[float, list[int]] = {}
     for i in indices:
         groups.setdefault(dataset.records[i].timestamp, []).append(i)
-    root = dataset.manifest.path.parent
     results: dict[int, ImageMetrics] = {}
     for timestamp, group in groups.items():
-        items = tuple(RenderItem(str(i), timestamp, dataset.records[i].camera) for i in group)
-        request = RenderRequest(items, time_unit=dataset.manifest.time_unit, background=background)
-        renders = render_request(model, request, backend=backend)
+        if renders is None:
+            items = tuple(RenderItem(str(i), timestamp, dataset.records[i].camera) for i in group)
+            request = RenderRequest(
+                items, time_unit=dataset.manifest.time_unit, background=background
+            )
+            rgb = render_request(model, request, backend=backend).rgb
+            predictions = {i: rgb[str(i)] for i in group}
+        else:
+            predictions = {i: renders[i] for i in group}
         for i in group:
             record = dataset.records[i]
             mask = dataset.load_mask(i)
-            entire, dynamic = evaluator(renders.rgb[str(i)], dataset.load_image(i), mask=mask)
+            entire, dynamic = evaluator(predictions[i], dataset.load_image(i), mask=mask)
             results[i] = ImageMetrics(
                 camera=record.camera.name,
                 timestamp=record.timestamp,
@@ -357,6 +374,7 @@ def metrics_report(
             "masks_approximate": approximate,
             "count": len(usable),
             "skipped": len(masked) - len(usable),
+            "missing": len(images) - len(masked),  # Q-135: images of the split without a mask
             "scene": _means(usable),
             "images": [_row(image, image.dynamic) for image in masked],
         }
@@ -386,3 +404,45 @@ def metrics_report(
             )
         report["fastest_10"] = block
     return report
+
+
+_HEADER = ("producer", "model", "manifest", "renders")
+
+
+def _producer() -> str:
+    try:
+        return f"openftgs {importlib.metadata.version('openftgs')}"
+    except importlib.metadata.PackageNotFoundError:
+        return "openftgs"
+
+
+# Q-136: the one writer of METRICS.json, for Trainer.evaluate and ftgs eval (Q-63, Q-74).
+def write_metrics(
+    path: Path,
+    body: Mapping[str, Any],
+    *,
+    manifest: SceneManifest,
+    model_path: Path | None = None,
+    iteration: int | None = None,
+    renders: Mapping[str, Any] | None = None,
+) -> None:
+    """Writes METRICS.json: the header (`producer`; `model` as {path, iteration}, either of
+    which may be null; the scene manifest as `manifest`, {path, sha256}; `renders` when given,
+    Q-137), then `body`, the `metrics_report` dict, as JSON without NaN or Infinity (Q-25)."""
+    clash = [key for key in _HEADER if key in body]
+    if clash:
+        raise ValueError(f"the report body holds header keys {clash}")
+    header: dict[str, Any] = {
+        "producer": _producer(),
+        "model": {
+            "path": None if model_path is None else str(model_path),
+            "iteration": iteration,
+        },
+        "manifest": {"path": str(manifest.path), "sha256": manifest.sha256},
+    }
+    if renders is not None:
+        header["renders"] = dict(renders)
+    text = json.dumps({**header, **body}, allow_nan=False, indent=1)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")

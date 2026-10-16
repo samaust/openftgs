@@ -6,5 +6,7 @@
   "s5": {"clutter": 1501},
   "s6": {"dead": 1601, "ground_truth": 1234},
   "s7": {"init_frames": 1701},
-  "s8": {"offsets": 1801, "init_images": 1802}
+  "s8": {"offsets": 1801, "init_images": 1802},
+  "s9": {"spheres": 1901, "lattice": 1902},
+  "s11": {"filler": 2101}
 }

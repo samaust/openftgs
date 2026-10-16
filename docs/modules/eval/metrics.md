@@ -30,7 +30,9 @@ Each metric is computed per test image, averaged over a scene's test images, the
 - the dynamic-region metrics under `dynamic`, when any test image is masked, with the mask source and the approximate flag of D-64;
 - under `fastest_10`, the means over the Fastest-10 frames, when the manifest names them (D-69).
 
-M14's `ftgs eval` adds the header and writes the file without NaN or Infinity, as every JSON file of the package is written (Q-25). The header names the scene manifest `manifest` ({`path`, `sha256`}), beside `model` and `producer`, because `scene` already holds the per-scene means (Q-63).
+`write_metrics` adds the header and writes the file without NaN or Infinity, as every JSON file of the package is written (Q-25). It is the one writer of METRICS.json, for `Trainer.evaluate` and `ftgs eval` alike (Q-136). The header holds `producer`; `model`, as {`path`, `iteration`}, either of which may be null (a trainer's model has no file, an exchange model no iteration); and the scene manifest as `manifest` ({`path`, `sha256`}), because `scene` already holds the per-scene means (Q-63). When `ftgs eval` scores supplied renders, a `renders` entry ({`dir`, `request_sha256`, `producer`}) says what was scored (Q-137).
+
+The `dynamic` block counts under `missing` the images of the split that have no mask, 0 for a full set, so a partial set is visible in the report (Q-135); `ftgs eval` and `ftgs train` refuse a partial set before doing any work.
 
 ## The Fastest-10 frames
 
@@ -38,4 +40,4 @@ The selection itself is not in `eval`. D-69 has the converter store the range in
 
 ## Evaluating a model on a scene
 
-`evaluate_images` evaluates a model on the images of one data split of a multi-view video, for `Trainer.evaluate` now and `ftgs eval` in M14 (Q-68). It renders through `render.render_request`, one request per timestamp, so cameras that share a time render in one call (D-55) and only one time's renders are held at once; it never calls the render backends itself. Each image is evaluated by the `Evaluator` the caller passes, which holds the LPIPS networks, with the test image's mask when it has one. The results come back as `ImageMetrics` in the manifest's order, each with its path relative to the manifest, as the metrics report lists them.
+`evaluate_images` evaluates a model on the images of one data split of a multi-view video, for `Trainer.evaluate` now and `ftgs eval` in M14 (Q-68). It renders through `render.render_request`, one request per timestamp, so cameras that share a time render in one call (D-55) and only one time's renders are held at once; it never calls the render backends itself. Each image is evaluated by the `Evaluator` the caller passes, which holds the LPIPS networks, with the test image's mask when it has one. The results come back as `ImageMetrics` in the manifest's order, each with its path relative to the manifest, as the metrics report lists them. Given `renders`, a prediction for every record of the split by record index, it renders nothing and scores those instead; `ftgs eval --renders-dir` uses it, so supplied renders and the model's own go through the same evaluator and report (Q-137).

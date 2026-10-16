@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from builders import BAD_EXCHANGE_CASES, bad_exchange, exchange_arrays, exchange_metadata
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import Tensor
@@ -260,48 +261,17 @@ def test_ftgs_init_writer_validates_before_writing(tmp_path: Path) -> None:
 # ftgs-if (§2.2; U-22 file parts, U-26; Q-22, Q-24)
 
 
-def _exchange_arrays(n: int = 6, sh_degree: int = 3, seed: int = 0) -> dict[str, Tensor]:
-    g = _gen(seed)
-    q = torch.randn(n, 4, generator=g)
-    q = q / q.norm(dim=-1, keepdim=True)
-    q = torch.where(q[:, :1] < 0, -q, q)
-    return {
-        "position": torch.randn(n, 3, generator=g),
-        "time_center": torch.rand(n, generator=g, dtype=F64) * 10.0 + 2.0,
-        "duration": torch.rand(n, generator=g, dtype=F64) + 0.05,
-        "velocity": torch.randn(n, 3, generator=g),
-        "scale": torch.rand(n, 3, generator=g) + 0.01,
-        "rotation": q,
-        "opacity": torch.rand(n, generator=g) * 0.98 + 0.01,
-        "sh": torch.randn(n, (sh_degree + 1) ** 2, 3, generator=g),
-    }
-
-
 def _exchange(sh_degree: int = 3, **arrays: Tensor) -> ExchangeModel:
-    a = _exchange_arrays(sh_degree=sh_degree)
+    a = exchange_arrays(sh_degree=sh_degree)
     a.update(arrays)
     return ExchangeModel(a, sh_degree, 2.0, 12.0, "s", "unit test")
-
-
-def _exchange_metadata(**override: str) -> dict[str, str]:
-    meta = {
-        "format": "ftgs-if",
-        "version": "1",
-        "sh_degree": "3",
-        "time_unit": "s",
-        "tau0": "2.0",
-        "tau1": "12.0",
-        "producer": "test",
-    }
-    meta.update(override)
-    return meta
 
 
 @pytest.mark.parametrize("sh_degree", [0, 1, 2, 3])
 def test_u26_ftgs_if_round_trip_for_each_sh_degree(tmp_path: Path, sh_degree: int) -> None:
     """U-26 (FTGS-IF round trip per L) and §2.2: every array, dtype and metadata field
     survives write → read bitwise."""
-    model = ExchangeModel(_exchange_arrays(sh_degree=sh_degree), sh_degree, 0.1, 9.7, "frame", "x")
+    model = ExchangeModel(exchange_arrays(sh_degree=sh_degree), sh_degree, 0.1, 9.7, "frame", "x")
     path = tmp_path / "model.safetensors"
     write_exchange(model, path)
     back = read_exchange(path)
@@ -331,7 +301,7 @@ def test_ftgs_if_metadata_follows_section_2_2(tmp_path: Path) -> None:
     """§2.2 ftgs-if metadata: format, version, sh_degree, time_unit, tau0, tau1 (shortest
     round-trip repr), producer, and render_conventions as compact JSON from E6 and D-34 (Q-24),
     with D-73's Jacobian clamp margin, screen-extent rule and rasterize mode under Q-35's keys."""
-    model = ExchangeModel(_exchange_arrays(), 3, 0.1, 1.0 / 3.0, "s", "unit test")
+    model = ExchangeModel(exchange_arrays(), 3, 0.1, 1.0 / 3.0, "s", "unit test")
     path = tmp_path / "model.safetensors"
     write_exchange(model, path)
     with safe_open(str(path), framework="pt") as f:
@@ -354,79 +324,35 @@ def test_ftgs_if_metadata_follows_section_2_2(tmp_path: Path) -> None:
     }
 
 
-def _bad_exchange(case: str) -> tuple[dict[str, Tensor], dict[str, str]]:
-    a = _exchange_arrays()
-    meta = _exchange_metadata()
-    if case == "nan position":
-        a["position"][0, 0] = float("nan")
-    elif case == "inf sh":
-        a["sh"][1, 4, 2] = float("inf")
-    elif case == "zero duration":
-        a["duration"][2] = 0.0
-    elif case == "negative duration":
-        a["duration"][2] = -0.5
-    elif case == "opacity 0":
-        a["opacity"][3] = 0.0
-    elif case == "opacity 1":
-        a["opacity"][3] = 1.0
-    elif case == "zero scale":
-        a["scale"][0, 1] = 0.0
-    elif case == "zero rotation":
-        a["rotation"][4] = 0.0
-    elif case == "rotation [N, 3]":
-        a["rotation"] = a["rotation"][:, :3].contiguous()
-    elif case == "sh of degree 2 for 3":
-        a["sh"] = a["sh"][:, :9].contiguous()
-    elif case == "velocity of another N":
-        a["velocity"] = a["velocity"][:5].contiguous()
-    elif case == "float32 time_center":
-        a["time_center"] = a["time_center"].float()
-    elif case == "float64 position":
-        a["position"] = a["position"].double()
-    elif case == "missing opacity":
-        del a["opacity"]
-    elif case == "empty":
-        a = {k: v[:0] for k, v in a.items()}
-    elif case == "version 2":
-        meta["version"] = "2"
-    elif case == "sh_degree 4":
-        meta["sh_degree"] = "4"
-        a["sh"] = torch.zeros(6, 25, 3)
-    elif case == "tau1 < tau0":
-        meta["tau1"] = "1.0"
-    elif case == "missing tau0":
-        del meta["tau0"]
-    return a, meta
+def test_ftgs_if_records_the_exchange_models_background(tmp_path: Path) -> None:
+    """Q-141 (Q-24): render_conventions records the exchange model's `background`, black by
+    default (D-34); readers ignore the block (§2.2), so the model read back is black."""
+    model = ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t", background=(1.0, 0.5, 0.0))
+    path = tmp_path / "model.safetensors"
+    write_exchange(model, path)
+    with safe_open(str(path), framework="pt") as f:
+        conventions = json.loads(f.metadata()["render_conventions"])
+    assert conventions["background"] == [1.0, 0.5, 0.0]
+    assert read_exchange(path).background == (0.0, 0.0, 0.0)
+    assert ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t").background == (0.0, 0.0, 0.0)
 
 
 @pytest.mark.parametrize(
-    "case",
-    [
-        "nan position",
-        "inf sh",
-        "zero duration",
-        "negative duration",
-        "opacity 0",
-        "opacity 1",
-        "zero scale",
-        "zero rotation",
-        "rotation [N, 3]",
-        "sh of degree 2 for 3",
-        "velocity of another N",
-        "float32 time_center",
-        "float64 position",
-        "missing opacity",
-        "empty",
-        "version 2",
-        "sh_degree 4",
-        "tau1 < tau0",
-        "missing tau0",
-    ],
+    "background",
+    [(1.5, 0.0, 0.0), (-0.1, 0.0, 0.0), (math.nan, 0.0, 0.0), (0.0, 0.0), (True, 0.0, 0.0)],
 )
+def test_validate_exchange_needs_a_background_in_the_unit_interval(background: object) -> None:
+    """Q-141 (Q-11's range): three finite numbers in [0, 1], not bools."""
+    model = ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t", background=background)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="background"):
+        validate_exchange(model)
+
+
+@pytest.mark.parametrize("case", BAD_EXCHANGE_CASES)
 def test_u22_ftgs_if_validator_rejects_invalid_files(tmp_path: Path, case: str) -> None:
     """U-22: the validator rejects NaN, durations ≤ 0, opacity outside (0, 1), wrong shapes and
     an unknown major version; and the other §2.2 rules (Q-24): dtypes, keys, ranges, N ≥ 1."""
-    arrays, meta = _bad_exchange(case)
+    arrays, meta = bad_exchange(case)
     path = tmp_path / "bad.safetensors"
     save_file(arrays, str(path), metadata=meta)
     with pytest.raises(ValueError):
@@ -436,11 +362,11 @@ def test_u22_ftgs_if_validator_rejects_invalid_files(tmp_path: Path, case: str) 
 def test_ftgs_if_reader_ignores_unknown_keys_and_render_conventions(tmp_path: Path) -> None:
     """§2.2: unknown optional keys are ignored; render_conventions is accepted and ignored (Q-24);
     a unit rotation with w < 0 is accepted on read."""
-    arrays = _exchange_arrays()
+    arrays = exchange_arrays()
     arrays["rotation"][0] = -arrays["rotation"][0]
     arrays["confidence"] = torch.ones(6)
     path = tmp_path / "model.safetensors"
-    meta = _exchange_metadata(version="1.2", render_conventions="{}", comment="hi")
+    meta = exchange_metadata(version="1.2", render_conventions="{}", comment="hi")
     save_file(arrays, str(path), metadata=meta)
     back = read_exchange(path)
     assert set(back.arrays) == set(arrays) - {"confidence"}
@@ -451,10 +377,10 @@ def test_ftgs_if_reader_accepts_revision_549_render_conventions(tmp_path: Path) 
     """§2.2 introduction, D-73: a file whose render_conventions holds only the eight entries of
     spec revision 549 (no clamp margin, extent rule or rasterize mode) still reads, the block
     ignored, so D-73 needs no version bump."""
-    arrays = _exchange_arrays()
+    arrays = exchange_arrays()
     old_block = json.dumps(_REVISION_549_CONVENTIONS, separators=(",", ":"))
     path = tmp_path / "model.safetensors"
-    save_file(arrays, str(path), metadata=_exchange_metadata(render_conventions=old_block))
+    save_file(arrays, str(path), metadata=exchange_metadata(render_conventions=old_block))
     back = read_exchange(path)
     assert set(back.arrays) == set(arrays)
     for key, value in arrays.items():
@@ -992,10 +918,10 @@ def test_save_checkpoint_restores_the_newest_set_aside_checkpoint(
 def test_ftgs_if_single_frame_file_must_have_no_motion(tmp_path: Path, case: str) -> None:
     """§1.4 "Time" and Q-30: with τ₀ = τ₁, every time center must be τ₀ and every velocity 0;
     a file that says otherwise is rejected."""
-    arrays = _exchange_arrays()
+    arrays = exchange_arrays()
     arrays["time_center"] = torch.full((6,), 2.0, dtype=F64)
     arrays["velocity"] = torch.zeros(6, 3)
-    meta = _exchange_metadata(tau0="2.0", tau1="2.0")
+    meta = exchange_metadata(tau0="2.0", tau1="2.0")
     good = tmp_path / "good.safetensors"
     save_file(arrays, str(good), metadata=meta)
     read_exchange(good)
@@ -1037,14 +963,14 @@ def test_ftgs_if_writer_requires_canonical_unit_rotations(
     """§2.2 ftgs-if table: rotation is a unit quaternion with w ≥ 0. The writer enforces it,
     with Q-24's tie-break at w = 0 (first nonzero component positive); the reader stays lenient
     (Q-24)."""
-    arrays = _exchange_arrays()
+    arrays = exchange_arrays()
     arrays["rotation"][2] = torch.tensor(rotation)
     model = ExchangeModel(arrays, 3, 2.0, 12.0, "s", "x")
     path = tmp_path / "m.safetensors"
     with pytest.raises(ValueError, match="rotation"):
         write_exchange(model, path)
     assert not path.exists()
-    save_file(arrays, str(path), metadata=_exchange_metadata())
+    save_file(arrays, str(path), metadata=exchange_metadata())
     assert torch.equal(read_exchange(path).arrays["rotation"][2], torch.tensor(rotation))
 
 

@@ -32,7 +32,7 @@ A non-finite mean loss at a log read, or a model that fails `validate()` or grad
 
 ## Callbacks and stopping
 
-`train(until, callbacks)` calls every callback after each step, in order, and stops after that step when any returns True. Stopping happens only between iterations, so a state taken then is always whole; M14's SIGINT and SIGTERM handlers use this to save (§2.2).
+`train(until, callbacks)` calls every callback after each step, in order, and stops after that step when any returns True. Stopping happens only between iterations, so a state taken then is always whole; `ftgs train`'s SIGINT and SIGTERM handlers use this to save (§2.2, `docs/modules/cli/command-line.md`).
 
 ## Generators
 
@@ -82,4 +82,4 @@ The global flags are set around each training iteration and restored afterwards,
 
 ## Evaluation
 
-`evaluate` renders the images of a data split through `eval.evaluate_images`, which goes through `render.render_request` one timestamp at a time, the path `ftgs render` and `ftgs eval` share (Q-57, Q-68). It builds the `Evaluator` once, on first use, and uses no generator, so an evaluation between steps never changes a run. With `out_dir` it writes METRICS.json in the report layout of Q-63, its header naming the trainer's iteration as the model (Q-74).
+`evaluate` renders the images of a data split through `eval.evaluate_images`, which goes through `render.render_request` one timestamp at a time, the path `ftgs render` and `ftgs eval` share (Q-57, Q-68). It builds the `Evaluator` once, on first use, and uses no generator, so an evaluation between steps never changes a run. With `out_dir` it writes METRICS.json through `eval.write_metrics`, in the report layout of Q-63, its header's `model` naming the trainer's iteration, with a null path (Q-74, Q-136).

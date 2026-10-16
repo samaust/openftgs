@@ -140,6 +140,9 @@ class ExchangeModel:  # FTGS-IF contents (§2.2): physical values, raw time unit
     tau1: float
     time_unit: str
     producer: str
+    # Q-141 (Q-24): the background the colors were trained against, recorded in
+    # render_conventions; readers ignore that block (§2.2), so a model read back is black (D-34).
+    background: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass

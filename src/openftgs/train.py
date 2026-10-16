@@ -8,8 +8,6 @@ Spec: §1.3, §2.2 (Full checkpoint), §2.4 rule 3, D-26, D-45. Band: Orchestrat
 import contextlib
 import dataclasses
 import hashlib
-import importlib.metadata
-import json
 import math
 import random
 import warnings
@@ -35,7 +33,13 @@ from openftgs.density import (
     relocate,
     reset_opacity,
 )
-from openftgs.eval import Evaluator, average_metrics, evaluate_images, metrics_report
+from openftgs.eval import (
+    Evaluator,
+    average_metrics,
+    evaluate_images,
+    metrics_report,
+    write_metrics,
+)
 from openftgs.io import load_checkpoint
 from openftgs.losses import LPIPSLoss, total_loss
 from openftgs.model import FreeTimeGaussians
@@ -346,13 +350,6 @@ def _cpu(tree: Any) -> Any:
     if isinstance(tree, Mapping):
         return {key: _cpu(value) for key, value in tree.items()}
     return tree
-
-
-def _producer() -> str:
-    try:
-        return f"openftgs {importlib.metadata.version('openftgs')}"
-    except importlib.metadata.PackageNotFoundError:
-        return "openftgs"
 
 
 @dataclass
@@ -743,16 +740,13 @@ class Trainer:
             result |= {f"dynamic/{k}": v for k, v in average_metrics(dynamic).items()}
         if out_dir is not None:
             manifest = self._dataset.manifest
-            report = {
-                "producer": _producer(),
-                "model": {"iteration": self._run.iteration},
-                "manifest": {"path": str(manifest.path), "sha256": manifest.sha256},
-                **metrics_report(images, split=split, metadata=manifest.metadata),
-            }
-            directory = Path(out_dir)
-            directory.mkdir(parents=True, exist_ok=True)
-            text = json.dumps(report, allow_nan=False, indent=1)
-            (directory / "METRICS.json").write_text(text, encoding="utf-8")
+            body = metrics_report(images, split=split, metadata=manifest.metadata)
+            write_metrics(  # Q-136
+                Path(out_dir) / "METRICS.json",
+                body,
+                manifest=manifest,
+                iteration=self._run.iteration,
+            )
         return result
 
     # -- state ----------------------------------------------------------------------------------
