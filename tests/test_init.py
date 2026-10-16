@@ -908,6 +908,63 @@ def _projection_of(camera: Camera) -> torch.Tensor:
     return camera.K.to(torch.float64) @ w2c[:3, :]
 
 
+Measured = tuple[torch.Tensor, list[float], list[float], float]
+
+
+def _measured(a: Camera, b: Camera, match: Sequence[float]) -> Measured:
+    """What D-22's filters see for one match, computed here: the point `triangulate_dlt`
+    returns [3], its reprojection error (px) and depth in views A and B, and the angle (°)
+    between the rays from the two camera centers to it."""
+    pixels = [torch.tensor([match[0:2]], dtype=torch.float64)]
+    pixels.append(torch.tensor([match[2:4]], dtype=torch.float64))
+    X = triangulate_dlt(pixels[0], pixels[1], _projection_of(a), _projection_of(b))
+    errors, depths, rays = [], [], []
+    for camera, x in zip((a, b), pixels, strict=True):
+        reprojected, depth = _project_points(camera, X)
+        errors.append(torch.linalg.vector_norm(reprojected - x).item())
+        depths.append(depth.item())
+        w2c = camera.world_to_camera.to(torch.float64)
+        rays.append(X[0] + w2c[:3, :3].T @ w2c[:3, 3])  # X minus the camera's center
+    sine = torch.linalg.vector_norm(torch.linalg.cross(rays[0], rays[1]))
+    angle = math.degrees(math.atan2(sine.item(), (rays[0] @ rays[1]).item()))
+    return X[0], errors, depths, angle
+
+
+def test_u19_filters_hold_d22s_bounds_of_2_px_and_1_degree(tmp_path: Path) -> None:
+    """§1.3 step 3, D-22: a point is kept with a reprojection error of at most 2 px in both
+    views and a triangulation angle of at least 1°. On the rectified rig, B's pixel moved
+    across the epipolar line by 3.8 px gives errors of about 1.91 px in each view (kept) and
+    by 4.2 px about 2.11 px (dropped); by 4.0 px, for another point, about 2.02 px in A and
+    just under 2 px in B (dropped: the bound holds in both views). Exact matches of points on
+    the rig's plane of symmetry at depths 27.2 and 30 are seen at about 1.05° (kept) and 0.95°
+    (dropped). Each value is computed here from the point `triangulate_dlt` returns, and
+    every other filter passes."""
+    dataset = _rig_scene(tmp_path, [0.0])
+    a, b = dataset.records[0].camera, dataset.records[1].camera
+    matches = [
+        _crafted(a, b, (0.2, -0.1, 2.0), shift_b=3.8),
+        _crafted(a, b, (-0.3, 0.05, 2.5), shift_b=4.2),
+        _crafted(a, b, (0.1, 0.1, 2.2), shift_b=4.0),
+        _crafted(a, b, (0.25, 0.0, 27.2)),
+        _crafted(a, b, (0.25, 0.0, 30.0)),
+    ]
+    measured = [_measured(a, b, match) for match in matches]
+    errors = [errors for _, errors, _, _ in measured]
+    angles = [angle for _, _, _, angle in measured]
+    assert all(depth > 0 for _, _, depths, _ in measured for depth in depths)
+    assert all(1.9 < error < 1.95 for error in errors[0])
+    assert all(2.05 < error < 2.15 for error in errors[1])
+    assert 2.0 < errors[2][0] < 2.05 and 1.99 < errors[2][1] < 2.0
+    assert all(error < 1e-6 for error in errors[3] + errors[4])
+    assert all(angle > 5.0 for angle in angles[:3])
+    assert 1.04 < angles[3] < 1.06 and 0.94 < angles[4] < 0.96
+
+    points = _run(dataset, _StandIn(dataset, crafted={("A", "B"): matches}))
+    expected = torch.stack([measured[0][0], measured[3][0]])
+    got = _matched(points.positions.to(torch.float64), expected)
+    torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+
 def test_u19_colors_are_the_mean_of_the_two_source_pixels(tmp_path: Path) -> None:
     """§1.3 step 3, D-22; Q-110: each color is the mean of the two source pixels, each the
     pixel holding the match's continuous coordinate. The images encode (u, v) as (R, G); the
