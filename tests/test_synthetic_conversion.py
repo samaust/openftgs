@@ -210,26 +210,28 @@ def test_g1_n3dv_matches_the_ground_truth(
             assert np.array_equal(got, want)
 
 
-def test_g1_n3dv_h264_error_is_recorded(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("scene", "frames"), [("tiny", 12), ("kitchen", 2)])
+def test_g1_n3dv_h264_error_is_recorded(tmp_path: Path, scene: str, frames: int) -> None:
     """G-1 (calibrated): the mean absolute difference between frames converted from the H.264
-    videos and the ground truth, recorded for the Calibration data table."""
+    videos and the ground truth, for both of G-1's scenes, recorded for the Calibration data
+    table."""
     root = _root()
-    _verified_folder(root, "n3dv/tiny")
+    _verified_folder(root, f"n3dv/{scene}")
     manifest = read_scene_manifest(
-        convert_n3dv(root / "n3dv" / "tiny", tmp_path / "out", frames=12, resize=1.0)
+        convert_n3dv(root / "n3dv" / scene, tmp_path / "out", frames=frames, resize=1.0, jobs=4)
     )
-    truth = _ground_truth(root, "tiny")
+    truth = _ground_truth(root, scene)
     errors = []
     for record in manifest.records:
         gt = _gt_camera(truth, "n3dv", record.camera.name)
         errors.append(
             _mean_error(
                 _image(record.image_path),
-                _pinhole(root, "tiny", gt["name"], int(record.frame_index or 0)),
+                _pinhole(root, scene, gt["name"], int(record.frame_index or 0)),
             )
         )
     mean = float(np.mean(errors))
-    print(f"G-1 H.264 mean absolute difference on tiny: {mean:.3f} levels")
+    print(f"G-1 H.264 mean absolute difference on {scene}: {mean:.3f} levels")
     assert np.isfinite(mean)
 
 
