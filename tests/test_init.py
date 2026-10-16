@@ -766,6 +766,37 @@ def test_u19_e15_forward_and_backward_on_the_last_slot(tmp_path: Path) -> None:
         torch.testing.assert_close(v * (other - k) * step, offsets, rtol=1e-6, atol=0.0)
 
 
+def test_u19_e15_runs_against_the_full_point_set_of_the_other_init_frame(
+    tmp_path: Path,
+) -> None:
+    """E15, D-23, D-24, §1.3 steps 5 and 7; Q-111: velocities come from the other init
+    frame's full triangulated set, not from the subset it keeps. A plane moves by 1/64 along x
+    between two frames; B = 100 of its 448 points are kept per init frame. Each kept point's
+    velocity times dt equals the offset to its nearest point of the other frame's full set,
+    found by a float64 brute force on a run that keeps every point (the pairs' draws don't
+    depend on B, so its points are that full set). For some kept points, the nearest point
+    the other frame keeps is another one, so E15 against the kept subset would fail."""
+    plane = _plane(2.0)
+    shift = torch.tensor([1 / 64, 0.0, 0.0], dtype=torch.float64)
+    dataset = _rig_scene(tmp_path, [0.0, _FRAME])
+
+    def moving(tau: float) -> torch.Tensor:
+        return plane + shift * (tau / _FRAME)
+
+    full = _run(dataset, _StandIn(dataset, points=moving), points_per_frame=10_000)
+    kept = _run(dataset, _StandIn(dataset, points=moving), points_per_frame=100)
+    assert len(_frame(full, 0)) == len(_frame(full, 1)) == len(plane) == 448
+    assert len(_frame(kept, 0)) == len(_frame(kept, 1)) == 100
+    assert kept.velocities is not None and kept.frame_ids is not None
+    step = dataset.frame_dt * (dataset.time.tau1 - dataset.time.tau0)  # Δt_f·T_τ = 1/30
+    for k, other in [(0, 1), (1, 0)]:
+        v = kept.velocities[kept.frame_ids == k].to(torch.float64)
+        offsets = _offsets_to_nearest(_frame(kept, k), _frame(full, other))
+        torch.testing.assert_close(v * (other - k) * step, offsets, rtol=1e-6, atol=0.0)
+        to_kept = _offsets_to_nearest(_frame(kept, k), _frame(kept, other))
+        assert bool(((to_kept - offsets).abs().amax(dim=1) > 0.05).any())
+
+
 @pytest.mark.parametrize("taus", [[0.0], [0.0, 1 / 30]], ids=["one-timestamp", "stride-2"])
 def test_u19_a_single_init_frame_gives_zero_velocities(tmp_path: Path, taus: list[float]) -> None:
     """§1.3 step 5, D-23: with a single init frame, v = 0: a single timestamp, or two frames at
