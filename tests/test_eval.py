@@ -33,6 +33,7 @@ from openftgs.eval import (
     metrics_report,
     psnr,
     ssim_k,
+    write_metrics,
 )
 from openftgs.render import render_request
 from openftgs.types import RenderItem, RenderRequest, TimeNormalizer
@@ -67,6 +68,7 @@ def test_public_api() -> None:
         "metrics_report",
         "psnr",
         "ssim_k",
+        "write_metrics",
     ]
     assert METRIC_NAMES == (
         "psnr",
@@ -520,6 +522,88 @@ def test_metrics_report_fastest_10_block() -> None:
     plain = metrics_report(images[:3], split="test", metadata={"fastest_10": [5, 15]})
     assert plain["fastest_10"]["count"] == 0
     assert all(plain["fastest_10"]["entire"][name] is None for name in METRIC_NAMES)
+
+
+def test_metrics_report_counts_the_images_without_a_mask() -> None:
+    """Q-135 (#83): with masks on some images of the split, `dynamic.missing` is the number of
+    images without one, so a partial set shows in the report; a full set gives 0."""
+    masked = [_image(k, frame=k, dynamic=_values(1.0), masked=True) for k in range(3)]
+    partial = metrics_report(
+        [*masked, _image(3, frame=3), _image(4, frame=4)], split="test", metadata={}
+    )
+    assert partial["dynamic"]["missing"] == 2
+    assert metrics_report(masked, split="test", metadata={})["dynamic"]["missing"] == 0
+
+
+def _manifest(tmp_path: Path) -> MultiViewVideo:
+    cams = ring(2, width_px=8, height_px=6, focal=8.0)
+    gt = random_model(4, seed=0, sh_degree=0, time=TimeNormalizer(0.0, 0.1), spread=0.5)
+    images = [(cams[0], 0.0, "train"), (cams[1], 0.1, "train"), (cams[0], 0.1, "test")]
+    return MultiViewVideo.from_manifest(write_scene(tmp_path, gt, images))
+
+
+def test_write_metrics_writes_the_header_and_the_body(tmp_path: Path) -> None:
+    """Q-136 (Q-63, Q-74 note 1): one writer of METRICS.json: `producer`, `model` as {path,
+    iteration}, either of which may be null, `manifest` as {path, sha256}, `renders` only when
+    given, then the report body; parent folders are created and the JSON has no NaN."""
+    video = _manifest(tmp_path / "scene")
+    body = metrics_report([_image(0, frame=0)], split="test", metadata={})
+    out = tmp_path / "out" / "deep" / "METRICS.json"
+    write_metrics(out, body, manifest=video.manifest, iteration=7)
+    written = json.loads(out.read_text())
+    assert written["producer"].startswith("openftgs")
+    assert written["model"] == {"path": None, "iteration": 7}
+    assert written["manifest"] == {
+        "path": str(video.manifest.path),
+        "sha256": video.manifest.sha256,
+    }
+    assert "renders" not in written
+    assert {k: written[k] for k in body} == json.loads(json.dumps(body))
+    renders = {"dir": "r", "request_sha256": "0" * 64, "producer": "other 1.0"}
+    write_metrics(
+        out, body, manifest=video.manifest, model_path=Path("m.safetensors"), renders=renders
+    )
+    again = json.loads(out.read_text())
+    assert again["model"] == {"path": "m.safetensors", "iteration": None}
+    assert again["renders"] == renders
+    with pytest.raises(ValueError, match="header"):
+        write_metrics(out, {**body, "model": 1}, manifest=video.manifest)
+
+
+class _Unused:
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("nothing should be evaluated")
+
+
+def test_evaluate_images_needs_a_supplied_render_for_every_record(tmp_path: Path) -> None:
+    """Q-137: supplied renders must cover every record of the split, which is checked before
+    anything is rendered or evaluated."""
+    video = _manifest(tmp_path)
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    evaluator: Any = _Unused()
+    with pytest.raises(ValueError, match="000002"):
+        evaluate_images(model, video, evaluator, backend="reference", renders={})
+
+
+@pytest.mark.weights
+def test_evaluate_images_scores_supplied_renders_as_its_own(
+    tmp_path: Path, evaluator: Evaluator
+) -> None:
+    """Q-137: given the renders `render_request` makes of each record, the results equal those
+    of the rendered path; other renders give other values, so the supplied ones are scored."""
+    video = _scene_for_evaluation(tmp_path)
+    model = random_model(12, seed=1, sh_degree=1, time=video.time, spread=0.5)
+    own = evaluate_images(model, video, evaluator, backend="reference")
+    tests = [i for i, record in enumerate(video.records) if record.split == "test"]
+    items = tuple(
+        RenderItem(str(i), video.records[i].timestamp, video.records[i].camera) for i in tests
+    )
+    renders = render_request(model, RenderRequest(items, time_unit="s"), backend="reference")
+    supplied = {i: renders.rgb[str(i)] for i in tests}
+    assert evaluate_images(model, video, evaluator, backend="reference", renders=supplied) == own
+    black = {i: torch.zeros_like(supplied[i]) for i in tests}
+    other = evaluate_images(model, video, evaluator, backend="reference", renders=black)
+    assert [m.entire for m in other] != [m.entire for m in own]
 
 
 @pytest.mark.parametrize(
