@@ -484,6 +484,10 @@ _Avoid_: state dict (PyTorch's generic term), session, run state
 Continuing a run from a checkpoint, bit-exact on the reference backend; a forced resume, on a changed scene manifest, keeps the run's time normalizer, S and Δt_f. §2.2 Full checkpoint
 _Avoid_: restart, reload, warm start
 
+**Run directory**:
+The folder `ftgs train --out` writes a run into: its resolved configuration, its training log, its checkpoint and its final metrics. §2.1 CLI
+_Avoid_: output folder, experiment directory, log dir, checkpoint (the checkpoint is one folder inside it)
+
 ### Evaluation
 
 **SSIM_k**:

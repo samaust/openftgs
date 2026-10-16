@@ -4,7 +4,7 @@ How D-51 is met: training reads its images from a uint8 copy instead of decoding
 
 ## Layout
 
-A cache sits beside its manifest, in `.ftgs-cache/<manifest sha256>/`: one safetensors file per camera with training images, holding that camera's training frames as uint8 [F, H, W, 3] in manifest order. Each file's metadata names the format, its version, the manifest hash, the camera and the record indices of its frames; files are written under a temporary name and renamed. A cache is valid when every file's metadata matches the dataset. A PNG edited under an unchanged manifest isn't detected: rebuild the cache after such an edit. `FrameCache.build` writes a cache; `ftgs cache` (M14) will call it.
+A cache sits beside its manifest, in `.ftgs-cache/<manifest sha256>/`: one safetensors file per camera with training images, holding that camera's training frames as uint8 [F, H, W, 3] in manifest order. Each file's metadata names the format, its version, the manifest hash, the camera and the record indices of its frames; files are written under a temporary name and renamed. A cache is valid when every file's metadata matches the dataset. A PNG edited under an unchanged manifest isn't detected: rebuild the cache after such an edit. `FrameCache.build` writes a cache. `ftgs cache` builds it ahead of training and reports its directory and size; with `--placement gpu` or `mmap` it also opens the cache in that placement, to show that it fits or maps, while `auto` leaves the choice to the trainer. It never removes the caches of other manifest hashes: two manifests in one folder share `.ftgs-cache/`, and a cache records only its manifest's hash (Q-127).
 
 ## Placements
 
