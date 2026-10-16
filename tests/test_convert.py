@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The dataset converters of openftgs.data (§1.4 "Dataset protocols", D-28, D-48, D-59 to D-61,
-D-63, D-64; Q-85 to Q-101): U-27, U-37 and round trips on small generated datasets.
+D-63, D-64, D-80, D-81; Q-86 to Q-91, Q-93 to Q-101): U-27, U-37 and round trips on small
+generated datasets.
 
 Videos are generated with the user's ffmpeg from its lavfi test sources, encoded losslessly
 (libx264rgb, -qp 0) where pixels are compared, so ffmpeg's own PNG decode is the oracle for the
@@ -134,7 +135,7 @@ def test_u27_frames_come_through_in_order_and_equal_ffmpegs_decode(tmp_path: Pat
 @needs_ffmpeg
 @pytest.mark.parametrize("which", ["ffmpeg", "ffprobe"])
 def test_u27_a_wrong_ffmpeg_or_ffprobe_path_is_refused(tmp_path: Path, which: str) -> None:
-    """U-27, D-48, Q-85: a wrong --ffmpeg or --ffprobe path stops the converter with a
+    """U-27, D-48, D-80: a wrong --ffmpeg or --ffprobe path stops the converter with a
     ValueError, which `ftgs convert` (M14) maps to exit code 2; nothing is left in OUT."""
     src = _n3dv_source(tmp_path / "scene")
     tools = {which: str(tmp_path / "missing" / which)}
@@ -215,10 +216,10 @@ def test_n3dv_refuses_inconsistent_sources(tmp_path: Path, case: str) -> None:
 @needs_ffmpeg
 @pytest.mark.gpu
 def test_u27_hardware_decoding_is_within_one_level_of_cpu_decoding(tmp_path: Path) -> None:
-    """U-27 (GPU), Q-92: with --hwaccel cuda (when the build lists it) the frames are within
+    """U-27 (GPU), D-81: with --hwaccel cuda (when the build lists it) the frames are within
     one 8-bit level of CPU decoding, the differing pixels counted; the manifest records the
     decoder that ran. The clip is yuv420p H.264 rather than U-27's lossless RGB one, which
-    CUDA can't decode (Q-92 refuses gbrp)."""
+    CUDA can't decode (D-81 refuses gbrp)."""
     listed = subprocess.run(
         ["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True, text=True, check=True
     ).stdout.split()
@@ -239,7 +240,7 @@ def test_u27_hardware_decoding_is_within_one_level_of_cpu_decoding(tmp_path: Pat
     print(f"U-27 hwaccel: {differing} differing pixels of {len(cpu.records) * 160 * 128}")
 
 
-# OpenCV-style YAML converter (D-61, D-63; Q-85, Q-96).
+# OpenCV-style YAML converter (D-61, D-63, D-80; Q-96).
 
 _YAML_K = np.array([[60.0, 0.0, 31.5], [0.0, 60.0, 23.5], [0.0, 0.0, 1.0]])  # OpenCV convention
 _YAML_D = np.array([[-0.12], [0.03], [0.0005], [-0.0004], [0.0]])
@@ -302,7 +303,7 @@ def _yaml_source(
 @needs_ffmpeg
 @pytest.mark.parametrize("images", [False, True])
 def test_opencv_yaml_undistorts_shifts_and_times_frames(tmp_path: Path, images: bool) -> None:
-    """§1.4 ENeRF-Outdoor, D-61, D-63, Q-85, Q-96: frames from videos or image folders are
+    """§1.4 ENeRF-Outdoor, D-61, D-63, D-80, Q-96: frames from videos or image folders are
     undistorted with the file's K (OpenCV's convention), so they match OpenCV's undistort within
     one 8-bit level away from the border at resize 1.0; the manifest's K is the file's with
     +0.5 on cx and cy; R and T are world-to-camera; frame k at k/fps; the test camera is the
@@ -350,7 +351,7 @@ def test_opencv_yaml_undistorts_shifts_and_times_frames(tmp_path: Path, images: 
 
 @needs_ffmpeg
 def test_opencv_yaml_without_a_test_camera_has_only_training_images(tmp_path: Path) -> None:
-    """Q-85: without `test_camera` every image is a training image."""
+    """D-80: without `test_camera` every image is a training image."""
     src = _yaml_source(tmp_path / "s", ["0000", "0001"], frames=2)
     manifest = read_scene_manifest(
         convert_opencv_yaml(src, tmp_path / "out", fps=30.0, frames=2, resize=0.5)
@@ -811,7 +812,7 @@ def test_a_failed_conversion_leaves_out_as_it_found_it(tmp_path: Path, start: st
 
 @needs_ffmpeg
 def test_selfcap_resize_overrides_the_default_ratio(tmp_path: Path) -> None:
-    """Q-97 (owner answer): `resize` sets the ratio; a scene outside the card's table is
+    """D-80: `resize` sets the ratio; a scene outside the card's table is
     otherwise resized by 0.5. At 1.0 the 64×48 videos keep their size and the manifest records
     the ratio."""
     src = _selfcap_archives(tmp_path, "mini")

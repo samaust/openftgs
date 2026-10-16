@@ -533,11 +533,12 @@ def read_opencv_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-# Dataset conversion (§1.4 "Dataset protocols", D-48; Q-85 to Q-101): ffmpeg runs as a separate
-# program, frames are processed and encoded in a process pool (§2.4 "Threads and processes").
+# Dataset conversion (§1.4 "Dataset protocols", D-48, D-80, D-81; Q-86 to Q-91, Q-93 to Q-101):
+# ffmpeg runs as a separate program, frames are processed and encoded in a process pool (§2.4
+# "Threads and processes").
 
 _HWACCELS = ("none", "cuda")
-# Q-92: the software format hwdownload hands over, from the stream's pixel format.
+# D-81: the software format hwdownload hands over, from the stream's pixel format.
 _CUDA_FORMATS = {
     "yuv420p": "nv12",
     "yuvj420p": "nv12",
@@ -584,7 +585,7 @@ def _version_line(program: str, what: str) -> str:
 
 
 def _tools(ffmpeg: str, ffprobe: str | None) -> _Tools:
-    """Q-85: ffprobe defaults to the one beside a path-given ffmpeg, else the one on PATH."""
+    """D-80: ffprobe defaults to the one beside a path-given ffmpeg, else the one on PATH."""
     resolved = _program(ffmpeg, "ffmpeg")
     if ffprobe is None:
         separators = [os.sep] + ([os.altsep] if os.altsep else [])
@@ -644,7 +645,7 @@ def _decode_command(
     hwaccel: str,
 ) -> list[str]:
     """The ffmpeg command of §1.4: the first `count` frames, or with `window` = (N0, N1) the
-    decode indices N0 ≤ n < N1, as raw RGB24 on stdout (D-48). Q-92: with CUDA, hardware frames
+    decode indices N0 ≤ n < N1, as raw RGB24 on stdout (D-48). D-81: with CUDA, hardware frames
     downloaded explicitly, so a decode that can't use CUDA fails instead of falling back."""
     command = [tools.ffmpeg, "-v", "error"]
     filters: list[str] = []
@@ -887,7 +888,7 @@ def _ffmpeg_metadata(tools: _Tools, hwaccel: str, commands: dict[str, list[str]]
         "ffprobe": tools.ffprobe,
         "version": tools.version,
         "hwaccel": hwaccel,
-        "decoder": "cuda" if hwaccel == "cuda" else "cpu",  # Q-92: CUDA runs or fails
+        "decoder": "cuda" if hwaccel == "cuda" else "cpu",  # D-81: CUDA runs or fails
         "commands": commands,
     }
 
@@ -908,7 +909,7 @@ def convert_n3dv(
     jobs: int = 0,
     ffprobe: str | None = None,
 ) -> Path:
-    """Convert a Neural3DV scene (D-28, D-48; Q-85, Q-88, Q-94, Q-95): `poses_bounds.npy`'s rows
+    """Convert a Neural3DV scene (D-28, D-48, D-80; Q-88, Q-94, Q-95): `poses_bounds.npy`'s rows
     belong to the `camXX.mp4` files in name order; the first `frames` frames of each video,
     decoded by the user's ffmpeg, area-resized by `resize` and written as PNG; frame k at k/30 s;
     cam00 the test view. Returns the path of OUT/scene.json."""
@@ -1099,7 +1100,7 @@ def convert_opencv_yaml(
     test_camera: str | None = None,
 ) -> Path:
     """Convert a dataset with OpenCV-style YAML calibrations, such as ENeRF-Outdoor (§1.4,
-    D-61, D-63; Q-85, Q-96): intri.yml and extri.yml in SRC, frames from `images/<camera>/`
+    D-61, D-63, D-80; Q-96): intri.yml and extri.yml in SRC, frames from `images/<camera>/`
     (the first `frames` files by name) or `videos/<camera>.mp4`; frames undistorted with the
     file's K, K shifted by +0.5, frames and K resized; frame k at k/fps s; `test_camera` the
     test view. Returns the path of OUT/scene.json."""
@@ -1206,7 +1207,7 @@ _SELFCAP_SCENES: dict[str, tuple[str, str, tuple[int, int], float]] = {
     "bike1": ("bike", "0009", (8900, 8960), 1.0),
     "bike2": ("bike", "0009", (30020, 30080), 1.0),
 }
-_SELFCAP_DEFAULT_RESIZE = 0.5  # Q-97: other scene names, the protocol's ratio for 4K video
+_SELFCAP_DEFAULT_RESIZE = 0.5  # D-80: other scene names, the protocol's ratio for 4K video
 _SELFCAP_FPS = 60  # D-59: τ = n/60 s minus the sync offset
 _SELFCAP_CALIBRATION = ("intri.yml", "extri.yml", "sync.json")
 _FULL_OPENCV_COEFFICIENTS = 8  # k1, k2, p1, p2, k3, k4, k5, k6 (COLMAP's FULL_OPENCV)
@@ -1544,10 +1545,10 @@ def convert_selfcap(
     ffprobe: str | None = None,
     resize: float | None = None,
 ) -> Path:
-    """Convert a SelfCap scene (§1.4, D-59, D-60, D-63, D-64; Q-86, Q-87, Q-97, Q-101): SRC
+    """Convert a SelfCap scene (§1.4, D-59, D-60, D-63, D-64, D-80; Q-86, Q-87, Q-97, Q-101): SRC
     holds the archives as downloaded; dance1 … bike2 take window and test camera from the
     card's table, other names need both. `resize` sets the ratio; None takes the table's, or
-    0.5 for other names (Q-97). Frames N0 ≤ n < N1 of every camera, undistorted by
+    0.5 for other names (D-80). Frames N0 ≤ n < N1 of every camera, undistorted by
     COLMAP (or the package with undistort='internal'), area-resized, with τ = n/60 minus the
     camera's sync offset. Returns the path of OUT/scene.json."""
     src = Path(src)
