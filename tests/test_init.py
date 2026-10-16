@@ -656,3 +656,73 @@ def test_u19_exact_matches_of_one_synchronized_pair_give_back_the_points(
     )
     assert points.frame_ids is not None and not points.frame_ids.any()
     assert not points.timestamps.any()
+
+
+def _frame(points: InitPoints, k: int) -> torch.Tensor:
+    assert points.frame_ids is not None
+    return points.positions[points.frame_ids == k].to(torch.float64)
+
+
+def _offsets_to_nearest(query: torch.Tensor, others: torch.Tensor) -> torch.Tensor:
+    """For each row of `query`, the offset to its nearest row of `others` by a float64 brute
+    force on explicit differences, ties to the lower index."""
+    d = ((query[:, None, :] - others[None, :, :]) ** 2).sum(dim=2)
+    nearest = (d == d.amin(dim=1, keepdim=True)).to(torch.int8).argmax(dim=1)  # first at min
+    return others[nearest] - query
+
+
+def test_u19_e15_forward_and_backward_on_the_last_slot(tmp_path: Path) -> None:
+    """E15, D-23, §1.3 step 5: on a plane moving in depth, with a budget that keeps every
+    point, each velocity times dt equals the offset to the nearest output point of the next
+    slot, and on the last slot of the previous one (dt < 0), found by a float64 brute force;
+    dt = (k′ − k)·Δt_f·T_τ in raw units (Q-111). Within U-19's 1e-6."""
+    plane = _plane(2.0)
+    taus = [0.0, 1 / 30, 2 / 30]
+    dataset = _rig_scene(tmp_path, taus)
+
+    def moving(tau: float) -> torch.Tensor:
+        return plane + torch.tensor([0.0, 0.0, 7.5 * tau], dtype=torch.float64)
+
+    points = _run(dataset, _StandIn(dataset, points=moving), points_per_frame=10_000)
+    assert points.velocities is not None and points.frame_ids is not None
+    assert sorted(set(points.frame_ids.tolist())) == [0, 1, 2]
+    step = dataset.frame_dt * (taus[-1] - taus[0])  # Δt_f·T_τ = 1/30
+    for k, other in [(0, 1), (1, 2), (2, 1)]:
+        v = points.velocities[points.frame_ids == k].to(torch.float64)
+        offsets = _offsets_to_nearest(_frame(points, k), _frame(points, other))
+        assert offsets.abs().amax() > 0.2  # the plane moved 0.25 in depth
+        torch.testing.assert_close(v * (other - k) * step, offsets, rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.parametrize("taus", [[0.0], [0.0, 1 / 30]], ids=["one-timestamp", "stride-2"])
+def test_u19_a_single_init_frame_gives_zero_velocities(tmp_path: Path, taus: list[float]) -> None:
+    """§1.3 step 5, D-23: with a single init frame, v = 0: a single timestamp, or two frames at
+    k_stride = 2, whose only slot is 0."""
+    dataset = _rig_scene(tmp_path, taus)
+    points = _run(dataset, _StandIn(dataset, points=_static()), stride=2)
+    assert points.frame_ids is not None and not points.frame_ids.any()
+    assert points.velocities is not None
+    assert len(points.velocities) > 0 and not points.velocities.any()
+
+
+@pytest.mark.parametrize("stride", [1, 3])
+def test_u19_initial_durations_are_stride_times_the_frame_interval(
+    tmp_path: Path, stride: int
+) -> None:
+    """§1.3 step 6, D-21: s₀ = k_stride·Δt_f, written in raw units, d = k_stride·Δt_f·T_τ. Seven
+    frames 1/30 s apart give Δt_f = 1/6 and T_τ = 0.2, so d = k_stride/30 s."""
+    dataset = _rig_scene(tmp_path, [n / 30 for n in range(7)])
+    points = _run(dataset, _StandIn(dataset, points=_static()), stride=stride)
+    assert points.durations is not None and points.frame_ids is not None
+    assert sorted(set(points.frame_ids.tolist())) == list(range(0, 7, stride))
+    expected = torch.full_like(points.durations, stride / 30)
+    torch.testing.assert_close(points.durations, expected, rtol=1e-12, atol=0.0)
+
+
+def test_u19_initial_durations_with_a_single_timestamp_are_the_stride(tmp_path: Path) -> None:
+    """§1.3 step 6 with D-70: for a single timestamp Δt_f := 1 and the time unit is 1, so
+    d = k_stride."""
+    dataset = _rig_scene(tmp_path, [5.0])
+    points = _run(dataset, _StandIn(dataset, points=_static()), stride=3)
+    assert points.durations is not None
+    assert torch.equal(points.durations, torch.full_like(points.durations, 3.0))
