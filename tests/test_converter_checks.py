@@ -153,21 +153,19 @@ def _reprojection(manifest: SceneManifest, a: str, b: str, c: str, index: int = 
 # C-1 · Neural3DV (D-28).
 
 
-@needs_ffmpeg
-@pytest.mark.dataset
-def test_c1_n3dv_epipolar_residuals_and_column_permutations(tmp_path: Path) -> None:
-    """C-1: Sampson error of matches between neighbouring cameras at frame 0, median ≤ 1 px
-    with the converted cameras; every permutation of the LLFF rotation columns ≥ 10× worse."""
-    scene = _first_scene(_dataset("n3dv"), "poses_bounds.npy")
-    manifest = read_scene_manifest(convert_n3dv(scene, tmp_path / "out", frames=1))
+def _c1(scene: Path, out: Path) -> list[tuple[float, float]]:
+    """C-1's procedure on a Neural3DV-layout scene: per neighbouring pair, the median Sampson
+    error with the converted cameras and the smallest over the permuted LLFF columns."""
+    manifest = read_scene_manifest(convert_n3dv(scene, out, frames=1))
     poses = np.load(scene / "poses_bounds.npy")
     names = sorted({r.camera.name for r in manifest.records})
+    results = []
     for a, b in _neighbours(manifest):
         good = _median_sampson(manifest, a, b)
-        assert good <= 1.0
         ca, ia = _frame(manifest, a)
         cb, ib = _frame(manifest, b)
         xa, xb = _matches(ia, ib)
+        worst_case = np.inf
         for order in permutations(range(3)):
             if order == (0, 1, 2):
                 continue
@@ -181,22 +179,48 @@ def test_c1_n3dv_epipolar_residuals_and_column_permutations(tmp_path: Path) -> N
                 return camera.K.double().numpy(), rotation, -rotation @ m[:, 3]
 
             bad = float(np.median(_sampson(_fundamental(*pose(a, ca), *pose(b, cb)), xa, xb)))
-            assert bad >= 10 * good, f"columns {order}: {bad} against {good}"
+            worst_case = min(worst_case, bad)
+        results.append((good, worst_case))
+    return results
+
+
+def _assert_c1(results: list[tuple[float, float]]) -> None:
+    for good, permuted in results:
+        assert good <= 1.0
+        assert permuted >= 10 * good, f"a column permutation gives {permuted} against {good}"
+
+
+@needs_ffmpeg
+@pytest.mark.dataset
+def test_c1_n3dv_epipolar_residuals_and_column_permutations(tmp_path: Path) -> None:
+    """C-1: Sampson error of matches between neighbouring cameras at frame 0, median ≤ 1 px
+    with the converted cameras; every permutation of the LLFF rotation columns ≥ 10× worse."""
+    _assert_c1(_c1(_first_scene(_dataset("n3dv"), "poses_bounds.npy"), tmp_path / "out"))
 
 
 # C-2 · ENeRF-Outdoor; C-3 · both converters.
+
+
+def _c2(scene: Path, out: Path) -> list[float]:
+    """C-2's procedure on an opencv-yaml scene: the median Sampson error per neighbouring pair
+    after undistortion."""
+    manifest = read_scene_manifest(convert_opencv_yaml(scene, out, fps=60.0, frames=1, resize=1.0))
+    return [_median_sampson(manifest, a, b) for a, b in _neighbours(manifest)]
+
+
+def _c3(path: Path) -> float:
+    """C-3's procedure: matches triangulated from two cameras, reprojected into a third."""
+    manifest = read_scene_manifest(path)
+    names = sorted({r.camera.name for r in manifest.records})
+    return _reprojection(manifest, names[1], names[2], names[3])
 
 
 @needs_ffmpeg
 @pytest.mark.dataset
 def test_c2_enerf_outdoor_epipolar_residuals(tmp_path: Path) -> None:
     """C-2: the same test after undistortion: median Sampson error ≤ 1 px."""
-    scene = _first_scene(_dataset("enerf_outdoor"), "intri.yml")
-    manifest = read_scene_manifest(
-        convert_opencv_yaml(scene, tmp_path / "out", fps=60.0, frames=1, resize=1.0)
-    )
-    for a, b in _neighbours(manifest):
-        assert _median_sampson(manifest, a, b) <= 1.0
+    errors = _c2(_first_scene(_dataset("enerf_outdoor"), "intri.yml"), tmp_path / "out")
+    assert max(errors) <= 1.0
 
 
 @needs_ffmpeg
@@ -213,9 +237,53 @@ def test_c3_triangulated_matches_reproject_into_a_third_camera(
     else:
         scene = _first_scene(_dataset("enerf_outdoor"), "intri.yml")
         path = convert_opencv_yaml(scene, tmp_path / "out", fps=60.0, frames=1, resize=1.0)
-    manifest = read_scene_manifest(path)
-    names = sorted({r.camera.name for r in manifest.records})
-    assert _reprojection(manifest, names[1], names[2], names[3]) <= 1.5
+    assert _c3(path) <= 1.5
+
+
+# The C-1 to C-3 procedures on openftgs-synth (Q-100, owner answer): they prove the test code and
+# its thresholds on realistic images; the paper's datasets' conventions stay unverified (D-79).
+
+
+def _synth(*parts: str) -> Path:
+    folder = Path(os.environ.get("OPENFTGS_DATASETS", "")) / "synth"
+    if not (folder / "VERSION").is_file():
+        pytest.skip(f"openftgs-synth is not at {folder}")
+    return folder.joinpath(*parts)
+
+
+@needs_ffmpeg
+@pytest.mark.dataset
+def test_c1_procedure_on_openftgs_synth_kitchen(tmp_path: Path) -> None:
+    """C-1's procedure and thresholds on openftgs-synth's kitchen (Neural3DV layout, H.264)."""
+    results = _c1(_synth("n3dv", "kitchen"), tmp_path / "out")
+    print("C-1 on kitchen:", [(round(g, 3), round(p, 1)) for g, p in results])
+    _assert_c1(results)
+
+
+@needs_ffmpeg
+@pytest.mark.dataset
+def test_c2_procedure_on_openftgs_synth_courtyard(tmp_path: Path) -> None:
+    """C-2's procedure and threshold on openftgs-synth's courtyard (opencv-yaml layout,
+    distorted H.264)."""
+    errors = _c2(_synth("enerf_outdoor", "courtyard"), tmp_path / "out")
+    print("C-2 on courtyard:", [round(e, 3) for e in errors])
+    assert max(errors) <= 1.0
+
+
+@needs_ffmpeg
+@pytest.mark.dataset
+@pytest.mark.parametrize("scene", ["kitchen", "courtyard"])
+def test_c3_procedure_on_openftgs_synth(tmp_path: Path, scene: str) -> None:
+    """C-3's procedure and threshold on openftgs-synth's kitchen and courtyard."""
+    if scene == "kitchen":
+        path = convert_n3dv(_synth("n3dv", "kitchen"), tmp_path / "out", frames=1)
+    else:
+        path = convert_opencv_yaml(
+            _synth("enerf_outdoor", "courtyard"), tmp_path / "out", fps=60.0, frames=1, resize=1.0
+        )
+    error = _c3(path)
+    print(f"C-3 on {scene}: {error:.3f} px")
+    assert error <= 1.5
 
 
 # C-4 · SelfCap undistortion (D-60).
