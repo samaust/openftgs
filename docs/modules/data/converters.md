@@ -10,7 +10,7 @@ How `convert_n3dv`, `convert_opencv_yaml` and `convert_selfcap` meet their §2.1
 
 ## Output
 
-OUT must be absent or empty (Q-88). Frames go to `OUT/images/<camera>/<frame_index:06d>.png`, masks to `OUT/masks/<camera>/`, and `OUT/scene.json` is written last, through `io.write_scene_manifest`, and returned. `OUT/.work/` is removed whether the conversion succeeds or fails. Invalid input or environment raises `ValueError` (Q-26), which `ftgs convert` (M14) maps to exit code 2.
+OUT must be absent or empty (Q-88). Frames go to `OUT/images/<camera>/<frame_index:06d>.png`, masks to `OUT/masks/<camera>/`, and `OUT/scene.json` is written last, through `io.write_scene_manifest`, and returned. `OUT/.work/` is removed whether the conversion succeeds or fails, and a conversion that fails removes everything it wrote: OUT was absent or empty when it started, so it is left as it was found, and the same command can simply run again (Q-88). Invalid input or environment raises `ValueError` (Q-26), which `ftgs convert` (M14) maps to exit code 2.
 
 The manifest's metadata records how the scene was made (Q-94): the source and converter, the resize ratio, frames or window, ffmpeg's path, version line, the command per camera and the decoder that ran, and for SelfCap the archives' SHA-256s, the calibration source, whether sync offsets were applied, the undistortion mode, COLMAP's commands, warnings, the masks' source and, for dance1, the Fastest-10 range (D-69, Q-59). `metadata.source` for Neural3DV is "n3dv/<scene>", which `eval.lpips_backbone` reads (Q-62).
 

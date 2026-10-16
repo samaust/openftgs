@@ -841,13 +841,27 @@ def _run_jobs(
     return {job.name: commands[job.name] for job in camera_jobs if job.name in commands}
 
 
-def _prepare_out(dst: Path) -> Path:
-    """Q-88: OUT is absent or an empty directory."""
+def _prepare_out(dst: Path) -> tuple[Path, bool]:
+    """Q-88: OUT is absent or an empty directory; returns it and whether it was created."""
     dst = Path(dst)
     if dst.exists() and (not dst.is_dir() or any(dst.iterdir())):
         raise ValueError(f"{dst}: the output must be absent or an empty directory")
+    created = not dst.exists()
     dst.mkdir(parents=True, exist_ok=True)
-    return dst
+    return dst, created
+
+
+def _discard(out: Path, created: bool) -> None:
+    """Q-88 (owner answer): after a failure, remove everything the conversion wrote. OUT was
+    absent or empty when it started, so all of it is the conversion's own."""
+    if created:
+        shutil.rmtree(out, ignore_errors=True)
+        return
+    for child in out.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
 
 
 def _producer() -> str:
@@ -916,7 +930,7 @@ def convert_n3dv(
             f"{src}: poses_bounds.npy must hold one 17-value row per camXX.mp4 (Q-95), got "
             f"{list(poses.shape)} for {len(videos)} videos"
         )
-    out = _prepare_out(dst)
+    out, created = _prepare_out(dst)
     work = out / ".work"
     try:
         tools = _tools(ffmpeg, ffprobe)
@@ -960,6 +974,9 @@ def convert_n3dv(
             "bounds": bounds,
         }
         write_scene_manifest(out / "scene.json", records, time_unit="s", metadata=metadata)
+    except BaseException:
+        _discard(out, created)
+        raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return out / "scene.json"
@@ -1100,7 +1117,7 @@ def convert_opencv_yaml(
     calibrated = _calibration(src / "intri.yml", src / "extri.yml")
     if test_camera is not None and test_camera not in [c.name for c in calibrated]:
         raise ValueError(f"test_camera {test_camera!r} is not among the calibrated cameras")
-    out = _prepare_out(dst)
+    out, created = _prepare_out(dst)
     try:
         tools: _Tools | None = None
         cameras: list[Camera] = []
@@ -1170,6 +1187,9 @@ def convert_opencv_yaml(
         if tools is not None:
             metadata["ffmpeg"] = _ffmpeg_metadata(tools, hwaccel, commands)
         write_scene_manifest(out / "scene.json", records, time_unit="s", metadata=metadata)
+    except BaseException:
+        _discard(out, created)
+        raise
     finally:
         shutil.rmtree(out / ".work", ignore_errors=True)
     return out / "scene.json"
@@ -1549,7 +1569,7 @@ def convert_selfcap(
     indices = list(range(n0, n1))
     colmap_path, colmap_version = _colmap_version(colmap) if undistort == "colmap" else ("", "")
     mask_paths, mask_metadata = _masks(Path(masks), indices) if masks is not None else ({}, {})
-    out = _prepare_out(dst)
+    out, created = _prepare_out(dst)
     work = out / ".work"
     try:
         tools = _tools(ffmpeg, ffprobe)
@@ -1707,6 +1727,9 @@ def convert_selfcap(
         write_scene_manifest(
             out / "scene.json", records, time_unit="s", masks=record_masks, metadata=metadata
         )
+    except BaseException:
+        _discard(out, created)
+        raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return out / "scene.json"

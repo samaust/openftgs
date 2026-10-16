@@ -775,3 +775,35 @@ def test_opencv_yaml_outputs_do_not_depend_on_jobs(tmp_path: Path) -> None:
     for f in files:
         assert (one.parent / f).read_bytes() == (two.parent / f).read_bytes()
     assert json.loads(one.read_text())["images"] == json.loads(two.read_text())["images"]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("start", ["absent", "empty"])
+def test_a_failed_conversion_leaves_out_as_it_found_it(tmp_path: Path, start: str) -> None:
+    """Q-88 (owner answer): a conversion that fails after writing frames removes everything it
+    wrote, so OUT is absent or empty again and the same command can run again. A mask of the
+    wrong size fails only once the frames exist."""
+    src = _selfcap_archives(tmp_path, "mini")
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    for n in range(4, 6):
+        Image.fromarray(np.zeros((10, 10), dtype=np.uint8), "L").save(masks / f"{n:06d}.png")
+    (masks / "masks.json").write_text(
+        json.dumps({"mask_source": "test", "masks_approximate": False})
+    )
+    out = tmp_path / "out"
+    if start == "empty":
+        out.mkdir()
+    call: dict[str, Any] = {
+        "scene": "mini",
+        "window": (4, 6),
+        "test_camera": "0002",
+        "undistort": "internal",
+    }
+    with pytest.raises(ValueError, match="mask size"):
+        convert_selfcap(src, out, masks=masks, **call)
+    if start == "absent":
+        assert not out.exists()
+    else:
+        assert out.is_dir() and list(out.iterdir()) == []
+    assert convert_selfcap(src, out, **call).is_file()  # the rerun works
