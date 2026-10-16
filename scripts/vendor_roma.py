@@ -478,11 +478,23 @@ class _Patched:
     imports: _ImportCount
 
 
+def _parse(path: str, data: bytes) -> tuple[str, ast.Module]:
+    """Decode and parse; on failure report the line number only, never the text."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise VendorError(f"{path}: not UTF-8") from None
+    try:
+        tree = ast.parse(text, filename=path)
+    except SyntaxError as error:
+        raise VendorError(f"{path}: does not parse (line {error.lineno})") from None
+    return text, tree
+
+
 def _patch(path: str, data: bytes) -> _Patched:
-    text = data.decode("utf-8")
+    text, tree = _parse(path, data)
     if "\r" in text:
         raise VendorError(f"{path}: carriage returns are not handled")
-    tree = ast.parse(text, filename=path)
     lines = text.split("\n")
     edits, imports, notes = _rewrite_romatch_imports(path, tree, lines)
     for applies, rule in (
@@ -520,7 +532,7 @@ def _names_used(tree: ast.AST) -> Iterator[str]:
 def _check_patched(files: dict[str, bytes]) -> None:
     """After the patch: no romatch, cv2 or xformers import and no pose helper anywhere."""
     for path, data in files.items():
-        tree = ast.parse(data, filename=path)
+        _, tree = _parse(path, data)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import | ast.ImportFrom):
                 if _imports_xformers(node):
@@ -540,7 +552,8 @@ def _check_patched(files: dict[str, bytes]) -> None:
         left = sorted(used & set(POSE_HELPERS))
         if left:
             raise VendorError(f"{path}: {', '.join(left)} still named")
-    functions = [n.name for n in ast.parse(files[UTILS]).body if isinstance(n, ast.FunctionDef)]
+    _, utils = _parse(UTILS, files[UTILS])
+    functions = [n.name for n in utils.body if isinstance(n, ast.FunctionDef)]
     if not functions or functions[0] != FIRST_KEPT_FUNCTION:
         raise VendorError(f"{UTILS}: the first function is not {FIRST_KEPT_FUNCTION}")
 
