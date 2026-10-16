@@ -148,15 +148,16 @@ def test_nearest_indices_ties_go_to_the_lower_index(device: str) -> None:
 
     40 copies of one point (first at index 3) make the CPU path query again several times;
     one query row has a unique nearest point, so only some rows are queried again; two distinct
-    points exactly 1 apart from the origin tie by distance alone."""
-    a = torch.tensor([0.25, -0.5, 1.0], dtype=torch.float64)
+    points, each exactly 1 from the origin, tie by distance alone."""
+    f64 = torch.float64
+    a = torch.tensor([0.25, -0.5, 1.0], dtype=f64)
     others = torch.tensor(
-        [[5.0, 5.0, 5.0], [-1.0, 0.0, 0.0], [9.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float64
+        [[5.0, 5.0, 5.0], [-1.0, 0.0, 0.0], [9.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=f64
     )
     data = torch.cat([others[:3], a.expand(40, 3), others[3:]])  # a at 3 … 42, (1, 0, 0) at 43
-    order = torch.randperm(40, generator=torch.Generator().manual_seed(3))
-    data[3:43] = data[3:43][order]  # the copies are identical, so shuffling them is a no-op
-    query = torch.stack([a, a + 1e-3, torch.tensor([8.9, 0.0, 0.0]), torch.zeros(3)])
+    query = torch.stack(
+        [a, a + 1e-3, torch.tensor([8.9, 0.0, 0.0], dtype=f64), torch.zeros(3, dtype=f64)]
+    )
     expected = torch.tensor([3, 3, 2, 1])
     got = _nearest_indices(query.to(device), data.to(device))
     assert got.device.type == device
