@@ -965,6 +965,38 @@ def test_u19_filters_hold_d22s_bounds_of_2_px_and_1_degree(tmp_path: Path) -> No
     torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
 
 
+# A rig that isn't rectified: B stands 1 in front of A and faces it, so a point can lie in
+# front of one camera and behind the other while projecting into both images.
+_FACING: dict[str, CameraSpec] = {"A": (0.0, (0.0, 0.0, 0.0)), "B": (180.0, (0.5, 0.0, 1.0))}
+
+
+def test_u19_filters_drop_a_point_behind_one_camera_only(tmp_path: Path) -> None:
+    """§1.3 step 3, D-22: a point is kept only with a positive depth in both views. On a rig
+    whose cameras face each other, exact matches of a point behind B only and of a point
+    behind A only are dropped, and a point between the cameras is kept. Each of the three
+    passes the other filters (reprojection error near 0, angle far above 1°), as computed
+    here from the point `triangulate_dlt` returns."""
+    shots: list[Shot] = [("A", 0.0, "train"), ("B", 0.0, "train")]
+    dataset = MultiViewVideo.from_manifest(_write_scene(tmp_path, _FACING, shots))
+    a, b = dataset.records[0].camera, dataset.records[1].camera
+    behind_b, behind_a, between = (0.1, 0.05, 2.0), (0.4, -0.05, -1.0), (0.2, 0.05, 0.5)
+    matches = [_crafted(a, b, X) for X in (behind_b, behind_a, between)]
+    measured = [_measured(a, b, match) for match in matches]
+    depths = [depths for _, _, depths, _ in measured]
+    assert depths[0][0] > 0 > depths[0][1]
+    assert depths[1][1] > 0 > depths[1][0]
+    assert min(depths[2]) > 0
+    size = (float(_W), float(_H))
+    for match, (_, errors, _, angle) in zip(matches, measured, strict=True):
+        assert all(0 < match[i] < size[i % 2] for i in range(4))  # inside both images
+        assert max(errors) < 1e-6 and angle > 5.0
+
+    points = _run(dataset, _StandIn(dataset, crafted={("A", "B"): matches}))
+    expected = measured[2][0][None]
+    got = _matched(points.positions.to(torch.float64), expected)
+    torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+
 def test_u19_colors_are_the_mean_of_the_two_source_pixels(tmp_path: Path) -> None:
     """§1.3 step 3, D-22; Q-110: each color is the mean of the two source pixels, each the
     pixel holding the match's continuous coordinate. The images encode (u, v) as (R, G); the
