@@ -11,6 +11,7 @@ import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -29,7 +30,7 @@ from torch import Tensor
 
 import openftgs
 from openftgs.config import InitConfig
-from openftgs.data import MultiViewVideo
+from openftgs.data import MultiViewVideo, convert_selfcap
 from openftgs.init import (
     DenseMatcher,
     RomaInitConfig,
@@ -1445,3 +1446,84 @@ def test_u33_roma_outdoor_shards_and_pair_order_give_bitwise_identical_init_poin
     assert _slot_counts(outputs[0]) == {0: 1000, 1: 1000, 2: 1000}
     assert _same(outputs[0], outputs[1])
     assert _same(outputs[0], outputs[2])
+
+
+# The #37 evidence: per-slot counts on openftgs-synth's unsynchronized `studio` (CC0-1.0, #108),
+# converted by M12's SelfCap converter into pytest's temporary folder, outside the repository.
+
+_STUDIO_WINDOW = (0, 16)  # frames N0 ≤ n < N1 of every camera, at 60 fps
+_STUDIO_TEST_CAMERA = "0007"  # the dataset card's held-out camera
+
+
+def _synth_root() -> Path:
+    """$OPENFTGS_DATASETS/synth, version 0.1.x, or a skip naming the folder."""
+    root = Path(os.environ.get("OPENFTGS_DATASETS", "")) / "synth"
+    if not (root / "VERSION").is_file():
+        pytest.skip(f"openftgs-synth is not at {root}")
+    version = (root / "VERSION").read_text().strip()
+    if not version.startswith("0.1."):
+        pytest.skip(f"openftgs-synth {version} is not 0.1.x")
+    return root
+
+
+def _admitted_cameras(dataset: MultiViewVideo) -> dict[int, int]:
+    """Training cameras per frame slot at k_stride = 1, counted in the test from the records:
+    a camera joins slot k when one of its images has k as its nearest frame and lies within
+    Δt_f/2 of t_k (§1.3 step 1, D-47; Q-109). Recorded as evidence, not asserted."""
+    frame_dt = float(dataset.frame_dt)
+    cameras: dict[int, set[str]] = {}
+    for record in dataset.records:
+        if record.split != "train":
+            continue
+        t = float(dataset.time.to_t(float(record.timestamp)))
+        k = math.ceil(t / frame_dt - 0.5)
+        if abs(t - k * frame_dt) <= frame_dt / 2:
+            cameras.setdefault(k, set()).add(record.camera.name)
+    return {k: len(names) for k, names in sorted(cameras.items())}
+
+
+@pytest.mark.dataset
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="needs ffmpeg and ffprobe on PATH (D-48)",
+)
+def test_roma_init_per_slot_counts_on_studio(
+    tmp_path: Path, record_property: Callable[[str, object], None]
+) -> None:
+    """The #37 evidence (PRD #133, "Added"): `roma_init` with roma_outdoor on 16 frames of
+    `studio` (24 cameras, unsynchronized by up to ±0.03 s, about two frames at 60 fps), at its
+    defaults but for B = 20,000, above what D-47's thin end slots hold, so that their counts
+    are the points surviving D-22's filters. B is not unbounded, since E15 in float64 on the
+    GPU takes about 19 s for 75,000 points against 75,000 (a full slot here). Recorded per
+    slot: the training cameras admitted, the points kept at B = 20,000, and those B = 1000
+    would keep. The converted manifest records the archive's SHA-256 from SHA256SUMS (D-79),
+    and the init points pass `validate_init_points`."""
+    root = _synth_root()
+    manifest = convert_selfcap(
+        root / "selfcap",
+        tmp_path / "studio",
+        scene="studio",
+        window=_STUDIO_WINDOW,
+        test_camera=_STUDIO_TEST_CAMERA,
+        undistort="internal",
+        jobs=8,
+    )
+    lines = (root / "SHA256SUMS").read_text().splitlines()
+    sums = {line[66:]: line[:64] for line in lines}
+    dataset = MultiViewVideo.from_manifest(manifest)
+    archive = "studio-release.tar.gz"
+    assert dataset.manifest.metadata["archives"] == {archive: sums[f"selfcap/{archive}"]}
+    b = 20_000
+    points = roma_init(dataset, RomaInitConfig(points_per_frame=b), devices=["cuda:0"])
+    validate_init_points(points)
+    kept = _slot_counts(points)
+    cameras = _admitted_cameras(dataset)
+    table = {k: (cameras.get(k, 0), kept.get(k, 0), min(kept.get(k, 0), 1000)) for k in cameras}
+    record_property("studio_slots", json.dumps(table))
+    print(f"studio, slot: (training cameras admitted, points kept at B = {b}, at B = 1000)")
+    for k, row in table.items():
+        print(f"  {k}: {row}")
+    assert set(kept) <= set(cameras)
+    assert 0 < max(kept.values()) <= b
