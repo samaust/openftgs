@@ -51,14 +51,31 @@ def test_u20_opencv_extrinsics_are_world_to_camera() -> None:
 
 @pytest.mark.parametrize(
     ("width", "height", "ratio", "expected"),
-    [((2704, 2028, 0.5, (1352, 1014))), (50, 30, 0.37, (19, 11)), (3, 3, 0.1, (1, 1))],
+    [
+        (2704, 2028, 0.5, (1352, 1014)),
+        (50, 30, 0.37, (18, 11)),  # 18.5 → 18 (even), 11.1 → 11
+        (165, 121, 0.5, (82, 60)),  # 82.5 → 82, 60.5 → 60
+        (167, 123, 0.5, (84, 62)),  # 83.5 → 84, 61.5 → 62
+        (3, 3, 0.1, (1, 1)),
+    ],
 )
-def test_resized_size_rounds_half_up(
+def test_resized_size_rounds_half_to_even(
     width: int, height: int, ratio: float, expected: tuple[int, int]
 ) -> None:
-    """§1.4, D-33, Q-89: W′ = round(W·r) with an exact half rounding up (50 × 0.37 = 18.5 →
-    19; 30 × 0.37 = 11.1 → 11), and at least 1."""
+    """§1.4, D-33, Q-89: W′ = round(W·r) with an exact half rounding to even, at least 1."""
     assert resized_size(width, height, ratio) == expected
+
+
+@pytest.mark.parametrize(("width", "height"), [(165, 121), (167, 123), (1919, 1081), (1921, 1079)])
+def test_resized_size_matches_opencvs_resize_by_a_ratio(width: int, height: int) -> None:
+    """Q-89: the size OpenCV's resize gives an image resized by ½ (the card's "INTER_AREA at
+    0.5"), the oracle."""
+    import cv2
+
+    out = cv2.resize(
+        np.zeros((height, width), np.uint8), None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
+    )
+    assert resized_size(width, height, 0.5) == (out.shape[1], out.shape[0])
 
 
 def test_u20_resizing_scales_projections_by_the_realized_ratios() -> None:
@@ -75,15 +92,15 @@ def test_u20_resizing_scales_projections_by_the_realized_ratios() -> None:
 
 def test_resizing_uses_each_axis_ratio() -> None:
     """§1.4: with W·r or H·r not integral, fx and cx scale by W′/W and fy and cy by H′/H: 3×5
-    at r = ½ is 2×3 (1.5 and 2.5 rounding up), ratios 2/3 and 3/5."""
+    at r = ½ is 2×2 (1.5 and 2.5 rounding to even, Q-89), ratios 2/3 and 2/5."""
     K = np.array([[3.0, 0.0, 1.0], [0.0, 5.0, 2.0], [0.0, 0.0, 1.0]])
     camera = camera_from_opencv(K, np.eye(3), np.zeros(3), width=3, height=5)
     resized = resize_camera(camera, *resized_size(3, 5, 0.5))
     expected = torch.tensor(
-        [[3.0 * 2 / 3, 0.0, 1.5 * 2 / 3], [0.0, 5.0 * 3 / 5, 2.5 * 3 / 5], [0.0, 0.0, 1.0]],
+        [[3.0 * 2 / 3, 0.0, 1.5 * 2 / 3], [0.0, 5.0 * 2 / 5, 2.5 * 2 / 5], [0.0, 0.0, 1.0]],
         dtype=torch.float64,
     ).to(torch.float32)
-    assert (resized.width, resized.height) == (2, 3)
+    assert (resized.width, resized.height) == (2, 2)
     assert torch.equal(resized.K, expected)
 
 

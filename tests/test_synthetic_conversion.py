@@ -500,11 +500,12 @@ def _g4_errors(shared: Path, scene: str) -> list[tuple[str, float, float, float]
         n = int(record.frame_index or 0)
         K = record.camera.K.double().numpy()
         width, height = record.camera.width, record.camera.height
-        # COLMAP's size before resizing by ½ (half up): 2W′ − 1 or 2W′; fx, fy are the truth's.
+        # COLMAP's size before resizing by ½ (half to even, Q-89): 2W′ − 1, 2W′ or 2W′ + 1;
+        # fx, fy are the truth's.
         sizes = [
             (wc, hc)
-            for wc in (2 * width - 1, 2 * width)
-            for hc in (2 * height - 1, 2 * height)
+            for wc in (2 * width - 1, 2 * width, 2 * width + 1)
+            for hc in (2 * height - 1, 2 * height, 2 * height + 1)
             if np.isclose(K[0, 0] * wc / width, gt["K_opencv"][0][0], rtol=1e-6)
             and np.isclose(K[1, 1] * hc / height, gt["K_opencv"][1][1], rtol=1e-6)
         ]

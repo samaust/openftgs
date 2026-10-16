@@ -299,15 +299,15 @@ def camera_from_llff(pose: Any, *, name: str = "") -> Camera:
 
 
 def resized_size(width: int, height: int, ratio: float) -> tuple[int, int]:
-    """§1.4's W′ = round(W·r) and H′ = round(H·r), an exact half rounding up, at least 1
-    (Q-89)."""
+    """§1.4's W′ = round(W·r) and H′ = round(H·r), an exact half rounding to even as OpenCV's
+    resize by a ratio does, at least 1 (Q-89)."""
     if (
         isinstance(ratio, bool)
         or not isinstance(ratio, numbers.Real)
         or not (math.isfinite(ratio) and ratio > 0.0)
     ):
         raise ValueError(f"ratio must be a finite number > 0, got {ratio!r}")
-    return max(1, math.floor(width * ratio + 0.5)), max(1, math.floor(height * ratio + 0.5))
+    return max(1, round(width * ratio)), max(1, round(height * ratio))  # half to even
 
 
 def resize_camera(camera: Camera, width: int, height: int) -> Camera:

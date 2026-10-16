@@ -8,7 +8,7 @@ A calibration in OpenCV's integer-centre convention is used as it is to undistor
 
 ## Area resizing
 
-`resized_size` gives W′ = round(W·r) and H′ = round(H·r), an exact half rounding up, at least 1 (Q-89). `resize_area` treats every input pixel as a constant square and gives each output pixel the mean over its footprint, the footprint taken from the realized ratios W/W′ and H/H′ (D-33). It is separable, with banded weights in float64. uint8 input gives uint8 output rounded half to even; floating input gives float64. `resize_camera` scales fx and cx by W′/W and fy and cy by H′/H.
+`resized_size` gives W′ = round(W·r) and H′ = round(H·r), an exact half rounding to even, as OpenCV's resize by a ratio does, at least 1 (Q-89). `resize_area` treats every input pixel as a constant square and gives each output pixel the mean over its footprint, the footprint taken from the realized ratios W/W′ and H/H′ (D-33). It is separable, with banded weights in float64. uint8 input gives uint8 output rounded half to even; floating input gives float64. `resize_camera` scales fx and cx by W′/W and fy and cy by H′/H.
 
 ## Undistortion
 

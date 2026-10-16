@@ -732,12 +732,13 @@ def test_u37_with_the_real_colmap(tmp_path: Path) -> None:
     )
     assert len(manifest.records) == 6
     for record in manifest.records:
-        # COLMAP changes the size and keeps fx = 60; resizing by ½ rounds half up, so COLMAP's
-        # width was 2W′ − 1 or 2W′ and fx is 60·W′ over it.
+        # COLMAP changes the size and keeps fx = 60; resizing by ½ rounds half to even (Q-89),
+        # so COLMAP's width was 2W′ − 1, 2W′ or 2W′ + 1 and fx is 60·W′ over it.
         width = record.camera.width
         fx = record.camera.K[0, 0].item()
         assert any(
-            fx == pytest.approx(60.0 * width / w, abs=1e-4) for w in (2 * width - 1, 2 * width)
+            fx == pytest.approx(60.0 * width / w, abs=1e-4)
+            for w in (2 * width - 1, 2 * width, 2 * width + 1)
         )
         assert np.asarray(Image.open(record.image_path)).shape == (
             record.camera.height,
