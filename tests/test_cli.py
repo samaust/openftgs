@@ -1234,3 +1234,32 @@ def test_init_roma_that_fails_partway_leaves_the_target_as_it_was(
     with pytest.raises(OSError, match="No space left"):
         _ftgs("init", "roma", run["scene"], out)
     _assert_untouched(out, before)
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
+def test_eval_that_fails_partway_leaves_the_target_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    """Q-126: METRICS.json written partway leaves the old file, or no file, and no temporary;
+    the failure propagates as before (Q-26). Text writes into its directory write a few
+    characters, then raise OSError, as a full disk would."""
+    scene, checkpoint = _trained(tmp_path)
+    out = tmp_path / "metrics" / "METRICS.json"
+    before = None
+    if existing:
+        assert _ftgs("eval", checkpoint, scene, "--out", out) == 0
+        before = out.read_bytes()
+    else:
+        out.parent.mkdir()
+    original = Path.write_text
+
+    def partial(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if self.parent != out.parent:
+            return original(self, data, *args, **kwargs)
+        original(self, data[:5], *args, **kwargs)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_text", partial)
+    with pytest.raises(OSError, match="No space left"):
+        _ftgs("eval", checkpoint, scene, "--out", out)
+    _assert_untouched(out, before)

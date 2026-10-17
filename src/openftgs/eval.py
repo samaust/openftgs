@@ -9,6 +9,7 @@ import contextlib
 import importlib.metadata
 import json
 import math
+import os
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -445,4 +446,12 @@ def write_metrics(
     text = json.dumps({**header, **body}, allow_nan=False, indent=1)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    # Q-126 (as answered, #179): written to a temporary sibling named as Q-25's
+    # `.<name>.tmp-<pid>` and renamed over the target, so a write that fails partway leaves the
+    # old file, or no file, and no temporary.
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
