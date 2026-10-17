@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-144): a smoke test of
-every command on a small synthetic scene, the CLI round trips of U-26, U-22's rejections with
-exit code 2, U-27's exit code, and the train, resume, render, eval and export behaviour.
+"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-144, Q-146): a
+smoke test of every command on a small synthetic scene, the CLI round trips of U-26, U-22's
+rejections with exit code 2, U-27's exit code, and the train, resume, render, eval and export
+behaviour.
 
 The tests call `main(argv)` in process, on the CPU unless marked gpu: `torch.cuda.is_available`
 is patched for the CLI to read False (Q-125). A few subprocess tests run the real entry points.
