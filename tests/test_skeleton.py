@@ -178,8 +178,8 @@ def test_openftgs_distribution_packages_only_src() -> None:
 
 
 def test_init_extra_lists_no_fused_local_corr() -> None:
-    """Q-145 (#2): `[init]` lists no fused-local-corr, on any Python, so installing it never
-    changes the user's torch; the reasons are in Q-145's row."""
+    """D-85: `[init]` lists no fused-local-corr, on any Python, so installing it never changes
+    the user's torch; the reasons are in D-85's row."""
     project = _pyproject(ROOT / "pyproject.toml")["project"]
     assert isinstance(project, dict)
     init = project["optional-dependencies"]["init"]

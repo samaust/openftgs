@@ -1610,7 +1610,7 @@ def test_u33_roma_outdoor_shards_and_pair_order_give_bitwise_identical_init_poin
     `["cuda:0"] * 3`, and `["cuda:0"] * 3` on a copy of the manifest whose images are shuffled
     give bitwise identical init points. Each pair's draw and each slot's subset bind (B is
     below the points a slot keeps). Verified here with `use_custom_corr` as the import check
-    resolves it, off while fused-local-corr isn't built (Q-6, Q-145); the value is
+    resolves it, off while fused-local-corr isn't built (D-85); the value is
     recorded."""
     path = _plane_scene(tmp_path)
     permuted = _permuted_copy(path, 1)

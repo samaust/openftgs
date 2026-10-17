@@ -269,7 +269,7 @@ def test_u38_vendored_match_agrees_with_upstream_romatch(
     """U-38 (GPU, weights): on two procedurally generated, seeded image pairs, the vendored and
     upstream (77f8d68) roma_outdoor, built from the same weights with the same settings, give
     `match()` warps and certainties within 1e-5. Both run under Q-112's flags, with
-    `use_custom_corr` off (Q-6, Q-145)."""
+    `use_custom_corr` off (D-85)."""
     upstream_zoo = _upstream_zoo()
     vendored_zoo = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
     urls = vendored_zoo.weight_urls
