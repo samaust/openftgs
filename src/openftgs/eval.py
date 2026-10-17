@@ -448,7 +448,7 @@ def write_metrics(
     path.parent.mkdir(parents=True, exist_ok=True)
     # Q-126 (as answered, #179): written to a temporary sibling named as Q-25's
     # `.<name>.tmp-<pid>` and renamed over the target, so a write that fails partway leaves the
-    # old file, or no file, and no temporary.
+    # old file, or no file, and no temporary. A symlink at `path` becomes a regular file (Q-146).
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
         temporary.write_text(text, encoding="utf-8")

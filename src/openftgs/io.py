@@ -108,7 +108,8 @@ def _replace_with_safetensors(
 ) -> None:
     """Q-126 (as answered, #179): write a single-file output to a temporary sibling, named as
     Q-25's `.<name>.tmp-<pid>`, and rename it over `path`, so a write that fails partway leaves
-    the old file, or no file, and no temporary."""
+    the old file, or no file, and no temporary. A symlink at `path` becomes a regular file
+    (Q-146)."""
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
         _write_safetensors(tensors, temporary, meta)

@@ -1260,3 +1260,18 @@ def test_eval_that_fails_partway_leaves_the_target_as_it_was(
     with pytest.raises(OSError, match="No space left"):
         _ftgs("eval", checkpoint, scene, "--out", out)
     _assert_untouched(out, before)
+
+
+def test_export_replaces_a_symlinked_target_by_a_regular_file(tmp_path: Path) -> None:
+    """Q-146: the atomic replace (Q-126) swaps the directory entry the path names, so a symlink
+    there becomes a regular file and the file it pointed to keeps its content."""
+    _, checkpoint = _trained(tmp_path)
+    elsewhere = tmp_path / "elsewhere.safetensors"
+    elsewhere.write_bytes(b"not overwritten")
+    out = tmp_path / "exports" / "model.safetensors"
+    out.parent.mkdir()
+    out.symlink_to(elsewhere)
+    assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", out) == 0
+    assert not out.is_symlink()
+    read_exchange(out)
+    assert elsewhere.read_bytes() == b"not overwritten"
