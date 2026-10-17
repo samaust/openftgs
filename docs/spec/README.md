@@ -1,8 +1,9 @@
 # Specification
 
-`openftgs-spec.md` is an export of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", revision 549 (2026-10-07), amended in the repository as revisions 549a, 549b and 549c (2026-10-12), 549d and 549e (2026-10-15) and 549f (2026-10-16).
+`openftgs-spec.md` is an export of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", revision 549 (2026-10-07), amended in the repository as revisions 549a, 549b and 549c (2026-10-12), 549d and 549e (2026-10-15) and 549f and 549g (2026-10-16).
 
-- SHA-256: `c608d391340abcf86a87bd6756c4ff3a3cc2f167366834e3717eb5097777e303` (revision 549f)
+- SHA-256: `42a5bfe2a26b6dfc61e7f9c8904c914806b56d98e8217dd6476a46cc4fb64901` (revision 549g)
+- SHA-256 of revision 549f as committed: `c608d391340abcf86a87bd6756c4ff3a3cc2f167366834e3717eb5097777e303`
 - SHA-256 of revision 549e as committed: `50ac48beb5d339841b0fcefc7cab782d3066b086b438c52dacc7341eb436c5d2`
 - SHA-256 of revision 549d as committed: `2be17db783de915b14d1d81de27aa3074c2fecba7ecc9e1aa18ad5a58e721a20`
 - SHA-256 of revision 549c as committed: `315724dfeafb66d78f8004365b42343c5a6170e32e05ee81093bf01a1dab2b21`
@@ -24,5 +25,7 @@ Revision 549d is a fourth such exception, on 2026-10-15: the owner asked the imp
 Revision 549e is a fifth such exception, on 2026-10-15: the owner asked the implementer, this one time, to edit this copy in the owner's name with the wording of issue #131, which the owner approved (D-80 to D-82, from Q-85, Q-92, Q-97 and Q-103). The converters take `ffprobe`, `convert_opencv_yaml` a `test_camera` and `convert_selfcap` a `resize` (D-80; §2.1 follows, with the keywords in the code's order rather than #131's, as the correction on #131 records); --hwaccel cuda forces hardware frames, so that the decoder recorded is the one that ran (D-81; §1.4's Neural3DV paragraph follows); and G-4 records its frame error instead of bounding it by G-2's (D-82; §3.1 G-4 follows). The optional CLI flags #131 offered are left to M14. The Appendix B count and the revision notes are kept consistent; Appendix A and the diagrams are unchanged. The owner's document must receive these changes too, or its next export would drop them.
 
 Revision 549f is a sixth such exception, on 2026-10-16: the owner asked the implementer to edit this copy in the owner's name with the wording of issue #181, which the owner approved, with its open point as proposed and its optional section included. `ftgs train` can save a checkpoint every N iterations and keep the K latest (D-83, from the owner's request while answering Q-132; §2.1's CLI block and the paragraph after it, §2.2's checkpoint contract and the §1.3 calendar follow), and §2.1's `ftgs convert` line lists the `--test-camera` and `--window` options that M14 built for D-80 (Q-85; D-80 gains a closing sentence). The Appendix B count and the revision notes are kept consistent; Appendix A and the diagrams are unchanged. The owner's document must receive these changes too, or its next export would drop them.
+
+Revision 549g is a seventh such exception, on the same day: the owner asked the implementer to edit this copy in the owner's name with the wording of issue #186, which the owner approved. An exchange model records the background it was trained against, and readers return it, black when absent (D-84, from Q-141, superseding Q-24's "ignored on read" for the background); §2.1's `ExchangeModel` and §2.2's ftgs-if metadata follow. The Appendix B count and the revision notes are kept consistent; Appendix A and the diagrams are unchanged. The owner's document must receive these changes too, or its next export would drop them.
 
 Don't edit it here. Changes are made in the owner's document and arrive as a new export that replaces this file in a single commit, with the revision and hash above updated.
