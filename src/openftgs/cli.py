@@ -143,8 +143,8 @@ def _pair(text: str) -> tuple[int, int]:
 
 # -- convert -------------------------------------------------------------------------------------
 
-# The options each converter takes (§2.1 CLI line; Q-85 adds --test-camera and --window, the CLI
-# part of that row, which D-80 left out of the spec), by
+# The options each converter takes (§2.1 CLI line, with --test-camera and --window since revision
+# 549f; D-80), by
 # the keyword they map to; anything else given for a kind is exit code 2.
 _CONVERT_OPTIONS: dict[str, tuple[str, ...]] = {
     "n3dv": ("frames", "resize", "ffmpeg", "ffprobe", "hwaccel", "jobs"),

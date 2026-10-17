@@ -925,7 +925,7 @@ def test_cache_opens_on_the_gpu(run: dict[str, Path]) -> None:
     assert _ftgs("cache", run["scene"], "--placement", "gpu") == 0
 
 
-# ftgs convert (§1.4 "Dataset protocols"; U-27's exit code; Q-85, Q-88).
+# ftgs convert (§1.4 "Dataset protocols"; U-27's exit code; D-80, Q-88).
 
 
 @needs_ffmpeg
@@ -944,7 +944,7 @@ def test_convert_n3dv(tmp_path: Path) -> None:
 
 @needs_ffmpeg
 def test_convert_selfcap_with_a_stub_colmap(tmp_path: Path) -> None:
-    """§2.1, Q-85: ftgs convert selfcap on a generated mini-archive (U-37's), with --window,
+    """§2.1, D-80: ftgs convert selfcap on a generated mini-archive (U-37's), with --window,
     --test-camera and a stub COLMAP: frames 4 ≤ n < 8 of three cameras, the test camera's
     images in the test split, and COLMAP called."""
     src = selfcap_archives(tmp_path, "mini")
@@ -989,7 +989,7 @@ def test_u27_a_wrong_ffmpeg_or_ffprobe_path_is_exit_code_2(tmp_path: Path) -> No
 def test_convert_maps_options_to_the_converter_keywords(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """§2.1 CLI line, Q-85: each option reaches its keyword, --window N0:N1 as (N0, N1) and
+    """§2.1 CLI line, D-80: each option reaches its keyword, --window N0:N1 as (N0, N1) and
     --no-sync as use_sync=False; an option of another kind, or a missing required one, is
     exit 2 before the converter runs."""
     import openftgs.data
