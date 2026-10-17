@@ -517,7 +517,8 @@ def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
 class _Loaded:
     model: FreeTimeGaussians
     iteration: int | None  # a checkpoint's
-    background: tuple[float, float, float]  # Q-141: a checkpoint's configuration's, else black
+    # D-84: a checkpoint's configuration's background, else black until #187
+    background: tuple[float, float, float]
 
 
 def _load_model(path: Path, device: str) -> _Loaded:
@@ -695,7 +696,7 @@ def _export(args: argparse.Namespace) -> int:
     if not args.checkpoint.is_dir():
         _fail(f"{args.checkpoint} is not a checkpoint directory")
     loaded = _load_model(args.checkpoint, "cpu")
-    # Q-141: the file records the background the run was trained against.
+    # D-84: the file records the background the run was trained against.
     exchange = dataclasses.replace(loaded.model.to_exchange(), background=loaded.background)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with _as_input_error(f"exchange model {args.out}"):

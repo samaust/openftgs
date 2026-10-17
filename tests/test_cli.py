@@ -622,11 +622,11 @@ def test_render_with_gsplat(tmp_path: Path) -> None:
         torch.testing.assert_close(a.rgb[key], b.rgb[key], rtol=0.0, atol=1e-4)  # U-7
 
 
-# ftgs export (§2.1; Q-141) and U-22's rejections with exit code 2.
+# ftgs export (§2.1; D-84) and U-22's rejections with exit code 2.
 
 
 def test_export_writes_a_valid_exchange_model_with_the_runs_background(tmp_path: Path) -> None:
-    """Q-141 (Q-24): the file records the checkpoint's TrainConfig.background in
+    """D-84: the file records the checkpoint's TrainConfig.background in
     render_conventions; a default run records black; an existing file is replaced (Q-126)."""
     _, white = _trained(tmp_path / "white", background=(1.0, 1.0, 1.0))
     _, black = _trained(tmp_path / "black")
@@ -735,7 +735,7 @@ def test_u26_cli_round_trips_for_each_sh_degree(tmp_path: Path, sh_degree: int) 
         torch.testing.assert_close(ra.alpha[key], rb.alpha[key], rtol=1e-6, atol=1e-6)
 
 
-# ftgs eval (§2.1 CLI paragraph on METRICS.json; Q-135 to Q-137, Q-141).
+# ftgs eval (§2.1 CLI paragraph on METRICS.json; Q-135 to Q-137, D-84).
 
 
 def _body(report: dict[str, Any]) -> dict[str, Any]:
@@ -778,7 +778,7 @@ def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Pa
 
 @pytest.mark.weights
 def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) -> None:
-    """Q-141, Q-74: ftgs eval of a checkpoint renders against its configuration's background,
+    """D-84, Q-74: ftgs eval of a checkpoint renders against its configuration's background,
     so a white-background run's report body equals Trainer.evaluate's."""
     from openftgs.data import MultiViewVideo
 

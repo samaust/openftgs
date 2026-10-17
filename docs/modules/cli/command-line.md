@@ -14,7 +14,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.save_checkpoint`, `Trainer.evaluate` |
 | `render` | the model as `FreeTimeGaussians.load` reads it, `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
 | `eval` | the model, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
-| `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (Q-141) |
+| `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
 | `bench` | a stub until M15: it checks its arguments and returns 1 (Q-130) |
 
 The device is CUDA when PyTorch sees one, else the CPU, and the backend follows it, as in the trainer. `ftgs render` keeps `render()`'s default backend, gsplat, so on a machine without CUDA it needs `--backend reference`, which renders on the CPU (Q-125).
@@ -53,4 +53,4 @@ While training runs, SIGINT and SIGTERM are recorded rather than acted on at onc
 
 ## Evaluation
 
-`ftgs eval MODEL SCENE.json` renders the split (`--split test`, the default, or `train`; Q-143) with the model and scores it. A checkpoint is rendered against its configuration's background, an exchange model against black, since readers ignore `render_conventions` (§2.2, Q-141). With `--renders-dir DIR` it instead scores the renders in DIR (`request.json` and `renders.safetensors`), matching each image of the split to one request item by timestamp, image size and camera, the camera within a relative 1e-6 (Q-137). `ftgs render --backend reference` followed by `ftgs eval --renders-dir` scores the reference backend. A split with masks on some images but not all is refused (Q-135).
+`ftgs eval MODEL SCENE.json` renders the split (`--split test`, the default, or `train`; Q-143) with the model and scores it. A checkpoint is rendered against its configuration's background, an exchange model against black until #187, when it renders against the background its file records (D-84). With `--renders-dir DIR` it instead scores the renders in DIR (`request.json` and `renders.safetensors`), matching each image of the split to one request item by timestamp, image size and camera, the camera within a relative 1e-6 (Q-137). `ftgs render --backend reference` followed by `ftgs eval --renders-dir` scores the reference backend. A split with masks on some images but not all is refused (Q-135).

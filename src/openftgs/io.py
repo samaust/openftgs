@@ -261,7 +261,7 @@ _RENDER_CONVENTIONS = {
 def validate_exchange(model: ExchangeModel) -> None:
     """§2.2 ftgs-if validation (Q-22, Q-24): the table's keys, dtypes and shapes, N ≥ 1, all
     values finite, opacity in (0, 1), durations and scales positive, rotations of norm > 1e-8,
-    sh_degree in {0, 1, 2, 3}, finite τ₀ ≤ τ₁, a background of three numbers in [0, 1] (Q-141).
+    sh_degree in {0, 1, 2, 3}, finite τ₀ ≤ τ₁, a background of three numbers in [0, 1] (D-84).
     Raises ValueError (Q-26)."""
     where = "ftgs-if"
     degree = model.sh_degree
@@ -275,7 +275,7 @@ def validate_exchange(model: ExchangeModel) -> None:
             isinstance(c, int | float) and not isinstance(c, bool) and 0.0 <= c <= 1.0
             for c in background
         )
-    ):  # Q-141, Q-11's range; NaN fails the comparison
+    ):  # D-84, Q-11's range; NaN fails the comparison
         _fail(where, f"background must be three numbers in [0, 1], got {background!r}")
     tau0, tau1 = model.tau0, model.tau1
     if not (math.isfinite(tau0) and math.isfinite(tau1)) or tau1 < tau0:
@@ -344,7 +344,7 @@ def write_exchange(model: ExchangeModel, path: Path) -> None:
         "tau0": repr(float(model.tau0)),
         "tau1": repr(float(model.tau1)),
         "producer": model.producer,
-        # Q-141: the model's background in place of the renderer's default (D-34).
+        # D-84: the model's background in place of the renderer's default (D-34).
         "render_conventions": json.dumps(
             {**_RENDER_CONVENTIONS, "background": [float(c) for c in model.background]},
             separators=(",", ":"),
