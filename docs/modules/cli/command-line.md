@@ -17,7 +17,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (Q-141) |
 | `bench` | a stub until M15: it checks its arguments and returns 1 (Q-130) |
 
-The device is CUDA when PyTorch sees one, else the CPU, and the backend follows it, as in the trainer. `ftgs render` keeps `render()`'s default backend, gsplat, so on a machine without CUDA it needs `--backend reference`, which renders on the CPU (Q-125).
+The device is CUDA when PyTorch sees one, else the CPU, and the backend follows it, as in the trainer. `ftgs render` keeps `render()`'s default backend, gsplat, so on a machine without CUDA it needs `--backend reference`, which renders on the CPU (Q-125). To run `train` or `eval` on the CPU on a machine with a GPU, for example for the bit-exact resume of the reference backend (§2.2), hide the GPU from PyTorch with `CUDA_VISIBLE_DEVICES=""`.
 
 Single-file outputs replace an existing file; directory outputs, a converter's OUT and a fresh run directory, must be absent or empty (Q-126).
 
