@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-144): a smoke test of
-every command on a small synthetic scene, the CLI round trips of U-26, U-22's rejections with
-exit code 2, U-27's exit code, and the train, resume, render, eval and export behaviour.
+"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-144, Q-146): a
+smoke test of every command on a small synthetic scene, the CLI round trips of U-26, U-22's
+rejections with exit code 2, U-27's exit code, and the train, resume, render, eval and export
+behaviour.
 
 The tests call `main(argv)` in process, on the CPU unless marked gpu: `torch.cuda.is_available`
 is patched for the CLI to read False (Q-125). A few subprocess tests run the real entry points.
@@ -1138,3 +1139,140 @@ def test_bench_is_a_stub_until_m15(run: dict[str, Path], tmp_path: Path) -> None
     assert not out.exists()
     assert _ftgs("bench", "warp", run["scene"], "--out", out) == 2
     assert _ftgs("bench", "raster", tmp_path / "none.json", "--out", out) == 2
+
+
+# Single-file outputs are replaced atomically (Q-126 as answered; Q-25's temporary naming; #179).
+
+
+def _fail_partway(monkeypatch: pytest.MonkeyPatch, out: Path) -> None:
+    """Make every safetensors write into `out`'s directory stop partway: it writes a few bytes
+    of its file, then raises OSError, as a full disk would."""
+
+    def partial(tensors: Any, filename: Any, metadata: Any = None) -> None:
+        if Path(filename).parent != out.parent:
+            save_file(tensors, filename, metadata=metadata)
+            return
+        Path(filename).write_bytes(b"\x08\x00")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("openftgs.io.save_file", partial)
+
+
+def _assert_untouched(out: Path, before: bytes | None) -> None:
+    """Q-126: the target is as it was (bitwise, or still absent) and no temporary is left."""
+    if before is None:
+        assert not out.exists()
+    else:
+        assert out.read_bytes() == before
+    assert sorted(p.name for p in out.parent.iterdir() if p.name != out.name) == []
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
+def test_export_that_fails_partway_leaves_the_target_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    """Q-126: an exchange model written partway leaves the old file, or no file, and no
+    temporary; the failure propagates as before (Q-26)."""
+    _, checkpoint = _trained(tmp_path)
+    out = tmp_path / "exports" / "model.safetensors"
+    before = None
+    if existing:
+        assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", out) == 0
+        before = out.read_bytes()
+    else:
+        out.parent.mkdir()
+    _fail_partway(monkeypatch, out)
+    with pytest.raises(OSError, match="No space left"):
+        _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", out)
+    _assert_untouched(out, before)
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
+def test_render_that_fails_partway_leaves_the_target_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    """Q-126: renders written partway leave the old file, or no file, and no temporary; the
+    failure propagates as before (Q-26)."""
+    scene, checkpoint = _trained(tmp_path)
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
+    out = tmp_path / "renders" / "out.safetensors"
+    args = ("render", checkpoint, "--request", request, "--out", out, "--backend", "reference")
+    before = None
+    if existing:
+        assert _ftgs(*args) == 0
+        before = out.read_bytes()
+    else:
+        out.parent.mkdir()
+    _fail_partway(monkeypatch, out)
+    with pytest.raises(OSError, match="No space left"):
+        _ftgs(*args)
+    _assert_untouched(out, before)
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
+def test_init_roma_that_fails_partway_leaves_the_target_as_it_was(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    """Q-126: init points written partway leave the old file, or no file, and no temporary;
+    the failure propagates as before (Q-26). roma_init is stood in for, so no CUDA device or
+    [init] extra is needed."""
+    import openftgs.init
+
+    points = read_init_points(run["init"])
+    monkeypatch.setattr(openftgs.init, "roma_init", lambda video, cfg: points)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
+    out = tmp_path / "points" / "roma.safetensors"
+    before = None
+    if existing:
+        assert _ftgs("init", "roma", run["scene"], out) == 0
+        before = out.read_bytes()
+    else:
+        out.parent.mkdir()
+    _fail_partway(monkeypatch, out)
+    with pytest.raises(OSError, match="No space left"):
+        _ftgs("init", "roma", run["scene"], out)
+    _assert_untouched(out, before)
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
+def test_eval_that_fails_partway_leaves_the_target_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    """Q-126: METRICS.json written partway leaves the old file, or no file, and no temporary;
+    the failure propagates as before (Q-26). Text writes into its directory write a few
+    characters, then raise OSError, as a full disk would."""
+    scene, checkpoint = _trained(tmp_path)
+    out = tmp_path / "metrics" / "METRICS.json"
+    before = None
+    if existing:
+        assert _ftgs("eval", checkpoint, scene, "--out", out) == 0
+        before = out.read_bytes()
+    else:
+        out.parent.mkdir()
+    original = Path.write_text
+
+    def partial(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if self.parent != out.parent:
+            return original(self, data, *args, **kwargs)
+        original(self, data[:5], *args, **kwargs)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_text", partial)
+    with pytest.raises(OSError, match="No space left"):
+        _ftgs("eval", checkpoint, scene, "--out", out)
+    _assert_untouched(out, before)
+
+
+def test_export_replaces_a_symlinked_target_by_a_regular_file(tmp_path: Path) -> None:
+    """Q-146: the atomic replace (Q-126) swaps the directory entry the path names, so a symlink
+    there becomes a regular file and the file it pointed to keeps its content."""
+    _, checkpoint = _trained(tmp_path)
+    elsewhere = tmp_path / "elsewhere.safetensors"
+    elsewhere.write_bytes(b"not overwritten")
+    out = tmp_path / "exports" / "model.safetensors"
+    out.parent.mkdir()
+    out.symlink_to(elsewhere)
+    assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", out) == 0
+    assert not out.is_symlink()
+    read_exchange(out)
+    assert elsewhere.read_bytes() == b"not overwritten"

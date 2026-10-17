@@ -103,6 +103,21 @@ def _write_safetensors(tensors: Mapping[str, Tensor], path: Path, meta: Mapping[
     )
 
 
+def _replace_with_safetensors(
+    tensors: Mapping[str, Tensor], path: Path, meta: Mapping[str, str]
+) -> None:
+    """Q-126 (as answered, #179): write a single-file output to a temporary sibling, named as
+    Q-25's `.<name>.tmp-<pid>`, and rename it over `path`, so a write that fails partway leaves
+    the old file, or no file, and no temporary. A symlink at `path` becomes a regular file
+    (Q-146)."""
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        _write_safetensors(tensors, temporary, meta)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _check_tensor(
     tensors: Mapping[str, Tensor | None],
     name: str,
@@ -200,7 +215,7 @@ def write_init_points(
         "producer": producer,
         **extra,
     }
-    _write_safetensors(tensors, Path(path), meta)
+    _replace_with_safetensors(tensors, Path(path), meta)
 
 
 def read_init_points(path: Path, *, time_unit: str | None = None) -> InitPoints:
@@ -350,7 +365,7 @@ def write_exchange(model: ExchangeModel, path: Path) -> None:
             separators=(",", ":"),
         ),
     }
-    _write_safetensors({k: model.arrays[k] for k in _IF_KEYS}, Path(path), meta)
+    _replace_with_safetensors({k: model.arrays[k] for k in _IF_KEYS}, Path(path), meta)
 
 
 def read_exchange(path: Path) -> ExchangeModel:
@@ -817,7 +832,7 @@ def write_renders(renders: Renders, path: Path, *, producer: str, request_sha256
         "producer": producer,
         "request_sha256": request_sha256,
     }
-    _write_safetensors(tensors, Path(path), meta)
+    _replace_with_safetensors(tensors, Path(path), meta)
 
 
 def read_renders(path: Path, *, request_sha256: str | None = None) -> Renders:

@@ -19,7 +19,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 
 The device is CUDA when PyTorch sees one, else the CPU, and the backend follows it, as in the trainer. `ftgs render` keeps `render()`'s default backend, gsplat, so on a machine without CUDA it needs `--backend reference`, which renders on the CPU (Q-125). To run `train` or `eval` on the CPU on a machine with a GPU, for example for the bit-exact resume of the reference backend (§2.2), hide the GPU from PyTorch with `CUDA_VISIBLE_DEVICES=""`.
 
-Single-file outputs replace an existing file; directory outputs, a converter's OUT and a fresh run directory, must be absent or empty (Q-126).
+Single-file outputs, the init points, the renders, METRICS.json and the exchange model, replace an existing file atomically. Each is written to a temporary sibling named `.<name>.tmp-<pid>`, as checkpoint saves are (Q-25), and then renamed over the target. A write that fails partway leaves the old file, or no file, and removes the temporary. Directory outputs, a converter's OUT and a fresh run directory, must be absent or empty (Q-126).
 
 ## Exit codes
 
