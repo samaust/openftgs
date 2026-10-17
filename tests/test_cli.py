@@ -1146,18 +1146,15 @@ def test_bench_is_a_stub_until_m15(run: dict[str, Path], tmp_path: Path) -> None
 def _fail_partway(monkeypatch: pytest.MonkeyPatch, out: Path) -> None:
     """Make every safetensors write into `out`'s directory stop partway: it writes a few bytes
     of its file, then raises OSError, as a full disk would."""
-    import openftgs.io
-
-    original = openftgs.io.save_file
 
     def partial(tensors: Any, filename: Any, metadata: Any = None) -> None:
         if Path(filename).parent != out.parent:
-            original(tensors, filename, metadata=metadata)
+            save_file(tensors, filename, metadata=metadata)
             return
         Path(filename).write_bytes(b"\x08\x00")
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(openftgs.io, "save_file", partial)
+    monkeypatch.setattr("openftgs.io.save_file", partial)
 
 
 def _assert_untouched(out: Path, before: bytes | None) -> None:
