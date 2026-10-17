@@ -32,8 +32,8 @@ ftgs = "openftgs.cli:main"
 
 [project.optional-dependencies]
 # §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. Q-145: fused-local-corr, RoMa's optional
-# speed-up, isn't listed, since every wheel pins one torch release; it is built from source
-# against the installed torch (README), on every Python as Q-6 already did on 3.14.
+# speed-up, isn't listed, on any Python; it is built from source against the installed torch
+# (README).
 init = [
     "torch>=2.5.1",
     "torchvision",
@@ -93,7 +93,6 @@ module = [
     "gsplat.*",
     "lpips.*",
     "fused_ssim.*",
-    "fused_local_corr.*",
     "scipy.*",
     "yaml.*",
     "skimage.*",
