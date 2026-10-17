@@ -31,7 +31,7 @@ dependencies = [
 ftgs = "openftgs.cli:main"
 
 [project.optional-dependencies]
-# §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. Q-145: fused-local-corr, RoMa's optional
+# §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. D-85: fused-local-corr, RoMa's optional
 # speed-up, isn't listed, on any Python; it is built from source against the installed torch
 # (README).
 init = [

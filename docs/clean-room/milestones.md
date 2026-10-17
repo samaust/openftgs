@@ -1,6 +1,6 @@
 # Milestones
 
-Nineteen milestones, M0 to M18, build `openftgs` bottom-up along the dependency bands of spec §2.1 (`docs/spec/openftgs-spec.md`, revision 549g). Each one lands with the spec tests that pin it; a test listed under a milestone must pass before the next milestone starts. The order is the spec author's suggestion, not part of the spec.
+Nineteen milestones, M0 to M18, build `openftgs` bottom-up along the dependency bands of spec §2.1 (`docs/spec/openftgs-spec.md`, revision 549h). Each one lands with the spec tests that pin it; a test listed under a milestone must pass before the next milestone starts. The order is the spec author's suggestion, not part of the spec.
 
 How to run one. Each milestone runs as one PRD through the skills in `.claude/skills/`:
 
