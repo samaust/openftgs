@@ -31,14 +31,14 @@ dependencies = [
 ftgs = "openftgs.cli:main"
 
 [project.optional-dependencies]
-# §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1; fused-local-corr is a Linux-only speed-up.
-# Q-6: it has no wheels for Python 3.14; there it is built from source (README).
+# §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. Q-145: fused-local-corr, RoMa's optional
+# speed-up, isn't listed, since every wheel pins one torch release; it is built from source
+# against the installed torch (README), on every Python as Q-6 already did on 3.14.
 init = [
     "torch>=2.5.1",
     "torchvision",
     "einops",
     "loguru",
-    "fused-local-corr>=0.2.2; sys_platform == 'linux' and python_version < '3.14'",
 ]
 # Q-2: fused-ssim is not on PyPI; the README says how to install it.
 fast = []

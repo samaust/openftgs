@@ -175,3 +175,13 @@ def test_openftgs_distribution_packages_only_src() -> None:
     assert isinstance(tool, dict)
     assert tool["setuptools"]["packages"]["find"]["where"] == ["src"]
     assert not (ROOT / "src" / "ftgs_harness").exists()
+
+
+def test_init_extra_leaves_torch_to_the_user() -> None:
+    """Q-145 (#2): `[init]` lists no fused-local-corr, on any Python. Its wheels pin one exact
+    torch release (0.3.211: torch==2.11.0), so listing it moves the user's torch; it is built
+    from source against the installed torch instead (README), as Q-6 does on 3.14."""
+    project = _pyproject(ROOT / "pyproject.toml")["project"]
+    assert isinstance(project, dict)
+    init = project["optional-dependencies"]["init"]
+    assert "fused-local-corr" not in {_requirement_name(r) for r in init}
