@@ -7,6 +7,7 @@ form, crops built pixel by pixel) or come from torchmetrics' LPIPS, an oracle re
 another library's code path to the same published weights (§2.3).
 """
 
+import dataclasses
 import json
 import math
 import warnings
@@ -26,6 +27,7 @@ from openftgs.eval import (
     Evaluator,
     ImageMetrics,
     average_metrics,
+    check_nan_metrics,
     dssim_k,
     dynamic_region,
     evaluate_images,
@@ -61,6 +63,7 @@ def test_public_api() -> None:
         "ImageMetrics",
         "METRIC_NAMES",
         "average_metrics",
+        "check_nan_metrics",
         "dssim_k",
         "dynamic_region",
         "evaluate_images",
@@ -533,6 +536,52 @@ def test_metrics_report_counts_the_images_without_a_mask() -> None:
     )
     assert partial["dynamic"]["missing"] == 2
     assert metrics_report(masked, split="test", metadata={})["dynamic"]["missing"] == 0
+
+
+# A NaN metric is a numerical failure (§2.1 exit code 3; Q-129, Q-148).
+
+
+def test_check_nan_metrics_names_the_image_with_a_nan_metric() -> None:
+    """Q-129, Q-148: a NaN among an image's entire-image metrics raises FloatingPointError
+    naming that image's path, and only that one."""
+    images = [_image(0, frame=0), _image(1, frame=1), _image(2, frame=2)]
+    images[1] = dataclasses.replace(images[1], entire={**_values(0.0), "lpips_vgg": math.nan})
+    with pytest.raises(FloatingPointError) as raised:
+        check_nan_metrics(images)
+    message = str(raised.value)
+    assert images[1].path in message
+    assert images[0].path not in message and images[2].path not in message
+
+
+def test_check_nan_metrics_sees_the_dynamic_region() -> None:
+    """Q-129 ("entire or dynamic"), Q-148: a NaN in an image's dynamic-region metrics alone,
+    its entire-image metrics finite, raises too."""
+    dynamic = {**_values(1.0), "ssim2": math.nan}
+    images = [_image(0, frame=0, dynamic=_values(1.0), masked=True)]
+    images.append(_image(1, frame=1, dynamic=dynamic, masked=True))
+    with pytest.raises(FloatingPointError, match=images[1].path):
+        check_nan_metrics(images)
+
+
+def test_check_nan_metrics_allows_a_perfect_render_and_a_skipped_region() -> None:
+    """Q-129, Q-63: a perfect render's +inf PSNR is allowed, and so is a masked image whose
+    dynamic region was skipped (Q-61): neither is a failed render."""
+    perfect = ImageMetrics("c", 0.0, 0, "p.png", {**_values(0.0), "psnr": math.inf}, None, False)
+    skipped = _image(1, frame=1, dynamic=None, masked=True)
+    check_nan_metrics([perfect, skipped])
+
+
+def test_check_nan_metrics_names_up_to_five_images() -> None:
+    """Q-129: the message gives the number of images with a NaN metric and names the first five,
+    in the order given (the manifest's, Q-68)."""
+    nan = {**_values(0.0), "psnr": math.nan}
+    images = [dataclasses.replace(_image(k, frame=k), entire=nan) for k in range(7)]
+    with pytest.raises(FloatingPointError) as raised:
+        check_nan_metrics(images)
+    message = str(raised.value)
+    assert "7" in message
+    assert all(image.path in message for image in images[:5])
+    assert images[5].path not in message and images[6].path not in message
 
 
 def _manifest(tmp_path: Path) -> MultiViewVideo:

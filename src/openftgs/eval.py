@@ -30,6 +30,7 @@ __all__ = [
     "Evaluator",
     "ImageMetrics",
     "average_metrics",
+    "check_nan_metrics",
     "dssim_k",
     "dynamic_region",
     "evaluate_images",
@@ -302,6 +303,21 @@ def evaluate_images(
                 masked=mask is not None,
             )
     return [results[i] for i in indices]
+
+
+# Q-129, Q-148: the check `Trainer.evaluate` and `ftgs eval` make before anything is written.
+def check_nan_metrics(images: Sequence[ImageMetrics]) -> None:
+    """Raise FloatingPointError when a metric of `images` is NaN. Finite renders give finite
+    metrics or a perfect render's +inf PSNR, never NaN, so a NaN can only come from a render
+    that isn't finite (§2.1 exit code 3)."""
+    bad = [
+        image.path
+        for image in images
+        if any(math.isnan(v) for v in image.entire.values())
+        or (image.dynamic is not None and any(math.isnan(v) for v in image.dynamic.values()))
+    ]
+    if bad:
+        raise FloatingPointError(f"NaN metrics for {len(bad)} image(s): {bad[:5]}")
 
 
 _REPORT = "ftgs-metrics"  # Q-63
