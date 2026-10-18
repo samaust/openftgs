@@ -36,6 +36,7 @@ from openftgs.density import (
 from openftgs.eval import (
     Evaluator,
     average_metrics,
+    check_nan_metrics,
     evaluate_images,
     metrics_report,
     write_metrics,
@@ -723,7 +724,8 @@ class Trainer:
     def evaluate(self, split: str = "test", *, out_dir: Path | None = None) -> dict[str, float]:
         """The E16 metrics of a data split's images: the scene means of the entire images, and
         under "dynamic/<name>" those of the dynamic regions when there are any. With `out_dir`,
-        METRICS.json is written there (Q-63, Q-74)."""
+        METRICS.json is written there (Q-63, Q-74). A NaN metric raises FloatingPointError
+        before anything is written (Q-129, Q-147)."""
         if self._evaluator is None:
             self._evaluator = Evaluator(device=self._device)
         images = evaluate_images(
@@ -734,6 +736,7 @@ class Trainer:
             backend=self._backend,
             background=self._cfg.background,
         )
+        check_nan_metrics(images)  # Q-147
         result = average_metrics([image.entire for image in images])
         dynamic = [image.dynamic for image in images if image.dynamic is not None]
         if dynamic:
