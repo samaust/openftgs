@@ -493,7 +493,10 @@ def _train(args: argparse.Namespace) -> int:
         return 128 + signals.received
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
         with _environment("LPIPS networks"):
-            trainer.evaluate("test", out_dir=run_dir)
+            try:
+                trainer.evaluate("test", out_dir=run_dir)
+            except FloatingPointError as error:  # Q-129, Q-147: a NaN metric; nothing is written
+                _fail(str(error), _NUMERIC)
     return 0
 
 
@@ -648,7 +651,13 @@ def _match_renders(
 
 
 def _eval(args: argparse.Namespace) -> int:
-    from openftgs.eval import Evaluator, evaluate_images, metrics_report, write_metrics
+    from openftgs.eval import (
+        Evaluator,
+        check_nan_metrics,
+        evaluate_images,
+        metrics_report,
+        write_metrics,
+    )
 
     device = _device()
     loaded = _load_model(args.model, device)
@@ -675,6 +684,10 @@ def _eval(args: argparse.Namespace) -> int:
         background=loaded.background,
         renders=supplied,
     )
+    try:
+        check_nan_metrics(images)
+    except FloatingPointError as error:  # Q-129: nothing is written
+        _fail(str(error), _NUMERIC)
     body = metrics_report(images, split=args.split, metadata=video.manifest.metadata)
     write_metrics(
         args.out,
