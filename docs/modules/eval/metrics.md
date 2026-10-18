@@ -1,6 +1,6 @@
 # Metrics in `openftgs.eval`
 
-How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's. `eval` imports only `losses`. It never renders: renders come from `render.render_request` (Q-57), so the metrics stay pure tensor functions that run on the CPU.
+How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's, with `check_nan_metrics` (Q-148). `eval` imports only `losses`. It never renders: renders come from `render.render_request` (Q-57), so the metrics stay pure tensor functions that run on the CPU.
 
 ## The metrics
 
@@ -33,6 +33,8 @@ Each metric is computed per test image, averaged over a scene's test images, the
 `write_metrics` adds the header and writes the file without NaN or Infinity, as every JSON file of the package is written (Q-25). It replaces an existing file atomically: a temporary sibling is renamed over it, so a write that fails partway leaves the old file (Q-126, Q-146). It is the one writer of METRICS.json, for `Trainer.evaluate` and `ftgs eval` alike (Q-136). The header holds `producer`; `model`, as {`path`, `iteration`}, either of which may be null (a trainer's model has no file, an exchange model no iteration); and the scene manifest as `manifest` ({`path`, `sha256`}), because `scene` already holds the per-scene means (Q-63). When `ftgs eval` scores supplied renders, a `renders` entry ({`dir`, `request_sha256`, `producer`}) says what was scored (Q-137).
 
 The `dynamic` block counts under `missing` the images of the split that have no mask, 0 for a full set, so a partial set is visible in the report (Q-135); `ftgs eval` and `ftgs train` refuse a partial set before doing any work.
+
+A null in the report means "not defined here": a perfect render's PSNR, a mean over no images, a dynamic region that was skipped (Q-61). It never stands for a failed render: `check_nan_metrics` raises `FloatingPointError`, naming up to five images, when a metric of an image's entire frame or dynamic region is NaN, which only a render that isn't finite gives, and `Trainer.evaluate` and `ftgs eval` call it before anything is written (Q-129, Q-147, Q-148).
 
 ## The Fastest-10 frames
 
