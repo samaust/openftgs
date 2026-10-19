@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared test scenes for the test suite (forward note on PRD #20): random models and cameras,
-the hand-built render scenes and U-8's scenes that both render backends' tests use, U-4's
-change of time unit, and scenes written to disk as a scene manifest with its images, with the
+the hand-built render scenes and U-8's and U-32's scenes that both render backends' tests use,
+U-4's change of time unit, and scenes written to disk as a scene manifest with its images, with the
 shortened calendars of §3.2 (PRD #84, shared with M11).
 
 Each test file still writes out its own `PARAM_NAMES` from §1.1: that tuple is the tests'
@@ -27,7 +27,7 @@ from torch import Tensor
 from openftgs.config import TrainConfig
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
-from openftgs.types import Camera, ExchangeModel, TimeNormalizer
+from openftgs.types import Camera, ExchangeModel, RenderItem, RenderRequest, TimeNormalizer
 
 UNIT_TIME = TimeNormalizer(0.0, 1.0)
 C0 = 0.28209479177387814  # §1.1
@@ -283,6 +283,147 @@ U8_CASES: dict[str, tuple[int, int | None, bool]] = {  # n, rows passing the cul
     "depth tie": (33, None, True),
     "depth tie, more rows": (64, None, True),
 }
+
+
+# U-32's scene and times (D-55; Q-174), shared by both backends' U-32 tests.
+
+U32_WIDTH = 1.0 / 29.0  # the bucket width: Δt_f of 30 frames over t ∈ [0, 1]
+U32_BOUND_TIME = 11 * U32_WIDTH  # a bucket edge, at which rows sit on the 1/255 bound
+# Camera B: camera A's pose with the principal point moved, so camera A's pixel centers fall
+# between camera B's.
+CAM_B = pinhole(64, 48, fx=16.0, fy=16.0, cx=30.25, cy=22.75, name="b")
+
+
+def u32_scene() -> FreeTimeGaussians:
+    """Rows of five kinds in front of CAM_A and CAM_B (both 64×48, unit time span):
+
+    - 160 random rows at depths 5 to 8, durations s from e^−5.5 to e^−3 and time centers in
+      [−0.1, 1.1], so each can pass the opacity cull over a stretch of time from about one to
+      about ten bucket widths, some of it outside [0, 1];
+    - 12 long rows, with s from e^0.5 to e^2, which can pass it at every time in [0, 1];
+    - 12 rows with 255σ ≤ 1 (logit −7), which never pass it;
+    - rows at the cull bound at time U32_BOUND_TIME, each at depth 4 on its own pixel center of
+      CAM_A (so in front of the random rows) with color 1: 81 logits one float32 ulp apart around
+      logit(1/255), with time centers float32(U32_BOUND_TIME) so that σt = 1 there; then the first
+      of those logits above the bound with time centers δ = 2·10⁻⁵·j earlier (s = 1, j = 1 … 100),
+      whose σt < 1 lowers σ_eff in sub-ulp steps, so that rows land exactly on float32(1/255) and
+      one float32 ulp either side of it;
+    - last, two opaque rows tied in depth at one place, the first passing the cull at every time
+      (s = e²), the second only around t = 0.5 (s = e^−4.5), with different colors, so the order in
+      which they composite shows."""
+    g = torch.Generator().manual_seed(32)
+
+    def uniform(*shape: int, low: float, high: float) -> Tensor:
+        return low + (high - low) * torch.rand(*shape, generator=g)
+
+    rows: list[dict[str, Any]] = []
+    for kind, count in (("random", 160), ("long", 12), ("faint", 12)):
+        depth = uniform(count, low=5.0, high=8.0)
+        xy = uniform(count, 2, low=-1.8, high=1.8) * depth[:, None]
+        log_durations = {
+            "random": uniform(count, low=-5.5, high=-3.0),
+            "long": uniform(count, low=0.5, high=2.0),
+            "faint": uniform(count, low=-3.0, high=0.0),
+        }[kind]
+        times = (
+            uniform(count, low=-0.1, high=1.1)
+            if kind == "random"
+            else uniform(count, low=0, high=1)
+        )
+        logits = torch.full((count,), -7.0) if kind == "faint" else uniform(count, low=-2, high=3)
+        for i in range(count):
+            rows.append(
+                {
+                    "mean": (float(xy[i, 0]), float(xy[i, 1]), float(depth[i])),
+                    "time": float(times[i]),
+                    "log_duration": float(log_durations[i]),
+                    "velocity": tuple(float(v) for v in 0.3 * torch.randn(3, generator=g)),
+                    "scale": tuple(float(a) for a in uniform(3, low=0.3, high=0.9)),
+                    "quat": tuple(float(q) for q in torch.randn(4, generator=g)),
+                    "logit": float(logits[i]),
+                    "sh0": tuple(float(c) for c in torch.randn(3, generator=g)),
+                }
+            )
+    threshold = torch.tensor(1.0 / 255.0, dtype=torch.float32)
+    logit = torch.tensor(logit_of(1.0 / 255.0), dtype=torch.float32)
+    up, down = [logit], [logit]
+    for _ in range(40):
+        up.append(torch.nextafter(up[-1], torch.tensor(math.inf)))
+        down.append(torch.nextafter(down[-1], torch.tensor(-math.inf)))
+    logits_at = [float(x) for x in reversed(down[1:])] + [float(x) for x in up]
+    sigma = torch.sigmoid(torch.tensor(logits_at, dtype=torch.float32))
+    first_above = logits_at[int(torch.nonzero(sigma > threshold)[0])]
+    bound = float(torch.tensor(U32_BOUND_TIME, dtype=torch.float32))
+    params = [(x, bound, 20.0) for x in logits_at] + [
+        (first_above, U32_BOUND_TIME - 2e-5 * j, 0.0) for j in range(1, 101)
+    ]
+    pixels = [(v, u) for v in range(2, 48, 3) for u in range(2, 63, 3)][: len(params)]
+    for (x, time, log_duration), (v, u) in zip(params, pixels, strict=True):
+        rows.append(
+            {
+                "mean": ((u - 32) / 4, (v - 24) / 4, 4.0),
+                "logit": x,
+                "time": time,
+                "log_duration": log_duration,
+                "sh0": sh0_for((1.0, 1.0, 1.0)),
+            }
+        )
+    for log_duration, color in ((2.0, (1.0, 0.0, 0.0)), (-4.5, (0.0, 1.0, 0.0))):
+        # A depth tie between a row that passes the cull at every time and a later row that
+        # passes it only around t = 0.5: E6 composites the lower row first (Q-33).
+        rows.append(
+            {
+                "mean": (0.0, 1.5, 4.5),
+                "logit": 3.0,
+                "log_duration": log_duration,
+                "scale": 0.4,
+                "sh0": sh0_for(color),
+            }
+        )
+    return model_from_rows(rows)
+
+
+def u32_times() -> list[float]:
+    """U-32's 100 times: 0 and 1, the bucket edges k·U32_WIDTH for k = 1, 7, 11, 20 and 28 and
+    one float64 ulp either side of each, and 83 seeded uniform times in [0, 1]."""
+    edges = []
+    for k in (1, 7, 11, 20, 28):
+        edge = k * U32_WIDTH
+        edges += [math.nextafter(edge, -math.inf), edge, math.nextafter(edge, math.inf)]
+    fixed = [0.0, 1.0, *edges]
+    g = torch.Generator().manual_seed(3200)
+    drawn = torch.rand(100 - len(fixed), generator=g, dtype=torch.float64).tolist()
+    return fixed + drawn
+
+
+def u32_request(times: Sequence[float], cameras: Sequence[Camera]) -> RenderRequest:
+    """One item per time and camera, in time order; the unit time span makes each raw τ its
+    normalized t."""
+    items = tuple(
+        RenderItem(
+            f"{i}-{c}", t, Camera(cam.K, cam.world_to_camera, cam.width, cam.height, f"{i}-{c}")
+        )
+        for i, t in enumerate(times)
+        for c, cam in enumerate(cameras)
+    )
+    return RenderRequest(items=items, time_unit="s", background=(0.1, 0.2, 0.3))
+
+
+def index_lookups(monkeypatch: Any) -> dict[float, Tensor]:
+    """Records, by normalized time, the rows the temporal index hands to each render (Q-174):
+    the private seam U-32's "rows passed" check reads."""
+    import openftgs.render
+
+    seen: dict[float, Tensor] = {}
+    lookup = openftgs.render._TemporalIndex.rows
+
+    def rows(self: Any, t: float) -> Tensor:
+        found: Tensor = lookup(self, t)
+        seen[t] = found.cpu()
+        return found
+
+    monkeypatch.setattr(openftgs.render._TemporalIndex, "rows", rows)
+    return seen
 
 
 # U-4's change of time unit (E14, §1.4 "Time"), shared by both backends' U-4 tests.

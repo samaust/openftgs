@@ -999,6 +999,66 @@ def test_render_answers_a_request(tmp_path: Path) -> None:
         assert f.metadata()["request_sha256"] == sha
 
 
+def _model_of_kind(tmp_path: Path, checkpoint: Path, kind: str) -> tuple[Path, float | None]:
+    """MODEL as the checkpoint itself or as its export, with the Δt_f it carries (normalized
+    time, E14), None for an exchange model, which carries none."""
+    if kind == "checkpoint":
+        frame_dt = load_checkpoint(checkpoint).frame_dt
+        assert 0.0 < frame_dt < 1.0
+        return checkpoint, frame_dt
+    exchange = tmp_path / "m.safetensors"
+    assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
+    return exchange, None
+
+
+@pytest.mark.parametrize("kind", ["checkpoint", "exchange"])
+def test_render_passes_a_checkpoints_frame_interval_as_the_bucket_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Q-174: ftgs render passes a checkpoint's Δt_f to render_request as the temporal index's
+    bucket width, and None for an exchange model."""
+    import openftgs.render
+
+    scene, checkpoint = _trained(tmp_path)
+    model, frame_dt = _model_of_kind(tmp_path, checkpoint, kind)
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
+    original = openftgs.render.render_request
+    seen: list[Any] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("frame_dt", "absent"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(openftgs.render, "render_request", spy)
+    out = tmp_path / "r.safetensors"
+    ref = ("--backend", "reference")
+    assert _ftgs("render", model, "--request", request, "--out", out, *ref) == 0
+    assert seen == [frame_dt]
+
+
+@pytest.mark.parametrize("kind", ["checkpoint", "exchange"])
+def test_eval_passes_a_checkpoints_frame_interval_as_the_bucket_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Q-174, Q-183: ftgs eval passes a checkpoint's Δt_f, through evaluate_images, to the
+    render request of each timestamp, and None for an exchange model. (The render here stops
+    the command, as a render that isn't finite does, before any metric needs LPIPS weights.)"""
+    import openftgs.eval
+
+    scene, checkpoint = _trained(tmp_path)
+    model, frame_dt = _model_of_kind(tmp_path, checkpoint, kind)
+    seen: list[Any] = []
+
+    def stopping(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("frame_dt", "absent"))
+        raise FloatingPointError("stopped by the test")
+
+    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", lambda self, **kwargs: None)
+    monkeypatch.setattr("openftgs.eval.render_request", stopping)
+    assert _ftgs("eval", model, scene, "--out", tmp_path / "m.json") == 3
+    assert seen == [frame_dt]
+
+
 def test_render_refuses_invalid_requests_and_the_default_backend_without_cuda(
     tmp_path: Path,
 ) -> None:

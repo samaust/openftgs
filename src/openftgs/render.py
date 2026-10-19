@@ -7,8 +7,10 @@ Spec: E2, E5, E6, D-3, D-4, D-6, D-12, D-28, D-31, D-32, D-34, D-55, D-57. Band:
 (§2.1).
 """
 
+import itertools
 import math
 import numbers
+import statistics
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
@@ -19,6 +21,7 @@ from torch import Tensor
 
 from openftgs._stages import point, stage
 from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
+from openftgs.motion import temporal_slice
 from openftgs.sh import sh_basis
 from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders
 
@@ -44,6 +47,25 @@ _RASTERIZE_MODE: Literal["classic", "antialiased"] = (
 )
 _TILE_SIZE = 16  # D-57
 _RADIUS_CLIP = 0.0  # D-57: no primitive is skipped for its size
+
+# D-55's temporal index (Q-174).
+_INDEX_MIN_TIMES = 8  # Q-174: temporal_index None needs this many distinct times; B-7 (#231) sets T
+_INDEX_OPACITY_MARGIN = 1e-4  # D-55's margin: rows are listed where 255σ(1 + 10⁻⁴)·σt can reach 1
+_INDEX_TIME_MARGIN = 1e-6  # D-55's margin: added to each row's reach, in normalized time
+_INDEX_LONG = 8  # Q-174: rows whose reach covers more buckets go to the long list
+_INDEX_MIN_WIDTH = 2.0**-30  # keeps bucket numbers small integers; images don't depend on the width
+# Q-174's fallback, should U-32 on gsplat differ at the cull bound: True makes the gsplat backend
+# slice every row and keep the listed ones after, as the reference backend does.
+_GSPLAT_FULL_SLICE = False
+_SLICE_INPUTS = (  # the stored tensors the temporal slice reads, in its argument order (Q-12)
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+)
 
 _Backend = Literal["gsplat", "reference"]
 _TimeUnits = Literal["raw", "normalized"]
@@ -112,15 +134,35 @@ def render(
 
 
 def render_request(
-    model: FreeTimeGaussians, request: RenderRequest, *, backend: _Backend = "gsplat"
+    model: FreeTimeGaussians,
+    request: RenderRequest,
+    *,
+    backend: _Backend = "gsplat",
+    temporal_index: bool | None = None,  # Q-174
+    frame_dt: float | None = None,  # Q-174
+    device: str | torch.device = "cpu",  # Q-174
 ) -> Renders:
     """Answer a render request (§2.2, Q-57): one image and alpha per item, at the item's raw
     timestamp, with the request's background and SH degree, keyed by item id in request order.
 
-    Items that share a timestamp and an image size render in one `render()` call (D-55); the
-    temporal index comes in M15. Item ids must be unique; outputs are keyed by them, whatever
-    the cameras' names. Runs in inference mode; outputs are CPU inference tensors.
+    Items that share a timestamp and an image size render in one call (D-55). Item ids must be
+    unique; outputs are keyed by them, whatever the cameras' names. Runs in inference mode;
+    outputs are inference tensors on `device`, the CPU by default.
+
+    The temporal index of D-55 (Q-174) renders each timestamp inside the training span, a
+    normalized time in [0, 1], from the rows that can pass the opacity cull then, with images
+    unchanged (U-32); other timestamps render as without it. `temporal_index` None turns it on for
+    the gsplat backend when the request has at least `_INDEX_MIN_TIMES` distinct times in
+    [0, 1]; True or False forces it. `frame_dt` is the buckets' width in normalized time, Δt_f
+    (E14) for a model from a checkpoint; None takes the median gap between the request's
+    distinct times in [0, 1].
     """
+    _check_choice("backend", backend, get_args(_Backend))
+    if temporal_index is not None and not isinstance(temporal_index, bool):  # Q-174
+        raise ValueError(f"temporal_index must be None or a bool, got {temporal_index!r}")
+    if frame_dt is not None:  # Q-174
+        _check_frame_dt(frame_dt)
+    out_device = _output_device(device)
     # Q-57, Q-17: the timestamps are raw τ in the request's unit, which must be the model's.
     if request.time_unit != model.time_unit:
         raise ValueError(
@@ -134,23 +176,45 @@ def render_request(
     for item in request.items:
         key = (item.timestamp, item.camera.width, item.camera.height)
         groups.setdefault(key, []).append(item)
-    background = torch.tensor(request.background, dtype=torch.float32)
+    for group in groups.values():
+        _check_cameras([item.camera for item in group])
+    times = {key: _time_in_span(model, key[0]) for key in groups}
+    inside = sorted({t for t in times.values() if t is not None})
     rgb: dict[str, Tensor] = {}
     alpha: dict[str, Tensor] = {}
     with torch.inference_mode():
-        for (timestamp, _, _), group in groups.items():
-            # D-55: cameras that share a time (and, for render(), a size) render in one call.
-            out = render(
-                model,
-                [item.camera for item in group],
-                timestamp,
-                sh_degree=request.sh_degree,
-                background=background,
-                backend=backend,
-            )
+        like = model.means
+        background = _request_background(request.background, like)  # Q-174: once per request
+        cameras = _staged_cameras(request.items, like.device)
+        index: _TemporalIndex | None = None
+        sh: Tensor | None = None
+        if inside and _index_on(temporal_index, backend, len(inside)):
+            if backend == "gsplat":
+                _check_gsplat_model(model)
+            with stage("slice.sh_concat"):  # Q-174: once per request
+                sh = _sh_concat(model, request.sh_degree)
+            index = _TemporalIndex(model, _bucket_width(frame_dt, inside), inside)
+        for key, group in groups.items():
+            cams = [cameras[item.id] for item in group]
+            t = times[key]
+            if index is not None and sh is not None and t is not None:
+                image, alphas = _render_indexed(
+                    model, cams, t, index.rows(t), sh=sh, background=background, backend=backend
+                )
+            else:
+                # D-55: cameras that share a time (and, for render(), a size) render in one call.
+                out = render(
+                    model,
+                    cams,
+                    key[0],
+                    sh_degree=request.sh_degree,
+                    background=background,
+                    backend=backend,
+                )
+                image, alphas = out.image, out.alpha
             for k, item in enumerate(group):
-                rgb[item.id] = out.image[k].cpu()
-                alpha[item.id] = out.alpha[k].cpu()
+                rgb[item.id] = image[k].to(out_device)
+                alpha[item.id] = alphas[k].to(out_device)
     return Renders(rgb={i: rgb[i] for i in ids}, alpha={i: alpha[i] for i in ids})
 
 
@@ -282,6 +346,252 @@ def _camera_tensors(camera: Camera, like: Tensor) -> _CameraTensors:
         width=camera.width,
         height=camera.height,
     )
+
+
+# Rendering a request: its once-per-request parts and the temporal index (D-55; Q-57, Q-174).
+
+
+def _check_frame_dt(frame_dt: object) -> None:
+    # Q-174: a finite positive real number (not a bool), in normalized time.
+    if (
+        isinstance(frame_dt, bool)
+        or not isinstance(frame_dt, numbers.Real)
+        or not (math.isfinite(float(frame_dt)) and float(frame_dt) > 0.0)
+    ):
+        raise ValueError(f"frame_dt must be a finite positive number, got {frame_dt!r}")
+
+
+def _time_in_span(model: FreeTimeGaussians, timestamp: object) -> float | None:
+    """Q-174: the normalized time of a raw timestamp inside the training span [τ₀, τ₁], which
+    lies in [0, 1] and draws no warning; None for any other timestamp, which goes to `render()`
+    to be checked and warned about as before (Q-9, Q-32)."""
+    if isinstance(timestamp, bool) or not isinstance(timestamp, numbers.Real):
+        return None
+    value = float(timestamp)
+    if not model.time.tau0 <= value <= model.time.tau1:  # NaN included
+        return None
+    return model.time.to_t(value)
+
+
+def _output_device(device: str | torch.device) -> torch.device:
+    try:
+        return torch.device(device)
+    except (RuntimeError, TypeError) as error:
+        raise ValueError(f"device must name a torch device, got {device!r}") from error
+
+
+def _request_background(values: Sequence[float], like: Tensor) -> Tensor:
+    """The request's background [3], in float32 as render requests have always passed it (Q-57),
+    on the model's device: filled there rather than copied from the host, so building it doesn't
+    synchronize (Q-174)."""
+    return torch.stack([like.new_full((), float(v), dtype=torch.float32) for v in values])
+
+
+def _staged_cameras(items: Sequence[RenderItem], device: torch.device) -> dict[str, Camera]:
+    """Each item's camera by item id, with its tensors on the model's device (Q-174). Cameras
+    held on the host go to a CUDA device in one copy for the whole request, staged in pinned
+    memory and sent without blocking, so that no render synchronizes to copy them (§2.4 rule 3);
+    their values are unchanged."""
+    cameras = {item.id: item.camera for item in items}
+    if device.type != "cuda":
+        return cameras
+    host = [
+        item
+        for item in items
+        if item.camera.K.device.type == "cpu" and item.camera.world_to_camera.device.type == "cpu"
+    ]
+    if not host:
+        return cameras
+    flat = torch.cat(
+        [
+            torch.cat([item.camera.K.reshape(-1), item.camera.world_to_camera.reshape(-1)])
+            for item in host
+        ]
+    )
+    sent = flat.reshape(len(host), 25).pin_memory().to(device, non_blocking=True)
+    for row, item in zip(sent, host, strict=True):
+        cam = item.camera
+        cameras[item.id] = Camera(
+            row[:9].reshape(3, 3), row[9:].reshape(4, 4), cam.width, cam.height, cam.name
+        )
+    return cameras
+
+
+def _index_on(temporal_index: bool | None, backend: str, distinct_times: int) -> bool:
+    """Q-174: whether a request with this many distinct times in [0, 1] renders through the
+    temporal index. None turns it on for gsplat from `_INDEX_MIN_TIMES` times, so never for one
+    time; the threshold is provisional until B-7 (#231) measures it."""
+    if temporal_index is not None:
+        return temporal_index
+    return backend == "gsplat" and distinct_times >= _INDEX_MIN_TIMES
+
+
+def _bucket_width(frame_dt: float | None, times: Sequence[float]) -> float:
+    """Q-174: the buckets' width in normalized time: `frame_dt` when given, otherwise the median
+    gap between the request's distinct times in [0, 1] (`times`, ascending), as Q-8 takes
+    medians, and 1 for a single time, as E14 gives Δt_f = 1 for a single timestamp (Q-8). Never
+    below `_INDEX_MIN_WIDTH`; the images are the same at any width."""
+    if frame_dt is not None:
+        width = float(frame_dt)
+    elif len(times) >= 2:
+        width = statistics.median([b - a for a, b in itertools.pairwise(times)])
+    else:
+        width = 1.0
+    return max(width, _INDEX_MIN_WIDTH)
+
+
+def _sh_concat(model: FreeTimeGaussians, sh_degree: int | None) -> Tensor:
+    """The SH coefficients of every row cut to the request's degree, as `at_time` concatenates
+    them (Q-20), built once per request (Q-174); `at_time`'s check of the degree."""
+    degree = model.sh_degree if sh_degree is None else sh_degree
+    allowed = tuple(range(model.sh_degree + 1))
+    if isinstance(degree, bool) or not isinstance(degree, int) or degree not in allowed:
+        raise ValueError(f"sh_degree must be one of {allowed}, got {degree!r}")
+    return torch.cat([model.sh0, model.shN[:, : (degree + 1) ** 2 - 1]], dim=1)
+
+
+class _TemporalIndex:
+    """D-55's temporal index of one model for the times of one request (Q-174).
+
+    Normalized time is cut into buckets `width` wide; time t falls in bucket ⌊t·(1/width)⌋. A row
+    is listed in every bucket that its reach touches inside [0, 1], the reach being the times
+    at which its effective opacity can reach 1/255, widened by D-55's margins and computed in
+    float64: |t − μt| ≤ s·√(2 ln(255σ(1 + 10⁻⁴))) + 10⁻⁶. A row with 255σ(1 + 10⁻⁴) ≤ 1 can never
+    reach it and is never listed. A row whose reach covers more than `_INDEX_LONG` buckets is
+    kept once, on a long list that every render takes; the others are stored per bucket, in
+    ascending row order. Only the buckets of the request's times are kept.
+
+    Building the index reads counts back from the device, so it synchronizes; a lookup doesn't.
+    """
+
+    def __init__(self, model: FreeTimeGaussians, width: float, times: Sequence[float]) -> None:
+        self._scale = 1.0 / width
+        f64 = torch.float64
+        device = model.means.device
+        mu = model.times.detach().to(f64)
+        peak = 255.0 * torch.sigmoid(model.opacity_logits.detach().to(f64))
+        peak = peak * (1.0 + _INDEX_OPACITY_MARGIN)
+        reachable = peak > 1.0
+        spread = torch.sqrt(2.0 * torch.log(torch.where(reachable, peak, 1.0)))
+        reach = torch.exp(model.log_durations.detach().to(f64)) * spread + _INDEX_TIME_MARGIN
+        low = torch.clamp(mu - reach, min=0.0)
+        high = torch.clamp(mu + reach, max=1.0)
+        # The same rounding as `_bucket`: a time in [low, high] falls in a bucket in [first, last].
+        first = torch.floor(low * self._scale)
+        last = torch.floor(high * self._scale)
+        listed = reachable & (low <= high)
+        long = listed & (last - first >= _INDEX_LONG)
+        self._long = torch.nonzero(long).squeeze(1)
+        short = torch.nonzero(listed & ~long).squeeze(1)
+        steps = torch.arange(_INDEX_LONG, device=device)
+        buckets = first[short].to(torch.int64)[:, None] + steps
+        covered = steps <= (last[short] - first[short]).to(torch.int64)[:, None]
+        # Each row's buckets in row order, so a stable sort by bucket keeps every bucket's rows
+        # ascending (ties in depth then composite in row order, as without the index).
+        by_bucket = torch.sort(buckets[covered], stable=True)
+        self._rows = short[:, None].expand_as(buckets)[covered][by_bucket.indices]
+        keys = sorted({self._bucket(t) for t in times})
+        wanted = torch.tensor(keys, dtype=torch.int64, device=device)
+        starts = torch.searchsorted(by_bucket.values, wanted)
+        stops = torch.searchsorted(by_bucket.values, wanted, right=True)
+        bounds = torch.stack([starts, stops], dim=1).tolist()
+        self._ranges = {key: (a, b) for key, (a, b) in zip(keys, bounds, strict=True)}
+
+    def _bucket(self, t: float) -> int:
+        return math.floor(t * self._scale)
+
+    def rows(self, t: float) -> Tensor:
+        """The ascending model rows to render at normalized time t, one of the times the index
+        was built for: its bucket's rows and the long rows, a superset of the rows that pass the
+        opacity cull at t. Their count is known on the host."""
+        start, stop = self._ranges[self._bucket(t)]
+        listed = self._rows[start:stop]
+        if self._long.shape[0] == 0:
+            return listed
+        if start == stop:
+            return self._long
+        return torch.sort(torch.cat([listed, self._long])).values
+
+
+def _slice(
+    model: FreeTimeGaussians, t: float, sh: Tensor, rows: Tensor | None = None
+) -> GaussiansAtTime:
+    """The per-time arrays of `at_time`, from the request's SH concat `sh`, for every row or
+    only for `rows`, which are gathered first (Q-174)."""
+    with stage("slice"):
+        arrays = [getattr(model, name) for name in _SLICE_INPUTS]
+        if rows is not None:
+            arrays = [array[rows] for array in arrays]
+            sh = sh[rows]
+        means, times, log_durations, velocities, log_scales, quats, opacity_logits = arrays
+        with stage("slice.kernel"):
+            s = temporal_slice(
+                means,
+                times,
+                log_durations,
+                velocities,
+                log_scales,
+                quats,
+                opacity_logits,
+                t,
+                impl=model.slice_impl,
+            )
+    return GaussiansAtTime(
+        means_t=s.means_t,
+        opacities_t=s.opacities_t,
+        quats_n=s.quats_n,
+        scales=s.scales,
+        sh=sh,
+        opacities=s.opacities,
+        reg_terms=s.reg_terms,
+        passes_cull=s.passes_cull,
+    )
+
+
+def _render_indexed(
+    model: FreeTimeGaussians,
+    cameras: list[Camera],
+    t: float,
+    rows: Tensor,
+    *,
+    sh: Tensor,
+    background: Tensor,
+    backend: _Backend,
+) -> tuple[Tensor, Tensor]:
+    """Image [C, H, W, 3] and alpha [C, H, W, 1] of `cameras` at normalized time t, rendered from
+    the ascending model rows `rows` that the temporal index lists then, with `render()`'s
+    defaults (D-55, Q-174). The backend's own opacity cull then decides, so the images are those
+    of every row (U-32)."""
+    backgrounds = _backgrounds(background, len(cameras), model.means)
+    if rows.shape[0] == 0:
+        # Q-174: no row can pass the cull, so the slice isn't run (dynamo would specialize a
+        # graph for zero rows, Q-13), and the render is Q-38's empty render (D-76).
+        return _empty_images(backgrounds, cameras[0].width, cameras[0].height)
+    # CPU kernels can give other bits on a subset of rows (U-8), so the reference backend slices
+    # every row and keeps the listed ones; gsplat slices the listed rows only.
+    full = backend == "reference" or _GSPLAT_FULL_SLICE
+    g = _slice(model, t, sh, None if full else rows)
+    with stage("raster.forward"):
+        if full:
+            g = _take_rows(g, rows)
+        if backend == "gsplat":
+            image, alpha, *_ = _render_gsplat(
+                g, cameras, backgrounds, rows=rows, num_rows=model.num_gaussians, packed=True
+            )
+        else:
+            image, alpha, *_ = _render_reference(
+                g, cameras, backgrounds, rows=rows, num_rows=model.num_gaussians
+            )
+    return image, alpha
+
+
+def _empty_images(background: Tensor, width: int, height: int) -> tuple[Tensor, Tensor]:
+    """Q-38's empty render's image and alpha (D-76): the background [C, 3] composited as both
+    backends composite it, image + (1 − alpha)·c_bg with nothing drawn, so its bits are theirs."""
+    count = background.shape[0]
+    alpha = background.new_zeros((count, height, width, 1))
+    image = background.new_zeros((count, height, width, 3))
+    return image + (1.0 - alpha) * background[:, None, None, :], alpha
 
 
 # The reference backend.
