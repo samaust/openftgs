@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from openftgs._stages import stage
 from openftgs.config import LossConfig
 from openftgs.model import FreeTimeGaussians
 from openftgs.motion import reg4d_terms
@@ -222,26 +223,31 @@ def total_loss(
     _check_pair(pred, gt)
     terms: dict[str, Tensor] = {}
     weighted: list[Tensor] = []
+    # §3.4: each term is a stage of its own (B-1).
     if cfg.lambda_img > 0.0:
-        terms["l1"] = l1_loss(pred, gt)
-        weighted.append(cfg.lambda_img * terms["l1"])
+        with stage("loss.l1"):
+            terms["l1"] = l1_loss(pred, gt)
+            weighted.append(cfg.lambda_img * terms["l1"])
     if cfg.lambda_ssim > 0.0:
-        value = ssim(
-            pred, gt, window=cfg.ssim_window, sigma=cfg.ssim_sigma, padding=cfg.ssim_padding
-        )
-        terms["one_minus_ssim"] = 1.0 - value
-        weighted.append(cfg.lambda_ssim * terms["one_minus_ssim"])
+        with stage("loss.ssim"):
+            value = ssim(
+                pred, gt, window=cfg.ssim_window, sigma=cfg.ssim_sigma, padding=cfg.ssim_padding
+            )
+            terms["one_minus_ssim"] = 1.0 - value
+            weighted.append(cfg.lambda_ssim * terms["one_minus_ssim"])
     if perceptual is not None and cfg.lambda_perc > 0.0:
-        terms["perceptual"] = perceptual(pred, gt)
-        weighted.append(cfg.lambda_perc * terms["perceptual"])
+        with stage("loss.perceptual"):
+            terms["perceptual"] = perceptual(pred, gt)
+            weighted.append(cfg.lambda_perc * terms["perceptual"])
     if cfg.lambda_reg > 0.0:
-        if cfg.reg_until is None or it <= cfg.reg_until:
-            terms["reg"] = reg4d_loss(model, t)
-            weighted.append(cfg.lambda_reg * terms["reg"])
-        else:
-            # Q-41 (owner's answer): reported after the cutoff, for D-10's loss trace.
-            with torch.no_grad():
+        with stage("loss.reg"):
+            if cfg.reg_until is None or it <= cfg.reg_until:
                 terms["reg"] = reg4d_loss(model, t)
+                weighted.append(cfg.lambda_reg * terms["reg"])
+            else:
+                # Q-41 (owner's answer): reported after the cutoff, for D-10's loss trace.
+                with torch.no_grad():
+                    terms["reg"] = reg4d_loss(model, t)
     loss = functools.reduce(torch.add, weighted) if weighted else pred.new_zeros(())
     report = {name: value.detach() for name, value in terms.items()}
     report["total"] = loss.detach()

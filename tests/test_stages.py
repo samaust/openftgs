@@ -11,11 +11,18 @@ range") and the PRD's decisions on the stage instrumentation.
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
+from typing import Literal
 
 import pytest
 import torch
+from builders import random_model, ring, write_scene
 
 from openftgs import _stages
+from openftgs.config import LossConfig, OptimConfig, TrainConfig
+from openftgs.data import MultiViewVideo
+from openftgs.train import Trainer
+from openftgs.types import TimeNormalizer
 
 
 def test_stages_nest_on_the_wall_clock() -> None:
@@ -260,3 +267,81 @@ def test_cuda_events_time_each_stage_and_split_the_backward_pass() -> None:
         x.data.mul_(0.5)
     (adam,) = clock.read()
     assert adam.name == "adam" and adam.seconds > 0.0 and adam.start >= backward.end
+
+
+# The wiring: Trainer.step's stages (§3.4 B-1).
+
+_TIME = TimeNormalizer(0.0, 2.0 / 30.0)  # three frames at 30 FPS
+_RASTER = [
+    "raster.forward.projection",
+    "raster.forward.sh",
+    "raster.forward.isect",
+    "raster.forward.rasterize",
+]
+
+
+def _iteration(raster: list[str]) -> list[str]:
+    """One iteration's records in the order they begin: λ_perc = 0, so no perceptual stage."""
+    return [
+        "iteration",
+        "data",
+        "slice",
+        "slice.kernel",
+        "slice.sh_concat",
+        "raster.forward",
+        *raster,
+        "loss.l1",
+        "loss.ssim",
+        "loss.reg",
+        "backward",
+        "backward.losses_done",
+        "backward.raster_done",
+        "statistics",
+        "adam",
+        "events",
+        "log",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("device", "kind", "raster"),
+    [
+        pytest.param("cpu", "wall", [], id="cpu-reference-wall"),
+        pytest.param("cuda", "cuda", _RASTER, id="gsplat-cuda", marks=pytest.mark.gpu),
+    ],
+)
+def test_a_training_iteration_runs_its_stages_in_order(
+    tmp_path: Path, device: str, kind: Literal["cuda", "wall"], raster: list[str]
+) -> None:
+    """§3.4 B-1: each training iteration runs the stages B-1 times, in order and nested in the
+    iteration, with the backward pass split by its two points (losses → raster → slice); the
+    gsplat backend adds rasterization's four sub-stages."""
+    cams = ring(3, radius=4.0, elevation=1.0, width_px=32, height_px=24, focal=30.0)
+    truth = random_model(20, seed=0, sh_degree=1, time=_TIME, spread=0.6, log_scale=(-2.5, -1.5))
+    images = [(cam, k / 30.0, "train") for k in range(3) for cam in cams]
+    video = MultiViewVideo.from_manifest(write_scene(tmp_path, truth, images))
+    cfg = TrainConfig(
+        sh_degree=1,
+        loss=LossConfig(lambda_perc=0.0),
+        optim=OptimConfig(iterations=10, sh_interval=1),
+    )
+    model = random_model(30, seed=1, sh_degree=1, time=video.time, spread=0.6)
+    trainer = Trainer(cfg, video, model, device=device)
+    trainer.step()  # past "auto"'s placement and the first compilation
+    with _stages.Clock(kind) as clock:
+        trainer.step()
+        trainer.step()
+    timings = clock.read()
+    expected = _iteration(raster)
+    assert [t.name for t in timings] == expected * 2
+    for first in (0, len(expected)):
+        it = timings[first : first + len(expected)]
+        outer = it[0]
+        assert all(outer.start <= t.start <= t.end <= outer.end for t in it)
+        by_name = {t.name: t for t in it}
+        backward = by_name["backward"]
+        losses, raster_done = by_name["backward.losses_done"], by_name["backward.raster_done"]
+        assert backward.start <= losses.start <= raster_done.start <= backward.end
+        assert by_name["slice"].start <= by_name["slice.kernel"].start
+        assert by_name["slice.sh_concat"].end <= by_name["slice"].end
+        assert by_name["slice"].end <= by_name["raster.forward"].start
