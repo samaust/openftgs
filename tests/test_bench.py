@@ -10,11 +10,14 @@ tests do (Q-125); the benchmarks themselves run only on a GPU, except `convert`.
 
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
+import math
 import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +25,15 @@ from typing import Any
 
 import pytest
 import torch
-from builders import look_at, n3dv_source, random_model, ring, write_scene
+from builders import (
+    TexturedPlane,
+    look_at,
+    n3dv_source,
+    random_model,
+    ring,
+    write_plane_scene,
+    write_scene,
+)
 
 from openftgs.cli import main
 from openftgs.data import convert_n3dv
@@ -504,3 +515,84 @@ def test_b8_convert_with_and_without_hardware_decoding(tmp_path: Path, scratch: 
             assert figures["frames"] == 2 and 0.0 < figures["decode_s"] < figures["wall_s"]
         assert cases[(hwaccel, None)]["frames"] == 4 and cases[(hwaccel, None)]["wall_s"] > 0.0
     assert list(scratch.iterdir()) == []
+
+
+# B-8, `ftgs bench init` (§3.4, D-56, D-58; Q-106, Q-T234.1): `roma_init` on the wall clock.
+
+has_init_extra = all(importlib.util.find_spec(m) for m in ("einops", "loguru", "torchvision"))
+
+
+def test_b8_init_without_the_init_extra_or_the_weights_exits_2(
+    scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B-8, Q-166, Q-T234.1: `bench init` needs the [init] extra and RoMa's weights already in
+    torch.hub's cache, and is exit 2 without either, with nothing written and nothing
+    downloaded. PyTorch is made to see a CUDA device, which these checks come before."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
+    out = tmp_path / "bench.json"
+    with monkeypatch.context() as without:  # the vendored RoMa can't be imported
+        without.setitem(sys.modules, "openftgs._vendor.romatch.models.model_zoo", None)
+        assert _ftgs("bench", "init", scene, "--out", out) == 2
+        assert "[init]" in capsys.readouterr().err
+    if not has_init_extra:
+        return
+    hub = tmp_path / "hub"
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(hub))
+    try:
+        assert _ftgs("bench", "init", scene, "--out", out) == 2
+    finally:
+        torch.hub.set_dir(previous)
+    error = capsys.readouterr().err
+    assert str(hub / "checkpoints" / "roma_outdoor.pth") in error
+    assert str(hub / "checkpoints" / "dinov2_vitl14_pretrain.pth") in error
+    assert not hub.exists()  # nothing downloaded
+    assert not out.exists()
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(not has_init_extra, reason="needs the [init] extra")
+def test_b8_init_times_matching_per_pair_and_gpu_triangulation_knn_and_the_run(
+    tmp_path: Path,
+) -> None:
+    """B-8 (§3.4: "RoMa per pair and per GPU, triangulation, k-NN"; D-56, Q-106, Q-T234.1):
+    `bench init` runs `roma_init` once with the default settings on every visible GPU, on a
+    textured plane RoMa can match (four training cameras on an arc, 320 × 256 px, three
+    timestamps, as in the RoMa smoke test), and reports per GPU the pairs matched with their
+    time per pair and in total, the triangulation, the k-NN search of each of the three init
+    frames, and the whole call. B-8 has no budget. It needs the weights in torch.hub's cache,
+    which the weights tests fetch when downloads are allowed."""
+    plane = TexturedPlane(seed=3, velocity=(0.6, 0.3, 0.0))
+    images = []
+    for tau in (0.0, 1 / 30, 2 / 30):
+        for k, yaw in enumerate((-15.0, -5.0, 5.0, 15.0)):
+            theta = math.radians(yaw)
+            eye = (3.0 * math.sin(theta), -3.0 * math.cos(theta), 0.3)
+            camera = look_at(eye, width=320, height=256, focal=280.0, name=f"C{k}")
+            images.append((camera, tau, "train"))
+    manifest = write_plane_scene(tmp_path / "plane", plane, images)
+    out = tmp_path / "B-8-init.json"
+    assert _ftgs("bench", "init", manifest, "--out", out) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["benchmark"] == "B-8" and body["budgets"] == []
+    devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    assert body["setup"]["devices"] == devices
+    assert body["setup"]["roma_init"]["model"] == "roma_outdoor"
+    cases = {tuple(sorted(c["case"].items())): c["figures"] for c in body["cases"]}
+    run = cases[(("part", "roma_init"),)]
+    pairs = 0
+    for device in devices:
+        match = cases.get((("device", device), ("part", "init.match")))
+        if match is None:  # a device that got no pair
+            continue
+        triangulate = cases[(("device", device), ("part", "init.triangulate"))]
+        assert match["pairs"] == triangulate["pairs"] > 0
+        assert 0.0 < match["min_s"] <= match["median_s"] <= match["max_s"] <= match["total_s"]
+        assert 0.0 < triangulate["total_s"] < match["total_s"]
+        assert match["total_s"] <= run["wall_s"]
+        pairs += match["pairs"]
+    assert pairs == run["pairs"] >= 3  # at least one pair per init frame
+    knn = cases[(("part", "init.knn"),)]
+    assert knn["frames"] == run["init_frames"] == 3 and 0.0 < knn["total_s"] < run["wall_s"]
+    assert 0.0 < run["startup_s"] < run["wall_s"] and run["points"] > 0

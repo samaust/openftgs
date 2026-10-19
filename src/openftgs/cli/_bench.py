@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import importlib.metadata
+import json
 import os
 import platform
 import statistics
@@ -25,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -612,6 +615,107 @@ def _slice(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-8: initialization on the wall clock (§3.4, D-56, D-58; Q-106, Q-T234.1) ---------------------
+
+
+def _roma_weights() -> list[Path]:
+    """Q-T234.1: where torch.hub keeps the checkpoints `roma_init` loads with the default
+    RomaInitConfig, D-58's roma_outdoor: RoMa's and DINOv2's, each under its URL's file name in
+    `get_dir()/checkpoints` (source log T234.1). ImportError without the [init] extra, which the
+    vendored RoMa needs (D-65)."""
+    import torch
+
+    zoo: Any = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
+    urls = (zoo.weight_urls["romatch"]["outdoor"], zoo.weight_urls["dinov2"])
+    folder = Path(torch.hub.get_dir()) / "checkpoints"
+    return [folder / Path(urllib.parse.urlparse(url).path).name for url in urls]
+
+
+def _spread(values: Sequence[float]) -> dict[str, float]:
+    return {
+        "total_s": float(sum(values)),
+        "median_s": _median(values),
+        "min_s": float(min(values)),
+        "max_s": float(max(values)),
+    }
+
+
+def _init(ctx: _Context) -> _Result:
+    """B-8's initialization (§3.4, D-56): `roma_init` with the default RomaInitConfig on every
+    visible GPU (Q-106), once, under the wall clock: matching per pair and in total per GPU
+    (`init.match`, which holds the pair's two image reads and its triangulation), triangulation
+    per GPU (`init.triangulate`), the k-NN searches of E15 (`init.knn`), and the whole call. It
+    needs the [init] extra and RoMa's weights in torch.hub's cache, and never downloads them, so
+    no download is timed (Q-T234.1)."""
+    import torch
+
+    from openftgs._stages import Clock
+    from openftgs.init import RomaInitConfig, roma_init, roma_provenance
+
+    try:
+        weights = _roma_weights()
+    except ImportError as error:  # Q-142, Q-166
+        _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
+    missing = [str(path) for path in weights if not path.is_file()]
+    if missing:  # Q-166, Q-T234.1
+        _fail(
+            "bench init needs RoMa's weights in torch.hub's cache and doesn't download them; "
+            f"missing {', '.join(missing)} (one `ftgs init roma` run fetches them)"
+        )
+    cfg = RomaInitConfig()  # D-58's defaults (Q-T234.1)
+    devices = [str(torch.device("cuda", i)) for i in range(torch.cuda.device_count())]  # Q-106
+    try:
+        with _as_input_error("bench init: RoMa initialization"), Clock("wall") as clock:
+            start = time.perf_counter()
+            points = roma_init(ctx.video, cfg)  # devices None: every visible GPU (Q-106)
+            wall = time.perf_counter() - start
+    except ImportError as error:  # Q-142: the [init] extra, found missing only now
+        _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
+    timings = clock.read()
+
+    def of(name: str) -> dict[str | None, list[Timing]]:
+        by_key: dict[str | None, list[Timing]] = {}
+        for t in timings:
+            if t.name == name:
+                by_key.setdefault(t.key, []).append(t)
+        return by_key
+
+    cases: list[dict[str, Any]] = []
+    matches, triangulations = of("init.match"), of("init.triangulate")
+    for device in sorted(k for k in matches if k is not None):
+        seconds = [t.seconds for t in matches[device]]
+        figures = {"pairs": len(seconds), **_spread(seconds)}
+        cases.append({"case": {"part": "init.match", "device": device}, "figures": figures})
+    for device in sorted(k for k in triangulations if k is not None):
+        seconds = [t.seconds for t in triangulations[device]]
+        figures = {"pairs": len(seconds), **_spread(seconds)}
+        cases.append({"case": {"part": "init.triangulate", "device": device}, "figures": figures})
+    searches = [t.seconds for found in of("init.knn").values() for t in found]
+    if searches:
+        figures = {"frames": len(searches), **_spread(searches)}
+        cases.append({"case": {"part": "init.knn"}, "figures": figures})
+    pairs = [t for found in matches.values() for t in found]
+    frames = 0 if points.frame_ids is None else int(torch.unique(points.frame_ids).numel())
+    whole = {
+        "wall_s": wall,
+        # Loading the weights and building a model per GPU, before the first pair starts.
+        "startup_s": min((t.start for t in pairs), default=wall),
+        "pairs": len(pairs),
+        "init_frames": frames,
+        "points": int(points.positions.shape[0]),
+    }
+    cases.append({"case": {"part": "roma_init"}, "figures": whole})
+    setup = {
+        "roma_init": json.loads(roma_provenance(cfg)["roma_init"]),  # Q-107's record
+        "devices": devices,
+        "weights": [str(path) for path in weights],
+        "repetitions": 1,
+        "clock": "wall: init.match per camera pair, keyed by its shard's device, with "
+        "init.triangulate inside it; init.knn per init frame",
+    }
+    return _Result(setup, cases)
+
+
 # -- B-8: conversion on the wall clock (§3.4, D-48, D-81; Q-169, Q-T234.2) -------------------------
 
 # Q-T234.2: B-8's scene is a Neural3DV one; selfcap's recorded `-i` paths are inside the
@@ -800,6 +904,6 @@ _BENCHMARKS: dict[str, _Benchmark] = {
     "adam": _Benchmark("B-5", 229),
     "data": _Benchmark("B-6", 232),
     "render": _Benchmark("B-7", 231, model=True),
-    "init": _Benchmark("B-8", 234),
+    "init": _Benchmark("B-8", 234, _init),
     "convert": _Benchmark("B-8", 234, _convert, cuda=False),
 }
