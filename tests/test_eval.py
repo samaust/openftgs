@@ -7,7 +7,6 @@ form, crops built pixel by pixel) or come from torchmetrics' LPIPS, an oracle re
 another library's code path to the same published weights (§2.3).
 """
 
-import dataclasses
 import json
 import math
 import warnings
@@ -27,7 +26,6 @@ from openftgs.eval import (
     Evaluator,
     ImageMetrics,
     average_metrics,
-    check_nan_metrics,
     dssim_k,
     dynamic_region,
     evaluate_images,
@@ -63,7 +61,6 @@ def test_public_api() -> None:
         "ImageMetrics",
         "METRIC_NAMES",
         "average_metrics",
-        "check_nan_metrics",
         "dssim_k",
         "dynamic_region",
         "evaluate_images",
@@ -538,52 +535,6 @@ def test_metrics_report_counts_the_images_without_a_mask() -> None:
     assert metrics_report(masked, split="test", metadata={})["dynamic"]["missing"] == 0
 
 
-# A NaN metric is a numerical failure (§2.1 exit code 3; Q-129, Q-148).
-
-
-def test_check_nan_metrics_names_the_image_with_a_nan_metric() -> None:
-    """Q-129, Q-148: a NaN among an image's entire-image metrics raises FloatingPointError
-    naming that image's path, and only that one."""
-    images = [_image(0, frame=0), _image(1, frame=1), _image(2, frame=2)]
-    images[1] = dataclasses.replace(images[1], entire={**_values(0.0), "lpips_vgg": math.nan})
-    with pytest.raises(FloatingPointError) as raised:
-        check_nan_metrics(images)
-    message = str(raised.value)
-    assert images[1].path in message
-    assert images[0].path not in message and images[2].path not in message
-
-
-def test_check_nan_metrics_sees_the_dynamic_region() -> None:
-    """Q-129 ("entire or dynamic"), Q-148: a NaN in an image's dynamic-region metrics alone,
-    its entire-image metrics finite, raises too."""
-    dynamic = {**_values(1.0), "ssim2": math.nan}
-    images = [_image(0, frame=0, dynamic=_values(1.0), masked=True)]
-    images.append(_image(1, frame=1, dynamic=dynamic, masked=True))
-    with pytest.raises(FloatingPointError, match=images[1].path):
-        check_nan_metrics(images)
-
-
-def test_check_nan_metrics_allows_a_perfect_render_and_a_skipped_region() -> None:
-    """Q-129, Q-63: a perfect render's +inf PSNR is allowed, and so is a masked image whose
-    dynamic region was skipped (Q-61): neither is a failed render."""
-    perfect = ImageMetrics("c", 0.0, 0, "p.png", {**_values(0.0), "psnr": math.inf}, None, False)
-    skipped = _image(1, frame=1, dynamic=None, masked=True)
-    check_nan_metrics([perfect, skipped])
-
-
-def test_check_nan_metrics_names_up_to_five_images() -> None:
-    """Q-129: the message gives the number of images with a NaN metric and names the first five,
-    in the order given (the manifest's, Q-68)."""
-    nan = {**_values(0.0), "psnr": math.nan}
-    images = [dataclasses.replace(_image(k, frame=k), entire=nan) for k in range(7)]
-    with pytest.raises(FloatingPointError) as raised:
-        check_nan_metrics(images)
-    message = str(raised.value)
-    assert "7" in message
-    assert all(image.path in message for image in images[:5])
-    assert images[5].path not in message and images[6].path not in message
-
-
 def _manifest(tmp_path: Path) -> MultiViewVideo:
     cams = ring(2, width_px=8, height_px=6, focal=8.0)
     gt = random_model(4, seed=0, sh_degree=0, time=TimeNormalizer(0.0, 0.1), spread=0.5)
@@ -632,6 +583,80 @@ def test_evaluate_images_needs_a_supplied_render_for_every_record(tmp_path: Path
     evaluator: Any = _Unused()
     with pytest.raises(ValueError, match="000002"):
         evaluate_images(model, video, evaluator, backend="reference", renders={})
+
+
+# A render that isn't finite is a numerical failure (§2.1 exit code 3; Q-129, Q-147).
+
+
+def _broken_renders(
+    monkeypatch: pytest.MonkeyPatch, part: Literal["rgb", "alpha"], value: float
+) -> None:
+    """Patch the evaluation's renderer so that one pixel of every render's `part` is `value`."""
+    original = render_request  # the object openftgs.eval imports
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        renders = original(*args, **kwargs)
+        tensors = getattr(renders, part)
+        for key, tensor in tensors.items():
+            tensors[key] = tensor.clone()  # renders are inference tensors
+            tensors[key][0, 0, 0] = value
+        return renders
+
+    monkeypatch.setattr("openftgs.eval.render_request", broken)
+
+
+@pytest.mark.parametrize(
+    ("part", "value"),
+    [("rgb", math.nan), ("rgb", math.inf), ("rgb", -math.inf), ("alpha", math.nan)],
+)
+def test_evaluate_images_refuses_a_render_that_is_not_finite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, part: Literal["rgb", "alpha"], value: float
+) -> None:
+    """Q-129, Q-147: a render of the model that isn't finite, in its colors or its alpha, raises
+    FloatingPointError naming its image, and isn't scored. E16's clamp would map ±Inf to a
+    plausible color, and the metrics never see alpha."""
+    video = _manifest(tmp_path)
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    _broken_renders(monkeypatch, part, value)
+    evaluator: Any = _Unused()
+    with pytest.raises(FloatingPointError, match="000002"):
+        evaluate_images(model, video, evaluator, backend="reference")
+
+
+def test_evaluate_images_names_up_to_five_renders_that_are_not_finite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-129, Q-147: the whole split is rendered first, so the message gives the number of
+    images whose render isn't finite, here 7 at 7 timestamps, and names the first five in the
+    manifest's order."""
+    cams = ring(2, width_px=8, height_px=6, focal=8.0)
+    gt = random_model(4, seed=0, sh_degree=0, time=TimeNormalizer(0.0, 0.6), spread=0.5)
+    images = [(cams[0], 0.0, "train"), (cams[0], 0.6, "train")]
+    images += [(cams[1], k / 10, "test") for k in range(6, -1, -1)]
+    video = MultiViewVideo.from_manifest(write_scene(tmp_path, gt, images))
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    _broken_renders(monkeypatch, "rgb", math.nan)
+    evaluator: Any = _Unused()
+    with pytest.raises(FloatingPointError) as raised:
+        evaluate_images(model, video, evaluator, backend="reference")
+    message = str(raised.value)
+    root = video.manifest.path.parent
+    paths = [r.image_path.relative_to(root).as_posix() for r in video.records[2:]]
+    assert "7 image(s)" in message
+    assert message.index(paths[0]) < message.index(paths[4])
+    assert all(path in message for path in paths[:5])
+    assert paths[5] not in message and paths[6] not in message
+
+
+def test_evaluate_images_refuses_a_supplied_render_that_is_not_finite(tmp_path: Path) -> None:
+    """Q-147, Q-137: a supplied render is input, so one that isn't finite is a ValueError, as
+    read_renders refuses such a file (Q-142), checked before anything is evaluated."""
+    video = _manifest(tmp_path)
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    evaluator: Any = _Unused()
+    supplied = {2: torch.full((6, 8, 3), math.inf)}
+    with pytest.raises(ValueError, match="000002"):
+        evaluate_images(model, video, evaluator, backend="reference", renders=supplied)
 
 
 @pytest.mark.weights

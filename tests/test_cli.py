@@ -810,10 +810,12 @@ def test_eval_scores_supplied_renders_as_its_own(tmp_path: Path) -> None:
     assert report["renders"]["producer"].startswith("openftgs")
 
 
-def _nan_first_render(monkeypatch: pytest.MonkeyPatch, scene: Path) -> list[str]:
-    """Patch the evaluation's renderer so that its first render is NaN; the list receives the
-    manifest path of that render's image. Training renders through another function, so only
-    evaluations see the patch."""
+def _broken_first_render(
+    monkeypatch: pytest.MonkeyPatch, scene: Path, value: float = math.nan
+) -> list[str]:
+    """Patch the evaluation's renderer so that its first render is all `value`; the list
+    receives the manifest path of that render's image. Training renders through another
+    function, so only evaluations see the patch."""
     import openftgs.render
     from openftgs.data import MultiViewVideo
 
@@ -821,29 +823,32 @@ def _nan_first_render(monkeypatch: pytest.MonkeyPatch, scene: Path) -> list[str]
     original = openftgs.render.render_request  # the object openftgs.eval imports
     paths: list[str] = []
 
-    def nan(*args: Any, **kwargs: Any) -> Renders:
+    def broken(*args: Any, **kwargs: Any) -> Renders:
         renders = original(*args, **kwargs)
         if not paths:
             key = next(iter(renders.rgb))
-            renders.rgb[key] = torch.full_like(renders.rgb[key], math.nan)
+            renders.rgb[key] = torch.full_like(renders.rgb[key], value)
             image = video.records[int(key)].image_path
             paths.append(image.relative_to(scene.parent).as_posix())
         return renders
 
-    monkeypatch.setattr("openftgs.eval.render_request", nan)
+    monkeypatch.setattr("openftgs.eval.render_request", broken)
     return paths
 
 
 @pytest.mark.weights
+@pytest.mark.parametrize("value", [math.nan, math.inf], ids=["nan", "inf"])
 @pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
-def test_eval_with_a_nan_metric_is_exit_code_3(
+def test_eval_of_a_render_that_is_not_finite_is_exit_code_3(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     existing: bool,
+    value: float,
 ) -> None:
-    """Q-129 (as answered): a NaN render makes its image's metrics NaN; ftgs eval exits 3, names
-    the image, and writes no METRICS.json, leaving an existing one as it was (Q-126)."""
+    """Q-129 (as answered), Q-147: a NaN or Inf render makes ftgs eval exit 3, naming the image,
+    and write no METRICS.json, leaving an existing one as it was (Q-126). An Inf render would
+    score as a plausible image after E16's clamp."""
     scene, checkpoint = _trained(tmp_path)
     out = tmp_path / "metrics" / "METRICS.json"
     before = None
@@ -852,7 +857,7 @@ def test_eval_with_a_nan_metric_is_exit_code_3(
         before = out.read_bytes()
     else:
         out.parent.mkdir()
-    paths = _nan_first_render(monkeypatch, scene)
+    paths = _broken_first_render(monkeypatch, scene, value)
     capsys.readouterr()
     assert _ftgs("eval", checkpoint, scene, "--out", out) == 3
     assert paths and paths[0] in capsys.readouterr().err
@@ -860,16 +865,17 @@ def test_eval_with_a_nan_metric_is_exit_code_3(
 
 
 @pytest.mark.weights
-def test_a_nan_metric_in_the_final_evaluation_is_exit_code_3(
+def test_a_render_that_is_not_finite_in_the_final_evaluation_is_exit_code_3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-129 (as answered), Q-147: ftgs train's final evaluation with a NaN metric exits 3,
-    naming the image, with no METRICS.json; the checkpoint, saved before it (Q-132), is kept."""
+    """Q-129 (as answered), Q-147: ftgs train's final evaluation of a render that isn't finite
+    exits 3, naming the image, with no METRICS.json; the checkpoint, saved before it (Q-132),
+    is kept."""
     scene = _scene(tmp_path / "scene", test=True)
     init = _init(tmp_path / "init.safetensors")
     cfg = _config_file(tmp_path / "cfg.json")
     out = tmp_path / "run"
-    paths = _nan_first_render(monkeypatch, scene)
+    paths = _broken_first_render(monkeypatch, scene)
     capsys.readouterr()
     assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 3
     assert paths and paths[0] in capsys.readouterr().err
@@ -880,8 +886,8 @@ def test_a_nan_metric_in_the_final_evaluation_is_exit_code_3(
 @pytest.mark.weights
 def test_eval_of_a_perfect_render_is_exit_code_0_with_a_null_psnr(tmp_path: Path) -> None:
     """Q-129, Q-63: supplied renders equal to the ground-truth images have an infinite PSNR,
-    which is no failure: exit 0, PSNR null in the rows and the scene means, SSIM₁ 1 and LPIPS 0
-    (a worked example: identical images)."""
+    which is no failure: exit 0, PSNR null in the rows and the scene means, SSIM 1, DSSIM 0 and
+    every LPIPS 0 (a worked example: identical images)."""
     from openftgs.data import MultiViewVideo
 
     scene, checkpoint = _trained(tmp_path)
@@ -906,11 +912,15 @@ def test_eval_of_a_perfect_render_is_exit_code_0_with_a_null_psnr(tmp_path: Path
     entire = json.loads(out.read_text())["entire"]
     assert entire["scene"]["psnr"] is None
     assert all(row["psnr"] is None for row in entire["images"])
-    assert entire["scene"]["ssim1"] == pytest.approx(1.0)
-    assert entire["scene"]["lpips_alex"] == pytest.approx(0.0, abs=1e-6)
+    scene_means = entire["scene"]
+    assert scene_means["ssim1"] == pytest.approx(1.0) and scene_means["ssim2"] == pytest.approx(1.0)
+    for name in ("dssim1", "dssim2", "lpips_alex", "lpips_vgg", "lpips_vgg_raw"):
+        assert scene_means[name] == pytest.approx(0.0, abs=1e-6), name
 
 
-def test_eval_refuses_a_supplied_renders_file_that_is_not_finite(tmp_path: Path) -> None:
+def test_eval_refuses_a_supplied_renders_file_that_is_not_finite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Q-129, Q-142: a supplied renders file holding a NaN is invalid input, exit 2 as
     read_renders refuses it, not exit 3; nothing is written."""
     scene, checkpoint = _trained(tmp_path)
@@ -922,7 +932,9 @@ def test_eval_refuses_a_supplied_renders_file_that_is_not_finite(tmp_path: Path)
     tensors["rgb/t9"][0, 0, 0] = math.nan
     save_file(tensors, path, metadata=metadata)
     out = tmp_path / "m.json"
+    capsys.readouterr()
     assert _ftgs("eval", checkpoint, scene, "--out", out, "--renders-dir", directory) == 2
+    assert "rgb/t9 has values that are not finite" in capsys.readouterr().err
     assert not out.exists()
 
 

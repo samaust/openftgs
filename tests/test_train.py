@@ -961,11 +961,11 @@ def _nan_first_render(monkeypatch: pytest.MonkeyPatch, video: MultiViewVideo) ->
 
 @pytest.mark.weights
 @pytest.mark.parametrize("written", [False, True])
-def test_evaluate_refuses_a_nan_metric_before_writing(
+def test_evaluate_refuses_a_render_that_is_not_finite_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, written: bool
 ) -> None:
-    """Q-147, Q-129: a NaN render makes its image's metrics NaN, and evaluate raises
-    FloatingPointError naming the image before writing anything, with or without out_dir."""
+    """Q-147, Q-129: a NaN render makes evaluate raise FloatingPointError naming its image,
+    before writing anything, with or without out_dir."""
     video = _evaluation_scene(tmp_path / "scene")
     trainer = Trainer(_no_perceptual(), video, _init_points(), device="cpu")
     _run(trainer, 5)

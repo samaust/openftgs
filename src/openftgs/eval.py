@@ -30,7 +30,6 @@ __all__ = [
     "Evaluator",
     "ImageMetrics",
     "average_metrics",
-    "check_nan_metrics",
     "dssim_k",
     "dynamic_region",
     "evaluate_images",
@@ -265,7 +264,11 @@ def evaluate_images(
     one timestamp at a time, so cameras that share a time render together (D-55) and one
     time's renders are held at once, then evaluated by `evaluator` with the image's mask.
     Results come in the manifest's order. Given `renders`, a prediction [H, W, 3] for every
-    record of the split by record index, nothing is rendered and those are scored (Q-137)."""
+    record of the split by record index, nothing is rendered and those are scored (Q-137); one
+    that isn't finite is a ValueError.
+
+    A render of the model that isn't finite, in its colors or its alpha, is not scored: once
+    the split is rendered, FloatingPointError names up to five such images (Q-129, Q-147)."""
     indices = [i for i, record in enumerate(dataset.records) if record.split == split]
     if not indices:
         raise ValueError(f"the data split {split!r} holds no images")
@@ -273,23 +276,34 @@ def evaluate_images(
     if renders is not None:
         absent = [i for i in indices if i not in renders]
         if absent:
-            names = [dataset.records[i].image_path.relative_to(root).as_posix() for i in absent]
+            names = _image_names(dataset, absent)
             raise ValueError(f"no supplied render for {len(absent)} image(s): {names[:5]}")
+        unusable = [i for i in indices if not _finite(renders[i])]
+        if unusable:  # Q-147: input, as read_renders would refuse it (Q-142)
+            names = _image_names(dataset, unusable)
+            raise ValueError(
+                f"supplied renders that aren't finite for {len(names)} image(s): {names[:5]}"
+            )
     groups: dict[float, list[int]] = {}
     for i in indices:
         groups.setdefault(dataset.records[i].timestamp, []).append(i)
     results: dict[int, ImageMetrics] = {}
+    broken: list[int] = []
     for timestamp, group in groups.items():
         if renders is None:
             items = tuple(RenderItem(str(i), timestamp, dataset.records[i].camera) for i in group)
             request = RenderRequest(
                 items, time_unit=dataset.manifest.time_unit, background=background
             )
-            rgb = render_request(model, request, backend=backend).rgb
-            predictions = {i: rgb[str(i)] for i in group}
+            out = render_request(model, request, backend=backend)
+            predictions = {i: out.rgb[str(i)] for i in group}
+            # Q-147: before E16's clamp, which would turn ±Inf into a plausible color.
+            broken += [i for i in group if not _finite(out.rgb[str(i)], out.alpha[str(i)])]
         else:
             predictions = {i: renders[i] for i in group}
         for i in group:
+            if i in broken:
+                continue
             record = dataset.records[i]
             mask = dataset.load_mask(i)
             entire, dynamic = evaluator(predictions[i], dataset.load_image(i), mask=mask)
@@ -302,22 +316,21 @@ def evaluate_images(
                 dynamic=dynamic,
                 masked=mask is not None,
             )
+    if broken:
+        names = _image_names(dataset, sorted(broken))
+        raise FloatingPointError(
+            f"renders that aren't finite for {len(names)} image(s): {names[:5]}"
+        )
     return [results[i] for i in indices]
 
 
-# Q-129, Q-148: the check `Trainer.evaluate` and `ftgs eval` make before anything is written.
-def check_nan_metrics(images: Sequence[ImageMetrics]) -> None:
-    """Raise FloatingPointError when a metric of `images` is NaN. Finite renders give finite
-    metrics or a perfect render's +inf PSNR, never NaN, so a NaN can only come from a render
-    that isn't finite (§2.1 exit code 3)."""
-    bad = [
-        image.path
-        for image in images
-        if any(math.isnan(v) for v in image.entire.values())
-        or (image.dynamic is not None and any(math.isnan(v) for v in image.dynamic.values()))
-    ]
-    if bad:
-        raise FloatingPointError(f"NaN metrics for {len(bad)} image(s): {bad[:5]}")
+def _image_names(dataset: MultiViewVideo, indices: Sequence[int]) -> list[str]:
+    root = dataset.manifest.path.parent
+    return [dataset.records[i].image_path.relative_to(root).as_posix() for i in indices]
+
+
+def _finite(*tensors: Tensor) -> bool:
+    return all(bool(torch.isfinite(t).all()) for t in tensors)
 
 
 _REPORT = "ftgs-metrics"  # Q-63
