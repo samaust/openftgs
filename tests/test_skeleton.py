@@ -149,6 +149,15 @@ def test_stage_module_imports_nothing_from_openftgs() -> None:
     assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
 
 
+def test_shard_module_imports_nothing_from_openftgs() -> None:
+    """PRD #220 (the plan's choice for D-54): the thread-per-device runner is a private
+    top-level module of the same kind as the stage instrumentation, shared by `init`, `render`
+    and `eval`, so it imports nothing from openftgs itself."""
+    path = PACKAGE_DIR / "_shards.py"
+    assert path.is_file()
+    assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
+
+
 def test_harness_never_imports_openftgs() -> None:
     offenders = [
         str(p.relative_to(ROOT))

@@ -2,10 +2,10 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-55. Q-166 (BENCH.json and
-the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-174 (the index threshold T that B-7
-sets), Q-T231.1 and Q-T231.2 (B-7). docs/modules/cli/benchmarks.md maps each subcommand to its
-B-n.
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55. Q-166 (BENCH.json
+and the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-178 and Q-189 (B-6), Q-174 (the
+index threshold T that B-7 sets), Q-T231.1 and Q-T231.2 (B-7).
+docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
@@ -19,14 +19,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import itertools
 import os
 import platform
 import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
@@ -42,15 +43,18 @@ from openftgs.cli import (
     _output,
     _scene,
 )
-from openftgs.cli import _environment as _environment_error  # Q-142: a download's OSError
+from openftgs.cli import _environment as _environment_error
 
 if TYPE_CHECKING:
     from torch import Tensor
 
     from openftgs._stages import Timing
+    from openftgs.config import TrainConfig
     from openftgs.data import MultiViewVideo
     from openftgs.eval import Evaluator
     from openftgs.model import FreeTimeGaussians
+    from openftgs.optim import FTGSOptimizer
+    from openftgs.train import StepLog, Trainer
     from openftgs.types import Camera, RenderRequest, TimeNormalizer
 
 __all__ = ["add_parser", "run"]  # what `openftgs.cli` takes from this private module
@@ -614,6 +618,1043 @@ def _slice(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-1: a training iteration by stage (§3.4, D-49, D-50; Q-168, Q-185) -----------------------
+
+# #226: N = 0.5M, 1M and 3M with 20 % of the rows active, and 3M at 5 % as the conservative case
+# for D-50, where rasterization does the least per row.
+_TRAIN_STEP_CASES: tuple[tuple[int, float], ...] = (
+    (500_000, 0.2),
+    (1_000_000, 0.2),
+    (3_000_000, 0.2),
+    (3_000_000, 0.05),
+)
+_EVENTS_FROM = 100  # #226: growth and relocation start at iteration 100
+_HEADROOM_PERCENT = 2  # #226: n_max = ⌈1.02·N⌉
+_TIMED = (121, 420)  # #226: the iterations timed by the stage clock, events included
+_UNCLOCKED = (421, 720)  # Q-185: whole iterations timed without the clock
+_BOUND_LIMIT_S = 3600.0  # §3.4 B-1: a full training run ≤ 60 min on an RTX 4090 (Q-168's bound)
+_SLICE_SHARE_LIMIT = 0.10  # D-50: the CUDA operator only above 10 % of an iteration
+_COPY_REPETITIONS = 50  # Q-72 note 5: copies of the relocation scores, after _WARMUP
+
+
+def _train_step_config(n: int, *, sh_degree: int = 3) -> TrainConfig:
+    """B-1's configuration for a model of `n` rows (#226): the default, LPIPS-VGG included,
+    except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and the SH bands
+    all open by iteration 4 (sh_interval = 1); `sh_degree` is the model's (Q-185)."""
+    import dataclasses
+
+    from openftgs.config import TrainConfig
+
+    base = TrainConfig()
+    n_max = -(-(100 + _HEADROOM_PERCENT) * n // 100)  # ⌈1.02·N⌉ in integers, so never one over
+    return dataclasses.replace(
+        base,
+        sh_degree=sh_degree,
+        growth=dataclasses.replace(base.growth, start=_EVENTS_FROM, n_max=n_max),
+        reloc=dataclasses.replace(base.reloc, start=_EVENTS_FROM),
+        optim=dataclasses.replace(base.optim, sh_interval=1),
+    )
+
+
+# The backward stage in three parts, split by its two points (`openftgs._stages.POINTS`): every
+# loss's backward, then the rasterization's (projection and SH included), then the temporal
+# slice's, until `backward()` returns.
+_BACKWARD_PARTS = ("backward.losses", "backward.raster", "backward.slice")
+
+
+def _iteration_parts(timings: Sequence[Timing]) -> list[dict[str, float]]:
+    """One dict per `iteration` record, in order, from the records of a stage clock: each
+    stage's seconds in that iteration, and the three parts of its backward stage when both
+    points fired. Records belong to the last iteration that began before them (by `index`), so
+    the points recorded on the autograd thread fall in their own iteration."""
+    from openftgs._stages import POINTS
+
+    groups: list[list[Timing]] = []
+    for timing in sorted(timings, key=lambda t: t.index):
+        if timing.name == "iteration":
+            groups.append([])
+        if groups:
+            groups[-1].append(timing)
+    parts: list[dict[str, float]] = []
+    for group in groups:
+        seconds: dict[str, float] = {}
+        points: dict[str, float] = {}
+        backward: Timing | None = None
+        for timing in group:
+            if timing.name in POINTS:
+                points[timing.name] = timing.start
+                continue
+            seconds[timing.name] = seconds.get(timing.name, 0.0) + timing.seconds
+            if timing.name == "backward":
+                backward = timing
+        if backward is not None and set(POINTS) <= set(points):
+            losses, raster = points["backward.losses_done"], points["backward.raster_done"]
+            seconds["backward.losses"] = losses - backward.start
+            seconds["backward.raster"] = raster - losses
+            seconds["backward.slice"] = backward.end - raster
+        parts.append(seconds)
+    return parts
+
+
+def _training_bound(iteration_s: float, event_s: float) -> tuple[float, int, int]:
+    """Q-168's upper bound on a default training run, with T_it and the number of events of the
+    default calendar (§1.3): T_it × `iteration_s` + events × `event_s`, where `event_s` is what
+    an event iteration takes beyond an iteration without one."""
+    from openftgs.config import TrainConfig
+    from openftgs.train import calendar_entry
+
+    cfg = TrainConfig()
+    iterations = cfg.optim.iterations
+    events = 0
+    for it in range(1, iterations + 1):
+        entry = calendar_entry(cfg, it)
+        events += entry.event or entry.reset_opacity
+    return iterations * iteration_s + events * event_s, iterations, events
+
+
+def _stage_figures(
+    parts: Sequence[dict[str, float]], *, events: Sequence[bool]
+) -> dict[str, dict[str, float]]:
+    """§3.4 B-1 (#226): per stage, over the iterations without an event in which it ran, the
+    mean and median seconds, the count, and its share of an iteration, the ratio of its mean to
+    the mean iteration (Q-185)."""
+    quiet = [p for p, event in zip(parts, events, strict=True) if not event]
+    iteration = statistics.fmean(p["iteration"] for p in quiet)
+    names = dict.fromkeys(name for p in quiet for name in p)  # first-seen order
+    figures: dict[str, dict[str, float]] = {}
+    for name in names:
+        values = [p[name] for p in quiet if name in p]
+        mean = statistics.fmean(values)
+        figures[name] = {
+            "mean_s": mean,
+            "median_s": _median(values),
+            "share": mean / iteration,
+            "count": len(values),
+        }
+    return figures
+
+
+def _is_event(cfg: TrainConfig, it: int) -> bool:
+    """Whether iteration `it` of `cfg`'s calendar runs an event (`Trainer.step`'s `_event`)."""
+    from openftgs.train import calendar_entry
+
+    entry = calendar_entry(cfg, it)
+    return entry.event or entry.reset_opacity
+
+
+def _fractions(trainer: Trainer, video: MultiViewVideo, logs: Sequence[StepLog]) -> list[float]:
+    """The shares of the rows that pass the opacity cull (active, D-32) and that are visible in
+    the image (E6), averaged over the images and times of `logs`, on the trainer's model as it is
+    now, without gradients (Q-185)."""
+    import torch
+
+    from openftgs.render import render
+
+    model = trainer.model
+    totals = torch.zeros(2, dtype=torch.float64, device=model.means.device)
+    with torch.no_grad():
+        for log in logs:
+            camera = video.records[log.image_index].camera
+            out = render(
+                model,
+                camera,
+                log.t,
+                time_units="normalized",
+                sh_degree=log.sh_degree,
+                backend="gsplat",
+                return_aux=True,
+            )
+            assert out.visible is not None  # return_aux
+            totals[0] += model.at_time(log.t).passes_cull.double().mean()
+            totals[1] += out.visible.double().mean()
+    return [float(v) / len(logs) for v in totals.tolist()]
+
+
+def _score_copy(n: int) -> float:
+    """Q-72 note 5: the median wall time of copying N float32 sampling scores from the GPU to
+    the CPU, as relocation does before its CPU generator draws the targets; the copy
+    synchronizes, as an event does anyway."""
+    import torch
+
+    scores = torch.rand(n, device="cuda")
+    times: list[float] = []
+    for k in range(_WARMUP + _COPY_REPETITIONS):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        scores.to("cpu")
+        if k >= _WARMUP:
+            times.append(time.perf_counter() - start)
+    return _median(times)
+
+
+def _train_step_case(
+    ctx: _Context, case: dict[str, Any], model: FreeTimeGaussians
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """One B-1 case: a trainer on `model` with B-1's configuration, iterations 1 to 120 as a
+    warm-up, 121 to 420 under the stage clock and 421 to 720 without it (Q-185). Returns the
+    case's per-stage and per-event entries, and its summary figures."""
+    import gc
+
+    import torch
+
+    from openftgs._stages import Clock
+    from openftgs.train import Trainer
+
+    cfg = _train_step_config(model.num_gaussians, sh_degree=model.sh_degree)
+    given = f"model {ctx.args.model}" if ctx.model is not None else f"scene {ctx.args.scene}"
+    # A model of another scene's time can't train on this one; the LPIPS weights may download.
+    with _environment_error("LPIPS networks"), _as_input_error(given):
+        trainer = Trainer(cfg, ctx.video, model, device="cuda")
+    del model
+    n_start = trainer.model.num_gaussians
+    first, last = _TIMED
+    while trainer.iteration < first - 1:
+        trainer.step()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    n_timed_start = trainer.model.num_gaussians
+    logs: list[StepLog] = []
+    with Clock("cuda") as clock:
+        while trainer.iteration < last:
+            logs.append(trainer.step())
+    timings = clock.read()  # synchronizes, after the last timed iteration
+    peaks = torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+    n_end = trainer.model.num_gaussians
+    active, visible = _fractions(trainer, ctx.video, logs)
+
+    # Q-185: the stage clock costs host time per stage, which shows where an iteration is
+    # host-bound; whole iterations timed by one pair of events each, without it, measure that.
+    marks: list[tuple[int, Any, Any]] = []
+    while trainer.iteration < _UNCLOCKED[1]:
+        start = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        end = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        start.record()
+        iteration = trainer.step().iteration
+        end.record()
+        marks.append((iteration, start, end))
+    torch.cuda.synchronize()
+    unclocked = [(it, start.elapsed_time(end) / 1000.0) for it, start, end in marks]
+    copy_s = _score_copy(trainer.model.num_gaussians)
+    del trainer, marks
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    parts = _iteration_parts(timings)
+    if len(parts) != len(logs):
+        raise RuntimeError(f"the stage clock holds {len(parts)} iterations, not {len(logs)}")
+    events = [_is_event(cfg, log.iteration) for log in logs]
+    stages = _stage_figures(parts, events=events)
+    entries = [
+        {"case": {**case, "stage": name}, "figures": figures} for name, figures in stages.items()
+    ]
+    event_parts = [(log, part) for log, part, ev in zip(logs, parts, events, strict=True) if ev]
+    for log, part in event_parts:
+        figures = {
+            "events_s": part["events"],
+            "iteration_s": part["iteration"],
+            "n_after": log.num_gaussians,
+        }
+        entries.append({"case": {**case, "iteration": log.iteration}, "figures": figures})
+
+    iteration_s = stages["iteration"]["mean_s"]
+    quiet = [s for it, s in unclocked if not _is_event(cfg, it)]
+    loud = [s for it, s in unclocked if _is_event(cfg, it)]
+    unclocked_s = statistics.fmean(quiet)
+    if loud:  # what an event iteration takes beyond one without an event
+        event_extra_s = statistics.fmean(loud) - unclocked_s
+    else:
+        event_extra_s = statistics.fmean(p["iteration"] for _, p in event_parts) - iteration_s
+    bound, _, _ = _training_bound(unclocked_s, event_extra_s)
+    slice_s = stages["slice.kernel"]["mean_s"] + stages["backward.slice"]["mean_s"]
+    summary = {
+        "iterations": stages["iteration"]["count"],
+        "slice_forward_s": stages["slice.kernel"]["mean_s"],
+        "slice_backward_s": stages["backward.slice"]["mean_s"],
+        "slice_share": slice_s / iteration_s,  # D-50
+        "iteration_unclocked_mean_s": unclocked_s,
+        "iteration_unclocked_median_s": _median(quiet),
+        "unclocked_iterations": len(quiet),
+        "clock_overhead_s": iteration_s - unclocked_s,
+        "events_s": statistics.fmean(p["events"] for _, p in event_parts),
+        "event_iteration_s": statistics.fmean(p["iteration"] for _, p in event_parts),
+        "event_extra_s": event_extra_s,
+        "training_bound_s": bound,
+        "peak_allocated_bytes": peaks[0],
+        "peak_reserved_bytes": peaks[1],
+        "active_fraction": active,
+        "visible_fraction": visible,
+        "n_start": n_start,
+        "n_timed_start": n_timed_start,
+        "n_end": n_end,
+        "score_copy_s": copy_s,
+    }
+    return entries, summary
+
+
+def _train_step(ctx: _Context) -> _Result:
+    """B-1: a training iteration by stage, from the stage clock's CUDA events, on synthesized
+    models of 0.5M, 1M and 3M rows with 20 % active and 3M with 5 % (Q-168, Q-181), or on the
+    model given with `--model` (Q-167); with peak memory, the events, and a bound on a default
+    training run (Q-168); and D-50's share of the temporal slice (#226, Q-185)."""
+    import functools
+
+    from openftgs._stages import STAGES
+    from openftgs.data import FrameCache
+
+    with _as_input_error(f"frame cache of {ctx.args.scene}", OSError):
+        FrameCache.build(ctx.video)  # #226: built before timing, so "auto" only opens it
+    makers: list[tuple[dict[str, Any], Callable[[], FreeTimeGaussians]]] = []
+    if ctx.model is not None:
+        given = ctx.model.model
+        listed: list[list[Any]] = [[given.num_gaussians, None]]
+        makers.append(({"model": "given", "n": given.num_gaussians}, lambda: given))
+    else:
+        with _as_input_error(f"scene manifest {ctx.args.scene}"):
+            volume = _volume(ctx.video)
+        listed = [[n, active] for n, active in _TRAIN_STEP_CASES]
+        for n, active in _TRAIN_STEP_CASES:
+            synthesize = functools.partial(
+                _synthesize, volume, n, active=active, seed=_SEED, device="cuda"
+            )
+            makers.append(({"n": n, "active": active}, synthesize))
+
+    cases: list[dict[str, Any]] = []
+    summaries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for case, make in makers:
+        entries, summary = _train_step_case(ctx, case, make())
+        cases += entries
+        cases.append({"case": case, "figures": summary})
+        summaries.append((case, summary))
+
+    # The bound (Q-168) from the largest N, and among equal N the slowest; D-50's share from the
+    # case where the slice takes the largest share (#226).
+    case, summary = max(summaries, key=lambda s: (s[0]["n"], s[1]["training_bound_s"]))
+    budgets = [_budget(case, summary, "training_bound_s", _BOUND_LIMIT_S, "bound")]
+    case, summary = max(summaries, key=lambda s: s[1]["slice_share"])
+    budgets.append(_budget(case, summary, "slice_share", _SLICE_SHARE_LIMIT, "limit"))
+
+    any_cfg = _train_step_config(1)  # the events don't depend on N
+    _, iterations, events = _training_bound(0.0, 0.0)
+    first, last = _TIMED
+    setup = {
+        "model": "given (--model)" if ctx.model is not None else "synthesized (Q-168, Q-181)",
+        "seed": None if ctx.model is not None else _SEED,
+        "cases": listed,
+        "configuration": (
+            "the default, LPIPS-VGG included, except growth.start = reloc.start = "
+            f"{_EVENTS_FROM}, growth.n_max = ⌈1.02·N⌉, optim.sh_interval = 1, and the "
+            "model's SH degree"
+        ),
+        "frame_cache": 'built before timing; placement "auto"',
+        "warmup": first - 1,
+        "timed": [first, last],
+        "unclocked": list(_UNCLOCKED),
+        "events": [it for it in range(first, last + 1) if _is_event(any_cfg, it)],
+        "clock": "CUDA events (openftgs._stages), read after the last timed iteration",
+        "stages": list(STAGES[: STAGES.index("log") + 1]),
+        "backward_parts": list(_BACKWARD_PARTS),
+        "figures": "per stage over the iterations without an event; shares are ratios of means",
+        "training_iterations": iterations,
+        "default_events": events,
+        "bound_limit_s": _BOUND_LIMIT_S,
+        "slice_share_limit": _SLICE_SHARE_LIMIT,
+        "copy_repetitions": _COPY_REPETITIONS,
+    }
+    return _Result(setup, cases, budgets)
+
+
+# -- B-2: the rasterization variants (§3.4, D-32, D-57; Q-31, Q-36, Q-187) ----------------------
+
+_RASTER_TIMES = 10  # #227: one training camera at 10 fixed times
+
+
+def _raster_frames(video: MultiViewVideo) -> list[int]:
+    """The records B-2 renders (Q-187): the first training camera in the manifest's order, at
+    `_RASTER_TIMES` of its frames evenly spaced in time, round(k·(F − 1)/9) of its F frames for
+    k = 0…9, repeating frames when F < 10."""
+    first = next(r.camera.name for r in video.records if r.split == "train")
+    frames = sorted(
+        (r.timestamp, i)
+        for i, r in enumerate(video.records)
+        if r.split == "train" and r.camera.name == first
+    )
+    last = len(frames) - 1
+    return [frames[round(k * last / (_RASTER_TIMES - 1))][1] for k in range(_RASTER_TIMES)]
+
+
+def _raster_figures(timings: Sequence[Timing]) -> dict[str, Any]:
+    """B-2's times from the stage clock's records of its calls (Q-187), each the median over
+    the calls: the whole call, from the temporal slice's start to the backward's end (the figure
+    the decision rule reads); the rasterization, from `raster.forward`'s start to the point where
+    its backward is done; that forward and that backward (from the losses' backward done to the
+    rasterization's); and the backward."""
+
+    def named(name: str) -> list[Timing]:
+        return [t for t in timings if t.name == name]
+
+    calls = list(
+        zip(
+            named("slice"),
+            named("raster.forward"),
+            named("backward"),
+            named("backward.losses_done"),
+            named("backward.raster_done"),
+            strict=True,
+        )
+    )
+    return {
+        "forward_backward_s": _median([b.end - s.start for s, _, b, _, _ in calls]),
+        "raster_s": _median([done.start - r.start for _, r, _, _, done in calls]),
+        "raster_forward_s": _median([r.seconds for _, r, _, _, _ in calls]),
+        "raster_backward_s": _median([done.start - lo.start for _, _, _, lo, done in calls]),
+        "backward_s": _median([b.seconds for _, _, b, _, _ in calls]),
+        "repetitions": len(calls),
+    }
+
+
+def _intersections(model: FreeTimeGaussians, camera: Camera, timestamp: float) -> list[int]:
+    """At raw time `timestamp`: the rows that pass the opacity cull (D-32), the rows visible in
+    `camera` and gsplat's tile intersections (Q-187), from gsplat's own projection and tile
+    intersection with the arguments `render` gives them (E6, D-6, D-57). Every variant sorts and
+    rasterizes the same intersections (U-8), so they are counted once."""
+    import math
+
+    import gsplat
+    import torch
+
+    with torch.no_grad():
+        g = model.at_time(model.time.to_t(timestamp))
+        like = g.means_t
+        radii, means2d, depths, _, _ = gsplat.fully_fused_projection(
+            g.means_t,
+            None,
+            g.quats_n,
+            g.scales,
+            camera.world_to_camera.to(like)[None],
+            camera.K.to(like)[None],
+            camera.width,
+            camera.height,
+            eps2d=0.3,  # E6, D-6
+            near_plane=0.01,  # E6, D-6
+            far_plane=1e10,  # E6, D-6
+            radius_clip=0.0,  # D-57
+            packed=False,
+            opacities=g.opacities_t,  # E6, D-32: the opacity cull and the extent
+        )
+        visible_rows = (radii > 0).all(dim=-1)
+        # As `render` does: gsplat leaves the 2D means of culled rows unwritten (D-75).
+        means2d = torch.where(visible_rows[..., None], means2d, torch.zeros_like(means2d))
+        tile = 16  # D-57
+        _, isect_ids, _ = gsplat.isect_tiles(
+            means2d,
+            radii,
+            depths,
+            tile,
+            math.ceil(camera.width / tile),
+            math.ceil(camera.height / tile),
+            packed=False,
+            n_images=1,
+        )
+        active = int(g.passes_cull.sum())
+        visible = int(visible_rows.sum())
+    return [active, visible, int(isect_ids.shape[0])]
+
+
+_RASTER_SIZES = (1_000_000, 3_000_000)  # #227
+_RASTER_ACTIVE = (0.05, 0.2, 1.0)  # #227
+_RASTER_REPETITIONS = 50  # #227: the median of 50
+_RasterVariant = tuple[bool, Literal["internal", "compact"]]
+# packed × precull (Q-36, Q-31), D-57's default first: the spot check's reference.
+_RASTER_VARIANTS: tuple[_RasterVariant, ...] = (
+    (True, "internal"),
+    (True, "compact"),
+    (False, "internal"),
+    (False, "compact"),
+)
+_SPOT_LIMIT = 1e-6  # U-8 on the GPU: images within 1e-6
+
+
+def _spot_check(
+    model: FreeTimeGaussians, camera: Camera, timestamps: list[float]
+) -> dict[_RasterVariant, dict[str, Any]]:
+    """B-2's spot check (#227, Q-187), under `no_grad` at every time: each variant's image
+    against packed/internal's, its largest absolute difference and the pixels where some channel
+    differs by more than 1e-6, summed over the times; and each compacted image against the same
+    layout's internal one, U-8 itself."""
+    import torch
+
+    from openftgs.render import render
+
+    default = _RASTER_VARIANTS[0]
+    checks: dict[_RasterVariant, dict[str, Any]] = {
+        variant: {"image_max_abs_diff": 0.0, "image_pixels_over_limit": 0}
+        for variant in _RASTER_VARIANTS[1:]
+    }
+    with torch.no_grad():
+        for timestamp in timestamps:
+            images = {
+                variant: render(
+                    model, camera, timestamp, packed=variant[0], precull=variant[1]
+                ).image
+                for variant in _RASTER_VARIANTS
+            }
+            for variant, check in checks.items():
+                diff = (images[variant] - images[default]).abs().amax(dim=-1)
+                check["image_max_abs_diff"] = max(check["image_max_abs_diff"], float(diff.max()))
+                check["image_pixels_over_limit"] += int((diff > _SPOT_LIMIT).sum())
+                packed, precull = variant
+                if precull == "compact":
+                    same = float((images[variant] - images[(packed, "internal")]).abs().max())
+                    check["precull_max_abs_diff"] = max(
+                        check.get("precull_max_abs_diff", 0.0), same
+                    )
+    return checks
+
+
+def _raster_call(
+    model: FreeTimeGaussians,
+    camera: Camera,
+    frames: list[tuple[float, Tensor]],
+    variant: _RasterVariant,
+) -> Callable[[], None]:
+    """One B-2 call (Q-187): `render` at the next of `frames` (raw τ and its training image
+    [1, H, W, 3]) from `camera`, moved to the model's device first, the L1 loss against that
+    image, then its backward into the model's nine stored tensors, as the stage `backward`;
+    `torch.autograd.grad` accumulates nothing between calls."""
+    import torch
+
+    from openftgs._stages import point, stage
+    from openftgs.losses import l1_loss
+    from openftgs.render import render
+
+    packed, precull = variant
+    params = [getattr(model, name) for name in model.PARAM_NAMES]
+    order = itertools.cycle(frames)
+    # On the model's device once, as `Trainer` keeps its cameras: `render` copies a camera held on
+    # the host in every call, which synchronizes (§2.4 rule 3).
+    device = model.means.device
+    camera = replace(
+        camera, K=camera.K.to(device), world_to_camera=camera.world_to_camera.to(device)
+    )
+
+    def call() -> None:
+        timestamp, target = next(order)
+        out = render(model, camera, timestamp, packed=packed, precull=precull)
+        point(out.image, "backward.losses_done")  # as `Trainer.step` marks it
+        with stage("loss.l1"):
+            loss = l1_loss(out.image, target)
+        with stage("backward"):
+            torch.autograd.grad(loss, params)
+
+    return call
+
+
+def _raster(ctx: _Context) -> _Result:
+    """B-2: `render` forward plus an L1 backward for every `packed` × `precull` combination
+    (D-57), on synthesized models at N = 1M and 3M with 5 %, 20 % and 100 % of rows active, from
+    one training camera at 10 fixed times (Q-187). Per model, the rows active, the rows
+    visible and the tile intersections at each time, and the spot check (`_spot_check`), each
+    image held to 1e-6 of packed/internal's (#227) and each compacted one to 1e-6 of its layout's
+    internal one (U-8); per variant, the first call and the medians of 50 calls, and the peak
+    allocated memory."""
+    import torch
+
+    from openftgs.config import PerfConfig
+
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    indices = _raster_frames(ctx.video)
+    records = [ctx.video.records[i] for i in indices]
+    camera = records[0].camera
+    frames = [
+        (r.timestamp, ctx.video.load_image(i).to("cuda")[None])
+        for i, r in zip(indices, records, strict=True)
+    ]
+    cases: list[dict[str, Any]] = []
+    budgets: list[dict[str, Any]] = []
+    for n in _RASTER_SIZES:
+        for active in _RASTER_ACTIVE:
+            model = _synthesize(volume, n, active=active, seed=_SEED, device="cuda")
+            # Q-187: the eager slice, the same in every variant, compiles nothing into the first
+            # call and can't fall back unannounced ("auto", Q-13).
+            model.slice_impl = "eager"
+            counts = [_intersections(model, camera, timestamp) for timestamp, _ in frames]
+            resident = torch.cuda.memory_allocated()
+            cases.append(
+                {
+                    "case": {"n": n, "active": active},
+                    "figures": {
+                        "active_rows": [c[0] for c in counts],
+                        "visible_rows": [c[1] for c in counts],
+                        "tile_intersections": [c[2] for c in counts],
+                        "resident_memory_bytes": resident,
+                    },
+                }
+            )
+            spot = _spot_check(model, camera, [timestamp for timestamp, _ in frames])
+            for variant in _RASTER_VARIANTS:
+                packed, precull = variant
+                case = {"n": n, "active": active, "packed": packed, "precull": precull}
+                call = _raster_call(model, camera, frames, variant)
+                torch.cuda.reset_peak_memory_stats()
+                first = _first_call(call)
+                figures = _raster_figures(_repeat(call, _RASTER_REPETITIONS))
+                figures["first_call_s"] = first
+                figures["peak_memory_bytes"] = torch.cuda.max_memory_allocated()
+                checked = spot.get(variant, {})
+                figures |= checked
+                for name in ("image_max_abs_diff", "precull_max_abs_diff"):
+                    if name in checked:
+                        budgets.append(_budget(case, figures, name, _SPOT_LIMIT, "limit"))
+                cases.append({"case": case, "figures": figures})
+            del model, call  # the last call holds the model; the next resident figure must not
+    setup = {
+        "model": "synthesized (Q-168, Q-181)",
+        "seed": _SEED,
+        "sizes": list(_RASTER_SIZES),
+        "active_fractions": list(_RASTER_ACTIVE),
+        "variants": [{"packed": p, "precull": c} for p, c in _RASTER_VARIANTS],
+        "default": {"packed": PerfConfig.packed, "precull": PerfConfig.precull},  # D-57
+        "camera": camera.name,
+        "width": camera.width,
+        "height": camera.height,
+        "timestamps": [timestamp for timestamp, _ in frames],
+        "slice_impl": "eager",
+        "loss": "L1 against the camera's training image at that time (losses.l1_loss)",
+        "backward": "torch.autograd.grad into the nine stored tensors",
+        "warmup": _WARMUP,
+        "repetitions": _RASTER_REPETITIONS,
+        "clock": (
+            "CUDA events: slice to backward (forward_backward_s), raster.forward to "
+            "backward.raster_done (raster_s), backward.losses_done to backward.raster_done "
+            "(raster_backward_s)"
+        ),
+        "spot_check_limit": _SPOT_LIMIT,
+    }
+    return _Result(setup, cases, budgets)
+
+
+# -- B-5: the Adam kinds (§3.4, D-53; Q-168, Q-188) --------------------------------------------
+
+
+def _visibility(n: int, fraction: float, *, seed: int, device: str) -> Tensor:
+    """Q-188: selective Adam's mask, a bool [n] with exactly round(`fraction`·n) rows true,
+    chosen by a seeded permutation, so the visible rows are spread over the tensors as a render
+    leaves them."""
+    import torch
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    mask = torch.zeros(n, dtype=torch.bool, device=device)
+    mask[torch.randperm(n, generator=g, device=device)[: round(fraction * n)]] = True
+    return mask
+
+
+def _seed_gradients(model: FreeTimeGaussians, *, seed: int) -> None:
+    """#229, Q-188: a seeded N(0, 1) gradient on each of the model's nine stored tensors."""
+    import torch
+
+    g = torch.Generator(device=model.means.device).manual_seed(seed)
+    for name in model.PARAM_NAMES:
+        param = getattr(model, name)
+        param.grad = torch.randn(param.shape, generator=g, dtype=param.dtype, device=param.device)
+
+
+_ADAM_LIMIT = 1.0  # §3.4 B-5: fused no slower than foreach, with no tolerance (Q-188)
+
+
+def _adam_budgets(
+    medians: Mapping[tuple[str, int], float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """§3.4 B-5's budget (Q-188): from the median of each `(kind, n)`, per N in the order
+    given a case `{"n"}` with fused's median over foreach's, and its budget entry against 1.0."""
+    cases: list[dict[str, Any]] = []
+    budgets: list[dict[str, Any]] = []
+    for n in dict.fromkeys(n for _, n in medians):
+        case = {"n": n}
+        figures = {"fused_over_foreach": medians["fused", n] / medians["foreach", n]}
+        cases.append({"case": case, "figures": figures})
+        budgets.append(_budget(case, figures, "fused_over_foreach", _ADAM_LIMIT, "budget"))
+    return cases, budgets
+
+
+_AdamKind = Literal["fused", "foreach", "selective"]
+_ADAM_KINDS: tuple[_AdamKind, ...] = ("fused", "foreach", "selective")  # D-53, PerfConfig.adam
+# #229: N = 1M and 3M, each with selective Adam's mask at the visible fraction B-1 measured at
+# that N with 20 % of the rows active, to three decimals (Calibration data, Q-185; Q-188).
+_ADAM_CASES: tuple[tuple[int, float], ...] = ((1_000_000, 0.173), (3_000_000, 0.170))
+_ADAM_ACTIVE = 0.2  # Q-188: B-1's models at these N
+_ADAM_REPETITIONS = 50  # #229: the median of 50
+
+
+def _adam_call(optimizer: FTGSOptimizer, visibility: Tensor | None) -> Callable[[], None]:
+    """One B-5 call (#229): the next iteration's rates, then one Adam step, as the stage
+    `adam`; the gradients stay, since no `zero_grad` clears them (Q-188)."""
+    import itertools
+
+    from openftgs._stages import stage
+
+    iterations = itertools.count(1)
+
+    def call() -> None:
+        it = next(iterations)
+        with stage("adam"):
+            optimizer.set_iteration(it)
+            if visibility is None:
+                optimizer.step()
+            else:
+                optimizer.step(visibility=visibility)
+
+    return call
+
+
+def _adam(ctx: _Context) -> _Result:
+    """B-5: `FTGSOptimizer.set_iteration` plus `step` for fused, foreach and selective Adam
+    (D-53) at N = 1M and 3M, on B-1's synthesized models with seeded gradients on all nine
+    stored tensors: the time of the first call, then the median of 50 calls after a warm-up;
+    selective Adam's mask at the visible fraction B-1 measured; and per N the budget, fused no
+    slower than foreach (#229, Q-188)."""
+    import gc
+
+    import torch
+
+    from openftgs.config import OptimConfig
+    from openftgs.optim import build_optimizer
+
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    cases: list[dict[str, Any]] = []
+    medians: dict[tuple[str, int], float] = {}
+    for n, fraction in _ADAM_CASES:
+        model = _synthesize(volume, n, active=_ADAM_ACTIVE, seed=_SEED, device="cuda")
+        _seed_gradients(model, seed=_SEED)
+        mask = _visibility(n, fraction, seed=_SEED, device="cuda")
+        for kind in _ADAM_KINDS:
+            # The same model for every kind: Adam's cost doesn't depend on the values.
+            optimizer = build_optimizer(
+                model,
+                OptimConfig(),
+                spatial_scale=volume.spatial_scale,
+                frame_dt=ctx.video.frame_dt,
+                adam=kind,
+            )
+            call = _adam_call(optimizer, mask if kind == "selective" else None)
+            torch.cuda.reset_peak_memory_stats()
+            first = _first_call(call)
+            timings = [t for t in _repeat(call, _ADAM_REPETITIONS) if t.name == "adam"]
+            figures: dict[str, Any] = {
+                "step_s": _median([t.seconds for t in timings]),
+                "first_call_s": first,
+                "repetitions": len(timings),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            }
+            if kind == "selective":
+                figures["visible_fraction"] = round(fraction * n) / n
+            medians[kind, n] = figures["step_s"]
+            cases.append({"case": {"adam": kind, "n": n}, "figures": figures})
+            del optimizer, call
+        del model, mask
+        gc.collect()
+        torch.cuda.empty_cache()
+    compared, budgets = _adam_budgets(medians)
+    setup = {
+        "model": "synthesized (Q-168, Q-181)",
+        "seed": _SEED,
+        "active_fraction": _ADAM_ACTIVE,
+        "cases": [[n, fraction] for n, fraction in _ADAM_CASES],
+        "kinds": list(_ADAM_KINDS),
+        "configuration": "OptimConfig() with the scene's S (D-27) and Δt_f",
+        "gradients": "N(0, 1), seeded, on all nine stored tensors, set once and kept",
+        "call": "set_iteration(it) then step(), it = 1, 2, …, without zero_grad",
+        "visibility": (
+            "selective Adam's mask: round(f·N) rows chosen by a seeded permutation, f being "
+            "B-1's visible fraction at N with 20 % active (Calibration data, Q-185)"
+        ),
+        "warmup": _WARMUP,
+        "repetitions": _ADAM_REPETITIONS,
+        "clock": "CUDA events: adam",
+        "budget": f"fused_over_foreach ≤ {_ADAM_LIMIT} at each N",
+    }
+    return _Result(setup, cases + compared, budgets)
+
+
+# -- B-6: the data wait per cache placement (§3.4, D-51; Q-99, Q-178, Q-189) -------------------
+
+_DATA_N = 1_000_000  # #232: B-1's configuration at N = 1M
+_DATA_ACTIVE = 0.2  # Q-189: as B-1's case at 1M rows (#226)
+_MEMORY_N = 3_000_000  # #232, Q-99's note: peak memory at N = 3M with the cache on the GPU
+_DATA_TIMED = (121, 320)  # #232: 200 iterations under the CUDA clock, after B-1's warm-up
+_DATA_HOST = (321, 420)  # Q-189: 100 iterations under the wall clock, a diagnostic
+_DATA_SHARE_LIMIT = 0.01  # §3.4 B-6, D-51: the data wait under 1 % of an iteration
+# #232, Q-178: each placement, with the prefetch depth where it has one ("gpu" takes its frames in
+# place and "off" decodes PNGs, so neither reads ahead).
+_DATA_PLACEMENTS: tuple[tuple[Literal["gpu", "mmap", "off"], int | None], ...] = (
+    ("gpu", None),
+    ("mmap", 8),
+    ("mmap", 0),
+    ("off", None),
+)
+
+
+def _data_config(
+    n: int, placement: Literal["gpu", "mmap", "off"], prefetch: int | None
+) -> TrainConfig:
+    """B-6's configuration (#232): B-1's at `n` rows, with the case's frame-cache placement and
+    prefetch depth; None keeps the default depth, which "gpu" and "off" don't use."""
+    import dataclasses
+
+    cfg = _train_step_config(n)
+    perf = dataclasses.replace(cfg.perf, frame_cache=placement)
+    if prefetch is not None:
+        perf = dataclasses.replace(perf, prefetch=prefetch)
+    return dataclasses.replace(cfg, perf=perf)
+
+
+@dataclass(frozen=True)
+class _AutoEstimate:
+    """What "auto" measures after a warm-up iteration on CUDA (Q-99), in bytes: the free GPU
+    memory, `mem_get_info`'s plus what the allocator holds unused; what growth to N_max adds;
+    the cache's size; the memory allocated and reserved then; and the device's total."""
+
+    free: int
+    growth: int
+    cache: int
+    allocated: int
+    reserved: int
+    total: int
+
+    @property
+    def limit(self) -> float:
+        """D-51, Q-99: the largest cache "auto" puts on the GPU, ½·free − growth."""
+        return 0.5 * self.free - self.growth
+
+    @property
+    def fits(self) -> bool:
+        return self.cache <= self.limit
+
+    def figures(self) -> dict[str, float]:
+        return {
+            "auto_free_bytes": self.free,
+            "auto_growth_bytes": self.growth,
+            "auto_allocated_bytes": self.allocated,
+            "auto_reserved_bytes": self.reserved,
+            "auto_total_bytes": self.total,
+            # Q-189: the device's memory outside this process's allocator, other processes'
+            # and the CUDA context's, which the free memory leaves out.
+            "auto_outside_bytes": self.total - self.free - self.allocated,
+            "cache_bytes": self.cache,
+            "auto_limit_bytes": self.limit,
+        }
+
+    def margin(self, *, peak_reserved: int) -> dict[str, float]:
+        """Q-99's note (Q-189): what a run with the cache on the GPU took after the warm-up
+        iteration beyond the cache and the growth, its peak reserved memory less what was
+        allocated then, and that as a share of the ½·free the rule leaves for it; above 1, a cache
+        at the rule's limit wouldn't have fit."""
+        beyond = peak_reserved - self.allocated - self.cache - self.growth
+        return {"beyond_estimate_bytes": beyond, "margin_used": beyond / (0.5 * self.free)}
+
+
+def _data_figures(
+    timed: Sequence[dict[str, float]],
+    timed_events: Sequence[bool],
+    host: Sequence[dict[str, float]],
+    host_events: Sequence[bool],
+) -> dict[str, Any]:
+    """§3.4 B-6 (Q-189): from the per-iteration stage times of the CUDA window (`timed`) and
+    of the wall clock's (`host`), over the iterations without an event: the data stage's share
+    of an iteration, a ratio of means as B-1's (Q-185), with its mean and median, the mean
+    iteration and the count; then the host times of the data stage and of an iteration."""
+    stages = _stage_figures(timed, events=timed_events)
+    on_host = _stage_figures(host, events=host_events)
+    return {
+        "data_share": stages["data"]["share"],
+        "data_mean_s": stages["data"]["mean_s"],
+        "data_median_s": stages["data"]["median_s"],
+        "iteration_mean_s": stages["iteration"]["mean_s"],
+        "iterations": stages["iteration"]["count"],
+        "data_host_mean_s": on_host["data"]["mean_s"],
+        "iteration_host_mean_s": on_host["iteration"]["mean_s"],
+        "host_iterations": on_host["iteration"]["count"],
+    }
+
+
+def _data_budgets(cases: Sequence[dict[str, Any]], *, n: int) -> list[dict[str, Any]]:
+    """§3.4 B-6, D-51 (#232): a budget entry for the data wait's share of every case that reads
+    the cache ("gpu", "mmap" at either depth) at B-6's `n` rows, against 1 %."""
+    return [
+        _budget(c["case"], c["figures"], "data_share", _DATA_SHARE_LIMIT, "budget")
+        for c in cases
+        if c["case"]["placement"] in ("gpu", "mmap") and c["case"]["n"] == n
+    ]
+
+
+def _release_cuda() -> None:
+    """Frees what the last trainer left in the allocator, so the next case starts alike."""
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _data_trainer(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> Trainer:
+    """A trainer of `cfg` on a synthesized model of `n` rows (Q-168, Q-181), B-1's case at 1M."""
+    from openftgs.train import Trainer
+
+    model = _synthesize(volume, n, active=_DATA_ACTIVE, seed=_SEED, device="cuda")
+    with _environment_error("LPIPS networks"):  # the LPIPS weights may download
+        return Trainer(cfg, ctx.video, model, device="cuda")
+
+
+def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
+    """Q-99, Q-189: what "auto" measures on CUDA, taken as it takes it: a trainer of B-6's
+    configuration at `n` rows runs its first iteration on decoded PNGs, as "auto" does, and the
+    free memory and growth are read when that iteration returns."""
+    import torch
+
+    from openftgs.data import FrameCache
+
+    cfg = _data_config(n, "off", None)
+    trainer = _data_trainer(ctx, volume, cfg, n)
+    trainer.step()
+    free, total = torch.cuda.mem_get_info()
+    allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+    model = trainer.model
+    # Q-99: the bytes of a row in training, its stored floats (§1.1) for the parameter, its
+    # gradient and Adam's two moments, plus the gradient statistics' two floats, all float32.
+    floats = sum(getattr(model, name)[0].numel() for name in model.PARAM_NAMES)
+    growth = max(0, cfg.growth.n_max - model.num_gaussians) * 4 * (4 * floats + 2)
+    estimate = _AutoEstimate(
+        free=free + reserved - allocated,
+        growth=growth,
+        cache=FrameCache.size_of(ctx.video),
+        allocated=allocated,
+        reserved=reserved,
+        total=total,
+    )
+    del trainer, model
+    _release_cuda()
+    return estimate
+
+
+def _data_case(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> dict[str, Any]:
+    """One B-6 case (#232, Q-189): a fresh trainer of `cfg` on `n` rows, iterations 1 to 120
+    as B-1's warm-up, 121 to 320 under the stage clock's CUDA events, then 321 to 420 under the
+    wall clock; with peak memory from the first iteration on."""
+    import torch
+
+    from openftgs._stages import Clock
+
+    trainer = _data_trainer(ctx, volume, cfg, n)
+    torch.cuda.reset_peak_memory_stats()  # after the cache's placement, which it includes
+    windows: list[tuple[list[dict[str, float]], list[bool]]] = []
+    for clock, (first, last) in ((Clock("cuda"), _DATA_TIMED), (Clock("wall"), _DATA_HOST)):
+        while trainer.iteration < first - 1:
+            trainer.step()
+        with clock:
+            iterations = [trainer.step().iteration for _ in range(first, last + 1)]
+        parts = _iteration_parts(clock.read())  # the CUDA clock synchronizes, after `last`
+        if len(parts) != len(iterations):
+            raise RuntimeError(
+                f"the stage clock holds {len(parts)} iterations, not {len(iterations)}"
+            )
+        windows.append((parts, [_is_event(cfg, it) for it in iterations]))
+    torch.cuda.synchronize()
+    peaks = torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+    del trainer
+    _release_cuda()
+    (timed, timed_events), (host, host_events) = windows
+    figures = _data_figures(timed, timed_events, host, host_events)
+    figures |= {"peak_allocated_bytes": peaks[0], "peak_reserved_bytes": peaks[1]}
+    return figures
+
+
+def _data(ctx: _Context) -> _Result:
+    """B-6: the data wait's share of an iteration per frame-cache placement (§3.4, D-51), with
+    B-1's configuration at 1M rows (#232): the GPU cache, the memory-mapped cache at prefetch
+    depths 8 and 0, and PNG decoding; then the GPU cache at 3M rows with peak memory against
+    what "auto" estimated (Q-99's note). The GPU cache is measured only where "auto" would place
+    it on the GPU (Q-178, Q-189), and skipped with that estimate otherwise."""
+    from openftgs.data import FrameCache
+
+    with _as_input_error(f"frame cache of {ctx.args.scene}", OSError):
+        FrameCache.build(ctx.video)  # as B-1: built before timing, so the cases only open it
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    runs = [(_DATA_N, placement, prefetch) for placement, prefetch in _DATA_PLACEMENTS]
+    runs.append((_MEMORY_N, "gpu", None))
+    cases: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for n, placement, prefetch in runs:
+        case: dict[str, Any] = {"n": n, "placement": placement}
+        if prefetch is not None:
+            case["prefetch"] = prefetch
+        estimate = None
+        if placement == "gpu":  # Q-178, Q-189
+            estimate = _probe(ctx, volume, n)
+            if not estimate.fits:
+                reason = (
+                    f'"auto" would memory-map the cache (Q-99): its {estimate.cache / 1e9:.2f} GB '
+                    f"exceed half the {estimate.free / 1e9:.2f} GB free after a warm-up "
+                    f"iteration less growth's {estimate.growth / 1e9:.3f} GB"
+                )
+                skipped.append({"case": case, "reason": reason, "estimate": estimate.figures()})
+                continue
+        figures = _data_case(ctx, volume, _data_config(n, placement, prefetch), n)
+        if estimate is not None:
+            figures |= estimate.figures()
+            figures |= estimate.margin(peak_reserved=figures["peak_reserved_bytes"])
+        cases.append({"case": case, "figures": figures})
+
+    any_cfg = _data_config(1, "off", None)  # the events don't depend on N
+    first, last = _DATA_TIMED[0], _DATA_HOST[1]
+    setup = {
+        "model": "synthesized (Q-168, Q-181)",
+        "seed": _SEED,
+        "active_fraction": _DATA_ACTIVE,
+        "cases": [[n, placement, prefetch] for n, placement, prefetch in runs],
+        "configuration": (
+            "B-1's (#226): the default, LPIPS-VGG included, except growth.start = reloc.start = "
+            f"{_EVENTS_FROM}, growth.n_max = ⌈1.02·N⌉ and optim.sh_interval = 1; with the "
+            "case's perf.frame_cache and perf.prefetch"
+        ),
+        "frame_cache": "built before timing",
+        "gpu": (
+            'measured where "auto" would place the cache on the GPU (Q-99): a trainer decoding '
+            "PNGs runs one iteration first, and the free memory and growth are read after it"
+        ),
+        "warmup": _DATA_TIMED[0] - 1,
+        "timed": list(_DATA_TIMED),
+        "host": list(_DATA_HOST),
+        "events": [it for it in range(first, last + 1) if _is_event(any_cfg, it)],
+        "clock": "CUDA events (openftgs._stages) over timed; the wall clock over host",
+        "figure": (
+            "data_share: the data stage's mean over the iteration's, over the timed iterations "
+            "without an event"
+        ),
+        "share_limit": _DATA_SHARE_LIMIT,
+        "memory_n": _MEMORY_N,
+        "skipped": skipped,
+    }
+    return _Result(setup, cases, _data_budgets(cases, n=_DATA_N))
+
+
+def _budget(
+    case: dict[str, Any], figures: dict[str, Any], figure: str, limit: float, kind: str
+) -> dict[str, Any]:
+    """A budget entry of BENCH.json (Q-166, Q-180) for one figure of one case."""
+    value = figures[figure]
+    return {
+        "case": case,
+        "figure": figure,
+        "limit": limit,
+        "value": value,
+        "pass": value <= limit,
+        "kind": kind,
+    }
+
+
 # -- B-7: rendering at a time, with and without the temporal index (§3.4, D-55; Q-174, Q-T231.1,
 # Q-T231.2) ---------------------------------------------------------------------------------------
 
@@ -998,12 +2039,12 @@ def _render(ctx: _Context) -> _Result:
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
-    "train-step": _Benchmark("B-1", 226, model=True),
-    "raster": _Benchmark("B-2", 227),
+    "train-step": _Benchmark("B-1", 226, _train_step, model=True),
+    "raster": _Benchmark("B-2", 227, _raster),
     "slice": _Benchmark("B-3", 225, _slice),
     "losses": _Benchmark("B-4", 228),
-    "adam": _Benchmark("B-5", 229),
-    "data": _Benchmark("B-6", 232),
+    "adam": _Benchmark("B-5", 229, _adam),
+    "data": _Benchmark("B-6", 232, _data),
     "render": _Benchmark("B-7", 231, _render, model=True),
     "init": _Benchmark("B-8", 234),
     "convert": _Benchmark("B-8", 234, cuda=False),

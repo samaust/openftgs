@@ -59,6 +59,12 @@ The settings of D-6 and D-57 are private constants beside E6's (classic mode, th
 
 The effective opacity goes into gsplat's projection, which applies the opacity cull and the opacity-aware extent there: D-32's default placement. Inside the projection gsplat applies E6's culls in its own order (depth, det Σ′, effective opacity, then the screen box off the image) and sets the screen radii from the extent rounded up to whole pixels; the reference reaches the same visibility (Q-33).
 
+### Layouts and the opacity cull's placement
+
+B-2 timed all four `packed` × `precull` combinations on kitchen (`docs/modules/cli/benchmarks.md`, #227, Calibration data), and the defaults D-57 sets stay: packed mode with the opacity cull inside gsplat's projection is the fastest at 20 % of rows active, at 1M and 3M rows, and within 1.1 % of the fastest at 5 %. Compaction adds its kept-row selection and gathers, which cost most where most rows pass the cull. Unpacked mode wins only when every row is active, and projects every row of the model whatever its share is visible.
+
+Compaction is exact: at B-2's scale its images are bitwise those of the internal cull, in both layouts (U-8). The layouts are not quite: gsplat 1.5.3's packed and unpacked projections compute bitwise-equal radii, 2D means and depths, but conics that differ in the last bits for most visible rows. Where a term of a pixel sits at the α skip or at the transmittance stop, that flips it, as between the two backends (Q-39, below). On kitchen that changed 1 to 17 of 13.7 million pixels per model, by up to 1.6e-3, and left every other pixel within 1e-6. D-57 and §2.4 say the layout leaves results unchanged; the owner has been told, B-2 keeps its 1e-6 limit, and the layout test (`test_packed_and_unpacked_layouts_render_alike`) still holds it on its small scene. The default layout is the one training and rendering use, so their results don't depend on it.
+
 ### Cameras
 
 View matrices are built from R_w and t_w with a last row of (0, 0, 0, 1), and K from f_x, f_y, c_x and c_y only, so the backend reads the same camera fields as the reference (Q-32). The camera center for E2's view direction is E2's own (§1.4), as for the reference, rather than gsplat's inverse of the view matrix: the same in exact arithmetic, and without the host synchronization of `torch.inverse` (§2.4 rule 3; D-76).
@@ -79,7 +85,7 @@ A render synchronizes where gsplat reads back the number of tile intersections a
 
 `render_request` answers a render request (§2.2, D-55, Q-57). Items that share a timestamp and an image size render in one call, since `render()` refuses cameras of different sizes (Q-32). Outputs are keyed by item id, which must be unique, never by camera name: a request built from a scene manifest's cameras repeats one camera at many times. The request's background and SH degree pass through. Its time unit must be the model's (Q-17). The whole request runs under inference mode.
 
-Three keyword-only arguments come from Q-174, so no caller had to change: `temporal_index` and `frame_dt`, below, and `device`, which places the outputs. By default they go to the CPU in request order, so a large request doesn't hold every image on the GPU; the model's device leaves them where they were rendered, with no copy.
+Three keyword-only arguments come from Q-174, so no caller had to change: `temporal_index` and `frame_dt`, below, and `device`, which places the outputs. A fourth, `devices`, spreads the request over several devices (Q-175; "Several devices", below). By default they go to the CPU in request order, so a large request doesn't hold every image on the GPU; the model's device leaves them where they were rendered, with no copy.
 
 ### Once per request
 
@@ -110,6 +116,16 @@ The width is `frame_dt`, in normalized time. `ftgs render` and `ftgs eval` pass 
 ### Where a request synchronizes
 
 On a GPU, a request synchronizes inside gsplat's calls, as every render does, and while the index is built, which reads counts back from the device. Nothing else does: the background is filled on the device; host cameras are sent once, without blocking; a bucket's rows are a slice whose length the host knows, so even an empty selection is found without reading the device; and with `device` set to the model's device the outputs aren't copied. A GPU test checks this under torch's debug mode. With the default CPU outputs, each output's copy to the CPU synchronizes as well.
+
+### Several devices
+
+A fourth keyword-only argument, `devices` (Q-175), spreads a request over shards, one per entry, without changing its images (D-54). `devices=None`, the default, renders on the model's device in the caller's thread, exactly as before. A repeated entry is another shard on the same device, as with `roma_init` (Q-106), which is how a test simulates several GPUs on one. A string, an empty list or an entry that isn't a device is a `ValueError` before anything renders (Q-186).
+
+Each shard gets its own copy of the model on its device, made with the public constructor from the model's tensors and keeping its `slice_impl` (Q-66), also on the model's own device, and builds for that copy what a request builds once: the background, the cameras and, with the index on, the SH concat and the index. Whether the index is on, and the width of its buckets, are decided once for the whole request, so every shard renders alike (Q-186). The jobs are the request's groups, one timestamp and image size each. One worker thread per shard takes them from a shared queue, renders under inference mode, which PyTorch keeps per thread, and moves each output to `device`. Outputs come back in request order whichever shard rendered them, and an error in a shard is raised in the caller's thread once every shard has stopped.
+
+The caller's thread builds the shards one after another before any worker starts, and runs each copy's temporal slice once, under inference mode, on each path the request's renders take: every row, as `render()` and the reference backend's index slice them, and, when gsplat slices the index's rows, a gathered copy of every row. So the compiled slice (Q-13) is compiled for each device by one thread at a time, and under "auto" a failed compilation warns from the caller's thread. Dynamo compiles a graph per device, and every graph counts toward the recompile limit of Q-13.
+
+On the reference backend, three shards on the CPU give bitwise the images of an unsharded request, which a test checks; on gsplat, three shards on one GPU agree with it within 1e-6, as two gsplat runs do. The runner is `openftgs._shards`, a private top-level module that imports nothing from openftgs, so `roma_init` and `evaluate_images` share it. `ftgs render` with gsplat passes every visible CUDA device (`docs/modules/cli/command-line.md`).
 
 ## Where the backends differ
 

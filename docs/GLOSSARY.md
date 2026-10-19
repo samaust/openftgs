@@ -331,7 +331,7 @@ What matches the two images of a camera pair at every pixel, giving a dense warp
 _Avoid_: matcher model, feature matcher, RoMa (when any dense matcher is meant), the matcher (unqualified)
 
 **Shard**:
-One share of `roma_init`'s camera pairs, matched on one device by its own dense matcher; the init points don't depend on how the pairs are spread over shards. D-54, D-56, Q-106
+One share of independent work done on one device with its own copy of what it needs, in its own thread: `roma_init`'s camera pairs, each shard with its own dense matcher; a render request's calls, or an evaluation's timestamps, each shard with its own model copy (and `Evaluator`). The results don't depend on how the work is spread over shards. D-54, D-56, Q-106, Q-175
 _Avoid_: rank (reserved for multi-GPU training), worker, partition
 
 ### Rendering
