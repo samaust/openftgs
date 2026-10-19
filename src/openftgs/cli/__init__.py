@@ -7,7 +7,8 @@ Each command parses its options and calls the library; heavy imports happen insi
 commands, so `ftgs --help` stays fast and `ftgs train` can set environment variables before
 CUDA starts. The exit codes are §2.1's: 0 success, 2 invalid input or environment, 3 a
 numerical failure (Q-142); `ftgs train` stopped by a signal exits with 128 plus its number
-(Q-133). Any other exception is a bug and keeps its traceback (Q-26).
+(Q-133). Any other exception is a bug and keeps its traceback (Q-26). `ftgs bench` and its
+benchmarks are in the private module `_bench` (Q-166 to Q-168).
 """
 
 from __future__ import annotations
@@ -37,19 +38,6 @@ __all__ = ["main"]
 
 _INPUT = 2  # §2.1: invalid input or environment
 _NUMERIC = 3  # §2.1: a numerical failure (NaN or Inf)
-_STUB = 1  # Q-130: ftgs bench until M15
-
-_BENCHMARKS = (
-    "train-step",
-    "raster",
-    "slice",
-    "losses",
-    "adam",
-    "data",
-    "render",
-    "init",
-    "convert",
-)
 # Q-137: K and world_to_camera of a supplied render's item, relative (absolute near zero), so a
 # producer's own float32 rounding of pixel intrinsics still matches.
 _CAMERA_TOLERANCE = 1e-6
@@ -876,19 +864,6 @@ def _export(args: argparse.Namespace) -> int:
     return 0
 
 
-# -- bench ---------------------------------------------------------------------------------------
-
-
-def _bench(args: argparse.Namespace) -> int:
-    _scene(args.scene)
-    print(
-        f"ftgs bench {args.benchmark}: the benchmarks of §3.4 arrive with milestone M15; "
-        "nothing was run or written",
-        file=sys.stderr,
-    )
-    return _STUB  # Q-130
-
-
 # -- parser --------------------------------------------------------------------------------------
 
 
@@ -976,11 +951,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, required=True, metavar="MODEL.safetensors")
     p.set_defaults(run=_export)
 
-    p = commands.add_parser("bench", help="performance benchmarks (M15)")
-    p.add_argument("benchmark", choices=_BENCHMARKS)
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--out", type=Path, required=True, metavar="BENCH.json")
-    p.set_defaults(run=_bench)
+    from openftgs.cli import _bench  # the package is loaded by now; the module imports from it
+
+    _bench.add_parser(commands)
     return parser
 
 
