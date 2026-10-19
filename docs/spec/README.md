@@ -1,8 +1,9 @@
 # Specification
 
-`openftgs-spec.md` is an export of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", revision 549 (2026-10-07), amended in the repository as revisions 549a, 549b and 549c (2026-10-12), 549d and 549e (2026-10-15) and 549f, 549g and 549h (2026-10-16).
+`openftgs-spec.md` is an export of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", revision 549 (2026-10-07), amended in the repository as revisions 549a, 549b and 549c (2026-10-12), 549d and 549e (2026-10-15), 549f, 549g and 549h (2026-10-16) and 549i (2026-10-19).
 
-- SHA-256: `1f4613e8182a11a39d7e5a9cd0c4e7b02515f2b98c615a0490da8cf5b475c396` (revision 549h)
+- SHA-256: `b434816aead095b17ffd39ecb53f9eb18e188dcd25d18565169f0401624eea4e` (revision 549i)
+- SHA-256 of revision 549h as committed: `1f4613e8182a11a39d7e5a9cd0c4e7b02515f2b98c615a0490da8cf5b475c396`
 - SHA-256 of revision 549g as committed: `42a5bfe2a26b6dfc61e7f9c8904c914806b56d98e8217dd6476a46cc4fb64901`
 - SHA-256 of revision 549f as committed: `c608d391340abcf86a87bd6756c4ff3a3cc2f167366834e3717eb5097777e303`
 - SHA-256 of revision 549e as committed: `50ac48beb5d339841b0fcefc7cab782d3066b086b438c52dacc7341eb436c5d2`
@@ -30,5 +31,7 @@ Revision 549f is a sixth such exception, on 2026-10-16: the owner asked the impl
 Revision 549g is a seventh such exception, on the same day: the owner asked the implementer to edit this copy in the owner's name with the wording of issue #186, which the owner approved. An exchange model records the background it was trained against, and readers return it, black when absent (D-84, from Q-141, superseding Q-24's "ignored on read" for the background); §2.1's `ExchangeModel` and §2.2's ftgs-if metadata follow. The Appendix B count and the revision notes are kept consistent; Appendix A and the diagrams are unchanged. The owner's document must receive these changes too, or its next export would drop them.
 
 Revision 549h is an eighth such exception, on the same day: the owner asked the implementer, this one time, to edit this copy in the owner's name with the wording of issue #189, which the owner approved. fused-local-corr leaves `[init]` and is built from source against the installed torch (D-85, from Q-6 and Q-145); §2.3's dependency table follows. The Appendix B count and the revision notes are kept consistent; Appendix A and the diagrams are unchanged. The owner's document must receive these changes too, or its next export would drop them.
+
+Revision 549i is a ninth such exception, on 2026-10-19: the owner asked the implementer, this one time, to edit this copy in the owner's name with the wording of issue #215, which the owner approved. S-5 runs on S-9's ray-cast scene, initialized from its surface samples, with growth off and λ\_reg = 0 vs 10⁻² the only difference (D-86, from Q-78 and Q-165; the measurement is #100's), and S-6 runs on S-2's objects as clusters of three Gaussians with N = 16, its relocation check made right after each event (D-87, from Q-78, Q-82 and Q-83); §3.2's introduction, shared setup, S-5 and S-6 rows follow, with the mechanical check #215 left to the owner's choice kept in S-6's row. #215 named the rows to enter but not their wording, so D-86 and D-87 are written in the form of D-83 to D-85 from those rows. The Appendix B count and the revision notes are kept consistent; Appendix A and the diagrams are unchanged. The owner's document must receive these changes too, or its next export would drop them.
 
 Don't edit it here. Changes are made in the owner's document and arrive as a new export that replaces this file in a single commit, with the revision and hash above updated.
