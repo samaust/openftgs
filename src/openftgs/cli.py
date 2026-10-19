@@ -531,6 +531,9 @@ class _Loaded:
     iteration: int | None  # a checkpoint's
     # D-84: a checkpoint's configuration's background, else black until #187
     background: tuple[float, float, float]
+    # Q-136 (as answered): an exchange model's file, or a checkpoint's manifest.json, which
+    # holds every other file's SHA-256 (§2.2, Q-25)
+    sha256: str
 
 
 def _load_model(path: Path, device: str) -> _Loaded:
@@ -545,6 +548,7 @@ def _load_model(path: Path, device: str) -> _Loaded:
                 FreeTimeGaussians.from_exchange(read_exchange(path), device=device),
                 None,
                 (0.0, 0.0, 0.0),
+                _sha256(path),
             )
         state = load_checkpoint(path)
         cfg = config_from_dict(state.config)
@@ -554,7 +558,7 @@ def _load_model(path: Path, device: str) -> _Loaded:
             time=state.time,
             time_unit=state.time_unit,
         )
-        return _Loaded(model, state.iteration, cfg.background)
+        return _Loaded(model, state.iteration, cfg.background, _sha256(path / "manifest.json"))
 
 
 def _render_device(backend: str) -> str:
@@ -698,6 +702,7 @@ def _eval(args: argparse.Namespace) -> int:
         model_path=args.model,
         iteration=loaded.iteration,
         renders=entry,
+        model_sha256=loaded.sha256,
     )
     return 0
 
