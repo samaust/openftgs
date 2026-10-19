@@ -86,7 +86,7 @@ def render(
     rows: Tensor | None = None
     if precull == "compact":
         # Q-31, D-57: compaction after the temporal slice, in ascending row order.
-        rows = torch.nonzero(g.passes_cull).squeeze(1)
+        rows = _kept_rows(g)
         g = _take_rows(g, rows)
     gaussian_ids: Tensor | None = None
     if backend == "gsplat":
@@ -224,6 +224,13 @@ def _backgrounds(background: Tensor | None, num_cameras: int, like: Tensor) -> T
     if tuple(color.shape) == (num_cameras, 3):
         return color
     raise ValueError(f"background must be [3] or [{num_cameras}, 3], got {list(color.shape)}")
+
+
+def _kept_rows(g: GaussiansAtTime) -> Tensor:
+    """The rows that pass the opacity cull, ascending (Q-31). Selecting them reads their count
+    back, the one host synchronization compaction adds (§2.4 rule 3, D-57), which U-29 allows
+    here only (Q-171)."""
+    return torch.nonzero(g.passes_cull).squeeze(1)
 
 
 def _take_rows(g: GaussiansAtTime, rows: Tensor) -> GaussiansAtTime:
