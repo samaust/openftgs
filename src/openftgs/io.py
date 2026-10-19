@@ -95,13 +95,18 @@ def _read_safetensors(path: Path) -> tuple[dict[str, Tensor], dict[str, str]]:
 
 
 def _write_safetensors(tensors: Mapping[str, Tensor], path: Path, meta: Mapping[str, str]) -> None:
-    save_file(
-        {k: v.detach().to("cpu").contiguous() for k, v in tensors.items()},
-        str(path),
-        # safetensors 0.8.0 writes an unreadable header for no tensors with an empty metadata
-        # map, so an empty map is passed as None (source log #11).
-        metadata=dict(meta) or None,
-    )
+    try:
+        save_file(
+            {k: v.detach().to("cpu").contiguous() for k, v in tensors.items()},
+            str(path),
+            # safetensors 0.8.0 writes an unreadable header for no tensors with an empty metadata
+            # map, so an empty map is passed as None (source log #11).
+            metadata=dict(meta) or None,
+        )
+    except SafetensorError as err:
+        # Q-158: the library reports a write that fails (a full disk, no permission) through
+        # its own class, not an OSError (source log #148); the data was checked before.
+        raise OSError(f"{path}: {err}") from err
 
 
 def _replace_with_safetensors(

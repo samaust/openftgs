@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -855,6 +856,26 @@ def test_checkpoint_save_over_a_regular_file_is_rejected(tmp_path: Path) -> None
     with pytest.raises(ValueError):
         save_checkpoint(_trainer_state(), target)
     assert target.read_text() == "not a checkpoint"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_writers_report_an_unwritable_directory_as_os_error(tmp_path: Path) -> None:
+    """Q-158, Q-142: a safetensors writer that can't write its file raises OSError, whatever the
+    library's own exception class; nothing is left in the directory."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        model = ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t")
+        with pytest.raises(OSError):
+            write_exchange(model, locked / "model.safetensors")
+        with pytest.raises(OSError):
+            write_init_points(
+                _init_points(), locked / "init.safetensors", time_unit="s", producer="t"
+            )
+        assert list(locked.iterdir()) == []
+    finally:
+        locked.chmod(0o755)
 
 
 # The kept checkpoints of a run directory (D-83; Q-149 to Q-152).
