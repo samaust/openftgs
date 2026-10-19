@@ -7,7 +7,14 @@ The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA devic
 tests do (Q-125); the benchmarks themselves run only on a GPU.
 """
 
+import hashlib
+import importlib.metadata
+import json
+import platform
+import re
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -216,3 +223,125 @@ def test__synthesize_puts_most_rows_in_view_of_every_camera(
         v = K[1, 1] * x[:, 1] / z + K[1, 2]
         inside = (z > 0) & (u >= 0) & (u < camera.width) & (v >= 0) & (v < camera.height)
         assert float(inside.double().mean()) >= 0.7, camera.name
+
+
+# BENCH.json (Q-166) and B-3, `ftgs bench slice` (§3.4, D-50; Q-13, Q-T225.3), run once on the
+# GPU for the tests below: about half a minute, most of it compiling the slice.
+
+
+@pytest.fixture(scope="module")
+def slice_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench") / "results" / "BENCH.json"
+    assert _ftgs("bench", "slice", scene, "--out", out) == 0
+    assert not list(out.parent.glob(".*")), "the temporary file is left behind (Q-126)"
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@pytest.mark.gpu
+def test_bench_json_layout_and_environment(slice_bench: dict[str, Any], scene: Path) -> None:
+    """Q-166, §3.4: BENCH.json holds its format and version, the benchmark and the command, the
+    environment (§3.4's GPU model, driver, CUDA, PyTorch and gsplat versions, with cuDNN,
+    fused-ssim, Python and the commit), the scene, the date, the setup, the cases and the
+    budgets."""
+    body = slice_bench
+    assert set(body) == {
+        "format",
+        "version",
+        "benchmark",
+        "command",
+        "environment",
+        "scene",
+        "date",
+        "setup",
+        "cases",
+        "budgets",
+    }
+    assert (body["format"], body["version"], body["benchmark"]) == ("ftgs-bench", 1, "B-3")
+    assert body["command"][:3] == ["ftgs", "bench", "slice"]
+    env = body["environment"]
+    assert env["gpu"] == {"name": torch.cuda.get_device_name(0), "count": torch.cuda.device_count()}
+    assert isinstance(env["driver"], str) and env["driver"]  # nvidia-smi is on this machine
+    assert env["cuda"] == torch.version.cuda
+    assert env["cudnn"] == torch.backends.cudnn.version()  # type: ignore[no-untyped-call]
+    assert env["torch"] == torch.__version__
+    assert env["gsplat"] == importlib.metadata.version("gsplat")
+    assert env["python"] == platform.python_version()
+    assert env["fused_ssim"] is None or isinstance(env["fused_ssim"], str)
+    assert env["commit"] is None or re.fullmatch(r"[0-9a-f]{40}", env["commit"])
+    assert env["dirty"] is None or isinstance(env["dirty"], bool)
+    assert body["scene"] == {
+        "path": str(scene.resolve()),
+        "sha256": hashlib.sha256(scene.read_bytes()).hexdigest(),
+        "cameras": 4,
+        "frames": 3,
+        "width": 48,
+        "height": 32,
+    }
+    assert datetime.fromisoformat(body["date"]).tzinfo is not None
+    for case in body["cases"]:
+        assert set(case) == {"case", "figures"}
+        assert isinstance(case["case"], dict) and isinstance(case["figures"], dict)
+    for budget in body["budgets"]:
+        assert set(budget) == {"case", "figure", "limit", "value", "pass", "kind"}
+
+
+@pytest.mark.gpu
+def test_b3_times_both_slices_at_every_size_and_counts_recompilations(
+    slice_bench: dict[str, Any],
+) -> None:
+    """B-3 (§3.4; D-50, Q-13, Q-T225.3): the eager and compiled temporal slices, forward and
+    backward, at N from 10⁵ to 3·10⁶ over 10 resizes: at each size the first call's time and the
+    medians of 50 calls; then the recompilations over the resizes, counted by dynamo's unique
+    graphs (Q-13) and set against U-28's limit of 2 as a budget entry, which doesn't change the
+    exit code (Q-166)."""
+    setup = slice_bench["setup"]
+    sizes = setup["sizes"]
+    assert sizes[0] == 100_000 and sizes[-1] == 3_000_000 and len(sizes) == 11
+    assert sizes == sorted(set(sizes)) and setup["resizes"] == 10
+    assert setup["repetitions"] == 50
+    cases = {
+        (c["case"].get("impl"), c["case"].get("n")): c["figures"] for c in slice_bench["cases"]
+    }
+    for impl in ("eager", "compiled"):
+        for n in sizes:
+            figures = cases[(impl, n)]
+            assert figures["repetitions"] == 50
+            for name in ("forward_backward_s", "forward_s", "backward_s", "first_call_s"):
+                assert 0.0 < figures[name] < 60.0, (impl, n, name)
+    compiled = cases[("compiled", sizes[0])]
+    assert compiled["first_call_s"] > compiled["forward_backward_s"]  # compilation included
+    resized = [c for c in slice_bench["cases"] if c["case"] == {"impl": "compiled", "resizes": 10}]
+    assert len(resized) == 1
+    recompilations = resized[0]["figures"]["recompilations"]
+    assert recompilations == resized[0]["figures"]["unique_graphs"] - 1 >= 0
+    assert slice_bench["budgets"] == [
+        {
+            "case": {"impl": "compiled", "resizes": 10},
+            "figure": "recompilations",
+            "limit": 2,
+            "value": recompilations,
+            "pass": recompilations <= 2,
+            "kind": "limit",
+        }
+    ]
+
+
+@pytest.mark.gpu
+def test_bench_slice_refuses_a_single_timestamp_scene_and_an_unwritable_out(
+    tmp_path: Path, scene: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-166, Q-T225.2: a scene with a single timestamp leaves no row of a synthesized model
+    inactive (D-71), so it is exit 2; so is a BENCH.json whose folder can't be made, found
+    before the benchmark runs (Q-142)."""
+    cams = ring(4, radius=4.0, elevation=1.0, width_px=48, height_px=32, focal=44.0)
+    model = random_model(8, seed=0, sh_degree=0)
+    single = write_scene(tmp_path / "single", model, [(cam, 0.0, "train") for cam in cams])
+    out = tmp_path / "bench.json"
+    assert _ftgs("bench", "slice", single, "--out", out) == 2
+    assert "more than one timestamp" in capsys.readouterr().err
+    assert not out.exists()
+    blocker = tmp_path / "file"
+    blocker.write_text("not a folder")
+    assert _ftgs("bench", "slice", scene, "--out", blocker / "bench.json") == 2
+    assert "cannot write BENCH.json" in capsys.readouterr().err

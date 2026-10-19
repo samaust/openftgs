@@ -6,31 +6,73 @@ Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50. Q-166 (BENC
 exit codes), Q-167 (`--model`), Q-168 (the setups). docs/modules/cli/benchmarks.md maps each
 subcommand to its B-n.
 
-Each subcommand has an entry in `_BENCHMARKS`: its B-n, the function that runs it, and whether
-it needs CUDA and takes `--model`. The framework checks the scene and the environment, runs
-the function and writes BENCH.json; a benchmark whose ticket hasn't landed has no function yet
-and keeps Q-130's behaviour: it says so, writes nothing and returns 1.
+Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
+that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
+the environment, runs the function, which returns its setup, cases and budgets, and writes
+BENCH.json. A benchmark whose ticket hasn't landed has no function yet and keeps Q-130's
+behaviour: it says so, writes nothing and returns 1. Adding one is a function and its entry.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
+import os
+import platform
+import statistics
+import subprocess
 import sys
-from collections.abc import Callable
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from random import Random
+from typing import TYPE_CHECKING, Any, Literal
 
-from openftgs.cli import _INPUT, _fail, _load_model, _scene
+from openftgs.cli import (
+    _INPUT,
+    _as_input_error,
+    _fail,
+    _json_text,
+    _load_model,
+    _Loaded,
+    _output,
+    _scene,
+)
 
 if TYPE_CHECKING:
     from torch import Tensor
 
+    from openftgs._stages import Timing
     from openftgs.data import MultiViewVideo
     from openftgs.model import FreeTimeGaussians
     from openftgs.types import TimeNormalizer
 
 _UNBUILT = 1  # Q-130: a benchmark whose ticket hasn't landed
+_FORMAT, _VERSION = "ftgs-bench", 1  # Q-166
+
+
+@dataclass(frozen=True)
+class _Context:
+    """What a benchmark gets: the parsed arguments, the scene, and `--model` read on CUDA
+    (Q-167), None when not given."""
+
+    args: argparse.Namespace
+    video: MultiViewVideo
+    model: _Loaded | None
+
+
+@dataclass
+class _Result:
+    """What a benchmark returns for BENCH.json (Q-166): its setup, its cases, each
+    `{"case": {parameter: value}, "figures": {name: value}}`, and its budgets, each
+    `{"case", "figure", "limit", "value", "pass", "kind"}`."""
+
+    setup: dict[str, Any]
+    cases: list[dict[str, Any]]
+    budgets: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -41,22 +83,9 @@ class _Benchmark:
 
     id: str
     ticket: int
-    run: Callable[..., Any] | None = None
+    run: Callable[[_Context], _Result] | None = None
     cuda: bool = True
     model: bool = False
-
-
-_BENCHMARKS: dict[str, _Benchmark] = {
-    "train-step": _Benchmark("B-1", 226, model=True),
-    "raster": _Benchmark("B-2", 227),
-    "slice": _Benchmark("B-3", 225),
-    "losses": _Benchmark("B-4", 228),
-    "adam": _Benchmark("B-5", 229),
-    "data": _Benchmark("B-6", 232),
-    "render": _Benchmark("B-7", 231, model=True),
-    "init": _Benchmark("B-8", 234),
-    "convert": _Benchmark("B-8", 234, cuda=False),
-}
 
 
 def add_parser(commands: Any) -> None:
@@ -71,18 +100,18 @@ def add_parser(commands: Any) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    """`ftgs bench BENCHMARK SCENE.json --out BENCH.json`."""
+    """`ftgs bench BENCHMARK SCENE.json --out BENCH.json [--model MODEL]`: exit 0 once the
+    benchmark ran, whatever its budgets; 2 for invalid input or environment (Q-166)."""
     import torch
 
     bench = _BENCHMARKS[args.benchmark]
     if args.model is not None and not bench.model:  # Q-167
         takers = " and ".join(name for name, b in _BENCHMARKS.items() if b.model)
         _fail(f"--model applies only to {takers}", _INPUT)
-    _scene(args.scene)
+    video = _scene(args.scene)
     if bench.cuda and not torch.cuda.is_available():  # Q-166: an invalid environment
         _fail(f"{bench.id} needs a CUDA device", _INPUT)
-    if args.model is not None:  # Q-167: MODEL as `ftgs render` reads it
-        _load_model(args.model, "cuda")
+    model = None if args.model is None else _load_model(args.model, "cuda")  # Q-167
     if bench.run is None:  # Q-130 until its ticket lands
         print(
             f"ftgs bench {args.benchmark}: {bench.id} comes with #{bench.ticket}; "
@@ -90,8 +119,173 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return _UNBUILT
-    result: int = bench.run(args)
-    return result
+    with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after it
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+    date = datetime.now(UTC).isoformat(timespec="seconds")
+    result = bench.run(_Context(args, video, model))
+    command = ["ftgs", "bench", args.benchmark, str(args.scene), "--out", str(args.out)]
+    if args.model is not None:
+        command += ["--model", str(args.model)]
+    body = {
+        "format": _FORMAT,
+        "version": _VERSION,
+        "benchmark": bench.id,
+        "command": command,
+        "environment": _environment(),
+        "scene": _scene_entry(args.scene, video),
+        "date": date,
+        "setup": result.setup,
+        "cases": result.cases,
+        "budgets": result.budgets,
+    }
+    _write(args.out, body)
+    print(args.out)
+    return 0
+
+
+# -- BENCH.json (Q-166, Q-T225.1) ------------------------------------------------------------------
+
+
+def _write(path: Path, body: dict[str, Any]) -> None:
+    """Q-126: replaced atomically through a temporary sibling, as the other outputs are."""
+    text = _json_text(body)  # Q-25: no NaN or Infinity
+    with _output(f"BENCH.json {path}"):  # Q-142
+        temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        try:
+            temporary.write_text(text + "\n", encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _version(distribution: str) -> str | None:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _run(*command: str, cwd: Path | None = None) -> str | None:
+    """A program's standard output, stripped, or None when it can't run or fails."""
+    try:
+        done = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def _driver() -> str | None:
+    """The NVIDIA driver's version from nvidia-smi (PyTorch has no public accessor; source log
+    T225.1): `driver_version`, deprecated for `kmd_version`, which older drivers lack."""
+    for query in ("driver_version", "kmd_version"):
+        out = _run("nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader")
+        if out:
+            return out.splitlines()[0].strip()
+    return None
+
+
+def _commit() -> tuple[str | None, bool | None]:
+    """Q-T225.1: the commit of the git checkout this openftgs is imported from, and whether its
+    tracked files differ from it; (None, None) when the package isn't a tracked file of one, as
+    when installed from a wheel."""
+    import openftgs
+
+    package = Path(openftgs.__file__).resolve().parent
+    if _run("git", "ls-files", "--error-unmatch", "__init__.py", cwd=package) is None:
+        return None, None
+    commit = _run("git", "rev-parse", "HEAD", cwd=package)
+    status = _run("git", "status", "--porcelain", "--untracked-files=no", cwd=package)
+    return commit, None if status is None else bool(status)
+
+
+def _cpu() -> str | None:
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or None
+
+
+def _environment() -> dict[str, Any]:
+    """Q-166, §3.4: the GPU's model and count, the driver, CUDA, cuDNN, PyTorch, gsplat,
+    fused-ssim and Python versions, and the commit with its dirty flag; also openftgs's version
+    and the CPU's model (Q-T225.1)."""
+    import torch
+
+    cuda = torch.cuda.is_available()
+    commit, dirty = _commit()
+    return {
+        "gpu": {
+            "name": torch.cuda.get_device_name(torch.cuda.current_device()) if cuda else None,
+            "count": torch.cuda.device_count() if cuda else 0,
+        },
+        "driver": _driver(),
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),  # type: ignore[no-untyped-call]
+        "torch": torch.__version__,
+        "gsplat": _version("gsplat"),
+        "fused_ssim": _version("fused_ssim"),
+        "python": platform.python_version(),
+        "openftgs": _version("openftgs"),
+        "cpu": _cpu(),
+        "commit": commit,
+        "dirty": dirty,
+    }
+
+
+def _scene_entry(path: Path, video: MultiViewVideo) -> dict[str, Any]:
+    """Q-166, Q-T225.1: the manifest's path and SHA-256, its cameras, the most images any camera
+    has (its frames), and the size of the first training image."""
+    per_camera: dict[str, int] = {}
+    for record in video.records:
+        per_camera[record.camera.name] = per_camera.get(record.camera.name, 0) + 1
+    first = next(r.camera for r in video.records if r.split == "train")
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "cameras": len(per_camera),
+        "frames": max(per_camera.values()),
+        "width": first.width,
+        "height": first.height,
+    }
+
+
+# -- measurement -----------------------------------------------------------------------------------
+
+_WARMUP = 10  # Q-168, Q-T225.3: untimed calls before the timed ones
+
+
+def _first_call(body: Callable[[], None]) -> float:
+    """The wall time of one call of `body` from an idle device until its work is done, so it
+    includes compilation and the first launches; it synchronizes, so it never runs inside a
+    timed repetition."""
+    import torch
+
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    body()
+    torch.cuda.synchronize()
+    return time.perf_counter() - start
+
+
+def _repeat(body: Callable[[], None], repetitions: int) -> list[Timing]:
+    """`_WARMUP` calls of `body`, then `repetitions` calls under the stage clock's CUDA events
+    (§3.4, `openftgs._stages`); `body` names its parts with `stage`. Nothing synchronizes until
+    the clock is read after the last call."""
+    from openftgs._stages import Clock
+
+    for _ in range(_WARMUP):
+        body()
+    with Clock("cuda") as clock:
+        for _ in range(repetitions):
+            body()
+    return clock.read()
+
+
+def _median(values: Sequence[float]) -> float:
+    return float(statistics.median(values))
 
 
 # -- the model synthesizer (Q-168, Q-T225.2) -------------------------------------------------------
@@ -189,9 +383,8 @@ def _synthesize(
 
     centre = torch.tensor(volume.centre, dtype=torch.float64, device=device)
     view = volume.view_radius
-    sphere_centres = centre + directions(_SPHERES) * view * 0.5 * uniform(0, 1, _SPHERES, 1) ** (
-        1 / 3
-    )
+    offsets = directions(_SPHERES) * uniform(0.0, 1.0, _SPHERES, 1) ** (1 / 3)  # in a unit ball
+    sphere_centres = centre + 0.5 * view * offsets
     sphere_radii = uniform(0.05, 0.15, _SPHERES) * view
     sphere_speeds = directions(_SPHERES) * uniform(0.0, 0.25, _SPHERES, 1) * view  # per unit t
     sphere_colors = uniform(0.2, 0.8, _SPHERES, 3)
@@ -256,3 +449,176 @@ def _synthesize(
         time=volume.time,
         time_unit=volume.time_unit,
     )
+
+
+# -- B-3: the temporal slice's implementations (§3.4, D-50; Q-13, Q-T225.3) -----------------------
+
+# Q-T225.3: 11 sizes, so 10 resizes, each keeping the rows before it and appending new ones, as
+# growth events do; B-1's 0.5M, 1M and 3M among them.
+_SLICE_SIZES = (
+    100_000,
+    150_000,
+    200_000,
+    300_000,
+    400_000,
+    500_000,
+    700_000,
+    1_000_000,
+    1_500_000,
+    2_000_000,
+    3_000_000,
+)
+_SLICE_REPETITIONS = 50  # #225: the median of 50
+# Explicit, never "auto", which may fall back to eager unannounced in the numbers (Q-13).
+_SLICE_IMPLS: tuple[Literal["eager", "compiled"], ...] = ("eager", "compiled")
+_SLICE_INPUTS = (
+    "means",
+    "times",
+    "log_durations",
+    "velocities",
+    "log_scales",
+    "quats",
+    "opacity_logits",
+)
+# The outputs a training iteration differentiates: the render's four and E8's terms (`at_time`).
+_SLICE_GRADIENTS = ("means_t", "opacities_t", "quats_n", "scales", "reg_terms")
+_RECOMPILE_LIMIT = 2  # U-28: at most 2 recompilations over 10 resizes
+_SEED = 0  # Q-168: the synthesized models are seeded
+_SLICE_ACTIVE = 0.2  # Q-T225.3: the share active at any time, as B-1's main cases
+
+
+def _slice_call(
+    leaves: list[Tensor], grads: list[Tensor], impl: Literal["eager", "compiled"], times: Random
+) -> Callable[[], None]:
+    """One B-3 call: the slice at the next time, as the stage `slice.kernel`, then its backward
+    from `grads` into `leaves`, as the stage `backward`; `torch.autograd.grad` accumulates
+    nothing between calls."""
+    import torch
+
+    from openftgs._stages import stage
+    from openftgs.motion import temporal_slice
+
+    means, times_, log_durations, velocities, log_scales, quats, opacity_logits = leaves
+
+    def call() -> None:
+        t = times.random()
+        with stage("slice.kernel"):
+            out = temporal_slice(
+                means,
+                times_,
+                log_durations,
+                velocities,
+                log_scales,
+                quats,
+                opacity_logits,
+                t,
+                impl=impl,
+            )
+        outputs = [getattr(out, name) for name in _SLICE_GRADIENTS]
+        with stage("backward"):
+            torch.autograd.grad(outputs, leaves, grads)
+
+    return call
+
+
+def _slice(ctx: _Context) -> _Result:
+    """B-3: the forward and backward of `motion.temporal_slice`, eager and compiled, at N from
+    10⁵ to 3·10⁶, grown as at growth events: the time of the first call at each size, which
+    includes compilation, then the medians of 50 calls after a warm-up; the recompilations over
+    the 10 resizes, counted as Q-13 counts them, against U-28's limit."""
+    import random
+
+    import torch
+    from torch._dynamo.utils import counters  # Q-13: dynamo's count of unique graphs
+
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    model = _synthesize(volume, _SLICE_SIZES[-1], active=_SLICE_ACTIVE, seed=_SEED, device="cuda")
+    stored = [getattr(model, name).detach() for name in _SLICE_INPUTS]
+    del model
+    times = random.Random(_SEED)  # the times of the calls, uniform in [0, 1]
+
+    torch.compiler.reset()  # the first compiled call compiles, whatever ran before
+    counters.clear()
+    cases: list[dict[str, Any]] = []
+    for n in _SLICE_SIZES:
+        leaves = [p[:n].clone().requires_grad_() for p in stored]
+        # Fixed upstream gradients, the same for both implementations, shaped as the outputs.
+        g = torch.Generator(device="cuda").manual_seed(n)
+        like = dict(zip(_SLICE_INPUTS, leaves, strict=True))
+        shapes = {"means_t": "means", "opacities_t": "times", "quats_n": "quats"}
+        shapes |= {"scales": "log_scales", "reg_terms": "times"}
+        grads = [
+            torch.randn(like[shapes[name]].shape, generator=g, device="cuda")
+            for name in _SLICE_GRADIENTS
+        ]
+        for impl in _SLICE_IMPLS:
+            call = _slice_call(leaves, grads, impl, times)
+            torch.cuda.reset_peak_memory_stats()
+            first = _first_call(call)
+            timings = _repeat(call, _SLICE_REPETITIONS)
+            forward = [t for t in timings if t.name == "slice.kernel"]
+            backward = [t for t in timings if t.name == "backward"]
+            figures: dict[str, Any] = {
+                "forward_backward_s": _median(
+                    [b.end - f.start for f, b in zip(forward, backward, strict=True)]
+                ),
+                "forward_s": _median([t.seconds for t in forward]),
+                "backward_s": _median([t.seconds for t in backward]),
+                "first_call_s": first,
+                "repetitions": len(forward),
+                "peak_memory_bytes": torch.cuda.max_memory_allocated(),
+            }
+            if impl == "compiled":
+                figures["unique_graphs"] = int(counters["stats"]["unique_graphs"])
+            cases.append({"case": {"impl": impl, "n": n}, "figures": figures})
+        del leaves
+    graphs = int(counters["stats"]["unique_graphs"])
+    resizes = len(_SLICE_SIZES) - 1
+    recompilations = graphs - 1
+    cases.append(
+        {
+            "case": {"impl": "compiled", "resizes": resizes},
+            "figures": {"unique_graphs": graphs, "recompilations": recompilations},
+        }
+    )
+    budgets = [
+        {
+            "case": {"impl": "compiled", "resizes": resizes},
+            "figure": "recompilations",
+            "limit": _RECOMPILE_LIMIT,
+            "value": recompilations,
+            "pass": recompilations <= _RECOMPILE_LIMIT,
+            "kind": "limit",
+        }
+    ]
+    setup = {
+        "model": "synthesized (Q-168, Q-T225.2)",
+        "seed": _SEED,
+        "active_fraction": _SLICE_ACTIVE,
+        "sizes": list(_SLICE_SIZES),
+        "resizes": resizes,
+        "implementations": list(_SLICE_IMPLS),
+        "warmup": _WARMUP,
+        "repetitions": _SLICE_REPETITIONS,
+        "gradients": list(_SLICE_GRADIENTS),
+        "times": "uniform in [0, 1], seeded",
+        "clock": "CUDA events: slice.kernel (forward), backward",
+        "recompile_limit": _RECOMPILE_LIMIT,
+    }
+    return _Result(setup, cases, budgets)
+
+
+# -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
+
+_BENCHMARKS: dict[str, _Benchmark] = {
+    "train-step": _Benchmark("B-1", 226, model=True),
+    "raster": _Benchmark("B-2", 227),
+    "slice": _Benchmark("B-3", 225, _slice),
+    "losses": _Benchmark("B-4", 228),
+    "adam": _Benchmark("B-5", 229),
+    "data": _Benchmark("B-6", 232),
+    "render": _Benchmark("B-7", 231, model=True),
+    "init": _Benchmark("B-8", 234),
+    "convert": _Benchmark("B-8", 234, cuda=False),
+}
