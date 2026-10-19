@@ -1721,6 +1721,23 @@ def test_export_replaces_a_symlinked_target_by_a_regular_file(tmp_path: Path) ->
 # Out of GPU memory in training and unwritable outputs (Q-142 as answered; Q-158 to Q-161).
 
 
+def _cut_at_ten(run: dict[str, Path], out: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A run directory whose run SIGTERM stopped at iteration 10, its checkpoint saved."""
+    with monkeypatch.context() as m:
+        _sigterm_at(m, 10)
+        assert _train(run, out, "--config", run["config"]) == 128 + signal.SIGTERM
+    return out
+
+
+def _blocked_profile(cut: Path, out: Path) -> Path:
+    """A run directory of `cut`'s run (its config.json) where a file stands in the way of the
+    profile trace's folder."""
+    out.mkdir()
+    shutil.copy(cut / "config.json", out / "config.json")
+    (out / "profile").write_text("a file where the trace's folder goes")
+    return out
+
+
 def _out_of_memory_at(monkeypatch: pytest.MonkeyPatch, iteration: int) -> None:
     """Trainer.step raises torch.OutOfMemoryError in iteration `iteration`, as CUDA would."""
     step = Trainer.step
@@ -1749,13 +1766,30 @@ def test_out_of_gpu_memory_in_training_is_exit_code_2(
     capsys.readouterr()
     assert _train(run, out, "--config", run["config"], "--checkpoint-every", every) == 2
     err = capsys.readouterr().err
-    assert "iteration 7" in err and "frame_cache" in err
+    assert "after iteration 6" in err and "frame_cache" in err
     if every:
         assert str(out / "checkpoint") in err
         assert _kept(out) == {"checkpoint": 5}
     else:
         assert "no checkpoint was saved" in err
         assert not (out / "checkpoint").exists()
+
+
+def test_out_of_gpu_memory_in_a_resumed_run_names_its_checkpoint(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (as answered): a resumed run that runs out of GPU memory before its first save
+    names the checkpoint it was resumed from."""
+    cut = _cut_at_ten(run, tmp_path / "cut", monkeypatch)
+    _out_of_memory_at(monkeypatch, 13)
+    capsys.readouterr()
+    assert _train(run, tmp_path / "resumed", "--resume", cut / "checkpoint") == 2
+    err = capsys.readouterr().err
+    assert str(cut / "checkpoint") in err and "after iteration 12" in err
+    assert not (tmp_path / "resumed" / "checkpoint").exists()
 
 
 def test_out_of_memory_or_a_read_error_elsewhere_keeps_its_traceback(
@@ -1772,6 +1806,11 @@ def test_out_of_memory_or_a_read_error_elsewhere_keeps_its_traceback(
         m.setattr(Trainer, "__init__", no_memory)
         with pytest.raises(torch.OutOfMemoryError):
             _train(run, tmp_path / "a", "--config", run["config"])
+    cut = _cut_at_ten(run, tmp_path / "cut", monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(Trainer, "from_checkpoint", no_memory)
+        with pytest.raises(torch.OutOfMemoryError):
+            _train(run, tmp_path / "resumed", "--resume", cut / "checkpoint")
     step = Trainer.step
 
     def unreadable(self: Trainer) -> Any:
@@ -1790,28 +1829,36 @@ def test_a_checkpoint_that_cannot_be_written_is_exit_code_2(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Q-142 (as answered), Q-159: a checkpoint save that fails with OSError, periodic here, is
-    exit code 2 naming the run directory; no further save is attempted, and the checkpoints
-    already kept survive (Q-25, Q-151)."""
+    """Q-142 (as answered), Q-159: a checkpoint save that fails partway, a periodic one here, is
+    exit code 2 naming the run directory; no further save is attempted, the checkpoint already
+    kept is as it was, and no temporary is left (Q-25, Q-151)."""
+    import safetensors.torch
+
     import openftgs.io
 
-    original = openftgs.io.save_checkpoint
-    calls = []
+    save_file = safetensors.torch.save_file  # the function openftgs.io writes with
+    save_checkpoint = openftgs.io.save_checkpoint
+    full = {"now": False}
 
-    def full_at_ten(state: Any, directory: Path) -> Path:
-        calls.append(state.iteration)
-        if state.iteration == 10:
+    def writing(*args: Any, **kwargs: Any) -> None:
+        if full["now"]:
             raise OSError(28, "No space left on device")
-        return original(state, directory)
+        save_file(*args, **kwargs)
 
-    monkeypatch.setattr("openftgs.io.save_checkpoint", full_at_ten)
+    def saving(state: Any, directory: Path) -> Path:
+        full["now"] = state.iteration == 10
+        return save_checkpoint(state, directory)
+
+    monkeypatch.setattr("openftgs.io.save_file", writing)
+    monkeypatch.setattr("openftgs.io.save_checkpoint", saving)
     out = tmp_path / "run"
     keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
     capsys.readouterr()
     assert _train(run, out, "--config", run["config"], *keep) == 2
     assert str(out) in capsys.readouterr().err
-    assert calls == [5, 10]
+    full["now"] = False
     assert _kept(out) == {"checkpoint": 5}
+    assert not [p.name for p in out.iterdir() if p.name.startswith(".")]
 
 
 def test_a_train_log_that_cannot_be_written_is_exit_code_2(
@@ -1867,28 +1914,65 @@ def test_outputs_into_a_read_only_directory_are_exit_code_2(
             capsys.readouterr()
             assert _ftgs(*command) == 2
             assert str(locked) in capsys.readouterr().err
+        capsys.readouterr()
         assert _train(run, locked / "run", "--config", run["config"]) == 2
+        assert str(locked / "run") in capsys.readouterr().err
         assert list(locked.iterdir()) == []
     finally:
         locked.chmod(0o755)
 
 
 def test_a_trace_that_cannot_be_written_is_exit_code_2_after_the_save(
-    run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Q-142 (as answered): the profile trace is an output, so a trace that can't be written is
-    exit code 2 naming it; the run's checkpoint is saved first, so no training is lost. A file
-    where the trace's folder goes makes the write fail; the run is resumed into its own run
-    directory, which may hold it."""
-    out = tmp_path / "run"
-    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
-    assert _train(run, out, "--config", run["config"], *keep) == 0
-    (out / "profile").write_text("a file where the trace's folder goes")
+    exit code 2 naming it; the run goes on to T_it and saves its checkpoint first, so no training
+    is lost. A file where the trace's folder goes makes the write fail at the window's end."""
+    cut = _cut_at_ten(run, tmp_path / "cut", monkeypatch)
+    out = _blocked_profile(cut, tmp_path / "resumed")
     capsys.readouterr()
-    args = ("--resume", out / "checkpoint-15", "--profile", "16:2", *keep)
-    assert _train(run, out, *args) == 2
+    assert _train(run, out, "--resume", cut / "checkpoint", "--profile", "12:2") == 2
     assert "profile" in capsys.readouterr().err
-    assert _kept(out) == {"checkpoint": ITERATIONS, "checkpoint-15": 15}
+    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+
+
+def test_a_signal_with_a_trace_that_cannot_be_written_keeps_its_exit_code(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-133, Q-142 (as answered): a signal still saves and exits 128 + its number when the
+    trace can't be written; the trace's failure is a warning."""
+    cut = _cut_at_ten(run, tmp_path / "cut", monkeypatch)
+    out = _blocked_profile(cut, tmp_path / "resumed")
+    _sigterm_at(monkeypatch, 16)
+    capsys.readouterr()
+    args = ("--resume", cut / "checkpoint", "--profile", "12:2")
+    assert _train(run, out, *args) == 128 + signal.SIGTERM
+    assert "warning" in capsys.readouterr().err
+    assert load_checkpoint(out / "checkpoint").iteration == 16
+
+
+def test_out_of_memory_with_an_unwritable_trace_reports_the_out_of_memory(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-160: when training runs out of memory inside a profile window and the trace can't be
+    written either, the out-of-memory error is what the command reports (exit 2), the trace's
+    failure a warning."""
+    cut = _cut_at_ten(run, tmp_path / "cut", monkeypatch)
+    out = _blocked_profile(cut, tmp_path / "resumed")
+    _out_of_memory_at(monkeypatch, 13)
+    capsys.readouterr()
+    assert _train(run, out, "--resume", cut / "checkpoint", "--profile", "12:5") == 2
+    err = capsys.readouterr().err
+    assert "out of GPU memory" in err and "warning" in err
 
 
 def test_out_of_memory_in_a_profile_window_writes_the_trace(
@@ -1919,5 +2003,6 @@ def test_metrics_that_cannot_be_written_in_training_are_exit_code_2(
     out = tmp_path / "run"
     capsys.readouterr()
     assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 2
-    assert "METRICS.json" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "METRICS.json" in err and "No space left" in err
     assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS

@@ -464,8 +464,16 @@ def _train(args: argparse.Namespace) -> int:
 
     with _output(f"run directory {run_dir}"):
         run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "config.json").write_text(_json_text(config_to_dict(cfg)), encoding="utf-8")
+    config_path = run_dir / "config.json"
+    with _output(str(config_path)):  # Q-142: replaced atomically, as the other outputs (Q-126)
+        temporary = config_path.with_name(f".{config_path.name}.tmp-{os.getpid()}")
+        try:
+            temporary.write_text(_json_text(config_to_dict(cfg)), encoding="utf-8")
+            os.replace(temporary, config_path)
+        finally:
+            temporary.unlink(missing_ok=True)
     log_path = run_dir / "train_log.jsonl"
+    trace_failure: _Failure | None = None  # Q-142: reported once the checkpoint is safe
 
     def save() -> None:
         """D-83: every save, periodic, final or on a signal, checks the state first (Q-133) and
@@ -475,9 +483,22 @@ def _train(args: argparse.Namespace) -> int:
         with _output(f"a checkpoint in {run_dir}"):  # Q-159: no further save is attempted
             save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
 
+    def end_profile(stage: Callable[[], None], *, failed: bool) -> None:
+        """Q-144: write the trace; Q-142: a trace that can't be written is exit 2, reported
+        after the checkpoint is saved; Q-160: after a training failure, only a warning."""
+        nonlocal trace_failure
+        try:
+            with _output(f"the profile trace {profile.path if profile else ''}"):
+                stage()
+        except _Failure as failure:
+            if failed:
+                print(f"warning: {failure}", file=sys.stderr)
+            elif trace_failure is None:
+                trace_failure = failure
+
     def record(_: Trainer, log: StepLog) -> bool:
         if profile is not None:
-            profile.step_done(log.iteration)
+            end_profile(lambda: profile.step_done(log.iteration), failed=False)
         if log.mean_losses is not None:  # Q-132: read every log_every iterations, no extra sync
             row = {
                 "iteration": log.iteration,
@@ -499,36 +520,35 @@ def _train(args: argparse.Namespace) -> int:
     if profile is not None:
         profile.begin_if_due(trainer.iteration)
     # Q-133: the guard stays on through the save, so a signal can't interrupt it.
-    trace_failure: _Failure | None = None
     with _Signals() as signals:
-        stopped = True
+        failed = True
         try:
             trainer.train(callbacks=[record])
-            stopped = False
+            failed = False
         except FloatingPointError as error:  # Q-69: divergence; nothing is saved
             _fail(str(error), _NUMERIC)
-        except torch.OutOfMemoryError:  # Q-142: the iteration was cut off; nothing is saved
-            _fail(_out_of_memory(trainer.iteration + 1, run_dir, args.resume))
+        except torch.OutOfMemoryError:  # Q-142: the step in progress is lost; nothing is saved
+            _fail(_out_of_memory(trainer.iteration, run_dir, args.resume))
         finally:
             if profile is not None:  # Q-144: a window cut short is still written
-                try:
-                    with _output(f"the profile trace {profile.path}"):
-                        profile.finish()
-                except _Failure as failure:
-                    if stopped:  # Q-160: the training failure is the one reported
-                        print(f"warning: {failure}", file=sys.stderr)
-                    else:  # reported once the checkpoint is safe
-                        trace_failure = failure
-        save()
-    if trace_failure is not None:
-        raise trace_failure
+                end_profile(profile.finish, failed=failed)
+        try:
+            save()
+        except _Failure:
+            if trace_failure is not None:
+                print(f"warning: {trace_failure}", file=sys.stderr)
+            raise
     if signals.received is not None and trainer.iteration < last:  # Q-133; a finished run goes on
+        if trace_failure is not None:  # the signal's exit code stands (Q-133)
+            print(f"warning: {trace_failure}", file=sys.stderr)
         print(
             f"stopped by signal {signals.received} at iteration {trainer.iteration}; "
             f"checkpoint in {run_dir / 'checkpoint'}",
             file=sys.stderr,
         )
         return 128 + signals.received
+    if trace_failure is not None:
+        raise trace_failure
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
         # Q-161: one call downloads the networks and writes the file, so the message names both.
         with _environment(f"LPIPS networks or {run_dir / 'METRICS.json'}"):
@@ -552,8 +572,9 @@ def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
         _fail(f"training diverged by iteration {trainer.iteration}: statistics", _NUMERIC)
 
 
-def _out_of_memory(iteration: int, run_dir: Path, resumed: Path | None) -> str:
-    """Q-142 (as answered): what an out-of-memory failure in training lost, and the way on."""
+def _out_of_memory(completed: int, run_dir: Path, resumed: Path | None) -> str:
+    """Q-142 (as answered): what an out-of-memory failure in training lost, and the way on:
+    `completed` is the trainer's iteration, the step in progress being lost."""
     latest = run_dir / "checkpoint"
     if latest.is_dir():
         where = f"resume from {latest}"
@@ -562,8 +583,8 @@ def _out_of_memory(iteration: int, run_dir: Path, resumed: Path | None) -> str:
     else:
         where = "no checkpoint was saved; start again"
     return (
-        f"out of GPU memory in iteration {iteration}, which wasn't saved; {where} with "
-        'perf.frame_cache = "mmap" or lower memory settings (D-51, Q-99)'
+        f"out of GPU memory after iteration {completed}, the step in progress unsaved; {where}"
+        ' with perf.frame_cache = "mmap" or lower memory settings (D-51, Q-99)'
     )
 
 

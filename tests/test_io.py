@@ -883,6 +883,12 @@ def test_writers_report_an_unwritable_directory_as_os_error(tmp_path: Path) -> N
             write_init_points(
                 _init_points(), locked / "init.safetensors", time_unit="s", producer="t"
             )
+        with pytest.raises(OSError):
+            write_renders(
+                _renders(), locked / "r.safetensors", producer="t", request_sha256="0" * 64
+            )
+        with pytest.raises(OSError):
+            save_checkpoint(_trainer_state(), locked / "ckpt")
         assert list(locked.iterdir()) == []
     finally:
         locked.chmod(0o755)
