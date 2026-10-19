@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
 
@@ -193,6 +194,53 @@ def test_python_m_runs_the_cli_and_reports_errors_without_a_traceback(tmp_path: 
     )
     assert bad.returncode == 2
     assert "ftgs bench: error:" in bad.stderr and "Traceback" not in bad.stderr
+
+
+def _physical_cores() -> int:
+    """§2.4's physical cores: the distinct sets of hardware threads that share a core."""
+    cores = {
+        p.read_text().strip()
+        for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology/core_cpus_list")
+    }
+    if not cores:
+        pytest.skip("needs Linux's CPU topology in /sys")
+    return len(cores)
+
+
+@pytest.fixture
+def _restore_threads() -> Iterator[None]:
+    """The intra-op thread count is process-wide, and parallel CPU reductions may round
+    differently with another count, so the bitwise tests after this one need it back."""
+    before = torch.get_num_threads()
+    yield
+    torch.set_num_threads(before)
+
+
+@pytest.mark.usefixtures("_restore_threads")
+@pytest.mark.parametrize("variable", [None, "OMP_NUM_THREADS", "MKL_NUM_THREADS"])
+def test_ftgs_sets_the_intra_op_threads_to_the_physical_cores_at_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variable: str | None,
+) -> None:
+    """§2.4 "Threads and processes", Q-176: a command sets PyTorch's intra-op threads to the
+    number of physical cores at startup, before it runs (here one that fails at once), unless
+    OMP_NUM_THREADS or MKL_NUM_THREADS is set: then the count PyTorch took from the variable
+    stands. --help runs no command and leaves the count alone."""
+    cores = _physical_cores()
+    other = cores + 1
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    if variable is not None:
+        monkeypatch.setenv(variable, str(other))
+    torch.set_num_threads(other)  # what PyTorch took from the variable, or another default
+    assert _ftgs("--help") == 0
+    assert torch.get_num_threads() == other
+    missing = tmp_path / "absent"
+    assert _ftgs("export", missing, "--format", "ftgs-if", "--out", tmp_path / "m") == 2
+    assert torch.get_num_threads() == (cores if variable is None else other)
+    capsys.readouterr()
 
 
 # ftgs train (§2.1; Q-131 to Q-135).
