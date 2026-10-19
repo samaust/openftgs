@@ -21,7 +21,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from openftgs.config import PerfConfig, TrainConfig, config_from_dict, config_to_dict
+from openftgs.config import (
+    PerfConfig,
+    TrainConfig,
+    config_from_dict,
+    config_to_dict,
+    resume_conflicts,
+)
 from openftgs.data import FrameCache, MultiViewVideo, Prefetcher
 from openftgs.density import (
     OPACITY_RESET_EVERY,
@@ -434,18 +440,30 @@ class Trainer:
         *,
         device: str = "cuda",
         force: bool = False,
+        perf: PerfConfig | None = None,
     ) -> "Trainer":
         """Resume the run saved in a ftgs-checkpoint directory (io.load_checkpoint, then
         load_state_dict). A checkpoint of another scene manifest is refused unless forced; a
-        forced resume keeps the run's τ₀, τ₁, S and Δt_f (§2.2; Q-70)."""
+        forced resume keeps the run's τ₀, τ₁, S and Δt_f (§2.2; Q-70). Given `perf`, the run
+        continues with those performance settings, which may differ from the checkpoint's only
+        in the fields that change no number (Q-134, Q-153); else with the checkpoint's."""
         state = load_checkpoint(Path(directory))
         if state.scene_sha256 != dataset.manifest.sha256 and not force:
             raise ValueError(
                 f"checkpoint {directory} was made from the scene manifest {state.scene_sha256}, "
                 f"not {dataset.manifest.sha256}; pass force=True to resume anyway"
             )
+        cfg = config_from_dict(state.config)
+        if perf is not None:  # Q-134 (as answered)
+            given = dataclasses.replace(cfg, perf=perf)
+            conflicts = resume_conflicts(cfg, given)
+            if conflicts:
+                raise ValueError(
+                    f"perf differs from the checkpoint's where it must match: {conflicts}"
+                )
+            cfg = given
         trainer = cls.__new__(cls)
-        trainer._configure(config_from_dict(state.config), dataset, device)
+        trainer._configure(cfg, dataset, device)
         trainer.load_state_dict(state)
         return trainer
 
@@ -777,12 +795,14 @@ class Trainer:
         )
 
     def load_state_dict(self, state: TrainerState) -> None:
-        """Continue the run `state` holds: its configuration must be this trainer's; its
-        τ₀, τ₁, S and Δt_f are adopted. Everything is built before anything is replaced, so a
-        rejected state leaves the trainer as it was (Q-69, Q-72)."""
+        """Continue the run `state` holds: its configuration must be this trainer's, apart from
+        the performance settings that change no number, for which the trainer keeps its own
+        (Q-134, Q-153); its τ₀, τ₁, S and Δt_f are adopted. Everything is built before anything
+        is replaced, so a rejected state leaves the trainer as it was (Q-69, Q-72)."""
         cfg = self._cfg
-        if config_from_dict(state.config) != cfg:
-            raise ValueError("the state's configuration differs from the trainer's")
+        conflicts = resume_conflicts(config_from_dict(state.config), cfg)
+        if conflicts:
+            raise ValueError(f"the state's configuration differs from the trainer's: {conflicts}")
         time_unit = self._dataset.manifest.time_unit
         if state.time_unit != time_unit:
             raise ValueError(f"the state's time unit {state.time_unit!r} isn't {time_unit!r}")
