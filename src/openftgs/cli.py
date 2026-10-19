@@ -653,6 +653,13 @@ def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
     keeps the reader's error (Q-154 as answered)."""
     changed_message = f"model {path} changed while it was read; evaluate it again"
     with _as_input_error(f"model {path}", OSError):  # Q-142, Q-154
+        try:  # a mistyped checkpoint directory isn't an unreadable FTGS-IF file
+            path.stat()
+        except FileNotFoundError:
+            _fail(
+                f"model {path}: No such file or directory; MODEL is a checkpoint directory or "
+                "an FTGS-IF file"
+            )
         before = _model_sha256(path) if hashed else None
         try:
             loaded = _read_model(path, device)
@@ -724,6 +731,7 @@ def _render(args: argparse.Namespace) -> int:
             f"the request's time unit {request.time_unit!r} isn't the model's "
             f"{loaded.model.time_unit!r}"
         )
+    # Q-20: at_time refuses L′ > L, which is exit 2 (Q-26, Q-142); checked before rendering
     if request.sh_degree is not None and request.sh_degree > loaded.model.sh_degree:
         _fail(
             f"the request's sh_degree {request.sh_degree} is above the model's "
