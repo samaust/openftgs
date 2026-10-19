@@ -27,6 +27,7 @@ from safetensors import safe_open
 from torch import Tensor
 
 import openftgs
+from openftgs import _stages
 from openftgs.config import InitConfig
 from openftgs.data import MultiViewVideo, convert_selfcap
 from openftgs.init import (
@@ -1364,6 +1365,31 @@ def test_u33_shards_and_pair_order_give_bitwise_identical_init_points(tmp_path: 
     assert len(outputs[0].positions) == 4 * 50  # every slot holds more than B points
     assert _same(outputs[0], outputs[1])
     assert _same(outputs[0], outputs[2])
+
+
+def test_roma_init_runs_its_stages_on_the_wall_clock(tmp_path: Path) -> None:
+    """§3.4 B-8 (PRD #220): under a wall clock, each camera pair is the stage "init.match" in
+    its shard's thread, keyed by the shard's device, with its triangulation nested in it, and
+    each init frame's E15 search is the stage "init.knn" in the caller's thread."""
+    dataset = _rig_scene(tmp_path, [0.0, _FRAME, 2 * _FRAME])
+    with _stages.Clock("wall") as clock:
+        _run(dataset, _StandIn(dataset, points=_static()), ["cpu", "cpu"])
+    timings = clock.read()
+    matches = [t for t in timings if t.name == "init.match"]
+    assert len(matches) == 3  # one pair (A, B) per init frame
+    for match in matches:
+        assert match.key == "cpu" and match.thread.startswith("roma_init shard")
+        (triangulate,) = [
+            t
+            for t in timings
+            if t.name == "init.triangulate"
+            and t.thread == match.thread
+            and match.start <= t.start <= t.end <= match.end
+        ]
+        assert triangulate.key == "cpu"
+    assert len([t for t in timings if t.name == "init.triangulate"]) == 3
+    knn = [t for t in timings if t.name == "init.knn"]
+    assert len(knn) == 3 and {t.thread for t in knn} == {threading.current_thread().name}
 
 
 def test_roma_init_sets_the_deterministic_flags_for_the_call_and_restores_them(
