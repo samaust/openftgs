@@ -877,22 +877,32 @@ def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
     after a warm-up iteration, minus what growth to N_max adds, the boundary included. Q-99's
     note (Q-T232.1): what a run with the cache on the GPU then took beyond the cache and the
     growth, from its peak reserved memory and the memory allocated after that iteration,
-    against the half of the free memory the rule leaves for it."""
+    against the half of the free memory the rule leaves for it. With the device's total, what
+    lies outside this process's allocator (other processes, the CUDA context), which the free
+    memory leaves out."""
     import dataclasses
 
     from openftgs.cli._bench import _AutoEstimate
 
     gib = 2**30
     rule = _AutoEstimate(
-        free=10 * gib, growth=gib, cache=4 * gib, allocated=3 * gib, reserved=5 * gib
+        free=10 * gib,
+        growth=gib,
+        cache=4 * gib,
+        allocated=3 * gib,
+        reserved=5 * gib,
+        total=24 * gib,
     )
     assert rule.limit == 4 * gib and rule.fits
     assert not dataclasses.replace(rule, cache=4 * gib + 1).fits
+    # Free on the device: 10 − (5 − 3) = 8 GiB; so 24 − 8 − 5 reserved = 11 GiB lie outside.
     assert rule.figures() == {
         "auto_free_bytes": 10 * gib,
         "auto_growth_bytes": gib,
         "auto_allocated_bytes": 3 * gib,
         "auto_reserved_bytes": 5 * gib,
+        "auto_total_bytes": 24 * gib,
+        "auto_outside_bytes": 11 * gib,
         "cache_bytes": 4 * gib,
         "auto_limit_bytes": 4 * gib,
     }
@@ -1023,6 +1033,8 @@ def test_b6_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> No
             0.5 * figures["auto_free_bytes"] - figures["auto_growth_bytes"]
         )
         assert figures["auto_growth_bytes"] > 0  # n_max = ⌈1.02·N⌉ > N
+        assert figures["auto_total_bytes"] == torch.cuda.mem_get_info()[1]
+        assert 0 < figures["auto_outside_bytes"] < figures["auto_total_bytes"]  # the context
         assert figures["peak_allocated_bytes"] >= figures["cache_bytes"], case
         assert figures["beyond_estimate_bytes"] == (
             figures["peak_reserved_bytes"]

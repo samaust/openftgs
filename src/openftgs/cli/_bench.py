@@ -1267,13 +1267,14 @@ def _data_config(
 class _AutoEstimate:
     """What "auto" measures after a warm-up iteration on CUDA (Q-99), in bytes: the free GPU
     memory, `mem_get_info`'s plus what the allocator holds unused; what growth to N_max adds;
-    the cache's size; and the memory allocated and reserved then."""
+    the cache's size; the memory allocated and reserved then; and the device's total."""
 
     free: int
     growth: int
     cache: int
     allocated: int
     reserved: int
+    total: int
 
     @property
     def limit(self) -> float:
@@ -1290,6 +1291,10 @@ class _AutoEstimate:
             "auto_growth_bytes": self.growth,
             "auto_allocated_bytes": self.allocated,
             "auto_reserved_bytes": self.reserved,
+            "auto_total_bytes": self.total,
+            # Q-T232.1: the device's memory outside this process's allocator, other processes'
+            # and the CUDA context's, which the free memory leaves out.
+            "auto_outside_bytes": self.total - self.free - self.allocated,
             "cache_bytes": self.cache,
             "auto_limit_bytes": self.limit,
         }
@@ -1367,7 +1372,7 @@ def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
     cfg = _data_config(n, "off", None)
     trainer = _data_trainer(ctx, volume, cfg, n)
     trainer.step()
-    free, _ = torch.cuda.mem_get_info()
+    free, total = torch.cuda.mem_get_info()
     allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
     model = trainer.model
     # Q-99: the bytes of a row in training, its stored floats (§1.1) for the parameter, its
@@ -1380,6 +1385,7 @@ def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
         cache=FrameCache.size_of(ctx.video),
         allocated=allocated,
         reserved=reserved,
+        total=total,
     )
     del trainer, model
     _release_cuda()
