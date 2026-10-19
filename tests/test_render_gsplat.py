@@ -1230,3 +1230,29 @@ def test_render_request_on_the_gpu_synchronizes_only_in_gsplat_and_the_index_bui
     assert not elsewhere, elsewhere
     assert in_build, "the debug mode saw no synchronization in the index build"
     assert all(value.device.type == "cuda" for value in [*out.rgb.values(), *out.alpha.values()])
+
+
+# D-54's sharding of a render request (Q-175, Q-186)
+
+
+@pytest.mark.parametrize("temporal_index", [False, True])
+def test_render_request_sharded_on_one_gpu_matches_unsharded(temporal_index: bool) -> None:
+    """D-54 ("without changing results"), Q-175 (GPU): three shards on one GPU
+    (`devices=["cuda:0"] * 3`, shards simulated as U-33 simulates them) give the renders of
+    `devices=None` within 1e-6, two gsplat runs, in request order, with the temporal index on
+    and off. The "auto" slice, compiled per shard before the threads start, never falls back to
+    eager (Q-13)."""
+    model = _cuda(u32_scene())
+    request = u32_request(u32_times()[:24], [CAM_A, CAM_B])
+    kw: dict[str, Any] = {
+        "backend": "gsplat",
+        "temporal_index": temporal_index,
+        "frame_dt": U32_WIDTH,
+    }
+    unsharded = render_request(model, request, **kw)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="torch.compile failed for the temporal slice")
+        sharded = render_request(model, request, devices=["cuda:0"] * 3, **kw)
+    assert list(sharded.rgb) == [item.id for item in request.items]
+    assert all(value.device.type == "cpu" for value in sharded.rgb.values())
+    _assert_renders_close(sharded, unsharded, 1e-6)

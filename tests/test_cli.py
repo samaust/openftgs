@@ -1059,6 +1059,71 @@ def test_eval_passes_a_checkpoints_frame_interval_as_the_bucket_width(
     assert seen == [frame_dt]
 
 
+def _visible_gpus(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
+    """Stands in for `count` visible CUDA devices, as `CUDA_VISIBLE_DEVICES` would leave them;
+    the model is still read onto the CPU, so nothing runs on a GPU."""
+    import openftgs.cli
+
+    read = openftgs.cli._read_model
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
+    monkeypatch.setattr(openftgs.cli, "_read_model", lambda path, device: read(path, "cpu"))
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_render_passes_every_visible_cuda_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    """D-54, Q-175, Q-186: `ftgs render` with gsplat spreads the request over every visible
+    CUDA device, `cuda:0` to `cuda:n−1`, with no option of its own; `--backend reference`
+    renders on the CPU (Q-125), unsharded."""
+    import openftgs.render
+
+    scene, checkpoint = _trained(tmp_path)
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
+    original = openftgs.render.render_request
+    seen: list[Any] = []
+
+    def spy(model: FreeTimeGaussians, request: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("devices", "absent"))
+        return original(model, request, backend="reference")
+
+    monkeypatch.setattr(openftgs.render, "render_request", spy)
+    _visible_gpus(monkeypatch, count)
+    for backend in ("gsplat", "reference"):
+        out = tmp_path / f"{backend}.safetensors"
+        assert (
+            _ftgs("render", checkpoint, "--request", request, "--out", out, "--backend", backend)
+            == 0
+        )
+    assert seen == [[f"cuda:{k}" for k in range(count)], None]
+
+
+@pytest.mark.parametrize("cuda", [False, True])
+def test_eval_passes_every_visible_cuda_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cuda: bool
+) -> None:
+    """D-54, Q-175, Q-186: `ftgs eval` on CUDA spreads the evaluation over every visible CUDA
+    device, `cuda:0` to `cuda:n−1`, with no option of its own; on the CPU it passes None. (The
+    evaluation here stops the command, as a render that isn't finite does, before any metric
+    needs LPIPS weights.)"""
+    import openftgs.eval
+
+    scene, checkpoint = _trained(tmp_path)
+    seen: list[Any] = []
+
+    def stopping(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("devices", "absent"))
+        raise FloatingPointError("stopped by the test")
+
+    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", lambda self, **kwargs: None)
+    monkeypatch.setattr(openftgs.eval, "evaluate_images", stopping)
+    if cuda:
+        _visible_gpus(monkeypatch, 2)
+    assert _ftgs("eval", checkpoint, scene, "--out", tmp_path / "m.json") == 3
+    assert seen == [["cuda:0", "cuda:1"] if cuda else None]
+
+
 def test_render_refuses_invalid_requests_and_the_default_backend_without_cuda(
     tmp_path: Path,
 ) -> None:
