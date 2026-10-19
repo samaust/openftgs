@@ -15,7 +15,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `render` | the model, read with `io.read_exchange` and `FreeTimeGaussians.from_exchange` from an FTGS-IF file, or with `io.load_checkpoint`, `config_from_dict` and the `FreeTimeGaussians` constructor from a checkpoint directory; `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
 | `eval` | the model, with the SHA-256 of its file or of its checkpoint's `manifest.json`, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
-| `bench` | the §3.4 benchmark its subcommand names, written as BENCH.json (Q-166): `slice` (B-3) times `motion.temporal_slice` on a seeded synthesized model; the others check their arguments, say which ticket brings them and exit 1 until it lands, as Q-130's stub did; `--model MODEL` on `train-step` and `render` only (Q-167); `benchmarks.md` |
+| `bench` | the §3.4 benchmark its subcommand names, written as BENCH.json (Q-166): `slice` (B-3) times `motion.temporal_slice` on a seeded synthesized model; `init` and `convert` (B-8) time `roma_init` and a rerun of the scene's recorded conversion on the wall clock; the others check their arguments, say which ticket brings them and exit 1 until it lands, as Q-130's stub did; `--model MODEL` on `train-step` and `render` only (Q-167); `benchmarks.md` |
 
 A MODEL path that doesn't exist, as a mistyped checkpoint directory, is exit 2, reported as missing rather than as an unreadable FTGS-IF file; one that exists but can't be reached, under a directory without search permission say, is exit 2 with the operating system's error (Q-142). A request whose `sh_degree` is above the model's is exit 2 before anything is rendered, since `at_time` refuses it (Q-20).
 
@@ -31,7 +31,7 @@ Single-file outputs, the init points, the renders, METRICS.json and the exchange
 | --- | --- |
 | 0 | success; for `ftgs bench`, the benchmark ran, whatever its budgets say (Q-166) |
 | 1 | an unexpected exception, with its traceback; `ftgs bench` for a benchmark whose ticket hasn't landed |
-| 2 | invalid input or environment: a usage error, a file that fails validation, a missing ffmpeg, ffprobe or COLMAP, a benchmark other than `ftgs bench convert` without a CUDA device, a configuration this build can't run, a missing `[init]` extra, LPIPS weights that can't be downloaded, a frame cache that doesn't fit in GPU memory, training that runs out of GPU memory, an output that can't be written |
+| 2 | invalid input or environment: a usage error, a file that fails validation, a missing ffmpeg, ffprobe or COLMAP, a benchmark other than `ftgs bench convert` without a CUDA device, a configuration this build can't run, a missing `[init]` extra, LPIPS weights that can't be downloaded, RoMa weights missing from torch.hub's cache for `ftgs bench init` (Q-T234.1), a recorded source video that can't be found for `ftgs bench convert` (Q-169), a frame cache that doesn't fit in GPU memory, training that runs out of GPU memory, an output that can't be written |
 | 3 | a numerical failure: training diverged, or a render isn't finite (in `ftgs render`, `ftgs eval` or `ftgs train`'s final evaluation) |
 | 130, 143 | `ftgs train` stopped by SIGINT or SIGTERM, after saving its checkpoint |
 

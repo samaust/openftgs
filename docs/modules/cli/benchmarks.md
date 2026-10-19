@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168 and Q-180 to Q-182.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-169, Q-180 to Q-182, Q-T234.1 and Q-T234.2.
 
 ## Subcommands
 
@@ -13,8 +13,8 @@
 | `adam` | B-5 | fused, foreach and selective Adam | yes | | #229 |
 | `data` | B-6 | the share of an iteration spent waiting for data, per cache placement | yes | | #232 |
 | `render` | B-7 | rendering speed with and without the temporal index | yes | yes | #231 |
-| `init` | B-8 | the wall time of RoMa initialization | yes | | #234 |
-| `convert` | B-8 | the wall time of conversion | no | | #234 |
+| `init` | B-8 | the wall time of RoMa initialization: matching per pair and per GPU, triangulation, k-NN | yes | | #234 |
+| `convert` | B-8 | the wall time of conversion per camera and in total, with and without hardware decoding | no | | #234 |
 
 Each subcommand is one entry of `_BENCHMARKS`, at the end of the module: its B-n, the ticket that builds it, the function that runs it, and whether it needs CUDA and takes `--model`. A benchmark whose ticket hasn't landed has no function yet. It keeps Q-130's behaviour: it says which ticket brings it, writes nothing and exits 1, after the same checks as the others. Adding a benchmark is a function that takes the context (the parsed arguments, the scene and the model given with `--model`) and returns its setup, cases and budgets, set as `run` in its entry; the framework does the rest.
 
@@ -29,7 +29,7 @@ The checks run in this order (Q-180):
 5. A benchmark not built yet stops here with exit 1.
 6. BENCH.json's folder is made before the run, so an output that can't be written is exit 2 at once, not after minutes of measuring (Q-142).
 
-Exit 0 means the benchmark ran, whatever its budgets and limits say: a measurement is not a command failure, and the comparison against the stored baselines decides (Q-166, Q-170). A scene the benchmark can't use is exit 2 as well: the synthesized models need more than one timestamp and two training poses (Q-181).
+Exit 0 means the benchmark ran, whatever its budgets and limits say: a measurement is not a command failure, and the comparison against the stored baselines decides (Q-166, Q-170). A scene the benchmark can't use is exit 2 as well: the synthesized models need more than one timestamp and two training poses (Q-181); `init` needs the `[init]` extra and RoMa's weights in torch.hub's cache (Q-T234.1); `convert` needs a manifest that records a Neural3DV conversion whose source videos are still where its ffmpeg commands read them (Q-169, Q-T234.2).
 
 ## `--model`
 
@@ -72,7 +72,9 @@ One JSON object, replaced atomically through a temporary sibling `.<name>.tmp-<p
 
 ## Measurement
 
-Every benchmark measures in the same way (Q-168): a first call, then 10 warm-up calls, then the timed calls, whose medians are the figures. The first call is timed on the wall clock from an idle device to a synchronize after it, so it includes compilation and the first launches of every kernel; it is never one of the timed calls. The timed calls run under the stage clock (`openftgs._stages.Clock("cuda")`), whose CUDA events are recorded on the stream without synchronizing; the clock is read once, after the last call, so nothing synchronizes inside the timed region (§2.4 rule 3, `docs/modules/train/trainer.md`, "Stages"). The calls are issued back to back, so where the GPU's work outlasts the host's launches the events time the GPU, and where it doesn't (a small N) they time the launches, as an iteration would see them.
+Every benchmark but B-8 measures in the same way (Q-168): a first call, then 10 warm-up calls, then the timed calls, whose medians are the figures. The first call is timed on the wall clock from an idle device to a synchronize after it, so it includes compilation and the first launches of every kernel; it is never one of the timed calls. The timed calls run under the stage clock (`openftgs._stages.Clock("cuda")`), whose CUDA events are recorded on the stream without synchronizing; the clock is read once, after the last call, so nothing synchronizes inside the timed region (§2.4 rule 3, `docs/modules/train/trainer.md`, "Stages"). The calls are issued back to back, so where the GPU's work outlasts the host's launches the events time the GPU, and where it doesn't (a small N) they time the launches, as an iteration would see them.
+
+B-8 times work that runs once, initialization and conversion, so it runs it once, without a warm-up, under the wall clock (`Clock("wall")`), and its figures are sums and spreads of the stages it recorded (below).
 
 The stages are also NVTX ranges, so Nsight Systems shows a benchmark's calls by name. B-3 uses two of the fixed stage names:
 
@@ -101,3 +103,29 @@ Per case (`{"impl", "n"}`), the figures are the medians over 50 calls of the for
 **Decision rule** (Q-182), applied by #226 together with B-1: Q-13's "auto" stays the compiled slice on CUDA while its median forward plus backward is no slower than eager's at every size and its recompilations stay within U-28's limit. Otherwise the numbers go to the owner as a request to change "auto"'s mapping, which Q-13 fixes, and the code keeps it until the owner answers. Whether D-50's CUDA operator is written is B-1's rule, the slice's share of an iteration (PRD #220).
 
 The first run, on kitchen, is in the Calibration data table of `docs/clean-room/questions.md`: the compiled slice is no slower than eager only up to 3·10⁵ rows, where both sit at the host's floor of about 0.3 ms, and 8 to 49 % slower from 4·10⁵ rows on (10 % at 3·10⁶, where it takes 2.46 ms against 2.24). It never recompiled over the 10 resizes. Its first call took 0.53 s with warm compile caches and 2.25 s with empty ones.
+
+## B-8: `ftgs bench init` and `ftgs bench convert`
+
+B-8 reports the wall time of the two steps that run once per scene, initialization and conversion, on one Neural3DV-layout scene, openftgs-synth's `kitchen` in this project (D-79). It has no budget, only the regression rule, so its BENCH.json has no budget entries. Both run once, under the wall clock, and read the stages that `roma_init` and the converters record (`docs/modules/train/trainer.md`, "Stages").
+
+**`bench init`** (Q-T234.1) runs `roma_init` on the scene with the default `RomaInitConfig`, D-58's roma_outdoor, as `ftgs init roma` runs without options, on every visible GPU (Q-106). It needs the `[init]` extra and the two checkpoints roma_outdoor loads, RoMa's and DINOv2's, already in torch.hub's cache (`torch.hub.get_dir()/checkpoints/`). Without either it is exit 2, naming what is missing, before anything runs: it never downloads them, so no download is timed. One `ftgs init roma` run fetches them. The setup holds Q-107's provenance record (every setting, `use_custom_corr`, the vendored RoMa's commit), the devices and the weight files.
+
+| Case | Figures |
+| --- | --- |
+| `{"part": "init.match", "device"}` | per GPU: `pairs`, and the time per pair as `total_s`, `median_s`, `min_s`, `max_s`. A pair's stage holds its two image reads, the matcher, the draw of its matches (D-22) and its triangulation |
+| `{"part": "init.triangulate", "device"}` | per GPU: the same, for the triangulation alone |
+| `{"part": "init.knn"}` | `frames`, one E15 search per init frame in the calling thread, with the same spread |
+| `{"part": "roma_init"}` | `wall_s`, the whole call; `startup_s`, from its start to the first pair's, which is loading the weights and building one model per GPU; `pairs`, `init_frames` and `points` |
+
+The k-NN searches overlap the matching of the next frame's pairs, and with several GPUs the pairs of one GPU overlap the others', so the parts don't add up to the whole.
+
+**`bench convert`** (Q-169, Q-T234.2) reruns the conversion the scene's manifest records. The converter and its options (frames, resize, the ffmpeg and ffprobe paths) come from the manifest's metadata, and the source folder from the `-i` paths of the recorded ffmpeg commands. A missing source video is exit 2, naming its path; so is a manifest that records no conversion, and one recorded by another converter than Neural3DV's (selfcap reads its videos from a work folder it removes). `--jobs` isn't recorded, so the converter's default runs, one decoding process per four cores (§2.4). Each run converts into a temporary directory in the platform's temporary folder (`TMPDIR`; kitchen at full size needs about 12 GB), removed afterwards.
+
+It runs once with `--hwaccel none`, then once with `--hwaccel cuda` when PyTorch sees a CUDA device and the recorded ffmpeg lists `cuda` among its hardware acceleration methods (`ffmpeg -hwaccels`). A `cuda` run that fails, such as a pixel format D-81 refuses, leaves the CPU run's numbers standing: `setup.skipped.cuda` says why, and the exit stays 0. `setup.hwaccel` lists the runs made.
+
+| Case | Figures |
+| --- | --- |
+| `{"hwaccel", "camera"}` | `frames`; `wall_s`, from the camera's first frame read to its last frame written; `decode_s`, the sum of its frames' reads from ffmpeg (`convert.decode`), which wait for ffmpeg's decoding; `encode_s`, the sum of its frames' processing and PNG writing in the process pool (`convert.encode`), measured in the pool's processes, so it is work, not waiting, and cameras overlap |
+| `{"hwaccel"}` | `cameras`, `frames`; `wall_s`, the converter's call, probing the videos included; the sums of `decode_s` and `encode_s` |
+
+The setup also records the ffmpeg's version line, the CPU count and the temporary folder, since the conversion's time depends on them.
