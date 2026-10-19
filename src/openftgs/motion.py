@@ -217,18 +217,20 @@ def temporal_slice(
     same body through torch.compile with dynamic shapes and without graph breaks, raising if
     compilation fails; "auto" compiles on CUDA tensors and stays eager on CPU, falling back to
     eager with one warning if compilation fails, which includes reaching dynamo's recompile
-    limit; "cuda" is reserved for D-50's custom operator, which waits until B-1 justifies it
-    (M15).
+    limit; "cuda" is reserved for D-50's custom operator, which isn't built: B-1 put the slice
+    under 10% of an iteration (#226), so it raises NotImplementedError.
     """
     global _auto_fell_back
     if impl not in _IMPLS:
         raise ValueError(f"impl must be one of {_IMPLS}, got {impl!r}")
     if impl == "cuda":
-        # Q-13: D-50's custom CUDA operator is written only if B-1 shows the compiled slice above
-        # 10% of an iteration (M15).
+        # Q-13, D-50: the custom CUDA operator is written only if B-1 shows the slice above 10% of
+        # an iteration; on kitchen it took 1.2% at most (#226), so it isn't.
         raise NotImplementedError(
-            "the CUDA temporal slice is not built (D-50: it waits until B-1 justifies it, M15); "
-            "use impl='compiled' or 'eager'"
+            "the CUDA temporal slice is not built (D-50): B-1 measured the temporal slice at "
+            "1.2 % of a training iteration at most, under D-50's 10 % (§3.4 B-1 in the "
+            "Calibration data of docs/clean-room/questions.md, #226); use impl='compiled' or "
+            "'eager'"
         )
     args = (means, times, log_durations, velocities, log_scales, quats, opacity_logits)
     t_tensor = _as_time(t, times)
