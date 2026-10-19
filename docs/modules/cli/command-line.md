@@ -17,7 +17,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
 | `bench` | a stub until M15: it checks its arguments and returns 1 (Q-130) |
 
-A MODEL path that doesn't exist, as a mistyped checkpoint directory, is exit 2, reported as missing rather than as an unreadable FTGS-IF file. A request whose `sh_degree` is above the model's is exit 2 before anything is rendered, since `at_time` refuses it (Q-20).
+A MODEL path that doesn't exist, as a mistyped checkpoint directory, is exit 2, reported as missing rather than as an unreadable FTGS-IF file; one that exists but can't be reached, under a directory without search permission say, is exit 2 with the operating system's error (Q-142). A request whose `sh_degree` is above the model's is exit 2 before anything is rendered, since `at_time` refuses it (Q-20).
 
 The device is CUDA when PyTorch sees one, else the CPU, and the backend follows it, as in the trainer. `ftgs render` keeps `render()`'s default backend, gsplat, so on a machine without CUDA it needs `--backend reference`, which renders on the CPU (Q-125). To run `train` or `eval` on the CPU on a machine with a GPU, for example for the bit-exact resume of the reference backend (§2.2), hide the GPU from PyTorch with `CUDA_VISIBLE_DEVICES=""`.
 
