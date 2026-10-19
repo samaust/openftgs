@@ -1,6 +1,6 @@
 # The command line in `openftgs.cli`
 
-How `ftgs` meets §2.1's CLI block: what each command calls, the exit codes, the run directory, signals and resume. The module's one public name is `main(argv=None) -> int`, which the `ftgs` console script and `python -m openftgs.cli` both run (Q-124). The choices the spec leaves open are Q-124 to Q-144.
+How `ftgs` meets §2.1's CLI block: what each command calls, the exit codes, the run directory, signals and resume. The module's one public name is `main(argv=None) -> int`, which the `ftgs` console script and `python -m openftgs.cli` both run (Q-124). The module is a package: its `__init__` holds the commands and `main`, and its `__main__` runs `main` for `python -m openftgs.cli` (#220). The choices the spec leaves open are Q-124 to Q-144.
 
 ## Commands
 
