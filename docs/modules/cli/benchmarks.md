@@ -284,3 +284,7 @@ It runs once with `--hwaccel none`, then once with `--hwaccel cuda` when PyTorch
 | `{"hwaccel"}` | `cameras`, `frames`; `wall_s`, the converter's call, probing the videos included; the sums of `decode_s` and `encode_s` |
 
 The setup also records the ffmpeg's version line, the CPU count and the temporary folder, since the conversion's time depends on them.
+
+## B-8's first run
+
+On kitchen (Calibration data, #234), the conversion takes 40.7 s with CPU decoding and 40.9 s with `--hwaccel cuda`: a frame's read from ffmpeg takes about 5.5 ms against 118 ms of PNG encoding in the pool, so encoding bounds it, as §2.4 expects, and hardware decoding gains nothing. On kitchen's 60-frame conversion, initialization takes 366 s for 780 pairs: 0.45 s per pair on the RTX 4090, 98 % of the run, with 8 ms of triangulation per pair and 0.22 s of k-NN per init frame. The full scene's 3,900 pairs would take about half an hour.
