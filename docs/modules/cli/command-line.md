@@ -12,8 +12,8 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `cache` | `MultiViewVideo.from_manifest`, `FrameCache.build`, and for `gpu` or `mmap` `FrameCache.open` in that placement, which shows the cache fits on its own, not beside a training run (Q-127, Q-99) |
 | `init roma` | `RomaInitConfig`, `roma_init`, `io.write_init_points` with `roma_provenance(cfg)` as metadata (Q-107) |
 | `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.check_run_checkpoints` (Q-163), `io.save_run_checkpoint` (D-83, Q-152), `Trainer.evaluate` |
-| `render` | the model, read with `io.read_exchange` and `FreeTimeGaussians.from_exchange` from an FTGS-IF file, or with `io.load_checkpoint`, `config_from_dict` and the `FreeTimeGaussians` constructor from a checkpoint directory; `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
-| `eval` | the model, with the SHA-256 of its file or of its checkpoint's `manifest.json`, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
+| `render` | the model, read with `io.read_exchange` and `FreeTimeGaussians.from_exchange` from an FTGS-IF file, or with `io.load_checkpoint`, `config_from_dict` and the `FreeTimeGaussians` constructor from a checkpoint directory; `io.read_render_request`, `render.render_request` with a checkpoint's Δt_f as the temporal index's bucket width (`frame_dt`, Q-174), `io.write_renders` with the SHA-256 of the request's bytes |
+| `eval` | the model, with the SHA-256 of its file or of its checkpoint's `manifest.json`, `evaluate_images` with a checkpoint's Δt_f as `frame_dt` (Q-174, Q-T230.1), `metrics_report`, `eval.write_metrics` (Q-136) |
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
 | `bench` | a stub until M15: it checks its arguments and returns 1 (Q-130) |
 
