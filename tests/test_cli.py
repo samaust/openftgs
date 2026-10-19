@@ -1659,6 +1659,39 @@ def test_convert_selfcap_with_a_stub_colmap(tmp_path: Path) -> None:
 
 
 @needs_ffmpeg
+def test_convert_selfcap_with_a_missing_colmap_is_exit_code_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.1 exit code 2 ("a missing ffmpeg or COLMAP"), D-60: ftgs convert selfcap with
+    --undistort colmap and a --colmap path that doesn't exist names COLMAP and writes no
+    scene."""
+    src = selfcap_archives(tmp_path, "mini")
+    out = tmp_path / "out"
+    args = (
+        "convert",
+        "selfcap",
+        src,
+        out,
+        "--scene",
+        "mini",
+        "--window",
+        "4:8",
+        "--test-camera",
+        "0002",
+        "--undistort",
+        "colmap",
+        "--colmap",
+        tmp_path / "no-such-colmap",
+        "--jobs",
+        1,
+    )
+    capsys.readouterr()
+    assert _ftgs(*args) == 2
+    assert "COLMAP" in capsys.readouterr().err
+    assert not (out / "scene.json").exists()
+
+
+@needs_ffmpeg
 def test_u27_a_wrong_ffmpeg_or_ffprobe_path_is_exit_code_2(tmp_path: Path) -> None:
     """U-27, D-48: a wrong --ffmpeg or --ffprobe path stops the converter with exit code 2."""
     src = n3dv_source(tmp_path / "src", cameras=1, frames=2)
