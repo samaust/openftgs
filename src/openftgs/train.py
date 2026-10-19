@@ -454,7 +454,9 @@ class Trainer:
                 f"not {dataset.manifest.sha256}; pass force=True to resume anyway"
             )
         cfg = config_from_dict(state.config)
-        if perf is not None:  # Q-134 (as answered)
+        # Q-134 (as answered): checked before anything is configured, so a refused setting opens
+        # no frame cache and reaches no NotImplementedError; load_state_dict checks again.
+        if perf is not None:
             given = dataclasses.replace(cfg, perf=perf)
             conflicts = resume_conflicts(cfg, given)
             if conflicts:

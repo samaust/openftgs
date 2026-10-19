@@ -309,9 +309,8 @@ def _check_resume_dir(run_dir: Path, cfg: TrainConfig) -> None:
     if not run_dir.exists() or (run_dir.is_dir() and not any(run_dir.iterdir())):
         return
     try:
-        recorded = config_from_dict(
-            json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
-        )
+        data = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        recorded = config_from_dict(data) if isinstance(data, dict) else None
     except (OSError, ValueError):
         recorded = None
     if recorded is None or resume_conflicts(recorded, cfg):

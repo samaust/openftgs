@@ -398,6 +398,10 @@ def test_resume_conflicts_allow_each_exact_performance_setting(name: str, value:
     """Q-134 as answered, §2.4 rule 2: the PerfConfig fields that change no number may differ
     on a resume (D-50, D-51, D-56, D-57; log_every only reads)."""
     assert resume_conflicts(TrainConfig(), _perf(**{name: value})) == []
+
+
+def test_resume_conflicts_allow_all_exact_performance_settings_at_once() -> None:
+    """Q-134 as answered: the seven fields may differ together."""
     assert resume_conflicts(TrainConfig(), _perf(**EXACT_PERF)) == []
 
 
