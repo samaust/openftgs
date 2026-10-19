@@ -170,6 +170,22 @@ def _compiled_slice() -> _SliceFn:
     return _compiled
 
 
+def _rows_dynamic(tensor: Tensor) -> Tensor:
+    """A view of `tensor` for the compiled slice: its rows dynamic, its other dims static.
+
+    Q-T226.1: under `dynamic=True` dynamo makes every dim symbolic, the 3 of the means and the 4
+    of the quaternions too, and inductor then turns the quaternion norm over the last dim into
+    reduction kernels; with the row width static, the norm fuses into the pointwise kernels.
+    Only N changes at growth events, so this adds no recompilation, and the eager slice is
+    untouched: the compiled slice changes by rounding only (U-28)."""
+    import torch._dynamo  # loaded by torch.compile anyway
+
+    view = tensor.view_as(tensor)
+    for dim in range(1, view.dim()):
+        torch._dynamo.mark_static(view, dim)
+    return view
+
+
 def _compile_failures() -> tuple[type[Exception], ...]:
     """The exceptions Q-13 counts as a failed compilation: dynamo's and its backends' errors, and
     reaching the recompile limit, which is a plain Exception, not a dynamo one."""
@@ -222,8 +238,9 @@ def temporal_slice(
         return TemporalSlice(*out)
     # D-50: dynamo gives nn.Parameter inputs static shapes, so a model's stored tensors would
     # recompile the slice at every growth event; views of them are plain tensors with dynamic
-    # shapes, and gradients still reach the parameters (#45, source log #37).
-    views = tuple(arg.view_as(arg) for arg in args)
+    # shapes, and gradients still reach the parameters (#45, source log #37). Q-T226.1: only
+    # their rows are dynamic.
+    views = tuple(_rows_dynamic(arg) for arg in args)
     if impl == "compiled":
         out = _compiled_slice()(*views, t_tensor)
     else:
