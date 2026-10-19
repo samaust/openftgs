@@ -363,8 +363,8 @@ class _Signals:
 
 
 class _Profile:
-    """§3.4: a torch.profiler trace of iterations START … START + COUNT − 1 (NVTX ranges per
-    stage come with M15)."""
+    """§3.4: a torch.profiler trace of iterations START … START + COUNT − 1, in which every
+    stage of an iteration is a named range; the stages' NVTX ranges run with or without it."""
 
     def __init__(self, start: int, count: int, path: Path, device: str) -> None:
         import torch.profiler
@@ -379,8 +379,11 @@ class _Profile:
     def begin_if_due(self, iteration: int) -> None:
         """Start before iteration `iteration` + 1 when that is START."""
         if iteration + 1 == self._first and not self._running:
+            from openftgs._stages import set_profiling
+
             self._profiler.start()
             self._running = True
+            set_profiling(True)  # §3.4: the trace carries the stage names
 
     def step_done(self, iteration: int) -> None:
         """After iteration `iteration`: start before the window's first, finish after its
@@ -392,6 +395,9 @@ class _Profile:
     def finish(self) -> None:
         """Stop and write the trace, if the window has started (Q-144)."""
         if self._running:
+            from openftgs._stages import set_profiling
+
+            set_profiling(False)
             self._profiler.stop()
             self._running = False
             self.path.parent.mkdir(parents=True, exist_ok=True)

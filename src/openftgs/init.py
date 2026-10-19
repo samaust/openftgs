@@ -26,6 +26,7 @@ from PIL import Image
 from scipy.spatial import cKDTree
 from torch import Tensor
 
+from openftgs._stages import stage
 from openftgs.data import MultiViewVideo
 from openftgs.io import validate_init_points
 from openftgs.types import Camera, InitPoints
@@ -500,21 +501,24 @@ def _match_pair(
     dataset: MultiViewVideo,
     cfg: RomaInitConfig,
 ) -> _PairPoints:
-    """§1.3 steps 2–4 for one camera pair, on one shard."""
-    record_a, record_b = dataset.records[job.a], dataset.records[job.b]
-    image_a, image_b = dataset.load_image(job.a), dataset.load_image(job.b)
-    warp, certainty = _checked_matches(*matcher(image_a, image_b))
-    drawn = _draw(warp, certainty, cfg, job)
-    xa = _pixels(drawn[:, :2], record_a.camera)
-    xb = _pixels(drawn[:, 2:], record_b.camera)
-    X, keep = _triangulated(xa, xb, record_a.camera, record_b.camera, device)
-    # §1.3 step 3, D-22; Q-110: the color is the mean of the two source pixels.
-    colors = (_source_pixels(image_a, xa[keep]) + _source_pixels(image_b, xb[keep])) / 2
-    return _PairPoints(
-        positions=X[keep].to(torch.float32),  # Q-111: the values InitPoints stores
-        colors=colors,
-        timestamp=(float(record_a.timestamp) + float(record_b.timestamp)) / 2,  # step 4, D-47
-    )
+    """§1.3 steps 2–4 for one camera pair, on one shard: the stage "init.match", keyed by the
+    shard's device, with the triangulation's stage inside it (§3.4 B-8)."""
+    with stage("init.match", key=str(device)):
+        record_a, record_b = dataset.records[job.a], dataset.records[job.b]
+        image_a, image_b = dataset.load_image(job.a), dataset.load_image(job.b)
+        warp, certainty = _checked_matches(*matcher(image_a, image_b))
+        drawn = _draw(warp, certainty, cfg, job)
+        xa = _pixels(drawn[:, :2], record_a.camera)
+        xb = _pixels(drawn[:, 2:], record_b.camera)
+        with stage("init.triangulate", key=str(device)):
+            X, keep = _triangulated(xa, xb, record_a.camera, record_b.camera, device)
+        # §1.3 step 3, D-22; Q-110: the color is the mean of the two source pixels.
+        colors = (_source_pixels(image_a, xa[keep]) + _source_pixels(image_b, xb[keep])) / 2
+        return _PairPoints(
+            positions=X[keep].to(torch.float32),  # Q-111: the values InitPoints stores
+            colors=colors,
+            timestamp=(float(record_a.timestamp) + float(record_b.timestamp)) / 2,  # D-47
+        )
 
 
 class _Shards:
@@ -771,7 +775,9 @@ def roma_init(
             v = torch.zeros_like(frame.positions)
         else:  # E15, D-23; Q-111: against the other init frame's full set, dt from slot times
             dt = (other.k - frame.k) * frame_dt * unit
-            v = knn_velocities(frame.positions.to(e15_device), other.full.to(e15_device), dt)
+            with stage("init.knn"):  # §3.4 B-8, up to the copy back, which waits for it
+                v = knn_velocities(frame.positions.to(e15_device), other.full.to(e15_device), dt)
+                v = v.cpu()
         finished.append((dataclasses.replace(frame, full=frame.full.new_empty(0, 3)), v.cpu()))
 
     with _deterministic():

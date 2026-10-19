@@ -17,6 +17,7 @@ from typing import Literal, get_args
 import torch
 from torch import Tensor
 
+from openftgs._stages import point, stage
 from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
 from openftgs.sh import sh_basis
 from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders
@@ -82,21 +83,25 @@ def render(
         _check_gsplat_model(model)
     t = _normalized_time(model, timestamp, time_units)
     g = model.at_time(t, sh_degree=sh_degree)
-    backgrounds = _backgrounds(background, len(cams), g.means_t)
-    rows: Tensor | None = None
-    if precull == "compact":
-        # Q-31, D-57: compaction after the temporal slice, in ascending row order.
-        rows = _kept_rows(g)  # Q-171: the one synchronization compaction adds
-        g = _take_rows(g, rows)
-    gaussian_ids: Tensor | None = None
-    if backend == "gsplat":
-        image, alpha, means2d, visible, gaussian_ids = _render_gsplat(
-            g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians, packed=packed
-        )
-    else:
-        image, alpha, means2d, visible = _render_reference(
-            g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
-        )
+    # §3.4: with a stage clock active, the moved means' gradient marks where the rasterization's
+    # backward ends and the temporal slice's begins, compaction's gather included.
+    point(g.means_t, "backward.raster_done")
+    with stage("raster.forward"):
+        backgrounds = _backgrounds(background, len(cams), g.means_t)
+        rows: Tensor | None = None
+        if precull == "compact":
+            # Q-31, D-57: compaction after the temporal slice, in ascending row order.
+            rows = _kept_rows(g)  # Q-171: the one synchronization compaction adds
+            g = _take_rows(g, rows)
+        gaussian_ids: Tensor | None = None
+        if backend == "gsplat":
+            image, alpha, means2d, visible, gaussian_ids = _render_gsplat(
+                g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians, packed=packed
+            )
+        else:
+            image, alpha, means2d, visible = _render_reference(
+                g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
+            )
     if not return_aux:
         return RenderOutput(image=image, alpha=alpha)
     if means2d.requires_grad:
@@ -479,110 +484,115 @@ def _render_gsplat(
     # GPU, RGB). Calling the stages directly
     # keeps Q-32's 2D means in every layout (D-75); the background and the camera center are this
     # package's own (D-76).
-    cams = [_camera_tensors(camera, like) for camera in cameras]
-    viewmats = torch.stack([_view_matrix(cam) for cam in cams])
-    intrinsics = torch.stack([_intrinsics(cam) for cam in cams])
-    centers = torch.stack([cam.center for cam in cams])
-    projection = gsplat.fully_fused_projection(
-        g.means_t,
-        None,
-        g.quats_n,
-        g.scales,
-        viewmats,
-        intrinsics,
-        width,
-        height,
-        eps2d=_EPS2D,
-        near_plane=_NEAR,
-        far_plane=_FAR,
-        radius_clip=_RADIUS_CLIP,
-        packed=packed,
-        sparse_grad=False,
-        # Derived from _RASTERIZE_MODE (D-6): antialiasing scales the effective opacities (below).
-        calc_compensations=_RASTERIZE_MODE == "antialiased",
-        camera_model="pinhole",
-        opacities=g.opacities_t,  # E6, D-32: the opacity cull and the opacity-aware extent
-    )
-    camera_ids: Tensor | None = None
-    local_ids: Tensor | None = None
-    gaussian_ids: Tensor | None = None
-    if packed:
-        _, camera_ids, local_ids, radii, means2d, depths, conics, compensations = projection
-        # Every packed row is written and visible: gsplat's radius test drops a row only when both
-        # radii are at most radius_clip, here 0 (D-57), and ε keeps both diagonals of Σ′ positive
-        # while the extent is shared, so a row's radii are both positive or both 0 (E6, D-6).
-        # gsplat's own 2D means are therefore the anchor (D-75). Rows come camera-major, ascending
-        # within a camera (D-76).
-        anchor = rasterized = means2d
-        passed_visible = (radii > 0).all(dim=-1)
-        dirs = g.means_t[local_ids] - centers[camera_ids]
-        coeffs = g.sh[local_ids]
-        opacities = g.opacities_t[local_ids]
-        gaussian_ids = local_ids if rows is None else rows[local_ids]
-        visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=like.device)
-        # A value already on the device, so the scatter doesn't synchronize (D-49).
-        visible.index_put_((camera_ids, gaussian_ids), visible.new_ones(()))
-    else:
-        radii, means2d, depths, conics, compensations = projection
-        passed_visible = (radii > 0).all(dim=-1)  # E6: both screen radii positive
-        # gsplat leaves the 2D means of culled rows uninitialized; Q-32 wants 0 there, in the
-        # tensor the rasterizer reads (D-75).
-        means2d = torch.where(passed_visible[..., None], means2d, torch.zeros_like(means2d))
-        if rows is None:
+    with stage("raster.forward.projection"):
+        cams = [_camera_tensors(camera, like) for camera in cameras]
+        viewmats = torch.stack([_view_matrix(cam) for cam in cams])
+        intrinsics = torch.stack([_intrinsics(cam) for cam in cams])
+        centers = torch.stack([cam.center for cam in cams])
+        projection = gsplat.fully_fused_projection(
+            g.means_t,
+            None,
+            g.quats_n,
+            g.scales,
+            viewmats,
+            intrinsics,
+            width,
+            height,
+            eps2d=_EPS2D,
+            near_plane=_NEAR,
+            far_plane=_FAR,
+            radius_clip=_RADIUS_CLIP,
+            packed=packed,
+            sparse_grad=False,
+            # Derived from _RASTERIZE_MODE (D-6): antialiasing scales the effective opacities
+            # (below).
+            calc_compensations=_RASTERIZE_MODE == "antialiased",
+            camera_model="pinhole",
+            opacities=g.opacities_t,  # E6, D-32: the opacity cull and the opacity-aware extent
+        )
+        camera_ids: Tensor | None = None
+        local_ids: Tensor | None = None
+        gaussian_ids: Tensor | None = None
+        if packed:
+            _, camera_ids, local_ids, radii, means2d, depths, conics, compensations = projection
+            # Every packed row is written and visible: gsplat's radius test drops a row only when
+            # both radii are at most radius_clip, here 0 (D-57), and ε keeps both diagonals of Σ′
+            # positive while the extent is shared, so a row's radii are both positive or both 0
+            # (E6, D-6). gsplat's own 2D means are therefore the anchor (D-75). Rows come
+            # camera-major, ascending within a camera (D-76).
             anchor = rasterized = means2d
-            visible = passed_visible
+            passed_visible = (radii > 0).all(dim=-1)
+            dirs = g.means_t[local_ids] - centers[camera_ids]
+            coeffs = g.sh[local_ids]
+            opacities = g.opacities_t[local_ids]
+            gaussian_ids = local_ids if rows is None else rows[local_ids]
+            visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=like.device)
+            # A value already on the device, so the scatter doesn't synchronize (D-49).
+            visible.index_put_((camera_ids, gaussian_ids), visible.new_ones(()))
         else:
-            # Q-31, D-75: the 2D means go back among all N rows, and the rasterizer reads the kept
-            # rows from there, so that [C, N, 2] tensor is the anchor.
-            anchor = means2d.new_zeros((num_cams, num_rows, 2)).index_copy(1, rows, means2d)
-            rasterized = anchor.index_select(1, rows)
-            visible = passed_visible.new_zeros((num_cams, num_rows)).index_copy(
-                1, rows, passed_visible
-            )
-        dirs = g.means_t[None] - centers[:, None]
-        coeffs = g.sh.expand(num_cams, *g.sh.shape)
-        opacities = g.opacities_t.expand(num_cams, -1)
-    if compensations is not None:
-        opacities = opacities * compensations  # as gsplat's rasterization() does
-    # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; at_time has
-    # already cut the bands above the active degree (D-3).
-    degree = math.isqrt(g.sh.shape[1]) - 1
-    colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=passed_visible)
-    colors = torch.clamp_min(colors + _SH_OFFSET, 0.0)
-    tile_width = math.ceil(width / _TILE_SIZE)
-    tile_height = math.ceil(height / _TILE_SIZE)
-    _, isect_ids, flatten_ids = gsplat.isect_tiles(
-        rasterized,
-        radii,
-        depths,
-        _TILE_SIZE,
-        tile_width,
-        tile_height,
-        segmented=False,  # D-57
-        packed=packed,
-        n_images=num_cams,
-        image_ids=camera_ids,
-        gaussian_ids=local_ids,  # gsplat's own ids, local to the rows passed
-    )
-    offsets = gsplat.isect_offset_encode(isect_ids, num_cams, tile_width, tile_height)
-    offsets = offsets.reshape(num_cams, tile_height, tile_width)
-    image, alpha = gsplat.rasterize_to_pixels(
-        rasterized,
-        conics,
-        colors,
-        opacities,
-        width,
-        height,
-        _TILE_SIZE,
-        offsets,
-        flatten_ids,
-        backgrounds=None,
-        packed=packed,
-        absgrad=False,
-    )
-    # D-76: E6's background, T_final·c_bg = (1 − alpha)·c_bg, composited here in both layouts,
-    # since gsplat 1.5.3 cannot take a per-camera background in packed mode.
-    image = image + (1.0 - alpha) * background[:, None, None, :]
+            radii, means2d, depths, conics, compensations = projection
+            passed_visible = (radii > 0).all(dim=-1)  # E6: both screen radii positive
+            # gsplat leaves the 2D means of culled rows uninitialized; Q-32 wants 0 there, in the
+            # tensor the rasterizer reads (D-75).
+            means2d = torch.where(passed_visible[..., None], means2d, torch.zeros_like(means2d))
+            if rows is None:
+                anchor = rasterized = means2d
+                visible = passed_visible
+            else:
+                # Q-31, D-75: the 2D means go back among all N rows, and the rasterizer reads the
+                # kept rows from there, so that [C, N, 2] tensor is the anchor.
+                anchor = means2d.new_zeros((num_cams, num_rows, 2)).index_copy(1, rows, means2d)
+                rasterized = anchor.index_select(1, rows)
+                visible = passed_visible.new_zeros((num_cams, num_rows)).index_copy(
+                    1, rows, passed_visible
+                )
+            dirs = g.means_t[None] - centers[:, None]
+            coeffs = g.sh.expand(num_cams, *g.sh.shape)
+            opacities = g.opacities_t.expand(num_cams, -1)
+        if compensations is not None:
+            opacities = opacities * compensations  # as gsplat's rasterization() does
+    with stage("raster.forward.sh"):
+        # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; at_time has
+        # already cut the bands above the active degree (D-3).
+        degree = math.isqrt(g.sh.shape[1]) - 1
+        colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=passed_visible)
+        colors = torch.clamp_min(colors + _SH_OFFSET, 0.0)
+    with stage("raster.forward.isect"):
+        tile_width = math.ceil(width / _TILE_SIZE)
+        tile_height = math.ceil(height / _TILE_SIZE)
+        _, isect_ids, flatten_ids = gsplat.isect_tiles(
+            rasterized,
+            radii,
+            depths,
+            _TILE_SIZE,
+            tile_width,
+            tile_height,
+            segmented=False,  # D-57
+            packed=packed,
+            n_images=num_cams,
+            image_ids=camera_ids,
+            gaussian_ids=local_ids,  # gsplat's own ids, local to the rows passed
+        )
+        offsets = gsplat.isect_offset_encode(isect_ids, num_cams, tile_width, tile_height)
+        offsets = offsets.reshape(num_cams, tile_height, tile_width)
+    with stage("raster.forward.rasterize"):
+        image, alpha = gsplat.rasterize_to_pixels(
+            rasterized,
+            conics,
+            colors,
+            opacities,
+            width,
+            height,
+            _TILE_SIZE,
+            offsets,
+            flatten_ids,
+            backgrounds=None,
+            packed=packed,
+            absgrad=False,
+        )
+        # D-76: E6's background, T_final·c_bg = (1 − alpha)·c_bg, composited here in both layouts,
+        # since gsplat 1.5.3 cannot take a per-camera background in packed mode.
+        image = image + (1.0 - alpha) * background[:, None, None, :]
     return image, alpha, anchor, visible, gaussian_ids
 
 

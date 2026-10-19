@@ -43,6 +43,7 @@ from builders import (
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from openftgs import _stages
 from openftgs.cli import main
 from openftgs.config import (
     GrowthConfig,
@@ -505,6 +506,55 @@ def test_profile_writes_a_trace_of_its_window(run: dict[str, Path], tmp_path: Pa
             _train(run, tmp_path / f"bad{window}", "--config", run["config"], "--profile", window)
             == 2
         )
+
+
+_TRAINING_STAGES = {
+    "iteration",
+    "data",
+    "slice",
+    "slice.kernel",
+    "slice.sh_concat",
+    "raster.forward",
+    "loss.l1",
+    "loss.ssim",
+    "loss.reg",
+    "backward",
+    "statistics",
+    "adam",
+    "events",
+    "log",
+}
+_GSPLAT_STAGES = {
+    "raster.forward.projection",
+    "raster.forward.sh",
+    "raster.forward.isect",
+    "raster.forward.rasterize",
+}
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        pytest.param(_TRAINING_STAGES, id="cpu"),
+        pytest.param(_TRAINING_STAGES | _GSPLAT_STAGES, id="gpu", marks=pytest.mark.gpu),
+    ],
+)
+def test_profile_trace_carries_the_stage_names(
+    run: dict[str, Path], tmp_path: Path, stages: set[str]
+) -> None:
+    """§3.4 (PRD #220): the profile window turns the stages' profiler ranges on, so the trace
+    names every stage of its iterations (λ_perc = 0 here, so no perceptual stage), once per
+    iteration of the window; they are off again after it."""
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", run["config"], "--profile", "3:2") == 0
+    events = json.loads((out / "profile" / "trace.json").read_text())["traceEvents"]
+    names = [event.get("name") for event in events]
+    assert stages <= set(names)
+    assert names.count("iteration") == 2
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        with _stages.stage("adam"):
+            pass
+    assert "adam" not in {event.name for event in prof.events()}
 
 
 def test_profile_window_starts_after_a_resumed_iteration(

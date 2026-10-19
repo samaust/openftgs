@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from openftgs._stages import point, stage
 from openftgs.config import (
     PerfConfig,
     TrainConfig,
@@ -602,53 +603,66 @@ class Trainer:
         if it > cfg.optim.iterations:
             raise ValueError(f"the run is complete at iteration {run.iteration}")
         entry = calendar_entry(cfg, it)
-        with _perf_flags(cfg.perf), torch.enable_grad():
-            # Steps 1–2: the next image of the sampler, its normalized time and L_active.
-            index = run.sampler.next()
-            record = self._dataset.records[index]
-            gt = self._image(index)
-            t = float(run.time.to_t(record.timestamp))
-            # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
-            out = render(
-                run.model,
-                self._cameras[id(record.camera)],
-                t,
-                time_units="normalized",
-                sh_degree=entry.sh_degree,
-                background=self._background,
-                backend=self._backend,
-                return_aux=True,
-                precull=cfg.perf.precull,  # Q-31
-                packed=cfg.perf.packed,  # Q-36
-            )
-            # Step 4: E9.
-            loss, terms = total_loss(
-                out.image, gt[None], run.model, t, it, cfg.loss, perceptual=self._perceptual
-            )
-            # Step 5: backpropagate, then the gradient statistics (E10, D-12).
-            torch.autograd.backward(loss)
-            assert out.means2d is not None and out.visible is not None  # return_aux
-            grad = out.means2d.grad
-            if grad is not None:  # a check for None, not a synchronization
-                width, height = record.camera.width, record.camera.height
-                if out.gaussian_ids is not None:  # packed mode (Q-36)
-                    run.stats.update(
-                        grad, width=width, height=height, gaussian_ids=out.gaussian_ids
-                    )
-                else:
-                    run.stats.update(grad, width=width, height=height, visible=out.visible)
-            # Step 6: this iteration's rates and one Adam step.
-            rates = run.optimizer.set_iteration(it)
-            if cfg.perf.adam == "selective":
-                run.optimizer.step(visibility=out.visible.any(dim=0))
-            else:
-                run.optimizer.step()
-            run.optimizer.zero_grad()
-            # Step 7: the event.
-            growth, relocation, pruned = self._event(entry, it)
-        run.iteration = it
-        if self._placement_pending:
-            self._choose_placement()
+        # §3.4: the iteration's stages (B-1); the slice, rasterization and loss stages are
+        # render's, at_time's and total_loss's.
+        with stage("iteration"):
+            with _perf_flags(cfg.perf), torch.enable_grad():
+                # Steps 1–2: the next image of the sampler, its normalized time and L_active.
+                index = run.sampler.next()
+                record = self._dataset.records[index]
+                with stage("data"):
+                    gt = self._image(index)
+                t = float(run.time.to_t(record.timestamp))
+                # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
+                out = render(
+                    run.model,
+                    self._cameras[id(record.camera)],
+                    t,
+                    time_units="normalized",
+                    sh_degree=entry.sh_degree,
+                    background=self._background,
+                    backend=self._backend,
+                    return_aux=True,
+                    precull=cfg.perf.precull,  # Q-31
+                    packed=cfg.perf.packed,  # Q-36
+                )
+                # §3.4: with a stage clock active, the image's gradient marks where every loss's
+                # backward ends.
+                point(out.image, "backward.losses_done")
+                # Step 4: E9.
+                loss, terms = total_loss(
+                    out.image, gt[None], run.model, t, it, cfg.loss, perceptual=self._perceptual
+                )
+                # Step 5: backpropagate, then the gradient statistics (E10, D-12).
+                with stage("backward"):
+                    torch.autograd.backward(loss)
+                assert out.means2d is not None and out.visible is not None  # return_aux
+                with stage("statistics"):
+                    grad = out.means2d.grad
+                    if grad is not None:  # a check for None, not a synchronization
+                        width, height = record.camera.width, record.camera.height
+                        if out.gaussian_ids is not None:  # packed mode (Q-36)
+                            run.stats.update(
+                                grad, width=width, height=height, gaussian_ids=out.gaussian_ids
+                            )
+                        else:
+                            run.stats.update(grad, width=width, height=height, visible=out.visible)
+                # Step 6: this iteration's rates and one Adam step.
+                with stage("adam"):
+                    rates = run.optimizer.set_iteration(it)
+                    if cfg.perf.adam == "selective":
+                        run.optimizer.step(visibility=out.visible.any(dim=0))
+                    else:
+                        run.optimizer.step()
+                    run.optimizer.zero_grad()
+                # Step 7: the event.
+                with stage("events"):
+                    growth, relocation, pruned = self._event(entry, it)
+            run.iteration = it
+            if self._placement_pending:
+                self._choose_placement()
+            with stage("log"):
+                mean_losses = self._log(terms, it)
         return StepLog(
             iteration=it,
             image_index=index,
@@ -662,7 +676,7 @@ class Trainer:
             relocation=relocation,
             pruned=pruned,
             opacity_reset=entry.reset_opacity,
-            mean_losses=self._log(terms, it),
+            mean_losses=mean_losses,
         )
 
     def _check_valid(self, it: int) -> None:

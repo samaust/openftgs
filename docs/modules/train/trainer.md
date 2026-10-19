@@ -16,6 +16,18 @@ How `Trainer` meets its §2.1 row: the training iteration of §1.3, the calendar
 
 The backend follows the device: gsplat on a CUDA device, which D-76 requires of it, and the reference backend elsewhere (Q-69).
 
+## Stages
+
+`step()` runs inside the range `iteration`, which B-1 times as the whole iteration, and its stages run inside that range, in order (§3.4; the fixed list of names is `openftgs._stages.STAGES`):
+
+- `data`: taking the image, the data wait of B-6;
+- `slice`, in `at_time`: `slice.kernel` around the temporal slice's call (never inside the compiled function, D-50), then `slice.sh_concat`;
+- `raster.forward`, in `render` after the slice, compaction included; on gsplat it holds `raster.forward.projection`, `raster.forward.sh`, `raster.forward.isect` and `raster.forward.rasterize`;
+- `loss.l1`, `loss.ssim`, `loss.perceptual` and `loss.reg`, in `total_loss`, each only when its λ is above 0;
+- `backward`, `statistics`, `adam`, `events` and `log`.
+
+Each stage is an NVTX range whenever PyTorch has NVTX, a profiler range inside a `--profile` window, and, while a stage clock is active, a pair of CUDA events (B-1, B-6) or wall times. Two gradient hooks, registered only while a clock is active, split `backward` into three parts: `backward.losses_done` fires when the rendered image's gradient is complete, after every loss's backward; `backward.raster_done` when the gradient of the moved means, taken right after the slice and before compaction, is complete, so projection and SH are done; the rest, until `backward()` returns, is the slice's backward. Autograd interleaves the losses' backward passes, so a single loss's backward can't be timed apart; B-4 times each loss alone. The hooks run on the autograd engine's thread, and the clock records from any thread, never synchronizes (U-29's stage-clock case), and is read where the run synchronizes anyway. Initialization and conversion have their own stages for B-8, on the wall clock: `init.match` per camera pair in its shard's thread, with `init.triangulate` inside it, `init.knn`, and per frame `convert.decode` and `convert.encode`, keyed by camera.
+
 ## The calendar
 
 `calendar_entry(cfg, it)` is a pure function of the configuration and the iteration, so U-17 checks a 30,000-iteration calendar without training (Q-71). Every window and period comes from the configuration, so a shortened calendar (§3.2) needs no other change. Growth and relocation share the event period (`RelocConfig.every`) and have their own windows. In the "w/o periodic relocation" ablation, selected by `RelocConfig.prune_opacity`, pruning runs at every growth event and the opacity reset at every multiple of `density.OPACITY_RESET_EVERY` inside the growth window (owner answer, Q-71; Q-67). The ablation turns relocation off, so the trainer refuses a pruning opacity with relocation on (Q-71).
@@ -36,7 +48,7 @@ Every training record's camera is copied to the device when the trainer is built
 | gsplat's projection, which reads back its number of visible primitive–camera pairs | once | — |
 | with compaction, `render`'s `_kept_rows`, which reads back the number of rows kept (Q-31) | once | once |
 
-None of the other settings adds one: fused, foreach or selective Adam, the eager or compiled slice, any cache placement and prefetch depth, the perceptual loss, either SSIM path, deterministic mode (U-29's cases). Everything else an iteration does stays on the device or in host values that need no read-back:
+None of the other settings adds one: fused, foreach or selective Adam, the eager or compiled slice, any cache placement and prefetch depth, the perceptual loss, either SSIM path, deterministic mode, an active stage clock (U-29's cases). Everything else an iteration does stays on the device or in host values that need no read-back:
 
 - the image comes as the step-log section above says, without blocking the host;
 - cameras and the background are on the device from construction;
