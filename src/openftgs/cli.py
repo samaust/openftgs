@@ -88,6 +88,17 @@ def _environment(what: str) -> Iterator[None]:
         raise _Failure(_INPUT, f"{what}: {error}") from error
 
 
+@contextlib.contextmanager
+def _output(what: str) -> Iterator[None]:
+    """Q-142 (as answered): an OSError while writing a user-chosen output, or making its
+    directory, is exit code 2; the atomic writes leave the old file or checkpoint (Q-25,
+    Q-126)."""
+    try:
+        yield
+    except OSError as error:
+        raise _Failure(_INPUT, f"cannot write {what}: {error}") from error
+
+
 def _producer() -> str:
     try:
         return f"openftgs {importlib.metadata.version('openftgs')}"
@@ -269,8 +280,8 @@ def _init(args: argparse.Namespace) -> int:
             points = roma_init(video, cfg)
     except ImportError as error:  # Q-142: the [init] extra is missing
         _fail(f"RoMa initialization needs the [init] extra (pip install 'openftgs[init]'): {error}")
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with _as_input_error(f"init points {args.out}"):
+    with _output(f"init points {args.out}"), _as_input_error(f"init points {args.out}"):
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         write_init_points(
             points,
             args.out,
@@ -362,7 +373,7 @@ class _Profile:
         if device == "cuda":
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         self._profiler = torch.profiler.profile(activities=activities)
-        self._first, self._last, self._path = start, start + count - 1, path
+        self._first, self._last, self.path = start, start + count - 1, path
         self._running = False
 
     def begin_if_due(self, iteration: int) -> None:
@@ -383,11 +394,13 @@ class _Profile:
         if self._running:
             self._profiler.stop()
             self._running = False
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._profiler.export_chrome_trace(str(self._path))
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._profiler.export_chrome_trace(str(self.path))
 
 
 def _train(args: argparse.Namespace) -> int:
+    import torch
+
     from openftgs.config import config_from_dict, config_to_dict, resume_conflicts
     from openftgs.io import load_checkpoint, read_init_points, save_run_checkpoint
     from openftgs.train import Trainer
@@ -449,8 +462,9 @@ def _train(args: argparse.Namespace) -> int:
             )
         profile = _Profile(start, count, run_dir / "profile" / "trace.json", device)
 
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "config.json").write_text(_json_text(config_to_dict(cfg)), encoding="utf-8")
+    with _output(f"run directory {run_dir}"):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "config.json").write_text(_json_text(config_to_dict(cfg)), encoding="utf-8")
     log_path = run_dir / "train_log.jsonl"
 
     def save() -> None:
@@ -458,7 +472,8 @@ def _train(args: argparse.Namespace) -> int:
         rotates the run directory's kept checkpoints."""
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
-        save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
+        with _output(f"a checkpoint in {run_dir}"):  # Q-159: no further save is attempted
+            save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
 
     def record(_: Trainer, log: StepLog) -> bool:
         if profile is not None:
@@ -469,7 +484,7 @@ def _train(args: argparse.Namespace) -> int:
                 "losses": log.mean_losses,
                 "num_gaussians": log.num_gaussians,
             }
-            with log_path.open("a", encoding="utf-8") as f:
+            with _output(str(log_path)), log_path.open("a", encoding="utf-8") as f:  # Q-159
                 f.write(json.dumps(row, allow_nan=False) + "\n")
             total = sum(log.mean_losses.values())
             print(
@@ -484,15 +499,29 @@ def _train(args: argparse.Namespace) -> int:
     if profile is not None:
         profile.begin_if_due(trainer.iteration)
     # Q-133: the guard stays on through the save, so a signal can't interrupt it.
+    trace_failure: _Failure | None = None
     with _Signals() as signals:
+        stopped = True
         try:
             trainer.train(callbacks=[record])
+            stopped = False
         except FloatingPointError as error:  # Q-69: divergence; nothing is saved
             _fail(str(error), _NUMERIC)
+        except torch.OutOfMemoryError:  # Q-142: the iteration was cut off; nothing is saved
+            _fail(_out_of_memory(trainer.iteration + 1, run_dir, args.resume))
         finally:
-            if profile is not None:
-                profile.finish()  # Q-144: a window cut short by a signal is still written
+            if profile is not None:  # Q-144: a window cut short is still written
+                try:
+                    with _output(f"the profile trace {profile.path}"):
+                        profile.finish()
+                except _Failure as failure:
+                    if stopped:  # Q-160: the training failure is the one reported
+                        print(f"warning: {failure}", file=sys.stderr)
+                    else:  # reported once the checkpoint is safe
+                        trace_failure = failure
         save()
+    if trace_failure is not None:
+        raise trace_failure
     if signals.received is not None and trainer.iteration < last:  # Q-133; a finished run goes on
         print(
             f"stopped by signal {signals.received} at iteration {trainer.iteration}; "
@@ -501,7 +530,8 @@ def _train(args: argparse.Namespace) -> int:
         )
         return 128 + signals.received
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
-        with _environment("LPIPS networks"):
+        # Q-161: one call downloads the networks and writes the file, so the message names both.
+        with _environment(f"LPIPS networks or {run_dir / 'METRICS.json'}"):
             try:
                 trainer.evaluate("test", out_dir=run_dir)
             except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; no file
@@ -520,6 +550,21 @@ def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
         _fail(f"training diverged by iteration {trainer.iteration}: {error}", _NUMERIC)
     if not all(bool(torch.isfinite(v).all()) for v in stats.values()):
         _fail(f"training diverged by iteration {trainer.iteration}: statistics", _NUMERIC)
+
+
+def _out_of_memory(iteration: int, run_dir: Path, resumed: Path | None) -> str:
+    """Q-142 (as answered): what an out-of-memory failure in training lost, and the way on."""
+    latest = run_dir / "checkpoint"
+    if latest.is_dir():
+        where = f"resume from {latest}"
+    elif resumed is not None:
+        where = f"resume from {resumed}"
+    else:
+        where = "no checkpoint was saved; start again"
+    return (
+        f"out of GPU memory in iteration {iteration}, which wasn't saved; {where} with "
+        'perf.frame_cache = "mmap" or lower memory settings (D-51, Q-99)'
+    )
 
 
 # -- models --------------------------------------------------------------------------------------
@@ -614,8 +659,9 @@ def _render(args: argparse.Namespace) -> int:
     bad += [i for i, a in renders.alpha.items() if not bool(torch.isfinite(a).all())]
     if bad:  # Q-129
         _fail(f"renders that aren't finite: {sorted(set(bad))[:5]}", _NUMERIC)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    write_renders(renders, args.out, producer=_producer(), request_sha256=sha)
+    with _output(f"renders {args.out}"):  # Q-142
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        write_renders(renders, args.out, producer=_producer(), request_sha256=sha)
     return 0
 
 
@@ -711,15 +757,16 @@ def _eval(args: argparse.Namespace) -> int:
     except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; nothing is written
         _fail(str(error), _NUMERIC)
     body = metrics_report(images, split=args.split, metadata=video.manifest.metadata)
-    write_metrics(
-        args.out,
-        body,
-        manifest=video.manifest,
-        model_path=args.model,
-        iteration=loaded.iteration,
-        renders=entry,
-        model_sha256=loaded.sha256,
-    )
+    with _output(f"metrics {args.out}"):  # Q-142
+        write_metrics(
+            args.out,
+            body,
+            manifest=video.manifest,
+            model_path=args.model,
+            iteration=loaded.iteration,
+            renders=entry,
+            model_sha256=loaded.sha256,
+        )
     return 0
 
 
@@ -734,8 +781,8 @@ def _export(args: argparse.Namespace) -> int:
     loaded = _load_model(args.checkpoint, "cpu")
     # D-84: the file records the background the run was trained against.
     exchange = dataclasses.replace(loaded.model.to_exchange(), background=loaded.background)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with _as_input_error(f"exchange model {args.out}"):
+    with _output(f"exchange model {args.out}"), _as_input_error(f"exchange model {args.out}"):
+        args.out.parent.mkdir(parents=True, exist_ok=True)  # Q-142
         write_exchange(exchange, args.out)
     return 0
 

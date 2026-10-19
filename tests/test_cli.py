@@ -1591,10 +1591,13 @@ def _assert_untouched(out: Path, before: bytes | None) -> None:
 
 @pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
 def test_export_that_fails_partway_leaves_the_target_as_it_was(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    existing: bool,
 ) -> None:
     """Q-126: an exchange model written partway leaves the old file, or no file, and no
-    temporary; the failure propagates as before (Q-26)."""
+    temporary; the failure is exit code 2 naming the output (Q-142 as answered)."""
     _, checkpoint = _trained(tmp_path)
     out = tmp_path / "exports" / "model.safetensors"
     before = None
@@ -1604,17 +1607,21 @@ def test_export_that_fails_partway_leaves_the_target_as_it_was(
     else:
         out.parent.mkdir()
     _fail_partway(monkeypatch, out)
-    with pytest.raises(OSError, match="No space left"):
-        _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", out)
+    capsys.readouterr()
+    assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", out) == 2
+    assert str(out) in capsys.readouterr().err
     _assert_untouched(out, before)
 
 
 @pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
 def test_render_that_fails_partway_leaves_the_target_as_it_was(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    existing: bool,
 ) -> None:
     """Q-126: renders written partway leave the old file, or no file, and no temporary; the
-    failure propagates as before (Q-26)."""
+    failure is exit code 2 naming the output (Q-142 as answered)."""
     scene, checkpoint = _trained(tmp_path)
     request = write_render_request(tmp_path / "req.json", _test_items(scene))
     out = tmp_path / "renders" / "out.safetensors"
@@ -1626,18 +1633,23 @@ def test_render_that_fails_partway_leaves_the_target_as_it_was(
     else:
         out.parent.mkdir()
     _fail_partway(monkeypatch, out)
-    with pytest.raises(OSError, match="No space left"):
-        _ftgs(*args)
+    capsys.readouterr()
+    assert _ftgs(*args) == 2
+    assert str(out) in capsys.readouterr().err
     _assert_untouched(out, before)
 
 
 @pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
 def test_init_roma_that_fails_partway_leaves_the_target_as_it_was(
-    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    existing: bool,
 ) -> None:
     """Q-126: init points written partway leave the old file, or no file, and no temporary;
-    the failure propagates as before (Q-26). roma_init is stood in for, so no CUDA device or
-    [init] extra is needed."""
+    the failure is exit code 2 naming the output (Q-142 as answered). roma_init is stood in
+    for, so no CUDA device or [init] extra is needed."""
     import openftgs.init
 
     points = read_init_points(run["init"])
@@ -1651,18 +1663,22 @@ def test_init_roma_that_fails_partway_leaves_the_target_as_it_was(
     else:
         out.parent.mkdir()
     _fail_partway(monkeypatch, out)
-    with pytest.raises(OSError, match="No space left"):
-        _ftgs("init", "roma", run["scene"], out)
+    capsys.readouterr()
+    assert _ftgs("init", "roma", run["scene"], out) == 2
+    assert str(out) in capsys.readouterr().err
     _assert_untouched(out, before)
 
 
 @pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
 def test_eval_that_fails_partway_leaves_the_target_as_it_was(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    existing: bool,
 ) -> None:
     """Q-126: METRICS.json written partway leaves the old file, or no file, and no temporary;
-    the failure propagates as before (Q-26). Text writes into its directory write a few
-    characters, then raise OSError, as a full disk would."""
+    the failure is exit code 2 naming the output (Q-142 as answered). Text writes into its
+    directory write a few characters, then raise OSError, as a full disk would."""
     scene, checkpoint = _trained(tmp_path)
     out = tmp_path / "metrics" / "METRICS.json"
     before = None
@@ -1680,8 +1696,9 @@ def test_eval_that_fails_partway_leaves_the_target_as_it_was(
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(Path, "write_text", partial)
-    with pytest.raises(OSError, match="No space left"):
-        _ftgs("eval", checkpoint, scene, "--out", out)
+    capsys.readouterr()
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert str(out) in capsys.readouterr().err
     _assert_untouched(out, before)
 
 
@@ -1698,3 +1715,208 @@ def test_export_replaces_a_symlinked_target_by_a_regular_file(tmp_path: Path) ->
     assert not out.is_symlink()
     read_exchange(out)
     assert elsewhere.read_bytes() == b"not overwritten"
+
+
+# Out of GPU memory in training and unwritable outputs (Q-142 as answered; Q-158 to Q-161).
+
+
+def _out_of_memory_at(monkeypatch: pytest.MonkeyPatch, iteration: int) -> None:
+    """Trainer.step raises torch.OutOfMemoryError in iteration `iteration`, as CUDA would."""
+    step = Trainer.step
+
+    def stepping(self: Trainer) -> Any:
+        if self.iteration + 1 == iteration:
+            raise torch.OutOfMemoryError("CUDA out of memory (stood in for)")
+        return step(self)
+
+    monkeypatch.setattr(Trainer, "step", stepping)
+
+
+@pytest.mark.parametrize("every", [5, 0], ids=["periodic", "none"])
+def test_out_of_gpu_memory_in_training_is_exit_code_2(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    every: int,
+) -> None:
+    """Q-142 (as answered): out of GPU memory inside Trainer.train is exit code 2; nothing is
+    saved for the iteration cut off, and the message names it, the latest checkpoint when there
+    is one, and the frame-cache remedy (D-51, Q-99, Q-134)."""
+    _out_of_memory_at(monkeypatch, 7)
+    out = tmp_path / "run"
+    capsys.readouterr()
+    assert _train(run, out, "--config", run["config"], "--checkpoint-every", every) == 2
+    err = capsys.readouterr().err
+    assert "iteration 7" in err and "frame_cache" in err
+    if every:
+        assert str(out / "checkpoint") in err
+        assert _kept(out) == {"checkpoint": 5}
+    else:
+        assert "no checkpoint was saved" in err
+        assert not (out / "checkpoint").exists()
+
+
+def test_out_of_memory_or_a_read_error_elsewhere_keeps_its_traceback(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-26, Q-142 (as answered): only Trainer.train's out-of-memory error and the outputs'
+    write errors are exit code 2; out of memory while the trainer is built, or an OSError of a
+    read during training, stays a traceback."""
+
+    def no_memory(*args: Any, **kwargs: Any) -> None:
+        raise torch.OutOfMemoryError("CUDA out of memory (stood in for)")
+
+    with monkeypatch.context() as m:
+        m.setattr(Trainer, "__init__", no_memory)
+        with pytest.raises(torch.OutOfMemoryError):
+            _train(run, tmp_path / "a", "--config", run["config"])
+    step = Trainer.step
+
+    def unreadable(self: Trainer) -> Any:
+        if self.iteration == 3:
+            raise OSError(5, "Input/output error reading a frame")
+        return step(self)
+
+    monkeypatch.setattr(Trainer, "step", unreadable)
+    with pytest.raises(OSError, match="reading a frame"):
+        _train(run, tmp_path / "b", "--config", run["config"])
+
+
+def test_a_checkpoint_that_cannot_be_written_is_exit_code_2(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (as answered), Q-159: a checkpoint save that fails with OSError, periodic here, is
+    exit code 2 naming the run directory; no further save is attempted, and the checkpoints
+    already kept survive (Q-25, Q-151)."""
+    import openftgs.io
+
+    original = openftgs.io.save_checkpoint
+    calls = []
+
+    def full_at_ten(state: Any, directory: Path) -> Path:
+        calls.append(state.iteration)
+        if state.iteration == 10:
+            raise OSError(28, "No space left on device")
+        return original(state, directory)
+
+    monkeypatch.setattr("openftgs.io.save_checkpoint", full_at_ten)
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    capsys.readouterr()
+    assert _train(run, out, "--config", run["config"], *keep) == 2
+    assert str(out) in capsys.readouterr().err
+    assert calls == [5, 10]
+    assert _kept(out) == {"checkpoint": 5}
+
+
+def test_a_train_log_that_cannot_be_written_is_exit_code_2(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (as answered), Q-159: an OSError while appending to train_log.jsonl is exit code 2
+    naming it, at once: no checkpoint is saved after it."""
+    original = Path.open
+
+    def full(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == "train_log.jsonl":
+            raise OSError(28, "No space left on device")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", full)
+    out = tmp_path / "run"
+    capsys.readouterr()
+    assert _train(run, out, "--config", run["config"]) == 2
+    assert "train_log.jsonl" in capsys.readouterr().err
+    assert not (out / "checkpoint").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_outputs_into_a_read_only_directory_are_exit_code_2(
+    run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-142 (as answered), Q-158: the real failure of a write into a directory without write
+    permission, the safetensors writer's included, is exit code 2 naming the output, for
+    ftgs export, ftgs render and ftgs train's run directory."""
+    scene, checkpoint = _trained(tmp_path)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        request = write_render_request(tmp_path / "req.json", _test_items(scene))
+        commands = [
+            ("export", checkpoint, "--format", "ftgs-if", "--out", locked / "m.safetensors"),
+            (
+                "render",
+                checkpoint,
+                "--request",
+                request,
+                "--out",
+                locked / "r.safetensors",
+                "--backend",
+                "reference",
+            ),
+        ]
+        for command in commands:
+            capsys.readouterr()
+            assert _ftgs(*command) == 2
+            assert str(locked) in capsys.readouterr().err
+        assert _train(run, locked / "run", "--config", run["config"]) == 2
+        assert list(locked.iterdir()) == []
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_trace_that_cannot_be_written_is_exit_code_2_after_the_save(
+    run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-142 (as answered): the profile trace is an output, so a trace that can't be written is
+    exit code 2 naming it; the run's checkpoint is saved first, so no training is lost. A file
+    where the trace's folder goes makes the write fail; the run is resumed into its own run
+    directory, which may hold it."""
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, "--config", run["config"], *keep) == 0
+    (out / "profile").write_text("a file where the trace's folder goes")
+    capsys.readouterr()
+    args = ("--resume", out / "checkpoint-15", "--profile", "16:2", *keep)
+    assert _train(run, out, *args) == 2
+    assert "profile" in capsys.readouterr().err
+    assert _kept(out) == {"checkpoint": ITERATIONS, "checkpoint-15": 15}
+
+
+def test_out_of_memory_in_a_profile_window_writes_the_trace(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-160, Q-144: an out-of-memory error inside a profile window still writes the trace of the
+    iterations the window ran, and the command reports the out-of-memory error (exit 2)."""
+    _out_of_memory_at(monkeypatch, 6)
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", run["config"], "--profile", "3:10") == 2
+    assert json.loads((out / "profile" / "trace.json").read_text())["traceEvents"]
+
+
+@pytest.mark.weights
+def test_metrics_that_cannot_be_written_in_training_are_exit_code_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-142 (as answered), Q-161: a METRICS.json write that fails in ftgs train's final
+    evaluation is exit code 2 naming METRICS.json, after the checkpoint is saved (Q-132)."""
+
+    def full(*args: Any, **kwargs: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("openftgs.train.write_metrics", full)
+    scene = _scene(tmp_path / "scene", test=True)
+    init = _init(tmp_path / "init.safetensors")
+    cfg = _config_file(tmp_path / "cfg.json")
+    out = tmp_path / "run"
+    capsys.readouterr()
+    assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 2
+    assert "METRICS.json" in capsys.readouterr().err
+    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
