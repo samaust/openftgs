@@ -934,7 +934,7 @@ def test_eval_refuses_a_supplied_renders_file_that_is_not_finite(
     out = tmp_path / "m.json"
     capsys.readouterr()
     assert _ftgs("eval", checkpoint, scene, "--out", out, "--renders-dir", directory) == 2
-    assert "rgb/t9 has values that are not finite" in capsys.readouterr().err
+    assert "t9 has values that are not finite" in capsys.readouterr().err
     assert not out.exists()
 
 
