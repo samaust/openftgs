@@ -13,3 +13,18 @@ A cache sits beside its manifest, in `.ftgs-cache/<manifest sha256>/`: one safet
 ## The prefetcher
 
 The sampler's order is known ahead (D-26): its private `peek` returns the rest of the current permutation and the next epoch's, drawn on a copy of the generator's state, so the stream itself never moves (Q-72). The prefetcher keeps `prefetch` images in flight: on CUDA through a ring of pinned buffers copied on a side stream, the training stream waiting on each buffer's event; on the CPU through a reader thread. `take` returns float32 values, the uint8 frame divided by 255 on the device, bitwise equal to `load_image`'s. On CUDA the divisor is a 0-dim device tensor: there, dividing by a Python float multiplies by the reciprocal, which differs from the CPU's division in the last bit (Q-99). A resumed run rebuilds the queue from the restored sampler, so it trains on the same images in the same order as a straight run (U-30).
+
+## Measured: B-6 and Q-99's note
+
+B-6 (`ftgs bench data`, `docs/modules/cli/benchmarks.md`) times the data wait, the training stream's `data` stage, against D-51's budget of 1 %, with B-1's configuration at 1M rows on openftgs-synth's kitchen and its 60-frame conversion (Calibration data, #232):
+
+| Placement | Share of an iteration | Data stage, GPU (host) | Budget |
+| --- | --- | --- | --- |
+| "gpu" (60 frames; kitchen's 23.4 GB cache doesn't fit) | 0.035 % | 0.036 ms (0.03 ms) | passes |
+| "mmap", prefetch 8 | 0.035 % | 0.036 ms (0.06 ms) | passes |
+| "mmap", prefetch 0 | 0.044 % | 0.046 ms (0.44 ms) | passes |
+| "off" | 1.95 % | 2.06 ms (36 ms) | none |
+
+With the cache, the training stream spends its data stage converting the frame to float32. At prefetch 0 the read, and the wait on a pinned buffer's previous copy, move to the training thread: 0.44 ms of host time, which runs while the GPU still works through the previous iteration's losses and backward pass, so the stream barely notices. Without the cache, decoding a PNG takes 36 ms of host time, hidden the same way, and the stream copies a float32 image, four times a cached frame's bytes.
+
+"auto"'s rule for the GPU placement (Q-99) was checked at N = 3M rows, the default N_max, with the 60-frame cache (4.37 GiB) on the GPU. After the warm-up iteration it measured 20.31 GiB free and 0.058 GiB of growth, a limit of 10.10 GiB. The run then peaked at 12.09 GiB allocated and 15.23 GiB reserved, 8.57 GiB beyond the cache and the growth from reserved memory (5.43 GiB allocated). That is 84 % of the half of free memory the rule leaves for the iteration's own buffers, LPIPS's activations among them, so a cache at the rule's limit would still have fit, with about 1.6 GiB to spare. The rule stands as it is, and `frame_cache="mmap"` stays the safe setting at the edge of GPU memory.

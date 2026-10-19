@@ -2,9 +2,9 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50. Q-166 (BENCH.json and the
-exit codes), Q-167 (`--model`), Q-168 (the setups). docs/modules/cli/benchmarks.md maps each
-subcommand to its B-n.
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51. Q-166 (BENCH.json and
+the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-178 and Q-189 (B-6).
+docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
@@ -1378,6 +1378,269 @@ def _adam(ctx: _Context) -> _Result:
     return _Result(setup, cases + compared, budgets)
 
 
+# -- B-6: the data wait per cache placement (§3.4, D-51; Q-99, Q-178, Q-189) -------------------
+
+_DATA_N = 1_000_000  # #232: B-1's configuration at N = 1M
+_DATA_ACTIVE = 0.2  # Q-189: as B-1's case at 1M rows (#226)
+_MEMORY_N = 3_000_000  # #232, Q-99's note: peak memory at N = 3M with the cache on the GPU
+_DATA_TIMED = (121, 320)  # #232: 200 iterations under the CUDA clock, after B-1's warm-up
+_DATA_HOST = (321, 420)  # Q-189: 100 iterations under the wall clock, a diagnostic
+_DATA_SHARE_LIMIT = 0.01  # §3.4 B-6, D-51: the data wait under 1 % of an iteration
+# #232, Q-178: each placement, with the prefetch depth where it has one ("gpu" takes its frames in
+# place and "off" decodes PNGs, so neither reads ahead).
+_DATA_PLACEMENTS: tuple[tuple[Literal["gpu", "mmap", "off"], int | None], ...] = (
+    ("gpu", None),
+    ("mmap", 8),
+    ("mmap", 0),
+    ("off", None),
+)
+
+
+def _data_config(
+    n: int, placement: Literal["gpu", "mmap", "off"], prefetch: int | None
+) -> TrainConfig:
+    """B-6's configuration (#232): B-1's at `n` rows, with the case's frame-cache placement and
+    prefetch depth; None keeps the default depth, which "gpu" and "off" don't use."""
+    import dataclasses
+
+    cfg = _train_step_config(n)
+    perf = dataclasses.replace(cfg.perf, frame_cache=placement)
+    if prefetch is not None:
+        perf = dataclasses.replace(perf, prefetch=prefetch)
+    return dataclasses.replace(cfg, perf=perf)
+
+
+@dataclass(frozen=True)
+class _AutoEstimate:
+    """What "auto" measures after a warm-up iteration on CUDA (Q-99), in bytes: the free GPU
+    memory, `mem_get_info`'s plus what the allocator holds unused; what growth to N_max adds;
+    the cache's size; the memory allocated and reserved then; and the device's total."""
+
+    free: int
+    growth: int
+    cache: int
+    allocated: int
+    reserved: int
+    total: int
+
+    @property
+    def limit(self) -> float:
+        """D-51, Q-99: the largest cache "auto" puts on the GPU, ½·free − growth."""
+        return 0.5 * self.free - self.growth
+
+    @property
+    def fits(self) -> bool:
+        return self.cache <= self.limit
+
+    def figures(self) -> dict[str, float]:
+        return {
+            "auto_free_bytes": self.free,
+            "auto_growth_bytes": self.growth,
+            "auto_allocated_bytes": self.allocated,
+            "auto_reserved_bytes": self.reserved,
+            "auto_total_bytes": self.total,
+            # Q-189: the device's memory outside this process's allocator, other processes'
+            # and the CUDA context's, which the free memory leaves out.
+            "auto_outside_bytes": self.total - self.free - self.allocated,
+            "cache_bytes": self.cache,
+            "auto_limit_bytes": self.limit,
+        }
+
+    def margin(self, *, peak_reserved: int) -> dict[str, float]:
+        """Q-99's note (Q-189): what a run with the cache on the GPU took after the warm-up
+        iteration beyond the cache and the growth, its peak reserved memory less what was
+        allocated then, and that as a share of the ½·free the rule leaves for it; above 1, a cache
+        at the rule's limit wouldn't have fit."""
+        beyond = peak_reserved - self.allocated - self.cache - self.growth
+        return {"beyond_estimate_bytes": beyond, "margin_used": beyond / (0.5 * self.free)}
+
+
+def _data_figures(
+    timed: Sequence[dict[str, float]],
+    timed_events: Sequence[bool],
+    host: Sequence[dict[str, float]],
+    host_events: Sequence[bool],
+) -> dict[str, Any]:
+    """§3.4 B-6 (Q-189): from the per-iteration stage times of the CUDA window (`timed`) and
+    of the wall clock's (`host`), over the iterations without an event: the data stage's share
+    of an iteration, a ratio of means as B-1's (Q-185), with its mean and median, the mean
+    iteration and the count; then the host times of the data stage and of an iteration."""
+    stages = _stage_figures(timed, events=timed_events)
+    on_host = _stage_figures(host, events=host_events)
+    return {
+        "data_share": stages["data"]["share"],
+        "data_mean_s": stages["data"]["mean_s"],
+        "data_median_s": stages["data"]["median_s"],
+        "iteration_mean_s": stages["iteration"]["mean_s"],
+        "iterations": stages["iteration"]["count"],
+        "data_host_mean_s": on_host["data"]["mean_s"],
+        "iteration_host_mean_s": on_host["iteration"]["mean_s"],
+        "host_iterations": on_host["iteration"]["count"],
+    }
+
+
+def _data_budgets(cases: Sequence[dict[str, Any]], *, n: int) -> list[dict[str, Any]]:
+    """§3.4 B-6, D-51 (#232): a budget entry for the data wait's share of every case that reads
+    the cache ("gpu", "mmap" at either depth) at B-6's `n` rows, against 1 %."""
+    return [
+        _budget(c["case"], c["figures"], "data_share", _DATA_SHARE_LIMIT, "budget")
+        for c in cases
+        if c["case"]["placement"] in ("gpu", "mmap") and c["case"]["n"] == n
+    ]
+
+
+def _release_cuda() -> None:
+    """Frees what the last trainer left in the allocator, so the next case starts alike."""
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _data_trainer(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> Trainer:
+    """A trainer of `cfg` on a synthesized model of `n` rows (Q-168, Q-181), B-1's case at 1M."""
+    from openftgs.train import Trainer
+
+    model = _synthesize(volume, n, active=_DATA_ACTIVE, seed=_SEED, device="cuda")
+    with _environment_error("LPIPS networks"):  # the LPIPS weights may download
+        return Trainer(cfg, ctx.video, model, device="cuda")
+
+
+def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
+    """Q-99, Q-189: what "auto" measures on CUDA, taken as it takes it: a trainer of B-6's
+    configuration at `n` rows runs its first iteration on decoded PNGs, as "auto" does, and the
+    free memory and growth are read when that iteration returns."""
+    import torch
+
+    from openftgs.data import FrameCache
+
+    cfg = _data_config(n, "off", None)
+    trainer = _data_trainer(ctx, volume, cfg, n)
+    trainer.step()
+    free, total = torch.cuda.mem_get_info()
+    allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+    model = trainer.model
+    # Q-99: the bytes of a row in training, its stored floats (§1.1) for the parameter, its
+    # gradient and Adam's two moments, plus the gradient statistics' two floats, all float32.
+    floats = sum(getattr(model, name)[0].numel() for name in model.PARAM_NAMES)
+    growth = max(0, cfg.growth.n_max - model.num_gaussians) * 4 * (4 * floats + 2)
+    estimate = _AutoEstimate(
+        free=free + reserved - allocated,
+        growth=growth,
+        cache=FrameCache.size_of(ctx.video),
+        allocated=allocated,
+        reserved=reserved,
+        total=total,
+    )
+    del trainer, model
+    _release_cuda()
+    return estimate
+
+
+def _data_case(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> dict[str, Any]:
+    """One B-6 case (#232, Q-189): a fresh trainer of `cfg` on `n` rows, iterations 1 to 120
+    as B-1's warm-up, 121 to 320 under the stage clock's CUDA events, then 321 to 420 under the
+    wall clock; with peak memory from the first iteration on."""
+    import torch
+
+    from openftgs._stages import Clock
+
+    trainer = _data_trainer(ctx, volume, cfg, n)
+    torch.cuda.reset_peak_memory_stats()  # after the cache's placement, which it includes
+    windows: list[tuple[list[dict[str, float]], list[bool]]] = []
+    for clock, (first, last) in ((Clock("cuda"), _DATA_TIMED), (Clock("wall"), _DATA_HOST)):
+        while trainer.iteration < first - 1:
+            trainer.step()
+        with clock:
+            iterations = [trainer.step().iteration for _ in range(first, last + 1)]
+        parts = _iteration_parts(clock.read())  # the CUDA clock synchronizes, after `last`
+        if len(parts) != len(iterations):
+            raise RuntimeError(
+                f"the stage clock holds {len(parts)} iterations, not {len(iterations)}"
+            )
+        windows.append((parts, [_is_event(cfg, it) for it in iterations]))
+    torch.cuda.synchronize()
+    peaks = torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+    del trainer
+    _release_cuda()
+    (timed, timed_events), (host, host_events) = windows
+    figures = _data_figures(timed, timed_events, host, host_events)
+    figures |= {"peak_allocated_bytes": peaks[0], "peak_reserved_bytes": peaks[1]}
+    return figures
+
+
+def _data(ctx: _Context) -> _Result:
+    """B-6: the data wait's share of an iteration per frame-cache placement (§3.4, D-51), with
+    B-1's configuration at 1M rows (#232): the GPU cache, the memory-mapped cache at prefetch
+    depths 8 and 0, and PNG decoding; then the GPU cache at 3M rows with peak memory against
+    what "auto" estimated (Q-99's note). The GPU cache is measured only where "auto" would place
+    it on the GPU (Q-178, Q-189), and skipped with that estimate otherwise."""
+    from openftgs.data import FrameCache
+
+    with _as_input_error(f"frame cache of {ctx.args.scene}", OSError):
+        FrameCache.build(ctx.video)  # as B-1: built before timing, so the cases only open it
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    runs = [(_DATA_N, placement, prefetch) for placement, prefetch in _DATA_PLACEMENTS]
+    runs.append((_MEMORY_N, "gpu", None))
+    cases: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for n, placement, prefetch in runs:
+        case: dict[str, Any] = {"n": n, "placement": placement}
+        if prefetch is not None:
+            case["prefetch"] = prefetch
+        estimate = None
+        if placement == "gpu":  # Q-178, Q-189
+            estimate = _probe(ctx, volume, n)
+            if not estimate.fits:
+                reason = (
+                    f'"auto" would memory-map the cache (Q-99): its {estimate.cache / 1e9:.2f} GB '
+                    f"exceed half the {estimate.free / 1e9:.2f} GB free after a warm-up "
+                    f"iteration less growth's {estimate.growth / 1e9:.3f} GB"
+                )
+                skipped.append({"case": case, "reason": reason, "estimate": estimate.figures()})
+                continue
+        figures = _data_case(ctx, volume, _data_config(n, placement, prefetch), n)
+        if estimate is not None:
+            figures |= estimate.figures()
+            figures |= estimate.margin(peak_reserved=figures["peak_reserved_bytes"])
+        cases.append({"case": case, "figures": figures})
+
+    any_cfg = _data_config(1, "off", None)  # the events don't depend on N
+    first, last = _DATA_TIMED[0], _DATA_HOST[1]
+    setup = {
+        "model": "synthesized (Q-168, Q-181)",
+        "seed": _SEED,
+        "active_fraction": _DATA_ACTIVE,
+        "cases": [[n, placement, prefetch] for n, placement, prefetch in runs],
+        "configuration": (
+            "B-1's (#226): the default, LPIPS-VGG included, except growth.start = reloc.start = "
+            f"{_EVENTS_FROM}, growth.n_max = ⌈1.02·N⌉ and optim.sh_interval = 1; with the "
+            "case's perf.frame_cache and perf.prefetch"
+        ),
+        "frame_cache": "built before timing",
+        "gpu": (
+            'measured where "auto" would place the cache on the GPU (Q-99): a trainer decoding '
+            "PNGs runs one iteration first, and the free memory and growth are read after it"
+        ),
+        "warmup": _DATA_TIMED[0] - 1,
+        "timed": list(_DATA_TIMED),
+        "host": list(_DATA_HOST),
+        "events": [it for it in range(first, last + 1) if _is_event(any_cfg, it)],
+        "clock": "CUDA events (openftgs._stages) over timed; the wall clock over host",
+        "figure": (
+            "data_share: the data stage's mean over the iteration's, over the timed iterations "
+            "without an event"
+        ),
+        "share_limit": _DATA_SHARE_LIMIT,
+        "memory_n": _MEMORY_N,
+        "skipped": skipped,
+    }
+    return _Result(setup, cases, _data_budgets(cases, n=_DATA_N))
+
+
 def _budget(
     case: dict[str, Any], figures: dict[str, Any], figure: str, limit: float, kind: str
 ) -> dict[str, Any]:
@@ -1841,7 +2104,7 @@ _BENCHMARKS: dict[str, _Benchmark] = {
     "slice": _Benchmark("B-3", 225, _slice),
     "losses": _Benchmark("B-4", 228, _losses),
     "adam": _Benchmark("B-5", 229, _adam),
-    "data": _Benchmark("B-6", 232),
+    "data": _Benchmark("B-6", 232, _data),
     "render": _Benchmark("B-7", 231, model=True),
     "init": _Benchmark("B-8", 234),
     "convert": _Benchmark("B-8", 234, cuda=False),
