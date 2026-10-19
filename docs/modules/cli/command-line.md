@@ -11,7 +11,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `convert` | `data.convert_n3dv`, `convert_opencv_yaml` or `convert_selfcap`, one option per keyword, `--test-camera` and `--window N0:N1` among them (D-80) |
 | `cache` | `MultiViewVideo.from_manifest`, `FrameCache.build`, and for `gpu` or `mmap` `FrameCache.open` in that placement, which shows the cache fits on its own, not beside a training run (Q-127, Q-99) |
 | `init roma` | `RomaInitConfig`, `roma_init`, `io.write_init_points` with `roma_provenance(cfg)` as metadata (Q-107) |
-| `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.save_checkpoint`, `Trainer.evaluate` |
+| `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.save_run_checkpoint` (D-83, Q-152), `Trainer.evaluate` |
 | `render` | the model as `FreeTimeGaussians.load` reads it, `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
 | `eval` | the model, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
@@ -39,7 +39,8 @@ Exit code 2 comes from the `ValueError`s of the calls that read or check user in
 
 - `config.json`, the resolved configuration, after `--seed`;
 - `train_log.jsonl`, one row per log read: the iteration, the mean of each loss term since the last read, and N, the columns §3.3 asks of an adapter;
-- `checkpoint/`, saved when training reaches T_it and when a signal stops it, and nowhere else;
+- `checkpoint/`, the latest save: when training reaches T_it, when a signal stops it, and with `--checkpoint-every N` after every iteration that is a multiple of N below T_it (none by default, D-83). The multiples are absolute iterations, so a resume rejoins the same schedule;
+- `checkpoint-<iteration>/`, the earlier saves `--keep-checkpoints K` keeps: the K latest saves are kept, `checkpoint/` counting as one, the one before renamed as a new save arrives and the oldest beyond K removed once the new save is in place. A save at iteration it first removes the kept checkpoints of later iterations, the continuation a resume from an earlier one abandoned, and a save at the iteration `checkpoint/` already holds replaces it in place. Only checkpoints are counted or removed (D-83, Q-149 to Q-152). Neither option is part of the configuration: `config.json`, the checkpoint's manifest and a resume's configuration check ignore them, and N < 0 or K < 1 is exit code 2;
 - `METRICS.json`, the evaluation of the test split at the end, when the scene has one; it runs after the checkpoint is saved, so a failed evaluation loses no training, and a render that isn't finite writes no METRICS.json and exits 3 (Q-129);
 - `profile/trace.json`, with `--profile START:COUNT`: a `torch.profiler` trace of those iterations, which must lie inside the iterations the command runs; a window cut short still writes what it recorded (Q-144). NVTX ranges per stage come with M15.
 
@@ -47,7 +48,7 @@ With `perf.deterministic`, `ftgs train` sets `CUBLAS_WORKSPACE_CONFIG` before CU
 
 ## Signals and resume
 
-While training runs, SIGINT and SIGTERM are recorded rather than acted on at once. The trainer stops after the current iteration, so the saved state is whole (Q-69). The checkpoint is saved atomically (Q-25), and the command exits with 128 plus the signal number (Q-133). A divergence saves nothing, so the last good checkpoint survives: the trainer checks at its log reads and events (Q-69), and the command checks the model once more before it saves, so a model that turned non-finite since is exit 3 too.
+While training runs, SIGINT and SIGTERM are recorded rather than acted on at once. The trainer stops after the current iteration, so the saved state is whole (Q-69). The checkpoint is saved atomically (Q-25) and rotated like any other save (D-83), periodic saves keep signals waiting as the final save does, and the command exits with 128 plus the signal number (Q-133). A divergence saves nothing, so the last good checkpoint survives: the trainer checks at its log reads and events (Q-69), and the command checks the model once more before it saves, so a model that turned non-finite since is exit 3 too.
 
 `--resume CKPT` continues the run on the checkpoint's own configuration. A `--config` or `--seed` given beside it must give exactly that configuration, performance settings included. A manifest that changed since the checkpoint was made needs `--force` (Q-70, Q-134). The run directory must be the run's own (its `config.json` equal to the checkpoint's configuration), or absent or empty. A signal that comes once the run has reached T_it doesn't stop it: the run is complete and goes on to its evaluation. D-24's check of the start budget F·B against N_max happens when the trainer builds the model, so `ftgs init` can't make it (Q-128).
 
