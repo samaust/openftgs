@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-178, Q-180 to Q-182, Q-185 and Q-T232.1.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-178, Q-180 to Q-182, Q-185, Q-187 and Q-T232.1.
 
 ## Subcommands
 
@@ -68,7 +68,7 @@ One JSON object, replaced atomically through a temporary sibling `.<name>.tmp-<p
 - `date` is the start of the run, in UTC.
 - `setup` holds the benchmark's fixed parameters, so a later run can be checked to have measured the same thing.
 - `cases` holds one entry per measured case: `case` names its parameters, and `figures` its numbers, times in seconds (names ending `_s`) and memory in bytes.
-- `budgets` holds one entry per budget or limit the run is held to, naming the case and the figure: `kind` is `budget` for a §3.4 budget, `bound` for an upper bound standing for one (Q-168's B-1), and `limit` for another spec limit checked on the run, as U-28's recompilations in B-3. `pass` never changes the exit code.
+- `budgets` holds one entry per budget or limit the run is held to, naming the case and the figure: `kind` is `budget` for a §3.4 budget, `bound` for an upper bound standing for one (Q-168's B-1), and `limit` for another spec limit checked on the run, as U-28's recompilations in B-3 and U-8's 1e-6 in B-2's spot check. `pass` never changes the exit code.
 
 ## Measurement
 
@@ -76,12 +76,15 @@ Every benchmark measures in the same way (Q-168): a first call, then 10 warm-up 
 
 B-1 times training iterations rather than calls: its warm-up is the first 120 iterations, and its figures are means as well as medians, since an iteration's time is the sum of its stages (below).
 
-The stages are also NVTX ranges, so Nsight Systems shows a benchmark's calls by name. B-3 uses two of the fixed stage names:
+The stages are also NVTX ranges, so Nsight Systems shows a benchmark's calls by name. B-2 and B-3 use these of the fixed stage names:
 
-| Stage | In B-3 |
-| --- | --- |
-| `slice.kernel` | the forward call of `motion.temporal_slice` |
-| `backward` | `torch.autograd.grad` from the slice's outputs to its inputs: the slice's backward alone, where a training iteration's `backward` holds every backward pass |
+| Stage | In B-2 | In B-3 |
+| --- | --- | --- |
+| `slice`, `slice.kernel`, `slice.sh_concat` | the temporal slice inside `render` (`FreeTimeGaussians.at_time`) | `slice.kernel` alone: the forward call of `motion.temporal_slice` |
+| `raster.forward` and its four sub-stages | `render`'s rasterization forward, compaction included | |
+| `loss.l1` | the L1 loss against the camera's training image | |
+| `backward` | `torch.autograd.grad` from the L1 loss into the nine stored tensors | `torch.autograd.grad` from the slice's outputs to its inputs: the slice's backward alone, where a training iteration's `backward` holds every backward pass |
+| `backward.losses_done`, `backward.raster_done` (points) | where the loss's backward and the rasterization's end inside `backward`, as in `Trainer.step` | |
 
 ## The synthesized models
 
@@ -123,6 +126,35 @@ Per event (`{"n", "active", "iteration"}`): the `events` stage, the whole iterat
 **The copy of the relocation scores** (Q-72 note 5): the median wall time of 50 copies of an [N] float32 GPU tensor to the CPU, as relocation copies its scores before its CPU generator draws, with N the case's at the end.
 
 **Decision rule for D-50** (PRD #220, #226): the slice's share is (`slice.kernel` + `backward.slice`) / `iteration`, over the iterations without an event (`slice_share` in each case's summary), and the largest over the cases counts; its budget entry (`kind: "limit"`) sets it against 10 %. At 10 % or below, `"cuda"` keeps raising and its message cites the Calibration row; above, the conditional CUDA operator's ticket opens under #220. The SH concat's share (`slice.sh_concat`) and `loss.reg`'s, the second pass over all N rows, are recorded too; either above 5 % goes to the owner as a request. `loss.reg`'s share is its forward's only, a lower bound: autograd interleaves its backward with the other losses', so it can't be told apart.
+
+## B-2: `ftgs bench raster`
+
+B-2 times `render` forward plus an L1 backward for each of the four `packed` × `precull` combinations, so that D-57's defaults are set by measurement: gsplat's packed and unpacked layouts (Q-36), and D-32's opacity cull inside gsplat's projection (`internal`) or by compaction before it (`compact`, Q-31). The setup (#227, with Q-187 for the details):
+
+- **Models.** One synthesized model (seed 0) for each N in {10⁶, 3·10⁶} and each active fraction in {5 %, 20 %, 100 %}, six in all, with the eager temporal slice: the slice is the same in every variant, and eager compiles nothing into the first calls and never falls back mid-run as "auto" may (Q-13).
+- **Camera and times.** The first training camera in the manifest's order (kitchen's cam01; cam00 is held out), at 10 of its frames evenly spaced in time, round(k·(F − 1)/9) of its F frames for k = 0…9.
+- **A call.** `render(model, camera, τ, packed=…, precull=…)` with the camera moved to the GPU once, as the trainer keeps its cameras, since `render` copies a camera held on the host in every call and that copy synchronizes; the black background and the model's SH degree; `losses.l1_loss` against the camera's training image at τ, loaded onto the GPU once; `torch.autograd.grad` of the loss into the nine stored tensors.
+- **Order.** For each model, packed/internal (D-57's default), packed/compact, unpacked/internal, unpacked/compact, one after another: each a first call, 10 warm-up calls and 50 timed calls cycling through the 10 times, five each.
+
+Per variant (`{"n", "active", "packed", "precull"}`), the figures are the medians over the 50 calls of:
+
+| Figure | From | To |
+| --- | --- | --- |
+| `forward_backward_s` | `slice`'s start | `backward`'s end: the whole call, which the decision rule reads |
+| `raster_s` | `raster.forward`'s start | the `backward.raster_done` point: the rasterization forward and backward (with the L1, a few µs) |
+| `raster_forward_s` | `raster.forward`'s start | its end, compaction included |
+| `raster_backward_s` | the `backward.losses_done` point | the `backward.raster_done` point |
+| `backward_s` | `backward`'s start | its end |
+
+with the first call (`first_call_s`), the peak allocated memory since just before it, and the spot check's figures. Before timing a model, B-2 renders every variant at each of the 10 times under `no_grad`. For the three variants other than packed/internal it records the largest absolute difference of the image from packed/internal's (`image_max_abs_diff`, #227's check) and the pixels where some channel differs by more than 1e-6, summed over the times (`image_pixels_over_limit`); for the two compacted variants, U-8 itself, the largest difference from the same layout's internal image (`precull_max_abs_diff`). Both maxima are held to 1e-6 by `limit` entries in `budgets`. A difference above it is a finding for the owner, never a looser limit.
+
+Per model (`{"n", "active"}`), untimed, at each of the 10 times in order: `active_rows`, the rows that pass the opacity cull; `visible_rows`, the rows visible in the camera; and `tile_intersections`, the length of gsplat's `isect_ids`. They are counted once, with gsplat's `fully_fused_projection` and `isect_tiles` given the arguments `render` gives them, since U-8 makes them the same in every variant and `render` returns no count. `resident_memory_bytes` is the memory allocated before the variants run, the model and the 10 targets, so a variant's own working memory is its peak less this.
+
+**Decision rule** (#227, Q-187): a combination that, at both N, is at least 3 % faster than packed/internal in `forward_backward_s` at 20 % active and no more than 3 % slower at 5 % and 100 % goes to the owner as a spec-change request for D-57's defaults, in the form of #215. The code keeps D-57's defaults (`packed = True`, `precull = "internal"`) until the owner answers. `raster_s` is reported beside it; where it gives another verdict, the request says so.
+
+The run on kitchen (Calibration data, #227) keeps D-57's defaults. At 20 % active every other combination is 4 to 16 % slower than packed/internal at both N, so none goes to the owner. There packed/internal takes 3.60 ms at 1M and 9.68 ms at 3M, of which the rasterization takes 2.69 and 6.84 ms. Compaction costs most where most rows pass the cull, up to 1.49 times at 3M with every row active, and comes within 2 % only at 3M with 5 % active. Unpacked/internal is 14 to 16 % faster with every row active, but 10 to 26 % slower at 5 %, where it projects all N rows for a few visible ones, and it holds up to 587 MiB more.
+
+The spot check found compaction bitwise in both layouts (U-8), but the unpacked images differ from the packed ones at 1 to 17 of 13.7M pixels per model, by up to 1.6e-3. gsplat 1.5.3's two projections give conics that differ in the last bits, which flips a term at the α skip or the transmittance stop (`docs/modules/render/backends.md`, "Layouts and the opacity cull's placement"). Those `limit` entries fail; the 1e-6 limit stays, and the owner has been told. A first recording, at b0ef3bf, rendered from the manifest's camera, which `render` copies to the GPU in every call, a synchronization training doesn't make, and counted the previous model in the resident memory; it is superseded.
 
 ## B-3: `ftgs bench slice`
 
