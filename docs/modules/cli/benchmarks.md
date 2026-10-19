@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-169, Q-178, Q-180 to Q-182, Q-185, Q-187 to Q-189, Q-T234.1 and Q-T234.2.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-169, Q-178, Q-180 to Q-182, Q-185, Q-187 to Q-190, Q-T234.1 and Q-T234.2.
 
 ## Subcommands
 
@@ -170,9 +170,48 @@ The first run, on kitchen, is in the Calibration data table of `docs/clean-room/
 
 That run is superseded. Under `dynamic=True` dynamo had made the 3 and the 4 of the inner dims symbolic, and inductor computed the quaternion's norm in reduction kernels; since #226 the compiled slice's inner dims are static (Q-184, `docs/modules/motion/temporal-slice.md`). Rerun on kitchen, the compiled slice is no slower than eager at every size: 2 to 5 % faster up to 5·10⁵ rows, at the host's floor, 12 % at 7·10⁵, and 41 to 49 % faster from 10⁶ rows on (1.24 against 2.29 ms at 3·10⁶), still with no recompilation. So Q-182's rule keeps "auto" compiled on CUDA.
 
+## B-4: `ftgs bench losses`
+
+B-4 times the two image losses whose cost D-52 decides, LPIPS-VGG and SSIM, at 1352×1014 and 1920×1080 (§3.4; Q-190 for the details below). It sets D-52's exact defaults through Q-173's rule and records how far bf16 strays from float32. It has no budget of its own.
+
+**Images.** The target is the scene's first training image, resized bilinearly with antialiasing when its size differs (on kitchen, 1920×1080 stretches its 4:3 to 16:9); the prediction adds seeded Gaussian noise of σ 0.05. Natural content gives the deviation figures the feature statistics of training; timing doesn't depend on it.
+
+**LPIPS-VGG.** lpips's network is called directly (PRD #220), frozen and in evaluation mode, its inputs mapped to [−1, 1] as `LPIPSLoss` maps them (D-68). One call is the forward on both images and the mean (stage `loss.perceptual`), then the prediction's gradient (stage `backward`), for each of:
+
+| Axis | Values |
+| --- | --- |
+| precision | `ieee` (cuDNN's TF32 flag off), `tf32` (on, training's default), `bf16` (bfloat16 autocast around the network, TF32 on, the value cast to float32; Q-172) |
+| layout | `nchw` (contiguous NCHW inputs and weights); `channels_last_inputs` (channels-last inputs, NCHW weights); `channels_last_inputs_and_weights` |
+| cuDNN autotuning | off, on |
+
+`channels_last_inputs` is training's path: `LPIPSLoss` views a render's [..., H, W, 3] batch first, which is channels-last in memory, and every convolution of the network follows that layout (source log 175). So "channels-last on and off" (§3.4) is measured twice: on and off for the inputs, which training already has on, and for the weights, which it doesn't yet.
+
+**Processes.** cuDNN caches the algorithm it picked for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off and on can't be compared in one process: a later setting would run the earlier one's picks. The deviations (below) and fused-ssim run in the benchmark's process; every LPIPS case and the PyTorch SSIM path run in one child process per autotuning setting, off and then on.
+
+**SSIM.** `losses.ssim` with training's window, σ and padding, forward (stage `loss.ssim`) and the prediction's gradient: fused-ssim in the benchmark's process, when it imports, and the PyTorch path in the child processes, in which `fused_ssim` can't be imported, so `ssim()`'s signature doesn't change (PRD #220, owner's decision). The children run it with TF32 on, as training does (D-52), one with autotuning off and one with it on; each gets the folder the benchmark imported openftgs from first on its PYTHONPATH, so every case times the same code.
+
+**Figures.** Per case, as B-3's (`{"loss", "width", "height", …}`): the first call, then the medians over 30 calls after 10 warm-up calls of the forward, the backward and the span from one's start to the other's end, and the peak allocated memory. Per size, TF32's and bf16's deviation from IEEE float32 (`{"deviation", "width", "height"}`), measured first, with the network as training runs it: the two values and their relative difference, the gradients' relative L2 difference, and their largest difference over the largest IEEE gradient element.
+
+**Comparisons.** Per size, a variant's gain over its baseline, 1 − variant / baseline of the median forward plus backward (`{"comparison", "width", "height"}`), and over the sizes the smallest gain and whether it reaches 3 % (`{"comparison"}`):
+
+| Comparison | Baseline → variant | Decides |
+| --- | --- | --- |
+| `autotuning` | TF32, channels-last inputs: autotuning off → on | cuDNN autotuning in training steps (Q-173) |
+| `channels_last_weights` | TF32, autotuning off: channels-last inputs → inputs and weights | channels-last LPIPS weights in training (Q-173) |
+| `autotuning_and_channels_last_weights` | both together | reported |
+| `tf32` | IEEE → TF32, channels-last inputs | reported (D-52's default) |
+| `bf16` | TF32 → bf16, channels-last inputs | reported (bf16 stays opt-in, approximate) |
+| `fused_ssim` | the PyTorch path without autotuning → fused-ssim | Q-42's note: no gain sends Q-42 back to the owner |
+
+**Decision rule** (Q-173): an exact option without a `PerfConfig` field is turned on when its smallest gain is at least 3 % and a rerun of B-1 with it on is no slower than B-1's recorded iteration time.
+
+## B-4's first run
+
+On kitchen's first training image (Calibration data, #228), training's LPIPS-VGG path, TF32 with channels-last inputs and NCHW weights, takes 101.6 ms at 1352×1014 (forward 54.9, backward 46.6) and 150.6 ms at 1920×1080, which matches B-1's 52.7 ms of `loss.perceptual` and 44.9 ms of `backward.losses`. Neither exact option reaches Q-173's 3 % at both sizes: autotuning gains 4.3 % and −1.0 %, channels-last weights 1.0 % and 2.9 %, so both stay off and B-1 wasn't rerun. Reported beside them: both together 6.0 % and 3.1 %, and NCHW inputs with autotuning 7.2 % and 3.9 %, combinations the rule doesn't decide, which go to the owner; IEEE float32 is 12 % and 17 % slower than TF32, and slower with channels-last inputs than with NCHW; bf16 is 33 % and 30 % faster than TF32, its value within 2.2·10⁻³ relative and its gradient 17 to 18 % off in L2 (TF32: 3 %). fused-ssim takes 0.41 and 0.66 ms against the PyTorch path's 8.5 and 13.2 ms, about 95 % less. With autotuning, a configuration's first call takes 1 to 27 s. The run took 4 min 13 s.
+
 ## B-1's first run
 
-On kitchen (Calibration data, #226), an iteration without an event takes 102, 104 and 115 ms at 0.5M, 1M and 3M rows with 20 % active, and 112 ms at 3M with 5 %. LPIPS-VGG dominates: its forward takes 52.7 ms and every loss's backward 44.9 ms, whatever N. The temporal slice takes at most 1.24 % of an iteration, so D-50's CUDA operator isn't written; the SH concat at most 1.66 % and `loss.reg` 0.11 %, both under 5 %. The bound on a default run is 3,462 s at 3M rows, under the 3,600 s budget by 4 %, with cuDNN autotuning off and NCHW LPIPS as the defaults stood (B-4, #228, decides those). The clock's cost was inside the run-to-run spread: window B was 0.08 to 0.26 ms slower than window A, the iterations being GPU-bound.
+On kitchen (Calibration data, #226), an iteration without an event takes 102, 104 and 115 ms at 0.5M, 1M and 3M rows with 20 % active, and 112 ms at 3M with 5 %. LPIPS-VGG dominates: its forward takes 52.7 ms and every loss's backward 44.9 ms, whatever N. The temporal slice takes at most 1.24 % of an iteration, so D-50's CUDA operator isn't written; the SH concat at most 1.66 % and `loss.reg` 0.11 %, both under 5 %. The bound on a default run is 3,462 s at 3M rows, under the 3,600 s budget by 4 %, with cuDNN autotuning off and NCHW LPIPS weights as the defaults stood; its inputs were channels-last already (source log 176). B-4 (#228) kept both defaults. The clock's cost was inside the run-to-run spread: window B was 0.08 to 0.26 ms slower than window A, the iterations being GPU-bound.
 
 ## B-5: `ftgs bench adam`
 
