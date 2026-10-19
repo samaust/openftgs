@@ -14,8 +14,6 @@ import importlib
 import importlib.resources
 import json
 import math
-import queue
-import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn, Protocol
@@ -26,6 +24,7 @@ from PIL import Image
 from scipy.spatial import cKDTree
 from torch import Tensor
 
+from openftgs import _shards
 from openftgs._stages import stage
 from openftgs.data import MultiViewVideo
 from openftgs.io import validate_init_points
@@ -521,64 +520,6 @@ def _match_pair(
         )
 
 
-class _Shards:
-    """D-54, D-56; Q-106, Q-112: one thread and one dense matcher per `devices` entry, taking
-    jobs from a shared queue. Results come back keyed by `_Job.key`; a shard's exception is
-    raised in the caller's thread, after every shard has stopped."""
-
-    def __init__(
-        self,
-        jobs: Sequence[_Job],
-        matchers: Sequence[DenseMatcher],
-        devices: Sequence[torch.device],
-        work: Callable[[_Job, DenseMatcher, torch.device], _PairPoints],
-    ) -> None:
-        self._jobs: queue.SimpleQueue[_Job | None] = queue.SimpleQueue()
-        for job in jobs:
-            self._jobs.put(job)
-        for _ in matchers:
-            self._jobs.put(None)
-        self._results: queue.SimpleQueue[tuple[_Job, _PairPoints | BaseException]] = (
-            queue.SimpleQueue()
-        )
-        self._stop = threading.Event()
-        self._work = work
-        self._threads = [
-            threading.Thread(
-                target=self._serve, args=(matcher, device), name=f"roma_init shard {i}"
-            )
-            for i, (matcher, device) in enumerate(zip(matchers, devices, strict=True))
-        ]
-
-    def _serve(self, matcher: DenseMatcher, device: torch.device) -> None:
-        while not self._stop.is_set():
-            job = self._jobs.get()
-            if job is None:
-                return
-            try:
-                result: _PairPoints | BaseException = self._work(job, matcher, device)
-            except BaseException as error:  # noqa: BLE001 - raised again in the caller's thread
-                self._results.put((job, error))
-                return
-            self._results.put((job, result))
-
-    def __enter__(self) -> "_Shards":
-        for thread in self._threads:
-            thread.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._stop.set()
-        for thread in self._threads:
-            thread.join()
-
-    def next_result(self) -> tuple[_Job, _PairPoints]:
-        job, result = self._results.get()
-        if isinstance(result, BaseException):
-            raise result
-        return job, result
-
-
 @contextlib.contextmanager
 def _deterministic() -> Iterator[None]:
     """§2.4 "Initialization and conversion", "Precision", D-56; Q-112: float32 matmul precision
@@ -609,17 +550,7 @@ def _devices(devices: Sequence[str] | None) -> list[torch.device]:
         if count == 0:
             _fail("devices is None and no CUDA device is visible; pass devices, e.g. ['cpu']")
         return [torch.device("cuda", i) for i in range(count)]
-    if isinstance(devices, str):  # Q-122: a string is a sequence of characters
-        _fail(f"devices must be a sequence of device names, got the string {devices!r}")
-    out = []
-    for entry in devices:
-        try:
-            out.append(torch.device(entry))
-        except (RuntimeError, TypeError) as error:
-            _fail(f"devices holds {entry!r}, which isn't a device: {error}")
-    if not out:
-        _fail("devices must name at least one device")
-    return out
+    return _shards.devices(devices)  # Q-122: a non-empty sequence of device names
 
 
 def _pil(image: Tensor) -> Image.Image:
@@ -758,7 +689,8 @@ def roma_init(
     for keys in by_slot.values():
         keys.sort()  # Q-111: canonical pair order
 
-    def work(job: _Job, shard_matcher: DenseMatcher, device: torch.device) -> _PairPoints:
+    def work(shard: tuple[DenseMatcher, torch.device], job: _Job) -> _PairPoints:
+        shard_matcher, device = shard
         return _match_pair(job, shard_matcher, device, dataset, cfg)
 
     time = dataset.time
@@ -782,14 +714,16 @@ def roma_init(
 
     with _deterministic():
         build = matcher if matcher is not None else _roma_matchers(cfg)
-        matchers = [build(device) for device in shard_devices]
-        with _Shards(jobs, matchers, shard_devices, work) as shards:
+        # D-54, D-56; Q-106, Q-112: one thread and one dense matcher per `devices` entry, the
+        # matchers built here, one after another; results come back as pairs finish.
+        shards = [(build(device), device) for device in shard_devices]
+        with _shards.Shards(shards, jobs, work, name="roma_init shard") as running:
             results: dict[tuple[int, int, int], _PairPoints] = {}
             previous: _InitFrame | None = None  # the last init frame, not yet finished
             before: _InitFrame | None = None  # the init frame before it
             for k in slots:
                 while any(key not in results for key in by_slot[k]):
-                    job, result = shards.next_result()
+                    job, result = running.next_result()
                     results[job.key] = result
                 current = _init_frame(k, [results.pop(key) for key in by_slot[k]], cfg)
                 if current is None:  # no point survived at slot k: it has no init frame

@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import importlib
 import importlib.metadata
+import itertools
 import json
 import os
 import platform
@@ -27,8 +28,8 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
@@ -53,8 +54,9 @@ if TYPE_CHECKING:
     from openftgs.config import TrainConfig
     from openftgs.data import MultiViewVideo
     from openftgs.model import FreeTimeGaussians
+    from openftgs.optim import FTGSOptimizer
     from openftgs.train import StepLog, Trainer
-    from openftgs.types import TimeNormalizer
+    from openftgs.types import Camera, TimeNormalizer
 
 __all__ = ["add_parser", "run"]  # what `openftgs.cli` takes from this private module
 
@@ -962,6 +964,420 @@ def _train_step(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-2: the rasterization variants (§3.4, D-32, D-57; Q-31, Q-36, Q-187) ----------------------
+
+_RASTER_TIMES = 10  # #227: one training camera at 10 fixed times
+
+
+def _raster_frames(video: MultiViewVideo) -> list[int]:
+    """The records B-2 renders (Q-187): the first training camera in the manifest's order, at
+    `_RASTER_TIMES` of its frames evenly spaced in time, round(k·(F − 1)/9) of its F frames for
+    k = 0…9, repeating frames when F < 10."""
+    first = next(r.camera.name for r in video.records if r.split == "train")
+    frames = sorted(
+        (r.timestamp, i)
+        for i, r in enumerate(video.records)
+        if r.split == "train" and r.camera.name == first
+    )
+    last = len(frames) - 1
+    return [frames[round(k * last / (_RASTER_TIMES - 1))][1] for k in range(_RASTER_TIMES)]
+
+
+def _raster_figures(timings: Sequence[Timing]) -> dict[str, Any]:
+    """B-2's times from the stage clock's records of its calls (Q-187), each the median over
+    the calls: the whole call, from the temporal slice's start to the backward's end (the figure
+    the decision rule reads); the rasterization, from `raster.forward`'s start to the point where
+    its backward is done; that forward and that backward (from the losses' backward done to the
+    rasterization's); and the backward."""
+
+    def named(name: str) -> list[Timing]:
+        return [t for t in timings if t.name == name]
+
+    calls = list(
+        zip(
+            named("slice"),
+            named("raster.forward"),
+            named("backward"),
+            named("backward.losses_done"),
+            named("backward.raster_done"),
+            strict=True,
+        )
+    )
+    return {
+        "forward_backward_s": _median([b.end - s.start for s, _, b, _, _ in calls]),
+        "raster_s": _median([done.start - r.start for _, r, _, _, done in calls]),
+        "raster_forward_s": _median([r.seconds for _, r, _, _, _ in calls]),
+        "raster_backward_s": _median([done.start - lo.start for _, _, _, lo, done in calls]),
+        "backward_s": _median([b.seconds for _, _, b, _, _ in calls]),
+        "repetitions": len(calls),
+    }
+
+
+def _intersections(model: FreeTimeGaussians, camera: Camera, timestamp: float) -> list[int]:
+    """At raw time `timestamp`: the rows that pass the opacity cull (D-32), the rows visible in
+    `camera` and gsplat's tile intersections (Q-187), from gsplat's own projection and tile
+    intersection with the arguments `render` gives them (E6, D-6, D-57). Every variant sorts and
+    rasterizes the same intersections (U-8), so they are counted once."""
+    import math
+
+    import gsplat
+    import torch
+
+    with torch.no_grad():
+        g = model.at_time(model.time.to_t(timestamp))
+        like = g.means_t
+        radii, means2d, depths, _, _ = gsplat.fully_fused_projection(
+            g.means_t,
+            None,
+            g.quats_n,
+            g.scales,
+            camera.world_to_camera.to(like)[None],
+            camera.K.to(like)[None],
+            camera.width,
+            camera.height,
+            eps2d=0.3,  # E6, D-6
+            near_plane=0.01,  # E6, D-6
+            far_plane=1e10,  # E6, D-6
+            radius_clip=0.0,  # D-57
+            packed=False,
+            opacities=g.opacities_t,  # E6, D-32: the opacity cull and the extent
+        )
+        visible_rows = (radii > 0).all(dim=-1)
+        # As `render` does: gsplat leaves the 2D means of culled rows unwritten (D-75).
+        means2d = torch.where(visible_rows[..., None], means2d, torch.zeros_like(means2d))
+        tile = 16  # D-57
+        _, isect_ids, _ = gsplat.isect_tiles(
+            means2d,
+            radii,
+            depths,
+            tile,
+            math.ceil(camera.width / tile),
+            math.ceil(camera.height / tile),
+            packed=False,
+            n_images=1,
+        )
+        active = int(g.passes_cull.sum())
+        visible = int(visible_rows.sum())
+    return [active, visible, int(isect_ids.shape[0])]
+
+
+_RASTER_SIZES = (1_000_000, 3_000_000)  # #227
+_RASTER_ACTIVE = (0.05, 0.2, 1.0)  # #227
+_RASTER_REPETITIONS = 50  # #227: the median of 50
+_RasterVariant = tuple[bool, Literal["internal", "compact"]]
+# packed × precull (Q-36, Q-31), D-57's default first: the spot check's reference.
+_RASTER_VARIANTS: tuple[_RasterVariant, ...] = (
+    (True, "internal"),
+    (True, "compact"),
+    (False, "internal"),
+    (False, "compact"),
+)
+_SPOT_LIMIT = 1e-6  # U-8 on the GPU: images within 1e-6
+
+
+def _spot_check(
+    model: FreeTimeGaussians, camera: Camera, timestamps: list[float]
+) -> dict[_RasterVariant, dict[str, Any]]:
+    """B-2's spot check (#227, Q-187), under `no_grad` at every time: each variant's image
+    against packed/internal's, its largest absolute difference and the pixels where some channel
+    differs by more than 1e-6, summed over the times; and each compacted image against the same
+    layout's internal one, U-8 itself."""
+    import torch
+
+    from openftgs.render import render
+
+    default = _RASTER_VARIANTS[0]
+    checks: dict[_RasterVariant, dict[str, Any]] = {
+        variant: {"image_max_abs_diff": 0.0, "image_pixels_over_limit": 0}
+        for variant in _RASTER_VARIANTS[1:]
+    }
+    with torch.no_grad():
+        for timestamp in timestamps:
+            images = {
+                variant: render(
+                    model, camera, timestamp, packed=variant[0], precull=variant[1]
+                ).image
+                for variant in _RASTER_VARIANTS
+            }
+            for variant, check in checks.items():
+                diff = (images[variant] - images[default]).abs().amax(dim=-1)
+                check["image_max_abs_diff"] = max(check["image_max_abs_diff"], float(diff.max()))
+                check["image_pixels_over_limit"] += int((diff > _SPOT_LIMIT).sum())
+                packed, precull = variant
+                if precull == "compact":
+                    same = float((images[variant] - images[(packed, "internal")]).abs().max())
+                    check["precull_max_abs_diff"] = max(
+                        check.get("precull_max_abs_diff", 0.0), same
+                    )
+    return checks
+
+
+def _raster_call(
+    model: FreeTimeGaussians,
+    camera: Camera,
+    frames: list[tuple[float, Tensor]],
+    variant: _RasterVariant,
+) -> Callable[[], None]:
+    """One B-2 call (Q-187): `render` at the next of `frames` (raw τ and its training image
+    [1, H, W, 3]) from `camera`, moved to the model's device first, the L1 loss against that
+    image, then its backward into the model's nine stored tensors, as the stage `backward`;
+    `torch.autograd.grad` accumulates nothing between calls."""
+    import torch
+
+    from openftgs._stages import point, stage
+    from openftgs.losses import l1_loss
+    from openftgs.render import render
+
+    packed, precull = variant
+    params = [getattr(model, name) for name in model.PARAM_NAMES]
+    order = itertools.cycle(frames)
+    # On the model's device once, as `Trainer` keeps its cameras: `render` copies a camera held on
+    # the host in every call, which synchronizes (§2.4 rule 3).
+    device = model.means.device
+    camera = replace(
+        camera, K=camera.K.to(device), world_to_camera=camera.world_to_camera.to(device)
+    )
+
+    def call() -> None:
+        timestamp, target = next(order)
+        out = render(model, camera, timestamp, packed=packed, precull=precull)
+        point(out.image, "backward.losses_done")  # as `Trainer.step` marks it
+        with stage("loss.l1"):
+            loss = l1_loss(out.image, target)
+        with stage("backward"):
+            torch.autograd.grad(loss, params)
+
+    return call
+
+
+def _raster(ctx: _Context) -> _Result:
+    """B-2: `render` forward plus an L1 backward for every `packed` × `precull` combination
+    (D-57), on synthesized models at N = 1M and 3M with 5 %, 20 % and 100 % of rows active, from
+    one training camera at 10 fixed times (Q-187). Per model, the rows active, the rows
+    visible and the tile intersections at each time, and the spot check (`_spot_check`), each
+    image held to 1e-6 of packed/internal's (#227) and each compacted one to 1e-6 of its layout's
+    internal one (U-8); per variant, the first call and the medians of 50 calls, and the peak
+    allocated memory."""
+    import torch
+
+    from openftgs.config import PerfConfig
+
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    indices = _raster_frames(ctx.video)
+    records = [ctx.video.records[i] for i in indices]
+    camera = records[0].camera
+    frames = [
+        (r.timestamp, ctx.video.load_image(i).to("cuda")[None])
+        for i, r in zip(indices, records, strict=True)
+    ]
+    cases: list[dict[str, Any]] = []
+    budgets: list[dict[str, Any]] = []
+    for n in _RASTER_SIZES:
+        for active in _RASTER_ACTIVE:
+            model = _synthesize(volume, n, active=active, seed=_SEED, device="cuda")
+            # Q-187: the eager slice, the same in every variant, compiles nothing into the first
+            # call and can't fall back unannounced ("auto", Q-13).
+            model.slice_impl = "eager"
+            counts = [_intersections(model, camera, timestamp) for timestamp, _ in frames]
+            resident = torch.cuda.memory_allocated()
+            cases.append(
+                {
+                    "case": {"n": n, "active": active},
+                    "figures": {
+                        "active_rows": [c[0] for c in counts],
+                        "visible_rows": [c[1] for c in counts],
+                        "tile_intersections": [c[2] for c in counts],
+                        "resident_memory_bytes": resident,
+                    },
+                }
+            )
+            spot = _spot_check(model, camera, [timestamp for timestamp, _ in frames])
+            for variant in _RASTER_VARIANTS:
+                packed, precull = variant
+                case = {"n": n, "active": active, "packed": packed, "precull": precull}
+                call = _raster_call(model, camera, frames, variant)
+                torch.cuda.reset_peak_memory_stats()
+                first = _first_call(call)
+                figures = _raster_figures(_repeat(call, _RASTER_REPETITIONS))
+                figures["first_call_s"] = first
+                figures["peak_memory_bytes"] = torch.cuda.max_memory_allocated()
+                checked = spot.get(variant, {})
+                figures |= checked
+                for name in ("image_max_abs_diff", "precull_max_abs_diff"):
+                    if name in checked:
+                        budgets.append(_budget(case, figures, name, _SPOT_LIMIT, "limit"))
+                cases.append({"case": case, "figures": figures})
+            del model, call  # the last call holds the model; the next resident figure must not
+    setup = {
+        "model": "synthesized (Q-168, Q-181)",
+        "seed": _SEED,
+        "sizes": list(_RASTER_SIZES),
+        "active_fractions": list(_RASTER_ACTIVE),
+        "variants": [{"packed": p, "precull": c} for p, c in _RASTER_VARIANTS],
+        "default": {"packed": PerfConfig.packed, "precull": PerfConfig.precull},  # D-57
+        "camera": camera.name,
+        "width": camera.width,
+        "height": camera.height,
+        "timestamps": [timestamp for timestamp, _ in frames],
+        "slice_impl": "eager",
+        "loss": "L1 against the camera's training image at that time (losses.l1_loss)",
+        "backward": "torch.autograd.grad into the nine stored tensors",
+        "warmup": _WARMUP,
+        "repetitions": _RASTER_REPETITIONS,
+        "clock": (
+            "CUDA events: slice to backward (forward_backward_s), raster.forward to "
+            "backward.raster_done (raster_s), backward.losses_done to backward.raster_done "
+            "(raster_backward_s)"
+        ),
+        "spot_check_limit": _SPOT_LIMIT,
+    }
+    return _Result(setup, cases, budgets)
+
+
+# -- B-5: the Adam kinds (§3.4, D-53; Q-168, Q-188) --------------------------------------------
+
+
+def _visibility(n: int, fraction: float, *, seed: int, device: str) -> Tensor:
+    """Q-188: selective Adam's mask, a bool [n] with exactly round(`fraction`·n) rows true,
+    chosen by a seeded permutation, so the visible rows are spread over the tensors as a render
+    leaves them."""
+    import torch
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    mask = torch.zeros(n, dtype=torch.bool, device=device)
+    mask[torch.randperm(n, generator=g, device=device)[: round(fraction * n)]] = True
+    return mask
+
+
+def _seed_gradients(model: FreeTimeGaussians, *, seed: int) -> None:
+    """#229, Q-188: a seeded N(0, 1) gradient on each of the model's nine stored tensors."""
+    import torch
+
+    g = torch.Generator(device=model.means.device).manual_seed(seed)
+    for name in model.PARAM_NAMES:
+        param = getattr(model, name)
+        param.grad = torch.randn(param.shape, generator=g, dtype=param.dtype, device=param.device)
+
+
+_ADAM_LIMIT = 1.0  # §3.4 B-5: fused no slower than foreach, with no tolerance (Q-188)
+
+
+def _adam_budgets(
+    medians: Mapping[tuple[str, int], float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """§3.4 B-5's budget (Q-188): from the median of each `(kind, n)`, per N in the order
+    given a case `{"n"}` with fused's median over foreach's, and its budget entry against 1.0."""
+    cases: list[dict[str, Any]] = []
+    budgets: list[dict[str, Any]] = []
+    for n in dict.fromkeys(n for _, n in medians):
+        case = {"n": n}
+        figures = {"fused_over_foreach": medians["fused", n] / medians["foreach", n]}
+        cases.append({"case": case, "figures": figures})
+        budgets.append(_budget(case, figures, "fused_over_foreach", _ADAM_LIMIT, "budget"))
+    return cases, budgets
+
+
+_AdamKind = Literal["fused", "foreach", "selective"]
+_ADAM_KINDS: tuple[_AdamKind, ...] = ("fused", "foreach", "selective")  # D-53, PerfConfig.adam
+# #229: N = 1M and 3M, each with selective Adam's mask at the visible fraction B-1 measured at
+# that N with 20 % of the rows active, to three decimals (Calibration data, Q-185; Q-188).
+_ADAM_CASES: tuple[tuple[int, float], ...] = ((1_000_000, 0.173), (3_000_000, 0.170))
+_ADAM_ACTIVE = 0.2  # Q-188: B-1's models at these N
+_ADAM_REPETITIONS = 50  # #229: the median of 50
+
+
+def _adam_call(optimizer: FTGSOptimizer, visibility: Tensor | None) -> Callable[[], None]:
+    """One B-5 call (#229): the next iteration's rates, then one Adam step, as the stage
+    `adam`; the gradients stay, since no `zero_grad` clears them (Q-188)."""
+    import itertools
+
+    from openftgs._stages import stage
+
+    iterations = itertools.count(1)
+
+    def call() -> None:
+        it = next(iterations)
+        with stage("adam"):
+            optimizer.set_iteration(it)
+            if visibility is None:
+                optimizer.step()
+            else:
+                optimizer.step(visibility=visibility)
+
+    return call
+
+
+def _adam(ctx: _Context) -> _Result:
+    """B-5: `FTGSOptimizer.set_iteration` plus `step` for fused, foreach and selective Adam
+    (D-53) at N = 1M and 3M, on B-1's synthesized models with seeded gradients on all nine
+    stored tensors: the time of the first call, then the median of 50 calls after a warm-up;
+    selective Adam's mask at the visible fraction B-1 measured; and per N the budget, fused no
+    slower than foreach (#229, Q-188)."""
+    import gc
+
+    import torch
+
+    from openftgs.config import OptimConfig
+    from openftgs.optim import build_optimizer
+
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    cases: list[dict[str, Any]] = []
+    medians: dict[tuple[str, int], float] = {}
+    for n, fraction in _ADAM_CASES:
+        model = _synthesize(volume, n, active=_ADAM_ACTIVE, seed=_SEED, device="cuda")
+        _seed_gradients(model, seed=_SEED)
+        mask = _visibility(n, fraction, seed=_SEED, device="cuda")
+        for kind in _ADAM_KINDS:
+            # The same model for every kind: Adam's cost doesn't depend on the values.
+            optimizer = build_optimizer(
+                model,
+                OptimConfig(),
+                spatial_scale=volume.spatial_scale,
+                frame_dt=ctx.video.frame_dt,
+                adam=kind,
+            )
+            call = _adam_call(optimizer, mask if kind == "selective" else None)
+            torch.cuda.reset_peak_memory_stats()
+            first = _first_call(call)
+            timings = [t for t in _repeat(call, _ADAM_REPETITIONS) if t.name == "adam"]
+            figures: dict[str, Any] = {
+                "step_s": _median([t.seconds for t in timings]),
+                "first_call_s": first,
+                "repetitions": len(timings),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            }
+            if kind == "selective":
+                figures["visible_fraction"] = round(fraction * n) / n
+            medians[kind, n] = figures["step_s"]
+            cases.append({"case": {"adam": kind, "n": n}, "figures": figures})
+            del optimizer, call
+        del model, mask
+        gc.collect()
+        torch.cuda.empty_cache()
+    compared, budgets = _adam_budgets(medians)
+    setup = {
+        "model": "synthesized (Q-168, Q-181)",
+        "seed": _SEED,
+        "active_fraction": _ADAM_ACTIVE,
+        "cases": [[n, fraction] for n, fraction in _ADAM_CASES],
+        "kinds": list(_ADAM_KINDS),
+        "configuration": "OptimConfig() with the scene's S (D-27) and Δt_f",
+        "gradients": "N(0, 1), seeded, on all nine stored tensors, set once and kept",
+        "call": "set_iteration(it) then step(), it = 1, 2, …, without zero_grad",
+        "visibility": (
+            "selective Adam's mask: round(f·N) rows chosen by a seeded permutation, f being "
+            "B-1's visible fraction at N with 20 % active (Calibration data, Q-185)"
+        ),
+        "warmup": _WARMUP,
+        "repetitions": _ADAM_REPETITIONS,
+        "clock": "CUDA events: adam",
+        "budget": f"fused_over_foreach ≤ {_ADAM_LIMIT} at each N",
+    }
+    return _Result(setup, cases + compared, budgets)
+
+
 def _budget(
     case: dict[str, Any], figures: dict[str, Any], figure: str, limit: float, kind: str
 ) -> dict[str, Any]:
@@ -1421,10 +1837,10 @@ def _losses(ctx: _Context) -> _Result:
 
 _BENCHMARKS: dict[str, _Benchmark] = {
     "train-step": _Benchmark("B-1", 226, _train_step, model=True),
-    "raster": _Benchmark("B-2", 227),
+    "raster": _Benchmark("B-2", 227, _raster),
     "slice": _Benchmark("B-3", 225, _slice),
     "losses": _Benchmark("B-4", 228, _losses),
-    "adam": _Benchmark("B-5", 229),
+    "adam": _Benchmark("B-5", 229, _adam),
     "data": _Benchmark("B-6", 232),
     "render": _Benchmark("B-7", 231, model=True),
     "init": _Benchmark("B-8", 234),

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
-train-step`; D-49, D-50, Q-185), B-3 (`bench slice`; D-50, Q-13), and the seeded model
-synthesizer of the benchmark setups (Q-168).
+train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
+D-50, Q-13), B-4 (`bench losses`; D-52, Q-173, Q-T228.1), B-5 (`bench adam`; D-53, Q-188),
+and the seeded model synthesizer of the benchmark setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
 tests do (Q-125); the benchmarks themselves run only on a GPU.
@@ -234,6 +235,83 @@ def test__synthesize_puts_most_rows_in_view_of_every_camera(
         assert float(inside.double().mean()) >= 0.7, camera.name
 
 
+# B-2's camera, times and figures (§3.4; Q-187): private tests of `openftgs.cli._bench`.
+
+
+@pytest.fixture(scope="module")
+def held_out_first(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Three 24×16 ring cameras with 25 frames each, written frame by frame, the first camera
+    held out for testing."""
+    root = tmp_path_factory.mktemp("held-out-first")
+    cams = ring(3)
+    model = random_model(8, seed=0, sh_degree=0)
+    images = [
+        (cam, k / 30.0, "test" if c == 0 else "train")
+        for k in range(25)
+        for c, cam in enumerate(cams)
+    ]
+    return write_scene(root, model, images)
+
+
+def test__raster_frames_takes_the_first_training_camera_at_ten_spread_frames(
+    held_out_first: Path, scene: Path
+) -> None:
+    """Q-187: "one training camera at 10 fixed times" is the first training camera in the
+    manifest's order, at 10 of its frames evenly spaced over them in time, round(k·(F − 1)/9)
+    for k = 0…9: with 25 frames, 0, 3, 5, 8, 11, 13, 16, 19, 21 and 24; with 3, each repeats."""
+    from openftgs.cli._bench import _raster_frames
+    from openftgs.data import MultiViewVideo
+
+    video = MultiViewVideo.from_manifest(held_out_first)
+    records = [video.records[i] for i in _raster_frames(video)]
+    assert {r.camera.name for r in records} == {"ring01"}
+    assert all(r.split == "train" for r in records)
+    frames = [round(r.timestamp * 30.0) for r in records]
+    assert frames == [0, 3, 5, 8, 11, 13, 16, 19, 21, 24]
+
+    video = MultiViewVideo.from_manifest(scene)
+    records = [video.records[i] for i in _raster_frames(video)]
+    assert {r.camera.name for r in records} == {"ring00"}
+    assert [round(r.timestamp * 30.0) for r in records] == [0, 0, 0, 1, 1, 1, 1, 2, 2, 2]
+
+
+def test__raster_figures_pairs_each_calls_stages_and_takes_medians() -> None:
+    """Q-187: per call, the whole span from the slice's start to the backward's end, the
+    rasterization from `raster.forward`'s start to the `backward.raster_done` point, its forward
+    (`raster.forward`) and its backward (`backward.losses_done` to `backward.raster_done`), and
+    the backward; the figures are the medians over the calls. Three hand-built calls 10 s apart:
+    forward 2, 3, 4 s; backward 5, 4, 6 s; rasterization backward 3, 1, 2 s."""
+    from openftgs._stages import Timing
+    from openftgs.cli._bench import _raster_figures
+
+    timings: list[Timing] = []
+
+    def add(name: str, start: float, end: float, thread: str = "MainThread") -> None:
+        timings.append(Timing(name, None, thread, len(timings), start, end))
+
+    for k, (forward, backward, raster_backward) in enumerate([(2, 5, 3), (3, 4, 1), (4, 6, 2)]):
+        o = 10.0 * k
+        add("slice", o, o + 1.0)
+        add("slice.kernel", o, o + 0.8)
+        add("raster.forward", o + 1.0, o + 1.0 + forward)
+        add("raster.forward.projection", o + 1.0, o + 1.5)
+        add("loss.l1", o + 1.0 + forward, o + 1.1 + forward)
+        start = o + 1.1 + forward
+        add("backward", start, start + backward)
+        add("backward.losses_done", start + 0.2, start + 0.2, "autograd")
+        done = start + 0.2 + raster_backward
+        add("backward.raster_done", done, done, "autograd")
+    figures = _raster_figures(timings)
+    assert figures == {
+        "forward_backward_s": pytest.approx(8.1),  # 1 + forward + 0.1 + backward: 8.1, 8.1, 11.1
+        "raster_s": pytest.approx(5.3),  # forward + 0.3 + rasterization backward: 5.3, 4.3, 6.3
+        "raster_forward_s": pytest.approx(3.0),
+        "raster_backward_s": pytest.approx(2.0),
+        "backward_s": pytest.approx(5.0),
+        "repetitions": 3,
+    }
+
+
 # BENCH.json (Q-166) and B-3, `ftgs bench slice` (§3.4, D-50; Q-13, Q-182), run once on the
 # GPU for the tests below: about half a minute, most of it compiling the slice.
 
@@ -334,6 +412,176 @@ def test_b3_times_both_slices_at_every_size_and_counts_recompilations(
             "kind": "limit",
         }
     ]
+
+
+# B-2, `ftgs bench raster` (§3.4, D-32, D-57; U-8, Q-187), run once on the GPU for the tests
+# below.
+
+SIZES = (1_000_000, 3_000_000)  # #227: N = 1M and 3M
+ACTIVE = (0.05, 0.2, 1.0)  # #227: 5 %, 20 % and 100 % of rows active
+VARIANTS = (  # packed × precull, D-57's default first
+    (True, "internal"),
+    (True, "compact"),
+    (False, "internal"),
+    (False, "compact"),
+)
+
+
+@pytest.fixture(scope="module")
+def raster_bench(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """B-2 on four 384×256 ring cameras, three frames each: about half a minute. On `scene`'s
+    48×32 images, six tiles hold the millions of rows, so gsplat rasterizes them in six thread
+    blocks and the run takes over two minutes."""
+    root = tmp_path_factory.mktemp("raster")
+    cams = ring(4, radius=4.0, elevation=1.0, width_px=384, height_px=256, focal=352.0)
+    model = random_model(16, seed=0, sh_degree=1, time=TIME, spread=0.6)
+    scene = write_scene(root, model, [(cam, k / 30.0, "train") for k in range(3) for cam in cams])
+    out = root / "B-2.json"
+    assert _ftgs("bench", "raster", scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@pytest.mark.gpu
+def test_b2_times_every_variant_at_each_size_and_active_fraction(
+    raster_bench: dict[str, Any],
+) -> None:
+    """B-2 (§3.4; D-57, Q-187): `render` forward plus an L1 backward for every `packed` ×
+    `precull` combination, on synthesized models at N = 1M and 3M with 5 %, 20 % and 100 % of
+    rows active, from one training camera at 10 fixed times: per case the medians of 50 calls,
+    the first call and the peak memory; the rasterization is part of the whole call."""
+    body = raster_bench
+    assert body["benchmark"] == "B-2" and body["command"][:3] == ["ftgs", "bench", "raster"]
+    setup = body["setup"]
+    assert setup["sizes"] == list(SIZES) and setup["active_fractions"] == list(ACTIVE)
+    assert setup["variants"] == [{"packed": p, "precull": c} for p, c in VARIANTS]
+    assert setup["camera"] == "ring00" and len(setup["timestamps"]) == 10
+    assert setup["repetitions"] == 50
+    timed = [c for c in body["cases"] if "packed" in c["case"]]
+    keys = [
+        (c["case"]["n"], c["case"]["active"], c["case"]["packed"], c["case"]["precull"])
+        for c in timed
+    ]
+    assert sorted(keys) == sorted((n, a, p, c) for n in SIZES for a in ACTIVE for p, c in VARIANTS)
+    for case in timed:
+        figures = case["figures"]
+        assert figures["repetitions"] == 50, case["case"]
+        for name in (
+            "forward_backward_s",
+            "raster_s",
+            "raster_forward_s",
+            "raster_backward_s",
+            "backward_s",
+            "first_call_s",
+        ):
+            assert 0.0 < figures[name] < 60.0, (case["case"], name)
+        assert figures["raster_s"] < figures["forward_backward_s"], case["case"]
+        assert figures["peak_memory_bytes"] > 0, case["case"]
+
+
+@pytest.mark.gpu
+def test_b2_counts_tile_intersections_per_time(raster_bench: dict[str, Any]) -> None:
+    """B-2 (§3.4; Q-187): per model and time, the rows active, the rows visible in the camera
+    and gsplat's tile intersections, which every variant shares; more rows active at a time give
+    more of each, and the active share is near the fraction asked. The memory resident before
+    the variants run is the model's and the targets' alone: about the same at every active
+    fraction of one N, and more at 3M than at 1M by about the 2M rows' 64 float32 values."""
+    counted = {
+        (c["case"]["n"], c["case"]["active"]): c["figures"]
+        for c in raster_bench["cases"]
+        if "packed" not in c["case"]
+    }
+    assert sorted(counted) == sorted((n, a) for n in SIZES for a in ACTIVE)
+    for (n, active), figures in counted.items():
+        for name in ("active_rows", "visible_rows", "tile_intersections"):
+            assert len(figures[name]) == 10 and all(isinstance(v, int) for v in figures[name])
+        for rows in figures["active_rows"]:
+            assert abs(rows / n - active) <= 0.01, (n, active)
+        assert all(
+            0 < v <= a for v, a in zip(figures["visible_rows"], figures["active_rows"], strict=True)
+        )
+        assert figures["resident_memory_bytes"] > 0
+    for n in SIZES:
+        for fewer, more in zip(ACTIVE, ACTIVE[1:], strict=False):
+            for name in ("visible_rows", "tile_intersections"):
+                assert sum(counted[(n, fewer)][name]) < sum(counted[(n, more)][name]), (n, name)
+        # The same up to the caching allocator's rounding of blocks, well under a tenth of the
+        # model; a model still held from before would add at least a 1M-row model.
+        resident = [counted[(n, active)]["resident_memory_bytes"] for active in ACTIVE]
+        assert max(resident) - min(resident) <= n * 64 * 4 // 10, (n, resident)
+    small, large = (counted[(n, ACTIVE[0])]["resident_memory_bytes"] for n in SIZES)
+    added = (SIZES[1] - SIZES[0]) * 64 * 4  # §1.1 at SH degree 3 (Q-168)
+    assert abs((large - small) - added) <= added // 10, (small, large)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("packed", [True, False], ids=["packed", "unpacked"])
+def test__raster_call_synchronizes_only_inside_gsplat(scene: Path, packed: bool) -> None:
+    """Q-187, §2.4 rule 3: a B-2 call given the scene's camera, held on the host, times what a
+    training iteration runs, so with the opacity cull inside gsplat's projection it synchronizes
+    only inside gsplat's own calls, as `Trainer.step` does with its cameras on the device: every
+    synchronization torch's debug mode reports comes from gsplat's files."""
+    import warnings
+
+    from openftgs.cli._bench import _raster_call, _raster_frames, _synthesize, _volume
+    from openftgs.data import MultiViewVideo
+
+    video = MultiViewVideo.from_manifest(scene)
+    record = video.records[_raster_frames(video)[0]]
+    assert record.camera.K.device.type == "cpu"
+    model = _synthesize(_volume(video), 2000, active=0.2, seed=0, device="cuda")
+    model.slice_impl = "eager"
+    target = torch.zeros(1, record.camera.height, record.camera.width, 3, device="cuda")
+    call = _raster_call(model, record.camera, [(record.timestamp, target)], (packed, "internal"))
+    call()
+    torch.cuda.synchronize()
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            call()
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+    sites = {
+        f"{r.filename}:{r.lineno}"
+        for r in records
+        if "synchronizing CUDA operation" in str(r.message)
+    }
+    assert all("/gsplat/" in site for site in sites), sites
+
+
+@pytest.mark.gpu
+def test_b2_spot_checks_each_image_against_packed_internal(raster_bench: dict[str, Any]) -> None:
+    """B-2 (§3.4 "images identical (U-8)"; D-57, Q-187): at every time, each variant's image
+    against the packed/internal one (D-57's default), its largest difference and the pixels over
+    1e-6, held to 1e-6 by a `limit` entry (#227); and each compacted image against the same
+    layout's internal one, U-8 itself, within 1e-6 and held to it by a `limit` entry too.
+    Neither entry changes the exit code (Q-166)."""
+    timed = [c for c in raster_bench["cases"] if "packed" in c["case"]]
+    others = [c for c in timed if (c["case"]["packed"], c["case"]["precull"]) != VARIANTS[0]]
+    assert len(others) == 18
+    expected = []
+    for case in others:
+        figures = case["figures"]
+        names = ["image_max_abs_diff"]
+        if case["case"]["precull"] == "compact":
+            names.append("precull_max_abs_diff")
+            assert figures["precull_max_abs_diff"] <= 1e-6, case["case"]  # U-8
+        for name in names:
+            value = figures[name]
+            expected.append(
+                {
+                    "case": case["case"],
+                    "figure": name,
+                    "limit": 1e-6,
+                    "value": value,
+                    "pass": value <= 1e-6,
+                    "kind": "limit",
+                }
+            )
+        over = figures["image_pixels_over_limit"]
+        assert isinstance(over, int) and (over == 0) == (figures["image_max_abs_diff"] <= 1e-6)
+    assert raster_bench["budgets"] == expected
 
 
 @pytest.mark.gpu
@@ -596,6 +844,154 @@ def test_b1_takes_a_model(train_step_model_bench: dict[str, Any]) -> None:
     assert cases[(("model", "given"), ("n", 64), ("stage", "loss.perceptual"))]["count"] == 297
     bound = next(b for b in body["budgets"] if b["kind"] == "bound")
     assert bound["case"] == {"model": "given", "n": 64}
+
+
+# B-5, `ftgs bench adam` (§3.4, D-53; Q-168, Q-188): private tests of selective Adam's mask,
+# the seeded gradients and the budget entries, which run on the CPU.
+
+
+@pytest.mark.parametrize(
+    ("n", "fraction", "rows"), [(1000, 0.173, 173), (999, 0.17, 170), (20, 0.05, 1), (7, 1.0, 7)]
+)
+def test__visibility_holds_exactly_the_fraction_of_rows_seeded(
+    n: int, fraction: float, rows: int
+) -> None:
+    """Q-188: selective Adam's mask is a bool [N] with exactly round(f·N) rows true, chosen
+    by a seeded permutation: the same rows for the same seed, others for another."""
+    from openftgs.cli._bench import _visibility
+
+    mask = _visibility(n, fraction, seed=0, device="cpu")
+    assert mask.dtype == torch.bool and tuple(mask.shape) == (n,)
+    assert int(mask.sum()) == rows
+    assert torch.equal(mask, _visibility(n, fraction, seed=0, device="cpu"))
+    if rows < n:
+        assert not torch.equal(mask, _visibility(n, fraction, seed=1, device="cpu"))
+
+
+def test__visibility_spreads_the_rows_over_the_tensor() -> None:
+    """Q-188: the visible rows are spread at random, as a render leaves them, not one block:
+    each tenth of 100,000 rows holds the fraction within 0.01."""
+    from openftgs.cli._bench import _visibility
+
+    mask = _visibility(100_000, 0.17, seed=0, device="cpu")
+    for part in mask.view(10, -1):
+        assert abs(float(part.double().mean()) - 0.17) <= 0.01
+
+
+def test__seed_gradients_sets_all_nine_stored_tensors_seeded() -> None:
+    """#229, Q-188: "seeded gradients on all nine stored tensors", N(0, 1) and shaped as each
+    tensor: the same for the same seed, others for another."""
+    from openftgs.cli._bench import _seed_gradients
+
+    model = random_model(2000, seed=0, sh_degree=3)
+    _seed_gradients(model, seed=0)
+    first = {name: getattr(model, name).grad.clone() for name in PARAM_NAMES}
+    for name in PARAM_NAMES:
+        param = getattr(model, name)
+        assert first[name].shape == param.shape and first[name].dtype == param.dtype, name
+        assert first[name].device == param.device, name
+    every = torch.cat([g.flatten() for g in first.values()]).double()
+    assert abs(float(every.mean())) < 0.02 and abs(float(every.std()) - 1.0) < 0.02
+    _seed_gradients(model, seed=0)
+    for name in PARAM_NAMES:
+        torch.testing.assert_close(getattr(model, name).grad, first[name], rtol=0.0, atol=0.0)
+    _seed_gradients(model, seed=1)
+    grad = model.means.grad
+    assert grad is not None and not torch.equal(grad, first["means"])
+
+
+def test__adam_budgets_hold_fused_no_slower_than_foreach_at_each_n() -> None:
+    """§3.4 B-5's budget, "fused no slower than foreach" (Q-188, Q-180): per N a case
+    `{"n"}` with fused's median over foreach's, and a budget entry setting it against 1.0 that
+    passes at exactly 1.0, with no tolerance, and fails above it; selective Adam has no budget."""
+    from openftgs.cli._bench import _adam_budgets
+
+    medians = {
+        ("fused", 10): 0.5,
+        ("foreach", 10): 0.5,
+        ("selective", 10): 0.125,
+        ("fused", 20): 0.75,
+        ("foreach", 20): 0.5,
+        ("selective", 20): 0.25,
+        ("fused", 30): 0.25,
+        ("foreach", 30): 0.5,
+        ("selective", 30): 0.25,
+    }
+    cases, budgets = _adam_budgets(medians)
+    assert cases == [
+        {"case": {"n": 10}, "figures": {"fused_over_foreach": 1.0}},
+        {"case": {"n": 20}, "figures": {"fused_over_foreach": 1.5}},
+        {"case": {"n": 30}, "figures": {"fused_over_foreach": 0.5}},
+    ]
+    expected = [(10, 1.0, True), (20, 1.5, False), (30, 0.5, True)]
+    assert budgets == [
+        {
+            "case": {"n": n},
+            "figure": "fused_over_foreach",
+            "limit": 1.0,
+            "value": value,
+            "pass": passed,
+            "kind": "budget",
+        }
+        for n, value, passed in expected
+    ]
+
+
+# B-5 run on the small scene with reduced sizes, once for the test below.
+
+ADAM_CASES = ((300, 0.17), (400, 0.5))
+ADAM_KINDS = ("fused", "foreach", "selective")
+
+
+@pytest.fixture(scope="module")
+def adam_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench") / "B-5.json"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("openftgs.cli._bench._ADAM_CASES", ADAM_CASES)
+        assert _ftgs("bench", "adam", scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@pytest.mark.gpu
+def test_b5_times_each_adam_kind_at_each_n_and_holds_fused_against_foreach(
+    adam_bench: dict[str, Any],
+) -> None:
+    """§3.4 B-5 (D-53; #229, Q-188): `set_iteration` plus `step` of fused, foreach and
+    selective Adam at each N, with seeded gradients on all nine stored tensors, the median of 50
+    calls after a warm-up; selective Adam's mask at the visible fraction given for that N; per N
+    the budget "fused no slower than foreach" as fused's median over foreach's against 1.0,
+    which doesn't change the exit code (Q-166)."""
+    body = adam_bench
+    assert body["benchmark"] == "B-5"
+    assert body["command"][:3] == ["ftgs", "bench", "adam"]
+    setup = body["setup"]
+    assert setup["cases"] == [list(c) for c in ADAM_CASES]
+    assert setup["kinds"] == list(ADAM_KINDS)
+    assert (setup["warmup"], setup["repetitions"]) == (10, 50)
+    cases = _cases_by(body)
+    for n, fraction in ADAM_CASES:
+        for kind in ADAM_KINDS:
+            figures = cases[(("adam", kind), ("n", n))]
+            assert figures["repetitions"] == 50, (kind, n)
+            assert 0.0 < figures["step_s"] < 1.0 and figures["first_call_s"] > 0.0, (kind, n)
+            assert figures["peak_allocated_bytes"] > 0, (kind, n)
+        selective = cases[(("adam", "selective"), ("n", n))]
+        assert selective["visible_fraction"] == round(fraction * n) / n
+        fused = cases[(("adam", "fused"), ("n", n))]["step_s"]
+        foreach = cases[(("adam", "foreach"), ("n", n))]["step_s"]
+        assert cases[(("n", n),)]["fused_over_foreach"] == pytest.approx(fused / foreach)
+    assert body["budgets"] == [
+        {
+            "case": {"n": n},
+            "figure": "fused_over_foreach",
+            "limit": 1.0,
+            "value": cases[(("n", n),)]["fused_over_foreach"],
+            "pass": cases[(("n", n),)]["fused_over_foreach"] <= 1.0,
+            "kind": "budget",
+        }
+        for n, _ in ADAM_CASES
+    ]
 
 
 # B-4, `ftgs bench losses` (§3.4, D-52; Q-42, Q-172, Q-173, Q-T228.1): private tests of its
