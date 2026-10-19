@@ -1328,11 +1328,11 @@ def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) ->
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
     exported = tmp_path / "exported.json"
     assert _ftgs("eval", exchange, scene, "--out", exported) == 0
-    # Q-162: the exchange model stores opacities and durations, not their logits, so its body
-    # equals the checkpoint's only up to round-off. 1e-6 is a round-off band, not U-22's render
-    # tolerance carried over: metrics amplify render differences (PSNR by up to about
-    # 8.7 · δ / RMSE dB). It sits far above the rounding observed and far below the change a
-    # background mismatch makes, which is what D-84's test is for.
+    # Q-162: the exchange model stores opacities, durations and scales, not their logits and
+    # logarithms, so its body matches the checkpoint's only to round-off. 1e-6 is a round-off
+    # band, about 240 times the 4.2e-9 observed and far below a background mismatch (D-84), not
+    # U-22's render tolerance carried over: metrics amplify render differences, PSNR by up to
+    # about 8.7 · δ / RMSE dB when every pixel moves by at most δ.
     _assert_close(_body(json.loads(exported.read_text())), _body(got))
 
 
