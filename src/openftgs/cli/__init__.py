@@ -994,7 +994,3 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"warning: {note}", file=sys.stderr)
         return failure.code
     return code
-
-
-if __name__ == "__main__":
-    sys.exit(main())
