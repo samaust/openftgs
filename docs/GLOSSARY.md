@@ -238,7 +238,7 @@ _Avoid_: scene scale, scene extent, scene radius, cameras_extent (3DGS's name), 
 
 **Ablation**:
 A configured departure from the default method that reproduces one of the paper's §4.2 variants, such as "w/o 4D initialization" (zero initial velocities) or "w/o periodic relocation" (relocation off; 3DGS densification with pruning and opacity resets in its place). §1.3, §1.4
-_Avoid_: variant, baseline, experiment
+_Avoid_: variant, baseline (reserved for a benchmark's stored result), experiment
 
 **Pruning**:
 The removal of primitives whose base opacity is below 0.005 and, after iteration 3,000, of those whose largest scale exceeds 0.1·S; done only in the "w/o periodic relocation" ablation, the one exception to N never decreasing. §1.3 Count-control modes, §1.1
@@ -254,7 +254,7 @@ _Avoid_: small model, capped model, lite
 
 **Reference outcome**:
 A number the paper reports (training time, FPS, model size, primitive count, PSNR) that serves as a target when calibrating, never as a setting. §1.5
-_Avoid_: target metric, baseline number, spec value
+_Avoid_: target metric, baseline number (baseline is reserved for a benchmark's stored result), spec value
 
 **Training configuration**:
 The nested set of hyperparameters, `TrainConfig` and its sub-configs, whose field names are the spec's hyperparameter names; stored in full in every checkpoint manifest and named the same way in the harness config. §2.1, §2.2, §3.3
@@ -271,6 +271,14 @@ _Avoid_: iteration (one image), round, pass (unqualified)
 **Step log**:
 What one training iteration reports to its caller: its image, times, active SH degree, rates, loss terms, primitive count and any event's reports. §2.1 `StepLog`
 _Avoid_: metrics (reserved for E16), history, training record
+
+**Stage**:
+One named part of a training iteration that benchmarks time and profilers show by name: the data wait, the temporal slice, rasterization forward, each loss, the backward pass, the statistics, Adam, the event and the log read. §2.4, §3.4 B-1
+_Avoid_: phase, step (reserved for Adam's per-tensor step counter), section
+
+**Data wait**:
+The part of an iteration in which the training stream waits for its image; its share of iteration time is B-6's figure. §3.4 B-6, D-51
+_Avoid_: loader stall, I/O wait, input latency
 
 ### Initialization
 
@@ -562,7 +570,7 @@ _Avoid_: skipped, unsupported, ignored
 
 **Null distribution**:
 In L3, the A–A′ distances from a second independent seed set A′ of implementation A, against which the A–B distances are tested. §3.3 L3
-_Avoid_: control run, baseline
+_Avoid_: control run, baseline (reserved for a benchmark's stored result)
 
 ### Clean-room process
 
@@ -655,8 +663,12 @@ One of the eleven §3.2 recovery tests that train on a scene with known ground t
 _Avoid_: toy scene, end-to-end test, smoke test (only S-10 and U-26's runs are that)
 
 **Benchmark B-n**:
-One of the eight §3.4 measurements of speed and memory run by `ftgs bench`, never of correctness; a budgeted one fails CI when more than 10 % worse than its baseline. §3.4
+One of the eight §3.4 measurements of speed and memory, run by `ftgs bench`, which writes BENCH.json, never of correctness; a budgeted one fails CI when more than 10 % worse than its baseline. §3.4
 _Avoid_: perf test, profile, timing
+
+**Baseline**:
+A stored BENCH.json from a reference run on one GPU model, against which a later run of the same benchmark fails when a budgeted figure is more than 10 % worse. §3.4
+_Avoid_: golden file, reference run (a run, not its stored result), snapshot
 
 **Calibrated threshold**:
 A pass criterion or budget marked "calibrated" in the spec: set once from analytic expectations or the first reference run, then frozen; the first measured values go to the Calibration data table of questions.md, and changing it needs a logged reason. §3.2, §3.4
