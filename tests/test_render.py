@@ -1206,3 +1206,164 @@ def test_u32_temporal_index_leaves_reference_renders_bitwise_unchanged(
     bound = torch.tensor(1.0 / 255.0, dtype=F32)
     for value in (torch.nextafter(bound, -bound), bound, torch.nextafter(bound, 2 * bound)):
         assert bool((sigma == value).any()), float(value)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"temporal_index": "on"}, "temporal_index"),
+        ({"temporal_index": 1}, "temporal_index"),
+        ({"frame_dt": 0.0}, "frame_dt"),
+        ({"frame_dt": -0.1}, "frame_dt"),
+        ({"frame_dt": math.nan}, "frame_dt"),
+        ({"frame_dt": math.inf}, "frame_dt"),
+        ({"frame_dt": True}, "frame_dt"),
+        ({"frame_dt": "0.1"}, "frame_dt"),
+        ({"device": "no-such-device"}, "device"),
+    ],
+)
+def test_render_request_rejects_invalid_keywords(kwargs: dict[str, Any], match: str) -> None:
+    """Q-174: temporal_index is None or a bool, frame_dt a finite positive number and device a
+    torch device; anything else is a ValueError, before anything renders."""
+    request = u32_request([0.5], [CAM_A])
+    with pytest.raises(ValueError, match=match):
+        render_request(random_model(3, seed=2), request, backend="reference", **kwargs)
+
+
+@pytest.mark.parametrize("device", ["cpu", torch.device("cpu"), "meta"])
+@pytest.mark.parametrize("temporal_index", [False, True])
+def test_render_request_returns_outputs_on_the_requested_device(
+    device: str | torch.device, temporal_index: bool
+) -> None:
+    """Q-174: `device` places every output, with and without the index; on the CPU they equal
+    the default outputs (the meta device holds shapes only)."""
+    model = u32_scene()
+    request = u32_request([0.25, 0.75], [CAM_A, CAM_B])
+    default = render_request(model, request, backend="reference")
+    out = render_request(
+        model, request, backend="reference", temporal_index=temporal_index, device=device
+    )
+    for item in request.items:
+        pairs = ((out.rgb, default.rgb), (out.alpha, default.alpha))
+        for got, want in ((a[item.id], b[item.id]) for a, b in pairs):
+            assert got.device == torch.device(device)
+            assert got.shape == want.shape and got.dtype == want.dtype
+            if got.device.type == "cpu":
+                assert torch.equal(got, want)
+
+
+def test_render_request_with_an_empty_selection_skips_the_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-174, Q-38: at a time at which no row can pass the opacity cull the index selects no
+    row, so the temporal slice doesn't run, and the render is the empty render: the background
+    with alpha 0, bitwise the render without the index."""
+    import openftgs.model
+    import openftgs.motion
+    import openftgs.render
+
+    rows = [
+        {"mean": (0.0, 0.0, 4.0), "time": 0.2, "log_duration": -5.0, "logit": 2.0},
+        {"mean": (0.5, 0.0, 4.0), "time": 0.9, "log_duration": -5.0, "logit": 2.0},
+        {"mean": (0.0, 0.5, 4.0), "time": 0.5, "logit": -7.0},  # 255σ ≤ 1 at every time
+    ]
+    model = model_from_rows(rows)
+    request = u32_request([0.55], [CAM_A, CAM_B])
+    off = render_request(model, request, backend="reference", temporal_index=False)
+    slice_fn = openftgs.motion.temporal_slice
+    calls: list[int] = []
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        return slice_fn(*args, **kwargs)
+
+    monkeypatch.setattr(openftgs.render, "temporal_slice", counted)
+    monkeypatch.setattr(openftgs.model, "temporal_slice", counted)
+    seen = index_lookups(monkeypatch)
+    on = render_request(
+        model, request, backend="reference", temporal_index=True, frame_dt=U32_WIDTH
+    )
+    assert calls == []
+    assert len(seen[0.55]) == 0
+    background = torch.tensor(request.background)
+    for item in request.items:
+        assert torch.equal(on.rgb[item.id], background.expand(48, 64, 3))
+        assert torch.equal(on.alpha[item.id], torch.zeros(48, 64, 1))
+        assert torch.equal(on.rgb[item.id], off.rgb[item.id])
+        assert torch.equal(on.alpha[item.id], off.alpha[item.id])
+
+
+def test_render_request_renders_times_outside_the_unit_interval_without_the_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-174: with the index on, a time outside [0, 1] renders as without it, through render(),
+    which warns once (§1.4 "Time", Q-9); the times inside go through the index."""
+    import openftgs.render
+
+    model = u32_scene()
+    request = u32_request([0.3, 1.25, 0.6], [CAM_A])
+    with pytest.warns(UserWarning):
+        off = render_request(model, request, backend="reference", temporal_index=False)
+    calls: list[float] = []
+    original = openftgs.render.render
+
+    def spy(model: FreeTimeGaussians, cameras: Any, timestamp: float, **kw: Any) -> RenderOutput:
+        calls.append(timestamp)
+        return original(model, cameras, timestamp, **kw)
+
+    monkeypatch.setattr(openftgs.render, "render", spy)
+    seen = index_lookups(monkeypatch)
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        on = render_request(model, request, backend="reference", temporal_index=True)
+    assert calls == [1.25]
+    assert sorted(seen) == [0.3, 0.6]
+    assert len([r for r in records if issubclass(r.category, UserWarning)]) == 1
+    for item in request.items:
+        assert torch.equal(on.rgb[item.id], off.rgb[item.id])
+        assert torch.equal(on.alpha[item.id], off.alpha[item.id])
+
+
+@pytest.mark.parametrize("count", [1, 2, 7])
+def test_render_request_with_the_width_from_the_request_times_is_unchanged(count: int) -> None:
+    """Q-174: without frame_dt the buckets are as wide as the median gap between the request's
+    distinct times (one bucket for a single time); renders stay bitwise those without the
+    index."""
+    model = u32_scene()
+    g = torch.Generator().manual_seed(count)
+    times = torch.rand(count, generator=g, dtype=torch.float64).tolist()
+    request = u32_request(times, [CAM_A])
+    on = render_request(model, request, backend="reference", temporal_index=True)
+    off = render_request(model, request, backend="reference", temporal_index=False)
+    for item in request.items:
+        assert torch.equal(on.rgb[item.id], off.rgb[item.id])
+        assert torch.equal(on.alpha[item.id], off.alpha[item.id])
+
+
+def test_bucket_width_comes_from_frame_dt_or_the_request_times() -> None:
+    """Q-174 (private): frame_dt when given; otherwise the median gap between the distinct times
+    (the mean of the two middle gaps for an even count, as Q-8 takes medians); 1 for a single
+    time; never below the floor that keeps bucket numbers small."""
+    from openftgs.render import _INDEX_MIN_WIDTH, _bucket_width
+
+    assert _bucket_width(0.04, [0.1, 0.2]) == 0.04
+    assert _bucket_width(None, [0.0, 0.125, 0.5, 1.0]) == 0.375
+    assert _bucket_width(None, [0.0, 0.25, 0.5, 0.875, 1.0]) == 0.25
+    assert _bucket_width(None, [0.5]) == 1.0
+    assert _bucket_width(None, [0.5, 0.5 + 1e-15]) == _INDEX_MIN_WIDTH
+    assert _bucket_width(1e-300, [0.5]) == _INDEX_MIN_WIDTH
+
+
+def test_index_on_follows_the_switch_and_the_time_count() -> None:
+    """Q-174 (private): True and False force the index; None turns it on for gsplat only, from
+    `_INDEX_MIN_TIMES` distinct times in [0, 1], which is at least 2, so a request at one time
+    never builds it."""
+    from openftgs.render import _INDEX_MIN_TIMES, _index_on
+
+    assert _INDEX_MIN_TIMES >= 2
+    for backend in ("gsplat", "reference"):
+        assert _index_on(True, backend, 1) and not _index_on(False, backend, 10_000)
+    assert not _index_on(None, "gsplat", 1)
+    assert not _index_on(None, "gsplat", _INDEX_MIN_TIMES - 1)
+    assert _index_on(None, "gsplat", _INDEX_MIN_TIMES)
+    assert not _index_on(None, "reference", 10_000)
