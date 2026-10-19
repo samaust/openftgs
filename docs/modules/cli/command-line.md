@@ -12,10 +12,12 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `cache` | `MultiViewVideo.from_manifest`, `FrameCache.build`, and for `gpu` or `mmap` `FrameCache.open` in that placement, which shows the cache fits on its own, not beside a training run (Q-127, Q-99) |
 | `init roma` | `RomaInitConfig`, `roma_init`, `io.write_init_points` with `roma_provenance(cfg)` as metadata (Q-107) |
 | `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.check_run_checkpoints` (Q-163), `io.save_run_checkpoint` (D-83, Q-152), `Trainer.evaluate` |
-| `render` | the model as `FreeTimeGaussians.load` reads it, `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
+| `render` | the model, read with `io.read_exchange` and `FreeTimeGaussians.from_exchange` from an FTGS-IF file, or with `io.load_checkpoint`, `config_from_dict` and the `FreeTimeGaussians` constructor from a checkpoint directory; `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
 | `eval` | the model, with the SHA-256 of its file or of its checkpoint's `manifest.json`, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
 | `bench` | a stub until M15: it checks its arguments and returns 1 (Q-130) |
+
+A MODEL path that doesn't exist, as a mistyped checkpoint directory, is exit 2, reported as missing rather than as an unreadable FTGS-IF file. A request whose `sh_degree` is above the model's is exit 2 before anything is rendered, since `at_time` refuses it (Q-20).
 
 The device is CUDA when PyTorch sees one, else the CPU, and the backend follows it, as in the trainer. `ftgs render` keeps `render()`'s default backend, gsplat, so on a machine without CUDA it needs `--backend reference`, which renders on the CPU (Q-125). To run `train` or `eval` on the CPU on a machine with a GPU, for example for the bit-exact resume of the reference backend (§2.2), hide the GPU from PyTorch with `CUDA_VISIBLE_DEVICES=""`.
 
