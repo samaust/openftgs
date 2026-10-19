@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
-codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-3 (`bench
-slice`; D-50, Q-13), and the seeded model synthesizer of the benchmark setups (Q-168).
+codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
+train-step`; D-49, D-50, Q-185), B-3 (`bench slice`; D-50, Q-13), and the seeded model
+synthesizer of the benchmark setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
 tests do (Q-125); the benchmarks themselves run only on a GPU.
@@ -133,14 +134,22 @@ def test_bench_train_step_and_render_take_a_model(
     scene: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Q-167: `train-step` and `render` take `--model MODEL`, an FTGS-IF file or a checkpoint
-    directory, read as `ftgs render` reads one: an unreadable MODEL is exit 2. Until B-1 (#226)
-    and B-7 (#231) land, a valid one reaches Q-130's message: exit 1, nothing written."""
+    directory, read as `ftgs render` reads one: an unreadable MODEL is exit 2. Until B-7 (#231)
+    lands, a valid one reaches Q-130's message there: exit 1, nothing written. B-1 with a model
+    is `test_b1_takes_a_model`; one of another scene's time normalizer can't be trained on this
+    scene, exit 2 (#226)."""
     out = tmp_path / "bench.json"
     model = tmp_path / "model.safetensors"
     write_exchange(random_model(32, seed=1, sh_degree=1, time=TIME).to_exchange(), model)
+    assert _ftgs("bench", "render", scene, "--out", out, "--model", model) == 1
+    assert "comes with #" in capsys.readouterr().err
+    other = tmp_path / "other.safetensors"
+    later = TimeNormalizer(1.0, 2.0)
+    write_exchange(random_model(32, seed=1, sh_degree=3, time=later).to_exchange(), other)
+    assert _ftgs("bench", "train-step", scene, "--out", out, "--model", other) == 2
+    assert f"model {other}" in capsys.readouterr().err
+    assert not out.exists()
     for subcommand in ("train-step", "render"):
-        assert _ftgs("bench", subcommand, scene, "--out", out, "--model", model) == 1
-        assert "comes with #" in capsys.readouterr().err
         absent = tmp_path / "absent.safetensors"
         assert _ftgs("bench", subcommand, scene, "--out", out, "--model", absent) == 2
         assert f"model {absent}" in capsys.readouterr().err
@@ -345,3 +354,245 @@ def test_bench_slice_refuses_a_single_timestamp_scene_and_an_unwritable_out(
     blocker.write_text("not a folder")
     assert _ftgs("bench", "slice", scene, "--out", blocker / "bench.json") == 2
     assert "cannot write BENCH.json" in capsys.readouterr().err
+
+
+# B-1, `ftgs bench train-step` (§3.4, D-49, D-50; Q-168, Q-185): private tests of its
+# configuration, of the summary of the stage clock's records, and of the training bound.
+
+
+def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> None:
+    """#226: the default configuration, LPIPS-VGG included, except that growth and relocation
+    start at iteration 100, n_max = ⌈1.02·N⌉ and sh_interval = 1; so the timed iterations 121 to
+    420 hold exactly the events at 200, 300 and 400, all at SH degree 3."""
+    from openftgs.cli._bench import _train_step_config
+    from openftgs.config import TrainConfig
+    from openftgs.train import calendar_entry
+
+    cfg = _train_step_config(500_000)
+    default = TrainConfig()
+    assert (cfg.growth.start, cfg.reloc.start, cfg.optim.sh_interval) == (100, 100, 1)
+    assert cfg.growth.n_max == 510_000
+    assert _train_step_config(3_000_000).growth.n_max == 3_060_000
+    assert _train_step_config(101).growth.n_max == 104  # ⌈103.02⌉
+    assert _train_step_config(100).growth.n_max == 102  # exactly 102: no rounding up
+    assert (cfg.loss.lambda_perc, cfg.loss.perc_net) == (0.01, "vgg")
+    assert cfg.sh_degree == 3 and _train_step_config(10, sh_degree=1).sh_degree == 1
+    # Everything else is the default.
+    assert cfg.loss == default.loss and cfg.perf == default.perf and cfg.init == default.init
+    assert cfg.growth.stop == default.growth.stop and cfg.reloc.stop == default.reloc.stop
+    assert cfg.optim.iterations == default.optim.iterations
+    entries = {it: calendar_entry(cfg, it) for it in range(121, 421)}
+    assert [it for it, e in entries.items() if e.event] == [200, 300, 400]
+    assert all(e.grow and e.relocate for it, e in entries.items() if e.event)
+    assert {e.sh_degree for e in entries.values()} == {3}
+    assert calendar_entry(cfg, 100).event and not calendar_entry(cfg, 99).event
+
+
+def test__stage_figures_split_iterations_and_backward_and_skip_events() -> None:
+    """§3.4 B-1, #226: per stage, the mean and median over the iterations without an event,
+    and each one's share of an iteration (the ratio of the means); the backward stage split
+    into three parts by its two points, the last being the temporal slice's backward. Records
+    come in the order they began, the points from the autograd thread among them."""
+    from openftgs._stages import Timing
+    from openftgs.cli._bench import _iteration_parts, _stage_figures
+
+    def rec(index: int, name: str, start: float, end: float, thread: str = "main") -> Timing:
+        return Timing(name, None, thread, index, start, end)
+
+    timings = [
+        # Iteration 1, no event: 10 s, data 1, slice kernel 1, backward 4 split 1 / 2 / 1.
+        rec(0, "iteration", 0.0, 10.0),
+        rec(1, "data", 0.0, 1.0),
+        rec(2, "slice.kernel", 1.0, 2.0),
+        rec(3, "backward", 5.0, 9.0),
+        rec(4, "backward.losses_done", 6.0, 6.0, "autograd"),
+        rec(5, "backward.raster_done", 8.0, 8.0, "autograd"),
+        # Iteration 2, an event: 20 s, of which the event 8.
+        rec(6, "iteration", 10.0, 30.0),
+        rec(7, "data", 10.0, 11.0),
+        rec(8, "slice.kernel", 11.0, 12.0),
+        rec(9, "backward", 13.0, 17.0),
+        rec(10, "backward.losses_done", 14.0, 14.0, "autograd"),
+        rec(11, "backward.raster_done", 16.0, 16.0, "autograd"),
+        rec(12, "events", 20.0, 28.0),
+        # Iteration 3, no event: 14 s, data 3, slice kernel 1, backward 6 split 1 / 4 / 1.
+        rec(13, "iteration", 30.0, 44.0),
+        rec(14, "data", 30.0, 33.0),
+        rec(15, "slice.kernel", 33.0, 34.0),
+        rec(16, "backward", 36.0, 42.0),
+        rec(17, "backward.losses_done", 37.0, 37.0, "autograd"),
+        rec(18, "backward.raster_done", 41.0, 41.0, "autograd"),
+    ]
+    parts = _iteration_parts(list(reversed(timings)))  # sorted by index, whatever the order
+    assert len(parts) == 3
+    assert parts[1]["events"] == 8.0 and parts[1]["iteration"] == 20.0
+    assert parts[2]["backward.raster"] == 4.0 and parts[2]["backward.slice"] == 1.0
+    figures = _stage_figures(parts, events=[False, True, False])
+    assert set(figures) == {
+        "iteration",
+        "data",
+        "slice.kernel",
+        "backward",
+        "backward.losses",
+        "backward.raster",
+        "backward.slice",
+    }
+    assert figures["iteration"] == {"mean_s": 12.0, "median_s": 12.0, "share": 1.0, "count": 2}
+    assert figures["data"] == {"mean_s": 2.0, "median_s": 2.0, "share": 2.0 / 12.0, "count": 2}
+    assert figures["backward.losses"]["mean_s"] == 1.0
+    assert figures["backward.raster"] == {
+        "mean_s": 3.0,
+        "median_s": 3.0,
+        "share": 3.0 / 12.0,
+        "count": 2,
+    }
+    assert figures["backward.slice"]["share"] == 1.0 / 12.0
+
+
+def test__training_bound_counts_the_default_calendars_iterations_and_events() -> None:
+    """Q-168's bound for B-1: T_it × the iteration time + the default calendar's number of
+    events × the event time. By default T_it = 30,000, and the events are the relocation events
+    every 100 iterations from 500 to 25,000, 246 of them, growth's (500 to 15,000) falling on
+    the same iterations (§1.3 Iteration calendar)."""
+    from openftgs.cli._bench import _training_bound
+
+    assert _training_bound(0.1, 0.5) == (30_000 * 0.1 + 246 * 0.5, 30_000, 246)
+
+
+# B-1 run on the small scene with reduced sizes (#226: "a test on a small scene, with reduced
+# sizes, checks the layout"): two synthesized models, and once with `--model`. The default
+# configuration holds LPIPS-VGG, so these need its weights.
+
+TRAIN_STEP_CASES = ((300, 0.2), (400, 0.05))
+TRAINING_STAGES = (
+    "iteration",
+    "data",
+    "slice",
+    "slice.kernel",
+    "slice.sh_concat",
+    "raster.forward",
+    "raster.forward.projection",
+    "raster.forward.sh",
+    "raster.forward.isect",
+    "raster.forward.rasterize",
+    "loss.l1",
+    "loss.ssim",
+    "loss.perceptual",
+    "loss.reg",
+    "backward",
+    "statistics",
+    "adam",
+    "events",
+    "log",
+)
+BACKWARD_PARTS = ("backward.losses", "backward.raster", "backward.slice")
+
+
+@pytest.fixture(scope="module")
+def train_step_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench") / "B-1.json"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("openftgs.cli._bench._TRAIN_STEP_CASES", TRAIN_STEP_CASES)
+        assert _ftgs("bench", "train-step", scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@pytest.fixture(scope="module")
+def train_step_model_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    root = tmp_path_factory.mktemp("bench-model")
+    model = root / "model.safetensors"
+    write_exchange(random_model(64, seed=2, sh_degree=3, time=TIME).to_exchange(), model)
+    out = root / "B-1.json"
+    assert _ftgs("bench", "train-step", scene, "--out", out, "--model", model) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+def _cases_by(body: dict[str, Any]) -> dict[tuple[tuple[str, Any], ...], dict[str, Any]]:
+    return {tuple(sorted(c["case"].items())): c["figures"] for c in body["cases"]}
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b1_times_every_stage_and_bounds_a_training_run(train_step_bench: dict[str, Any]) -> None:
+    """§3.4 B-1 (#226, Q-185): per case, every stage of a training iteration and the three
+    parts of its backward, timed over iterations 121 to 420 by the stage clock, with the mean
+    and median over the 297 iterations without an event and its share of an iteration; the
+    events at 200, 300 and 400; whole iterations 421 to 720 without the clock; peak memory, the
+    active and visible fractions, N at the start and at the end; the cost of copying the
+    relocation scores to the CPU (Q-72 note 5); and the bound on a training run (Q-168) and
+    D-50's 10 % as budget entries, which don't change the exit code (Q-166)."""
+    body = train_step_bench
+    assert body["benchmark"] == "B-1"
+    assert body["command"][:3] == ["ftgs", "bench", "train-step"]
+    setup = body["setup"]
+    assert setup["timed"] == [121, 420] and setup["unclocked"] == [421, 720]
+    assert setup["events"] == [200, 300, 400] and setup["warmup"] == 120
+    assert setup["cases"] == [list(c) for c in TRAIN_STEP_CASES]
+    assert (setup["training_iterations"], setup["default_events"]) == (30_000, 246)
+    cases = _cases_by(body)
+    for n, active in TRAIN_STEP_CASES:
+        for name in TRAINING_STAGES + BACKWARD_PARTS:
+            figures = cases[(("active", active), ("n", n), ("stage", name))]
+            assert set(figures) == {"mean_s", "median_s", "share", "count"}, name
+            assert figures["count"] == 297, name
+            assert figures["mean_s"] > 0.0 and figures["median_s"] > 0.0, name
+            assert 0.0 < figures["share"] <= 1.0 + 1e-9, name
+        for it in (200, 300, 400):
+            event = cases[(("active", active), ("iteration", it), ("n", n))]
+            assert event["events_s"] > 0.0 and event["iteration_s"] > event["events_s"]
+        summary = cases[(("active", active), ("n", n))]
+        assert summary["n_start"] == n
+        assert n <= summary["n_timed_start"] <= summary["n_end"] <= -(-102 * n // 100)
+        for name in ("active_fraction", "visible_fraction", "slice_share"):
+            assert 0.0 <= summary[name] <= 1.0, name
+        assert summary["visible_fraction"] <= summary["active_fraction"] + 1e-9
+        assert summary["peak_reserved_bytes"] >= summary["peak_allocated_bytes"] > 0
+        assert summary["iterations"] == summary["unclocked_iterations"] == 297
+        for name in ("iteration_unclocked_mean_s", "iteration_unclocked_median_s"):
+            assert summary[name] > 0.0, name
+        assert summary["clock_overhead_s"] == pytest.approx(
+            cases[(("active", active), ("n", n), ("stage", "iteration"))]["mean_s"]
+            - summary["iteration_unclocked_mean_s"]
+        )
+        slice_s = (
+            cases[(("active", active), ("n", n), ("stage", "slice.kernel"))]["mean_s"]
+            + cases[(("active", active), ("n", n), ("stage", "backward.slice"))]["mean_s"]
+        )
+        iteration_s = cases[(("active", active), ("n", n), ("stage", "iteration"))]["mean_s"]
+        assert summary["slice_share"] == pytest.approx(slice_s / iteration_s)
+        assert summary["score_copy_s"] > 0.0 and summary["events_s"] > 0.0
+        assert summary["training_bound_s"] == pytest.approx(
+            30_000 * summary["iteration_unclocked_mean_s"] + 246 * summary["event_extra_s"]
+        )
+    largest = max(TRAIN_STEP_CASES)  # the largest N
+    kinds = {b["kind"]: b for b in body["budgets"]}
+    assert set(kinds) == {"bound", "limit"} and len(body["budgets"]) == 2
+    bound = kinds["bound"]
+    assert bound["case"] == {"n": largest[0], "active": largest[1]}
+    assert bound["figure"] == "training_bound_s" and bound["limit"] == 3600
+    assert bound["value"] == cases[(("active", largest[1]), ("n", largest[0]))]["training_bound_s"]
+    assert bound["pass"] == (bound["value"] <= 3600)
+    share = kinds["limit"]
+    assert share["figure"] == "slice_share" and share["limit"] == 0.1
+    shares = {(n, a): cases[(("active", a), ("n", n))]["slice_share"] for n, a in TRAIN_STEP_CASES}
+    assert share["value"] == max(shares.values())
+    assert shares[(share["case"]["n"], share["case"]["active"])] == share["value"]
+    assert share["pass"] == (share["value"] <= 0.1)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b1_takes_a_model(train_step_model_bench: dict[str, Any]) -> None:
+    """Q-167, #226: with `--model`, B-1 times that model, at its SH degree, as its one case,
+    which carries the bound."""
+    body = train_step_model_bench
+    assert body["command"][-2] == "--model"
+    assert body["setup"]["cases"] == [[64, None]]
+    cases = _cases_by(body)
+    summary = cases[(("model", "given"), ("n", 64))]
+    assert summary["n_start"] == 64
+    assert cases[(("model", "given"), ("n", 64), ("stage", "loss.perceptual"))]["count"] == 297
+    bound = next(b for b in body["budgets"] if b["kind"] == "bound")
+    assert bound["case"] == {"model": "given", "n": 64}

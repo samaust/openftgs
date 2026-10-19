@@ -418,9 +418,11 @@ def test_slice_culling_mask_boundary_is_inclusive() -> None:
     assert torch.equal(sl.passes_cull, sl.opacities_t >= boundary)
 
 
-def test_slice_cuda_implementation_is_a_stub() -> None:
-    """Q-13: impl="cuda" raises NotImplementedError until B-1 justifies it (D-50, M15)."""
-    with pytest.raises(NotImplementedError, match="D-50"):
+def test_slice_cuda_implementation_is_not_built() -> None:
+    """Q-13, D-50 (#226): impl="cuda" raises NotImplementedError, and its message cites the
+    decision: B-1's row in the Calibration data puts the slice under D-50's 10 % of an
+    iteration, so the custom operator isn't written."""
+    with pytest.raises(NotImplementedError, match=r"D-50.*B-1.*10 %.*Calibration data"):
         _slice(_model(4, 13, torch.float32), 0.5, impl="cuda")
 
 
