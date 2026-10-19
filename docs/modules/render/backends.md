@@ -59,6 +59,12 @@ The settings of D-6 and D-57 are private constants beside E6's (classic mode, th
 
 The effective opacity goes into gsplat's projection, which applies the opacity cull and the opacity-aware extent there: D-32's default placement. Inside the projection gsplat applies E6's culls in its own order (depth, det Σ′, effective opacity, then the screen box off the image) and sets the screen radii from the extent rounded up to whole pixels; the reference reaches the same visibility (Q-33).
 
+### Layouts and the opacity cull's placement
+
+B-2 timed all four `packed` × `precull` combinations on kitchen (`docs/modules/cli/benchmarks.md`, #227, Calibration data), and the defaults D-57 sets stay: packed mode with the opacity cull inside gsplat's projection is the fastest at 20 % of rows active, at 1M and 3M rows, and within 1.1 % of the fastest at 5 %. Compaction adds its kept-row selection and gathers, which cost most where most rows pass the cull. Unpacked mode wins only when every row is active, and projects every row of the model whatever its share is visible.
+
+Compaction is exact: at B-2's scale its images are bitwise those of the internal cull, in both layouts (U-8). The layouts are not quite: gsplat 1.5.3's packed and unpacked projections compute bitwise-equal radii, 2D means and depths, but conics that differ in the last bits for most visible rows. Where a term of a pixel sits at the α skip or at the transmittance stop, that flips it, as between the two backends (Q-39, below). On kitchen that changed 1 to 17 of 13.7 million pixels per model, by up to 1.6e-3, and left every other pixel within 1e-6. D-57 and §2.4 say the layout leaves results unchanged; the owner has been told, B-2 keeps its 1e-6 limit, and the layout test (`test_packed_and_unpacked_layouts_render_alike`) still holds it on its small scene. The default layout is the one training and rendering use, so their results don't depend on it.
+
 ### Cameras
 
 View matrices are built from R_w and t_w with a last row of (0, 0, 0, 1), and K from f_x, f_y, c_x and c_y only, so the backend reads the same camera fields as the reference (Q-32). The camera center for E2's view direction is E2's own (§1.4), as for the reference, rather than gsplat's inverse of the view matrix: the same in exact arithmetic, and without the host synchronization of `torch.inverse` (§2.4 rule 3; D-76).
