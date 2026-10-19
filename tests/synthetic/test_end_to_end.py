@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -127,9 +128,18 @@ def test_motion_stays_below_half_the_init_lattice_spacing(record_property: Recor
 # S-9 (§3.2): end-to-end quality on non-Gaussian data, through the command line.
 
 
+def _sphere_psnr(pred: torch.Tensor, gt: torch.Tensor, coverage: np.ndarray) -> float:
+    """Q-138: the PSNR over the pixels where any of the caster's rays hits a sphere, after
+    E16's clamp; the full-image PSNR's black background is left out."""
+    hit = torch.from_numpy(coverage > 0)
+    mse = (pred.clamp(0.0, 1.0).double() - gt.double())[hit].square().mean()
+    return float(-10.0 * torch.log10(mse))
+
+
 def _s9(
     scene: raycast.Scene, tmp_path: Path, record_property: Record, init: Path, prefix: str
 ) -> None:
+    started = time.perf_counter()
     config = tmp_path / "cfg.json"
     config.write_text(json.dumps(config_to_dict(_cfg())))
     run = tmp_path / "run"
@@ -148,14 +158,27 @@ def _s9(
     out = tmp_path / "renders.safetensors"
     assert main(["render", str(exchange), "--request", str(request), "--out", str(out)]) == 0
     renders = read_renders(out, request_sha256=hashlib.sha256(request.read_bytes()).hexdigest())
-    psnrs = [float(psnr(renders.rgb[str(i)], video.load_image(i))) for i in tests]
-    ssims = [float(ssim_k(renders.rgb[str(i)], video.load_image(i), 1)) for i in tests]  # Q-139
+    pairs = [(renders.rgb[str(i)], video.load_image(i)) for i in tests]
+    keys = [(video.records[i].camera.name, video.records[i].frame_index or 0) for i in tests]
+    psnrs = [float(psnr(pred, gt)) for pred, gt in pairs]
+    ssims = [float(ssim_k(pred, gt, 1)) for pred, gt in pairs]  # Q-139
+    ssims2 = [float(ssim_k(pred, gt, 2)) for pred, gt in pairs]  # Q-139: recorded only
+    spheres = [
+        _sphere_psnr(pred, gt, scene.coverage[key])
+        for (pred, gt), key in zip(pairs, keys, strict=True)
+    ]
     mean_psnr, mean_ssim = sum(psnrs) / len(psnrs), sum(ssims) / len(ssims)
     rows = (run / "train_log.jsonl").read_text().splitlines()
     record_property(f"{prefix}_psnr", mean_psnr)
     record_property(f"{prefix}_ssim1", mean_ssim)
+    record_property(f"{prefix}_ssim2", sum(ssims2) / len(ssims2))
+    record_property(f"{prefix}_psnr_spheres", sum(spheres) / len(spheres))  # Q-138
     record_property(f"{prefix}_final_n", json.loads(rows[-1])["num_gaussians"])
-    print(f"{prefix}: held-out PSNR {mean_psnr:.2f} dB, SSIM {mean_ssim:.4f}")
+    record_property(f"{prefix}_seconds", time.perf_counter() - started)
+    print(
+        f"{prefix}: held-out PSNR {mean_psnr:.2f} dB (spheres {sum(spheres) / len(spheres):.2f}),"
+        f" SSIM {mean_ssim:.4f}"
+    )
     assert mean_psnr >= S9_PSNR
     assert mean_ssim >= S9_SSIM
 
@@ -259,6 +282,7 @@ def test_s11_growth_covers_surfaces_with_no_initial_points(
     1 dB of a fully initialized run in held-out PSNR on the uninitialized half (calibrated); the
     same metric is reported for growth "none" started at the same final N, the missing points
     replaced by random low-opacity primitives (Q-140)."""
+    started = time.perf_counter()
     video = MultiViewVideo.from_manifest(scene.train_manifest)
     cfg = _cfg()
     full = Trainer(cfg, video, _full_init(scene), device="cuda")
@@ -276,6 +300,7 @@ def test_s11_growth_covers_surfaces_with_no_initial_points(
     p3 = _masked_psnr(still.model, scene)
     for name, value in (("full", p1), ("half_gradient", p2), ("half_none", p3)):
         record_property(f"s11_psnr_{name}", value)
+    record_property("s11_seconds", time.perf_counter() - started)
     record_property(
         "s11_n",
         json.dumps([full.model.num_gaussians, half.model.num_gaussians, still.model.num_gaussians]),
