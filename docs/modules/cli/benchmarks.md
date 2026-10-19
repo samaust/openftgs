@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168 and Q-180 to Q-182.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-180 to Q-182, Q-185 and Q-T228.1.
 
 ## Subcommands
 
@@ -135,6 +135,39 @@ Per case (`{"impl", "n"}`), the figures are the medians over 50 calls of the for
 The first run, on kitchen, is in the Calibration data table of `docs/clean-room/questions.md`: the compiled slice is no slower than eager only up to 3·10⁵ rows, where both sit at the host's floor of about 0.3 ms, and 8 to 49 % slower from 4·10⁵ rows on (10 % at 3·10⁶, where it takes 2.46 ms against 2.24). It never recompiled over the 10 resizes. Its first call took 0.53 s with warm compile caches and 2.25 s with empty ones.
 
 That run is superseded. Under `dynamic=True` dynamo had made the 3 and the 4 of the inner dims symbolic, and inductor computed the quaternion's norm in reduction kernels; since #226 the compiled slice's inner dims are static (Q-184, `docs/modules/motion/temporal-slice.md`). Rerun on kitchen, the compiled slice is no slower than eager at every size: 2 to 5 % faster up to 5·10⁵ rows, at the host's floor, 12 % at 7·10⁵, and 41 to 49 % faster from 10⁶ rows on (1.24 against 2.29 ms at 3·10⁶), still with no recompilation. So Q-182's rule keeps "auto" compiled on CUDA.
+
+## B-4: `ftgs bench losses`
+
+B-4 times the two image losses whose cost D-52 decides, LPIPS-VGG and SSIM, at 1352×1014 and 1920×1080 (§3.4; Q-T228.1 for the details below). It sets D-52's exact defaults through Q-173's rule and records how far bf16 strays from float32. It has no budget of its own.
+
+**Images.** The target is the scene's first training image, resized bilinearly with antialiasing when its size differs (on kitchen, 1920×1080 stretches its 4:3 to 16:9); the prediction adds seeded Gaussian noise of σ 0.05. Natural content gives the deviation figures the feature statistics of training; timing doesn't depend on it.
+
+**LPIPS-VGG.** lpips's network is called directly (PRD #220), frozen and in evaluation mode, its inputs mapped to [−1, 1] as `LPIPSLoss` maps them (D-68). One call is the forward on both images and the mean (stage `loss.perceptual`), then the prediction's gradient (stage `backward`), for each of:
+
+| Axis | Values |
+| --- | --- |
+| precision | `ieee` (cuDNN's TF32 flag off), `tf32` (on, training's default), `bf16` (bfloat16 autocast around the network, TF32 on, the value cast to float32; Q-172) |
+| layout | `nchw` (contiguous NCHW inputs and weights); `channels_last_inputs` (channels-last inputs, NCHW weights); `channels_last_inputs_and_weights` |
+| cuDNN autotuning | off, on |
+
+`channels_last_inputs` is training's path: `LPIPSLoss` views a render's [..., H, W, 3] batch first, which is channels-last in memory, and every convolution of the network follows that layout (source log T228.2). So "channels-last on and off" (§3.4) is measured twice: on and off for the inputs, which training already has on, and for the weights, which it doesn't yet. Every case without autotuning runs before any with it, since cuDNN caches the algorithm it picked for a configuration.
+
+**SSIM.** `losses.ssim` with training's window, σ and padding, forward (stage `loss.ssim`) and the prediction's gradient: fused-ssim in the benchmark's process, when it imports, and the PyTorch path in a child process in which `fused_ssim` can't be imported, so `ssim()`'s signature doesn't change (PRD #220, owner's decision). The child runs with TF32 on, as training does (D-52), autotuning off and then on; it gets the folder the benchmark imported openftgs from first on its PYTHONPATH, so both paths time the same code.
+
+**Figures.** Per case, as B-3's (`{"loss", "width", "height", …}`): the first call, then the medians over 30 calls after 10 warm-up calls of the forward, the backward and the span from one's start to the other's end, and the peak allocated memory. Per size, TF32's and bf16's deviation from IEEE float32 (`{"deviation", "width", "height"}`), measured first, with the network as training runs it: the two values and their relative difference, the gradients' relative L2 difference, and their largest difference over the largest IEEE gradient element.
+
+**Comparisons.** Per size, a variant's gain over its baseline, 1 − variant / baseline of the median forward plus backward (`{"comparison", "width", "height"}`), and over the sizes the smallest gain and whether it reaches 3 % (`{"comparison"}`):
+
+| Comparison | Baseline → variant | Decides |
+| --- | --- | --- |
+| `autotuning` | TF32, channels-last inputs: autotuning off → on | cuDNN autotuning in training steps (Q-173) |
+| `channels_last_weights` | TF32, autotuning off: channels-last inputs → inputs and weights | channels-last LPIPS weights in training (Q-173) |
+| `autotuning_and_channels_last_weights` | both together | reported |
+| `tf32` | IEEE → TF32, channels-last inputs | reported (D-52's default) |
+| `bf16` | TF32 → bf16, channels-last inputs | reported (bf16 stays opt-in, approximate) |
+| `fused_ssim` | the PyTorch path without autotuning → fused-ssim | Q-42's note: no gain sends Q-42 back to the owner |
+
+**Decision rule** (Q-173): an exact option without a `PerfConfig` field is turned on when its smallest gain is at least 3 % and a rerun of B-1 with it on is no slower than B-1's recorded iteration time.
 
 ## B-1's first run
 
