@@ -775,6 +775,15 @@ BAD_EXCHANGE_CASES = (
     "sh_degree 4",
     "tau1 < tau0",
     "missing tau0",
+    # D-84: the recorded background, refused unless three numbers in [0, 1]; Q-157: a
+    # render_conventions block that isn't a JSON object
+    "background out of range",
+    "background of two",
+    "background of bools",
+    "background null",
+    "background string",
+    "render_conventions not JSON",
+    "render_conventions a list",
 )
 
 
@@ -820,4 +829,17 @@ def bad_exchange(case: str) -> tuple[dict[str, Tensor], dict[str, str]]:
         meta["tau1"] = "1.0"
     elif case == "missing tau0":
         del meta["tau0"]
+    elif case.startswith("background"):
+        value = {
+            "background out of range": [2.0, 0.0, 0.0],
+            "background of two": [0.0, 0.0],
+            "background of bools": [True, False, False],
+            "background null": None,
+            "background string": "white",
+        }[case]
+        meta["render_conventions"] = json.dumps({"background": value})
+    elif case == "render_conventions not JSON":
+        meta["render_conventions"] = "background=white"
+    elif case == "render_conventions a list":
+        meta["render_conventions"] = "[1.0, 1.0, 1.0]"
     return a, meta
