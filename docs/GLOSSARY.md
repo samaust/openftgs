@@ -481,7 +481,7 @@ The plain data a checkpoint holds: iteration, config, time normalizer, S, Δt_f,
 _Avoid_: state dict (PyTorch's generic term), session, run state
 
 **Resume**:
-Continuing a run from a checkpoint, bit-exact on the reference backend; a forced resume, on a changed scene manifest, keeps the run's time normalizer, S and Δt_f. §2.2 Full checkpoint
+Continuing a run from a checkpoint, bit-exact on the reference backend; a forced resume, on a changed scene manifest, keeps the run's time normalizer, S and Δt_f. The configuration is the checkpoint's, except the performance settings that change no number, which a resume may change. §2.2 Full checkpoint, Q-134
 _Avoid_: restart, reload, warm start
 
 **Run directory**:

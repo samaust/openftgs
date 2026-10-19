@@ -38,6 +38,7 @@ from openftgs.config import (
     PerfConfig,
     RelocConfig,
     TrainConfig,
+    config_to_dict,
 )
 from openftgs.data import FrameCache, MultiViewVideo
 from openftgs.eval import METRIC_NAMES
@@ -800,6 +801,87 @@ def test_load_state_dict_refuses_another_run_and_changes_nothing(tmp_path: Path)
     _assert_states_equal(trainer.state_dict(), before)
 
 
+# A resume with other exact performance settings (Q-134 as answered; Q-153).
+
+
+def test_a_resume_with_other_exact_performance_settings_is_bitwise(tmp_path: Path) -> None:
+    """Q-134 as answered, §2.2, §2.4 rule 2: a run checkpointed in mid-epoch with the frame
+    cache on the device and resumed through from_checkpoint(perf=…) with the memory-mapped
+    cache, another prefetch depth, another log period and deterministic kernels gives bitwise
+    the state of a straight run, on the reference backend on the CPU, where the "gpu"
+    placement holds whole tensors; the resumed trainer runs with, and records, the new
+    settings."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    straight = _u21_trainer(video, _with_cache(ONE_EVENT, "gpu"))
+    _run(straight)
+    first = _u21_trainer(video, _with_cache(ONE_EVENT, "gpu"))
+    _run(first, 65)
+    save_checkpoint(first.state_dict(), tmp_path / "ckpt")
+    perf = dataclasses.replace(
+        ONE_EVENT.perf, frame_cache="mmap", prefetch=3, log_every=7, deterministic=True
+    )
+    resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu", perf=perf)
+    logs = _run(resumed)
+    assert [log.iteration for log in logs if log.mean_losses is not None] == list(
+        range(70, ONE_EVENT.optim.iterations + 1, 7)
+    )
+    state = resumed.state_dict()
+    assert state.config["perf"] == config_to_dict(dataclasses.replace(ONE_EVENT, perf=perf))["perf"]
+    want = straight.state_dict()
+    _assert_states_equal(want, dataclasses.replace(state, config=want.config), global_rng=False)
+
+
+@pytest.mark.parametrize(
+    "change", [{"adam": "foreach"}, {"perc_precision": "ieee"}, {"images_per_step": 2}]
+)
+def test_from_checkpoint_refuses_performance_settings_that_change_results(
+    tmp_path: Path, change: dict[str, Any]
+) -> None:
+    """Q-134 as answered: perc_precision, adam and images_per_step change results (D-52 to
+    D-54), so from_checkpoint(perf=…) refuses a change to one of them with ValueError naming
+    its dotted key, before anything is built."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    trainer = _u21_trainer(video, ONE_EVENT)
+    _run(trainer, 5)
+    save_checkpoint(trainer.state_dict(), tmp_path / "ckpt")
+    perf = dataclasses.replace(ONE_EVENT.perf, **change)
+    (key,) = change
+    with pytest.raises(ValueError, match=f"perf.{key}"):
+        Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cpu", perf=perf)
+
+
+@pytest.mark.parametrize("change", [{"adam": "foreach"}, {"perc_precision": "ieee"}])
+def test_load_state_dict_refuses_a_state_whose_results_would_differ(
+    tmp_path: Path, change: dict[str, Any]
+) -> None:
+    """Q-134 as answered, Q-69: a state whose configuration differs from the trainer's in a
+    PerfConfig field that changes results is a ValueError naming it, and the trainer keeps its
+    own state."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    source = _u21_trainer(video, ONE_EVENT)
+    _run(source, 5)
+    mine = dataclasses.replace(ONE_EVENT, perf=dataclasses.replace(ONE_EVENT.perf, **change))
+    trainer = _u21_trainer(video, mine)
+    before = trainer.state_dict()
+    (key,) = change
+    with pytest.raises(ValueError, match=f"perf.{key}"):
+        trainer.load_state_dict(source.state_dict())
+    _assert_states_equal(trainer.state_dict(), before)
+
+
+def test_load_state_dict_accepts_other_exact_settings_and_keeps_its_own(tmp_path: Path) -> None:
+    """Q-134 as answered, Q-69: a state whose configuration differs from the trainer's only in
+    exact PerfConfig fields is loaded, and the trainer keeps its own values for them."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    source = _u21_trainer(video, ONE_EVENT)
+    _run(source, 5)
+    mine = dataclasses.replace(ONE_EVENT, perf=dataclasses.replace(ONE_EVENT.perf, log_every=3))
+    trainer = _u21_trainer(video, mine)
+    trainer.load_state_dict(source.state_dict())
+    assert trainer.iteration == 5
+    assert trainer.state_dict().config["perf"]["log_every"] == 3
+
+
 # On the GPU: gsplat (U-21's GPU variant; D-57, Q-36, Q-73).
 
 
@@ -860,6 +942,47 @@ def test_u21_on_gsplat_without_events(tmp_path: Path) -> None:
         with torch.no_grad():
             renders.append(render(model, test.camera, test.timestamp).image)
     assert _psnr(renders[0], renders[1]) >= 50.0
+
+
+@pytest.mark.gpu
+def test_a_gsplat_resume_from_the_device_cache_to_the_mapped_one(tmp_path: Path) -> None:
+    """Q-134 as answered, §2.2's gsplat clause: a run checkpointed with frame_cache = "gpu"
+    and resumed with "mmap" matches a straight run within U-21's GPU tolerance (1e-4 relative
+    L2 error of every stored tensor, the same image order and rates)."""
+    video = _scene(tmp_path / "scene")
+    cfg = _with_cache(
+        dataclasses.replace(
+            U21,
+            growth=dataclasses.replace(U21.growth, mode="none"),
+            reloc=dataclasses.replace(U21.reloc, enabled=False),
+        ),
+        "gpu",
+    )
+
+    def trainer() -> Trainer:
+        model = random_model(40, seed=2, sh_degree=1, time=video.time, spread=0.6)
+        return Trainer(cfg, video, model, device="cuda")
+
+    straight_trainer = trainer()
+    straight = _run(straight_trainer)
+    first = trainer()
+    before = _run(first, 150)
+    save_checkpoint(first.state_dict(), tmp_path / "ckpt")
+    perf = dataclasses.replace(cfg.perf, frame_cache="mmap")
+    resumed = Trainer.from_checkpoint(tmp_path / "ckpt", video, device="cuda", perf=perf)
+    after = _run(resumed)
+    assert [(log.image_index, log.rates) for log in straight] == [
+        (log.image_index, log.rates) for log in before + after
+    ]
+    a, b = straight_trainer.state_dict(), resumed.state_dict()
+    assert b.config["perf"]["frame_cache"] == "mmap"
+    tensors = {**_flat("params", a.params), **_flat("optim", a.optim), **_flat("stats", a.stats)}
+    others = {**_flat("params", b.params), **_flat("optim", b.optim), **_flat("stats", b.stats)}
+    assert set(tensors) == set(others)
+    for name, value in tensors.items():
+        x, y = value.double(), others[name].double()
+        error = float(torch.linalg.vector_norm(x - y))
+        assert error <= 1e-4 * float(torch.linalg.vector_norm(x)) or error == 0.0, name
 
 
 @pytest.mark.gpu
