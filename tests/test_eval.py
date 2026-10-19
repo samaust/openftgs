@@ -596,6 +596,32 @@ class _Unused:
         raise AssertionError("nothing should be evaluated")
 
 
+def test_evaluate_images_passes_frame_dt_to_every_render_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-183, Q-174: `frame_dt` reaches each of the split's render requests, one per
+    timestamp, as the temporal index's bucket width; None by default."""
+    video = _manifest(tmp_path)
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    seen: list[Any] = []
+
+    class _Stop(Exception):
+        pass
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("frame_dt", "absent"))
+        raise _Stop
+
+    monkeypatch.setattr("openftgs.eval.render_request", spy)
+    evaluator: Any = _Unused()
+    for frame_dt in (None, 0.04):
+        with pytest.raises(_Stop):
+            evaluate_images(model, video, evaluator, backend="reference", frame_dt=frame_dt)
+    with pytest.raises(_Stop):
+        evaluate_images(model, video, evaluator, backend="reference")
+    assert seen == [None, 0.04, None]
+
+
 def test_evaluate_images_needs_a_supplied_render_for_every_record(tmp_path: Path) -> None:
     """Q-137: supplied renders must cover every record of the split, which is checked before
     anything is rendered or evaluated."""
