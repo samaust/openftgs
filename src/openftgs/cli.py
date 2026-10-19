@@ -463,7 +463,7 @@ def _train(args: argparse.Namespace) -> int:
         _check_finite(trainer, state.stats)
         save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
 
-    def record(trainer: Trainer, log: StepLog) -> bool:
+    def record(_: Trainer, log: StepLog) -> bool:
         if profile is not None:
             profile.step_done(log.iteration)
         if log.mean_losses is not None:  # Q-132: read every log_every iterations, no extra sync

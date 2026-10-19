@@ -485,8 +485,16 @@ Continuing a run from a checkpoint, bit-exact on the reference backend; a forced
 _Avoid_: restart, reload, warm start
 
 **Run directory**:
-The folder `ftgs train --out` writes a run into: its resolved configuration, its training log, its checkpoint and its final metrics. §2.1 CLI
-_Avoid_: output folder, experiment directory, log dir, checkpoint (the checkpoint is one folder inside it)
+The folder `ftgs train --out` writes a run into: its resolved configuration, its training log, its kept checkpoints and its final metrics. §2.1 CLI
+_Avoid_: output folder, experiment directory, log dir, checkpoint (the checkpoints are folders inside it)
+
+**Kept checkpoints**:
+The checkpoints a run directory holds under D-83's rotation: the latest save at `RUN_DIR/checkpoint` and up to K − 1 earlier ones at `RUN_DIR/checkpoint-<iteration>`, one per iteration (`ftgs train --keep-checkpoints K`). D-83, Q-149 to Q-152
+_Avoid_: kept set (the live set's synonym), checkpoint history, snapshots, backups
+
+**Periodic checkpoint**:
+A save that `ftgs train --checkpoint-every N` makes after every iteration that is a multiple of N below T_it, beside the saves at T_it and on a signal; it changes nothing in the run. D-83, §2.2
+_Avoid_: autosave, intermediate checkpoint
 
 ### Evaluation
 

@@ -872,18 +872,25 @@ def test_save_run_checkpoint_keeps_the_k_latest(tmp_path: Path) -> None:
     assert _kept(tmp_path) == {"checkpoint": 20, "checkpoint-10": 10, "checkpoint-15": 15}
 
 
-def test_save_run_checkpoint_removes_an_abandoned_continuation(tmp_path: Path) -> None:
-    """D-83: a save at iteration it first removes kept checkpoints of later iterations, the
-    continuation a resume from an earlier one abandoned."""
-    for iteration in (5, 10, 15):
-        save_run_checkpoint(_at(iteration), tmp_path, keep=3)
-    save_run_checkpoint(_at(7), tmp_path, keep=3)
-    assert _kept(tmp_path) == {"checkpoint": 7, "checkpoint-5": 5}
+@pytest.mark.parametrize(
+    ("iteration", "want"),
+    [(7, {"checkpoint": 7, "checkpoint-5": 5}), (10, {"checkpoint": 10, "checkpoint-5": 5})],
+)
+def test_save_run_checkpoint_removes_an_abandoned_continuation(
+    tmp_path: Path, iteration: int, want: dict[str, int]
+) -> None:
+    """D-83, Q-149: a save at iteration it drops the kept checkpoints of later iterations, the
+    continuation a resume from an earlier one abandoned, and one already at it, so no
+    iteration is kept twice; RUN_DIR/checkpoint is replaced in place, never renamed."""
+    for saved in (5, 10, 15):
+        save_run_checkpoint(_at(saved), tmp_path, keep=3)
+    save_run_checkpoint(_at(iteration), tmp_path, keep=3)
+    assert _kept(tmp_path) == want
 
 
 def test_save_run_checkpoint_at_the_same_iteration_replaces_in_place(tmp_path: Path) -> None:
     """Q-149: a save at the iteration RUN_DIR/checkpoint already holds replaces it, with no
-    rename, so the kept set is unchanged."""
+    rename, so the kept checkpoints are unchanged."""
     save_run_checkpoint(_at(5), tmp_path, keep=2)
     save_run_checkpoint(_at(10), tmp_path, keep=2)
     again = dataclasses.replace(_trainer_state(n=9), iteration=10)
@@ -909,6 +916,30 @@ def test_save_run_checkpoint_leaves_other_directories_alone(tmp_path: Path) -> N
     assert load_checkpoint(tmp_path / "checkpoint").iteration == 10
 
 
+def test_save_run_checkpoint_refuses_to_rename_onto_what_is_not_a_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Q-150, Q-25: with K > 1 the latest is renamed RUN_DIR/checkpoint-<its iteration>; when
+    something that isn't a checkpoint has that name, the save is refused with ValueError and
+    nothing is removed or replaced."""
+    (tmp_path / "checkpoint-5").write_text("mine")
+    save_run_checkpoint(_at(5), tmp_path, keep=2)
+    with pytest.raises(ValueError, match="checkpoint-5"):
+        save_run_checkpoint(_at(10), tmp_path, keep=2)
+    assert (tmp_path / "checkpoint-5").read_text() == "mine"
+    assert load_checkpoint(tmp_path / "checkpoint").iteration == 5
+
+
+def test_save_run_checkpoint_keeps_a_killed_saves_checkpoint(tmp_path: Path) -> None:
+    """Q-25, D-83: a checkpoint a killed save left set aside is restored first, so with K = 2
+    it is kept as RUN_DIR/checkpoint-<its iteration> rather than overwritten."""
+    save_run_checkpoint(_at(5), tmp_path, keep=2)
+    (tmp_path / "checkpoint").rename(tmp_path / ".checkpoint.old-99999")
+    save_run_checkpoint(_at(10), tmp_path, keep=2)
+    assert _kept(tmp_path) == {"checkpoint": 10, "checkpoint-5": 5}
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+
+
 @pytest.mark.parametrize("keep", [0, -1])
 def test_save_run_checkpoint_needs_at_least_one_kept(tmp_path: Path, keep: int) -> None:
     """D-83: K ≥ 1; anything else is a ValueError and nothing is written."""
@@ -920,8 +951,9 @@ def test_save_run_checkpoint_needs_at_least_one_kept(tmp_path: Path, keep: int) 
 def test_save_run_checkpoint_that_fails_partway_keeps_the_earlier_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Q-151: the oldest kept checkpoints are removed only once the new save is in place, so a
-    save that fails partway leaves every earlier checkpoint loadable."""
+    """Q-151: the oldest kept checkpoints are removed only once the new save is in place, and a
+    save that fails partway puts the previous latest back at RUN_DIR/checkpoint, so every
+    earlier checkpoint stays where it was."""
     for iteration in (5, 10):
         save_run_checkpoint(_at(iteration), tmp_path, keep=2)
 
@@ -931,9 +963,7 @@ def test_save_run_checkpoint_that_fails_partway_keeps_the_earlier_ones(
     monkeypatch.setattr("openftgs.io.save_file", full)
     with pytest.raises(OSError, match="No space left"):
         save_run_checkpoint(_at(15), tmp_path, keep=2)
-    monkeypatch.undo()
-    kept = _kept(tmp_path)
-    assert set(kept.values()) == {5, 10}
+    assert _kept(tmp_path) == {"checkpoint": 10, "checkpoint-5": 5}
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
 
 

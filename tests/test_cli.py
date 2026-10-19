@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-144, Q-146): a
+"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; D-83; Q-124 to Q-152): a
 smoke test of every command on a small synthetic scene, the CLI round trips of U-26, U-22's
 rejections with exit code 2, U-27's exit code, and the train, resume, render, eval and export
 behaviour.
@@ -267,14 +267,8 @@ def test_a_signal_saves_a_checkpoint_from_which_resume_is_bitwise(
     checkpoint = tmp_path / "cut" / "checkpoint"
     assert load_checkpoint(checkpoint).iteration == 12
     assert _train(run, tmp_path / "cut", "--resume", checkpoint) == 0
-    straight = load_checkpoint(tmp_path / "straight" / "checkpoint")
-    resumed = load_checkpoint(checkpoint)
-    assert resumed.iteration == straight.iteration == ITERATIONS
-    for part in ("params", "optim", "stats", "rng"):
-        a, b = _tensors(getattr(straight, part)), _tensors(getattr(resumed, part))
-        assert a.keys() == b.keys() and a, part
-        assert all(torch.equal(a[k], b[k]) for k in a), part
-    assert straight.sampler == resumed.sampler
+    assert load_checkpoint(checkpoint).iteration == ITERATIONS
+    _assert_same_run(tmp_path / "straight" / "checkpoint", checkpoint)
     rows = (tmp_path / "cut" / "train_log.jsonl").read_text().splitlines()
     assert [json.loads(r)["iteration"] for r in rows] == [5, 10, 15, 20]
 
@@ -564,19 +558,32 @@ def test_a_resume_from_a_periodic_checkpoint_is_bitwise(
     _assert_same_run(tmp_path / "straight" / "checkpoint", resumed / "checkpoint")
 
 
+@pytest.mark.parametrize("stop", [12, 15])
 def test_a_resume_from_an_older_checkpoint_removes_the_later_ones(
-    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: int
 ) -> None:
-    """D-83: a save at iteration it first removes the kept checkpoints of later iterations,
-    which belong to the continuation a resume from an earlier one abandoned. Here the resumed
-    run's first save is a signal's, at iteration 12."""
+    """D-83, Q-149: the resumed run's first save drops the kept checkpoints of its iteration or
+    later, the continuation the resume from an earlier one abandoned: at 12 a signal's save,
+    at 15 the periodic save the abandoned run also made, then the signal's in place."""
     out = tmp_path / "run"
     keep = ("--checkpoint-every", 5, "--keep-checkpoints", 3)
     assert _train(run, out, "--config", run["config"], *keep) == 0
     assert _kept(out) == {"checkpoint": ITERATIONS, "checkpoint-10": 10, "checkpoint-15": 15}
-    _sigterm_at(monkeypatch, 12)
+    _sigterm_at(monkeypatch, stop)
     assert _train(run, out, "--resume", out / "checkpoint-10", *keep) == 128 + signal.SIGTERM
-    assert _kept(out) == {"checkpoint": 12, "checkpoint-10": 10}
+    assert _kept(out) == {"checkpoint": stop, "checkpoint-10": 10}
+
+
+def test_a_resume_of_a_finished_run_keeps_its_checkpoints(
+    run: dict[str, Path], tmp_path: Path
+) -> None:
+    """Q-149: resuming a checkpoint at T_it saves T_it again, in place, so the run directory's
+    checkpoints stay as they were."""
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, "--config", run["config"], *keep) == 0
+    assert _train(run, out, "--resume", out / "checkpoint", *keep) == 0
+    assert _kept(out) == {"checkpoint": ITERATIONS, "checkpoint-15": 15}
 
 
 @pytest.mark.parametrize(
@@ -596,12 +603,14 @@ def test_a_diverged_state_is_never_saved_periodically(
 ) -> None:
     """D-83, Q-133: every save checks the model and its statistics first, so a model that turns
     NaN before a periodic save is exit code 3, nothing is saved or renamed, and the earlier
-    checkpoint is untouched."""
+    checkpoint is untouched. The NaN comes after the shortened calendar's last event (17) and
+    the save at 18 is no log read (7, 14), so the trainer's own checks (Q-69) don't see it
+    first."""
     step = Trainer.step
 
     def late(self: Trainer) -> Any:
         log = step(self)
-        if self.iteration == 9:
+        if self.iteration == 17:
             with torch.no_grad():
                 self.model.means[0, 0] = float("nan")
         return log
@@ -609,9 +618,9 @@ def test_a_diverged_state_is_never_saved_periodically(
     monkeypatch.setattr(Trainer, "step", late)
     cfg = _config_file(tmp_path / "seven.json", _cfg(perf=PerfConfig(log_every=7)))
     out = tmp_path / "run"
-    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    keep = ("--checkpoint-every", 9, "--keep-checkpoints", 2)
     assert _train(run, out, "--config", cfg, *keep) == 3
-    assert _kept(out) == {"checkpoint": 5}
+    assert _kept(out) == {"checkpoint": 9}
 
 
 @pytest.mark.parametrize(

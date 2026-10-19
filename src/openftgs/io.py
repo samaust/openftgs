@@ -5,7 +5,7 @@ manifests (SceneManifest), and PLY files for viewers, with the validators of the
 init formats. Plain data in and out: this module imports neither openftgs.model nor
 openftgs.train.
 
-Spec: §2.2, D-30, D-34, D-73; Q-64. Band: Foundation (§2.1).
+Spec: §2.2, D-30, D-34, D-73, D-83; Q-64, Q-152. Band: Foundation (§2.1).
 """
 
 import hashlib
@@ -506,12 +506,27 @@ def _mtime(path: Path) -> float:
     return path.stat().st_mtime
 
 
-def _is_checkpoint(directory: Path) -> bool:
+def _checkpoint_manifest(directory: Path) -> dict[str, Any] | None:
+    """The manifest of a checkpoint directory, or None for anything else."""
     try:
         manifest = json.loads((directory / _MANIFEST).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
-    return isinstance(manifest, dict) and manifest.get("format") == _CKPT
+        return None
+    return manifest if isinstance(manifest, dict) and manifest.get("format") == _CKPT else None
+
+
+def _is_checkpoint(directory: Path) -> bool:
+    return _checkpoint_manifest(directory) is not None
+
+
+def _recover_set_aside(directory: Path) -> None:
+    """Q-25: recover from a save killed between its two renames, then sweep leftovers. The
+    newest set-aside checkpoint is the one a killed save left last."""
+    aside = sorted(directory.parent.glob(f".{directory.name}.old-*"), key=_mtime)
+    if not directory.exists() and aside and _is_checkpoint(aside[-1]):
+        aside.pop().rename(directory)
+    for leftover in [*aside, *directory.parent.glob(f".{directory.name}.tmp-*")]:
+        shutil.rmtree(leftover, ignore_errors=True)
 
 
 def save_checkpoint(state: TrainerState, directory: Path) -> Path:
@@ -541,13 +556,7 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
     for name, value in stats_tensors.items():
         if tuple(value.shape) != (n,):
             _fail(where, f"stats[{name!r}] must have shape [{n}], got {list(value.shape)}")
-    # Q-25: recover from a save killed between its two renames, then sweep leftovers.
-    # The newest set-aside checkpoint is the one a killed save left last.
-    aside = sorted(directory.parent.glob(f".{directory.name}.old-*"), key=_mtime)
-    if not directory.exists() and aside and _is_checkpoint(aside[-1]):
-        aside.pop().rename(directory)
-    for leftover in [*aside, *directory.parent.glob(f".{directory.name}.tmp-*")]:
-        shutil.rmtree(leftover, ignore_errors=True)
+    _recover_set_aside(directory)  # Q-25
     # Q-25: a save never deletes a directory that isn't a checkpoint.
     if directory.exists() and not directory.is_dir():
         _fail(where, "exists and is not a directory; refusing to replace it")
@@ -604,60 +613,63 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
 
 
 _LATEST = "checkpoint"  # D-83: the latest save of a run directory
-_EARLIER = re.compile(r"checkpoint-(0|[1-9][0-9]*)")  # Q-150: an earlier one, by its iteration
+# Q-150: an earlier save, named after its iteration in decimal as the rotation writes it.
+_EARLIER_NAME = re.compile(r"checkpoint-(0|[1-9][0-9]*)")
 
 
 def _iteration_of(directory: Path) -> int | None:
     """The iteration a checkpoint's manifest records, or None for anything else (Q-150)."""
-    try:
-        manifest = json.loads((directory / _MANIFEST).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(manifest, dict) or manifest.get("format") != _CKPT:
-        return None
-    iteration = manifest.get("iteration")
+    manifest = _checkpoint_manifest(directory)
+    iteration = None if manifest is None else manifest.get("iteration")
     return iteration if isinstance(iteration, int) and not isinstance(iteration, bool) else None
 
 
-def _kept_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
-    """Q-150: RUN_DIR/checkpoint, at the iteration its manifest records, and every
-    RUN_DIR/checkpoint-<n> that is a checkpoint, at n; ordered by iteration."""
-    kept: list[tuple[int, Path]] = []
-    latest = run_dir / _LATEST
-    iteration = _iteration_of(latest) if latest.is_dir() else None
-    if iteration is not None:
-        kept.append((iteration, latest))
+def _earlier_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
+    """Q-150: every RUN_DIR/checkpoint-<n> that is a checkpoint, with n, ordered by n."""
+    found: list[tuple[int, Path]] = []
     for path in run_dir.glob("checkpoint-*"):
-        match = _EARLIER.fullmatch(path.name)
+        match = _EARLIER_NAME.fullmatch(path.name)
         if match is not None and path.is_dir() and _is_checkpoint(path):
-            kept.append((int(match.group(1)), path))
-    return sorted(kept, key=lambda entry: (entry[0], entry[1] == latest))
+            found.append((int(match.group(1)), path))
+    return sorted(found)
 
 
 # D-83, Q-152: the saves of ftgs train, rotated through the run directory.
 def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) -> Path:
     """Save `state` as RUN_DIR/checkpoint with `save_checkpoint`, keeping the `keep` latest
-    saves of the run directory (D-83): the one before is renamed RUN_DIR/checkpoint-<its
-    iteration> when `keep` > 1, and the oldest beyond `keep` are removed once the new save is in
-    place (Q-151). Kept checkpoints of later iterations, a continuation abandoned by a resume
-    from an earlier one, are removed first; a save at the iteration RUN_DIR/checkpoint already
-    holds replaces it in place (Q-149). Only checkpoints are counted or removed (Q-150, Q-25).
-    Returns RUN_DIR/checkpoint."""
+    saves of the run directory, one per iteration (D-83): the previous latest is renamed
+    RUN_DIR/checkpoint-<its iteration> when `keep` > 1, and the oldest beyond `keep` are removed
+    once the new save is in place (Q-151). Kept checkpoints of the saved iteration or later, the
+    continuation a resume from an earlier one abandoned, are not kept: RUN_DIR/checkpoint is
+    replaced in place, the others removed first (Q-149). Only checkpoints are counted or
+    removed, and a rename onto anything else is refused with ValueError (Q-150, Q-25). A save
+    that fails puts the previous latest back. Returns RUN_DIR/checkpoint."""
     if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
         raise ValueError(f"keep must be an integer of at least 1, got {keep!r}")
     run_dir = Path(run_dir)
     latest = run_dir / _LATEST
-    for iteration, path in _kept_checkpoints(run_dir):
-        if iteration > state.iteration:  # D-83: an abandoned continuation
-            shutil.rmtree(path)
-    current = _iteration_of(latest) if latest.is_dir() else None
-    if current is not None and current != state.iteration and keep > 1:
-        earlier = run_dir / f"checkpoint-{current}"
-        if earlier.exists() and _is_checkpoint(earlier):
-            shutil.rmtree(earlier)  # the same iteration saved again: the newer copy wins
-        latest.rename(earlier)
-    save_checkpoint(state, latest)
-    for _, path in _kept_checkpoints(run_dir)[:-keep]:  # Q-151: after the new save
+    _recover_set_aside(latest)  # Q-25: a killed save's checkpoint is the latest again
+    abandoned = [p for it, p in _earlier_checkpoints(run_dir) if it >= state.iteration]  # Q-149
+    current = _iteration_of(latest)
+    renamed: Path | None = None
+    if current is not None and current < state.iteration and keep > 1:
+        renamed = run_dir / f"checkpoint-{current}"
+        if renamed.exists() or renamed.is_symlink():
+            if not (renamed.is_dir() and _is_checkpoint(renamed)):  # Q-150
+                raise ValueError(f"{renamed} exists and is not a checkpoint; refusing to rotate")
+            abandoned.append(renamed)  # Q-149: one save per iteration, the newer one kept
+    for path in abandoned:
+        shutil.rmtree(path)
+    if renamed is not None:
+        latest.rename(renamed)
+    try:
+        save_checkpoint(state, latest)  # atomic over a later or equal latest (Q-25, Q-149)
+    except BaseException:
+        if renamed is not None and not latest.exists():
+            renamed.rename(latest)
+        raise
+    earlier = _earlier_checkpoints(run_dir)
+    for _, path in earlier[: max(len(earlier) - (keep - 1), 0)]:  # Q-151: after the new save
         shutil.rmtree(path)
     return latest
 
