@@ -469,7 +469,7 @@ One of the five versioned public formats, each carrying `format` and `version`: 
 _Avoid_: pickle, .pt, PLY as an interface (it is export-only)
 
 **Exchange model**:
-The implementation-neutral content of a ftgs-if file: physical values in raw time units (position, time_center, duration, velocity, scale, rotation, opacity, sh) with the render conventions as metadata, so any implementation can import or export it. §2.2, §2.1 `ExchangeModel`
+The implementation-neutral content of a ftgs-if file: physical values in raw time units (position, time_center, duration, velocity, scale, rotation, opacity, sh) with the render conventions as metadata, the background its colors were trained against among them, so any implementation can import or export it. §2.2, §2.1 `ExchangeModel`, D-84
 _Avoid_: FTGS-IF as a noun, interchange model, export file, model file (ambiguous with checkpoint)
 
 **Checkpoint**:

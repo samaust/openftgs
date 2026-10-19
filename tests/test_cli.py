@@ -972,7 +972,8 @@ def _body(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def _assert_close(a: Any, b: Any, path: str = "body") -> None:
-    """Equal JSON trees, numbers within 1e-6 relative (or 1e-9 absolute)."""
+    """Equal JSON trees, floats within 1e-6 relative (U-22's render tolerance, Q-162) or 1e-9
+    absolute."""
     if isinstance(a, dict):
         assert isinstance(b, dict) and a.keys() == b.keys(), path
         for key in a:
@@ -981,7 +982,7 @@ def _assert_close(a: Any, b: Any, path: str = "body") -> None:
         assert isinstance(b, list) and len(a) == len(b), path
         for k, (x, y) in enumerate(zip(a, b, strict=True)):
             _assert_close(x, y, f"{path}[{k}]")
-    elif isinstance(a, float) and not isinstance(a, bool):
+    elif isinstance(a, float):
         assert b == pytest.approx(a, rel=1e-6, abs=1e-9), path
     else:
         assert a == b, path
@@ -1071,8 +1072,8 @@ def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) ->
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
     exported = tmp_path / "exported.json"
     assert _ftgs("eval", exchange, scene, "--out", exported) == 0
-    # The exchange model stores opacities and durations, not their logits, so its renders may
-    # differ from the checkpoint's in the last bits.
+    # Q-162: the exchange model stores opacities and durations, not their logits, so its
+    # renders match the checkpoint's within U-22's 1e-6, and the bodies are compared there.
     _assert_close(_body(json.loads(exported.read_text())), _body(got))
 
 
