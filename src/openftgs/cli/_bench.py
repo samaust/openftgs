@@ -41,13 +41,16 @@ from openftgs.cli import (
     _output,
     _scene,
 )
+from openftgs.cli import _environment as _environment_error
 
 if TYPE_CHECKING:
     from torch import Tensor
 
     from openftgs._stages import Timing
+    from openftgs.config import TrainConfig
     from openftgs.data import MultiViewVideo
     from openftgs.model import FreeTimeGaussians
+    from openftgs.train import StepLog, Trainer
     from openftgs.types import TimeNormalizer
 
 __all__ = ["add_parser", "run"]  # what `openftgs.cli` takes from this private module
@@ -611,10 +614,370 @@ def _slice(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-1: a training iteration by stage (§3.4, D-49, D-50; Q-168, Q-185) -----------------------
+
+# #226: N = 0.5M, 1M and 3M with 20 % of the rows active, and 3M at 5 % as the conservative case
+# for D-50, where rasterization does the least per row.
+_TRAIN_STEP_CASES: tuple[tuple[int, float], ...] = (
+    (500_000, 0.2),
+    (1_000_000, 0.2),
+    (3_000_000, 0.2),
+    (3_000_000, 0.05),
+)
+_EVENTS_FROM = 100  # #226: growth and relocation start at iteration 100
+_HEADROOM_PERCENT = 2  # #226: n_max = ⌈1.02·N⌉
+_TIMED = (121, 420)  # #226: the iterations timed by the stage clock, events included
+_UNCLOCKED = (421, 720)  # Q-185: whole iterations timed without the clock
+_BOUND_LIMIT_S = 3600.0  # §3.4 B-1: a full training run ≤ 60 min on an RTX 4090 (Q-168's bound)
+_SLICE_SHARE_LIMIT = 0.10  # D-50: the CUDA operator only above 10 % of an iteration
+_COPY_REPETITIONS = 50  # Q-72 note 5: copies of the relocation scores, after _WARMUP
+
+
+def _train_step_config(n: int, *, sh_degree: int = 3) -> TrainConfig:
+    """B-1's configuration for a model of `n` rows (#226): the default, LPIPS-VGG included,
+    except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and the SH bands
+    all open by iteration 4 (sh_interval = 1); `sh_degree` is the model's (Q-185)."""
+    import dataclasses
+
+    from openftgs.config import TrainConfig
+
+    base = TrainConfig()
+    n_max = -(-(100 + _HEADROOM_PERCENT) * n // 100)  # ⌈1.02·N⌉ in integers, so never one over
+    return dataclasses.replace(
+        base,
+        sh_degree=sh_degree,
+        growth=dataclasses.replace(base.growth, start=_EVENTS_FROM, n_max=n_max),
+        reloc=dataclasses.replace(base.reloc, start=_EVENTS_FROM),
+        optim=dataclasses.replace(base.optim, sh_interval=1),
+    )
+
+
+# The backward stage in three parts, split by its two points (`openftgs._stages.POINTS`): every
+# loss's backward, then the rasterization's (projection and SH included), then the temporal
+# slice's, until `backward()` returns.
+_BACKWARD_PARTS = ("backward.losses", "backward.raster", "backward.slice")
+
+
+def _iteration_parts(timings: Sequence[Timing]) -> list[dict[str, float]]:
+    """One dict per `iteration` record, in order, from the records of a stage clock: each
+    stage's seconds in that iteration, and the three parts of its backward stage when both
+    points fired. Records belong to the last iteration that began before them (by `index`), so
+    the points recorded on the autograd thread fall in their own iteration."""
+    from openftgs._stages import POINTS
+
+    groups: list[list[Timing]] = []
+    for timing in sorted(timings, key=lambda t: t.index):
+        if timing.name == "iteration":
+            groups.append([])
+        if groups:
+            groups[-1].append(timing)
+    parts: list[dict[str, float]] = []
+    for group in groups:
+        seconds: dict[str, float] = {}
+        points: dict[str, float] = {}
+        backward: Timing | None = None
+        for timing in group:
+            if timing.name in POINTS:
+                points[timing.name] = timing.start
+                continue
+            seconds[timing.name] = seconds.get(timing.name, 0.0) + timing.seconds
+            if timing.name == "backward":
+                backward = timing
+        if backward is not None and set(POINTS) <= set(points):
+            losses, raster = points["backward.losses_done"], points["backward.raster_done"]
+            seconds["backward.losses"] = losses - backward.start
+            seconds["backward.raster"] = raster - losses
+            seconds["backward.slice"] = backward.end - raster
+        parts.append(seconds)
+    return parts
+
+
+def _training_bound(iteration_s: float, event_s: float) -> tuple[float, int, int]:
+    """Q-168's upper bound on a default training run, with T_it and the number of events of the
+    default calendar (§1.3): T_it × `iteration_s` + events × `event_s`, where `event_s` is what
+    an event iteration takes beyond an iteration without one."""
+    from openftgs.config import TrainConfig
+    from openftgs.train import calendar_entry
+
+    cfg = TrainConfig()
+    iterations = cfg.optim.iterations
+    events = 0
+    for it in range(1, iterations + 1):
+        entry = calendar_entry(cfg, it)
+        events += entry.event or entry.reset_opacity
+    return iterations * iteration_s + events * event_s, iterations, events
+
+
+def _stage_figures(
+    parts: Sequence[dict[str, float]], *, events: Sequence[bool]
+) -> dict[str, dict[str, float]]:
+    """§3.4 B-1 (#226): per stage, over the iterations without an event in which it ran, the
+    mean and median seconds, the count, and its share of an iteration, the ratio of its mean to
+    the mean iteration (Q-185)."""
+    quiet = [p for p, event in zip(parts, events, strict=True) if not event]
+    iteration = statistics.fmean(p["iteration"] for p in quiet)
+    names = dict.fromkeys(name for p in quiet for name in p)  # first-seen order
+    figures: dict[str, dict[str, float]] = {}
+    for name in names:
+        values = [p[name] for p in quiet if name in p]
+        mean = statistics.fmean(values)
+        figures[name] = {
+            "mean_s": mean,
+            "median_s": _median(values),
+            "share": mean / iteration,
+            "count": len(values),
+        }
+    return figures
+
+
+def _is_event(cfg: TrainConfig, it: int) -> bool:
+    """Whether iteration `it` of `cfg`'s calendar runs an event (`Trainer.step`'s `_event`)."""
+    from openftgs.train import calendar_entry
+
+    entry = calendar_entry(cfg, it)
+    return entry.event or entry.reset_opacity
+
+
+def _fractions(trainer: Trainer, video: MultiViewVideo, logs: Sequence[StepLog]) -> list[float]:
+    """The shares of the rows that pass the opacity cull (active, D-32) and that are visible in
+    the image (E6), averaged over the images and times of `logs`, on the trainer's model as it is
+    now, without gradients (Q-185)."""
+    import torch
+
+    from openftgs.render import render
+
+    model = trainer.model
+    totals = torch.zeros(2, dtype=torch.float64, device=model.means.device)
+    with torch.no_grad():
+        for log in logs:
+            camera = video.records[log.image_index].camera
+            out = render(
+                model,
+                camera,
+                log.t,
+                time_units="normalized",
+                sh_degree=log.sh_degree,
+                backend="gsplat",
+                return_aux=True,
+            )
+            assert out.visible is not None  # return_aux
+            totals[0] += model.at_time(log.t).passes_cull.double().mean()
+            totals[1] += out.visible.double().mean()
+    return [float(v) / len(logs) for v in totals.tolist()]
+
+
+def _score_copy(n: int) -> float:
+    """Q-72 note 5: the median wall time of copying N float32 sampling scores from the GPU to
+    the CPU, as relocation does before its CPU generator draws the targets; the copy
+    synchronizes, as an event does anyway."""
+    import torch
+
+    scores = torch.rand(n, device="cuda")
+    times: list[float] = []
+    for k in range(_WARMUP + _COPY_REPETITIONS):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        scores.to("cpu")
+        if k >= _WARMUP:
+            times.append(time.perf_counter() - start)
+    return _median(times)
+
+
+def _train_step_case(
+    ctx: _Context, case: dict[str, Any], model: FreeTimeGaussians
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """One B-1 case: a trainer on `model` with B-1's configuration, iterations 1 to 120 as a
+    warm-up, 121 to 420 under the stage clock and 421 to 720 without it (Q-185). Returns the
+    case's per-stage and per-event entries, and its summary figures."""
+    import gc
+
+    import torch
+
+    from openftgs._stages import Clock
+    from openftgs.train import Trainer
+
+    cfg = _train_step_config(model.num_gaussians, sh_degree=model.sh_degree)
+    given = f"model {ctx.args.model}" if ctx.model is not None else f"scene {ctx.args.scene}"
+    # A model of another scene's time can't train on this one; the LPIPS weights may download.
+    with _environment_error("LPIPS networks"), _as_input_error(given):
+        trainer = Trainer(cfg, ctx.video, model, device="cuda")
+    del model
+    n_start = trainer.model.num_gaussians
+    first, last = _TIMED
+    while trainer.iteration < first - 1:
+        trainer.step()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    n_timed_start = trainer.model.num_gaussians
+    logs: list[StepLog] = []
+    with Clock("cuda") as clock:
+        while trainer.iteration < last:
+            logs.append(trainer.step())
+    timings = clock.read()  # synchronizes, after the last timed iteration
+    peaks = torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+    n_end = trainer.model.num_gaussians
+    active, visible = _fractions(trainer, ctx.video, logs)
+
+    # Q-185: the stage clock costs host time per stage, which shows where an iteration is
+    # host-bound; whole iterations timed by one pair of events each, without it, measure that.
+    marks: list[tuple[int, Any, Any]] = []
+    while trainer.iteration < _UNCLOCKED[1]:
+        start = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        end = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        start.record()
+        iteration = trainer.step().iteration
+        end.record()
+        marks.append((iteration, start, end))
+    torch.cuda.synchronize()
+    unclocked = [(it, start.elapsed_time(end) / 1000.0) for it, start, end in marks]
+    copy_s = _score_copy(trainer.model.num_gaussians)
+    del trainer, marks
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    parts = _iteration_parts(timings)
+    if len(parts) != len(logs):
+        raise RuntimeError(f"the stage clock holds {len(parts)} iterations, not {len(logs)}")
+    events = [_is_event(cfg, log.iteration) for log in logs]
+    stages = _stage_figures(parts, events=events)
+    entries = [
+        {"case": {**case, "stage": name}, "figures": figures} for name, figures in stages.items()
+    ]
+    event_parts = [(log, part) for log, part, ev in zip(logs, parts, events, strict=True) if ev]
+    for log, part in event_parts:
+        figures = {
+            "events_s": part["events"],
+            "iteration_s": part["iteration"],
+            "n_after": log.num_gaussians,
+        }
+        entries.append({"case": {**case, "iteration": log.iteration}, "figures": figures})
+
+    iteration_s = stages["iteration"]["mean_s"]
+    quiet = [s for it, s in unclocked if not _is_event(cfg, it)]
+    loud = [s for it, s in unclocked if _is_event(cfg, it)]
+    unclocked_s = statistics.fmean(quiet)
+    if loud:  # what an event iteration takes beyond one without an event
+        event_extra_s = statistics.fmean(loud) - unclocked_s
+    else:
+        event_extra_s = statistics.fmean(p["iteration"] for _, p in event_parts) - iteration_s
+    bound, _, _ = _training_bound(unclocked_s, event_extra_s)
+    slice_s = stages["slice.kernel"]["mean_s"] + stages["backward.slice"]["mean_s"]
+    summary = {
+        "iterations": stages["iteration"]["count"],
+        "slice_forward_s": stages["slice.kernel"]["mean_s"],
+        "slice_backward_s": stages["backward.slice"]["mean_s"],
+        "slice_share": slice_s / iteration_s,  # D-50
+        "iteration_unclocked_mean_s": unclocked_s,
+        "iteration_unclocked_median_s": _median(quiet),
+        "unclocked_iterations": len(quiet),
+        "clock_overhead_s": iteration_s - unclocked_s,
+        "events_s": statistics.fmean(p["events"] for _, p in event_parts),
+        "event_iteration_s": statistics.fmean(p["iteration"] for _, p in event_parts),
+        "event_extra_s": event_extra_s,
+        "training_bound_s": bound,
+        "peak_allocated_bytes": peaks[0],
+        "peak_reserved_bytes": peaks[1],
+        "active_fraction": active,
+        "visible_fraction": visible,
+        "n_start": n_start,
+        "n_timed_start": n_timed_start,
+        "n_end": n_end,
+        "score_copy_s": copy_s,
+    }
+    return entries, summary
+
+
+def _train_step(ctx: _Context) -> _Result:
+    """B-1: a training iteration by stage, from the stage clock's CUDA events, on synthesized
+    models of 0.5M, 1M and 3M rows with 20 % active and 3M with 5 % (Q-168, Q-181), or on the
+    model given with `--model` (Q-167); with peak memory, the events, and a bound on a default
+    training run (Q-168); and D-50's share of the temporal slice (#226, Q-185)."""
+    import functools
+
+    from openftgs._stages import STAGES
+    from openftgs.data import FrameCache
+
+    with _as_input_error(f"frame cache of {ctx.args.scene}", OSError):
+        FrameCache.build(ctx.video)  # #226: built before timing, so "auto" only opens it
+    makers: list[tuple[dict[str, Any], Callable[[], FreeTimeGaussians]]] = []
+    if ctx.model is not None:
+        given = ctx.model.model
+        listed: list[list[Any]] = [[given.num_gaussians, None]]
+        makers.append(({"model": "given", "n": given.num_gaussians}, lambda: given))
+    else:
+        with _as_input_error(f"scene manifest {ctx.args.scene}"):
+            volume = _volume(ctx.video)
+        listed = [[n, active] for n, active in _TRAIN_STEP_CASES]
+        for n, active in _TRAIN_STEP_CASES:
+            synthesize = functools.partial(
+                _synthesize, volume, n, active=active, seed=_SEED, device="cuda"
+            )
+            makers.append(({"n": n, "active": active}, synthesize))
+
+    cases: list[dict[str, Any]] = []
+    summaries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for case, make in makers:
+        entries, summary = _train_step_case(ctx, case, make())
+        cases += entries
+        cases.append({"case": case, "figures": summary})
+        summaries.append((case, summary))
+
+    # The bound (Q-168) from the largest N, and among equal N the slowest; D-50's share from the
+    # case where the slice takes the largest share (#226).
+    case, summary = max(summaries, key=lambda s: (s[0]["n"], s[1]["training_bound_s"]))
+    budgets = [_budget(case, summary, "training_bound_s", _BOUND_LIMIT_S, "bound")]
+    case, summary = max(summaries, key=lambda s: s[1]["slice_share"])
+    budgets.append(_budget(case, summary, "slice_share", _SLICE_SHARE_LIMIT, "limit"))
+
+    any_cfg = _train_step_config(1)  # the events don't depend on N
+    _, iterations, events = _training_bound(0.0, 0.0)
+    first, last = _TIMED
+    setup = {
+        "model": "given (--model)" if ctx.model is not None else "synthesized (Q-168, Q-181)",
+        "seed": None if ctx.model is not None else _SEED,
+        "cases": listed,
+        "configuration": (
+            "the default, LPIPS-VGG included, except growth.start = reloc.start = "
+            f"{_EVENTS_FROM}, growth.n_max = ⌈1.02·N⌉, optim.sh_interval = 1, and the "
+            "model's SH degree"
+        ),
+        "frame_cache": 'built before timing; placement "auto"',
+        "warmup": first - 1,
+        "timed": [first, last],
+        "unclocked": list(_UNCLOCKED),
+        "events": [it for it in range(first, last + 1) if _is_event(any_cfg, it)],
+        "clock": "CUDA events (openftgs._stages), read after the last timed iteration",
+        "stages": list(STAGES[: STAGES.index("log") + 1]),
+        "backward_parts": list(_BACKWARD_PARTS),
+        "figures": "per stage over the iterations without an event; shares are ratios of means",
+        "training_iterations": iterations,
+        "default_events": events,
+        "bound_limit_s": _BOUND_LIMIT_S,
+        "slice_share_limit": _SLICE_SHARE_LIMIT,
+        "copy_repetitions": _COPY_REPETITIONS,
+    }
+    return _Result(setup, cases, budgets)
+
+
+def _budget(
+    case: dict[str, Any], figures: dict[str, Any], figure: str, limit: float, kind: str
+) -> dict[str, Any]:
+    """A budget entry of BENCH.json (Q-166, Q-180) for one figure of one case."""
+    value = figures[figure]
+    return {
+        "case": case,
+        "figure": figure,
+        "limit": limit,
+        "value": value,
+        "pass": value <= limit,
+        "kind": kind,
+    }
+
+
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
-    "train-step": _Benchmark("B-1", 226, model=True),
+    "train-step": _Benchmark("B-1", 226, _train_step, model=True),
     "raster": _Benchmark("B-2", 227),
     "slice": _Benchmark("B-3", 225, _slice),
     "losses": _Benchmark("B-4", 228),
