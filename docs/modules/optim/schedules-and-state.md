@@ -23,6 +23,8 @@ D-53 names the kinds, which `PerfConfig.adam` selects and the trainer passes to 
 - **foreach**: PyTorch's multi-tensor Adam.
 - **selective**: gsplat's Selective Adam, an approximate option. It needs CUDA, and `step` takes the visible rows as a bool mask (Q-44). gsplat's kernel never advances the step counter, so the optimizer advances it itself and the counter always counts the steps taken; a resume under another kind then applies the right bias correction (Q-45). The kernel takes its hyperparameters as float32, which is why U-31's float64 reference is fed the float32 values (Q-47).
 
+B-5 (`ftgs bench adam`, `docs/modules/cli/benchmarks.md`) times `set_iteration` plus `step` for each kind. On kitchen's synthesized models (Calibration data, #229) fused Adam takes 2.05 ms at 1M rows and 6.03 ms at 3M, 45 % of foreach's 4.51 and 13.56 ms, so §3.4's budget, fused no slower than foreach, holds and fused stays the default. Selective Adam, with 17 % of the rows visible, takes 0.67 and 2.00 ms, a third of fused's time, but stays opt-in because it is approximate (D-53). U-31 passes under these defaults, on the CPU and on the GPU.
+
 ## State, moment reset and resize
 
 The Adam moments and step counters are created when the optimizer is built, zero, where PyTorch would put them (the step counter on the parameter's device for fused Adam, on the CPU otherwise). PyTorch then uses them as its own, and a moment reset, a resize or a checkpoint works before the first step (Q-45).

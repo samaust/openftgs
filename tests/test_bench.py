@@ -2,7 +2,8 @@
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
-D-50, Q-13), and the seeded model synthesizer of the benchmark setups (Q-168).
+D-50, Q-13), B-5 (`bench adam`; D-53, Q-188), and the seeded model synthesizer of the
+benchmark setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
 tests do (Q-125); the benchmarks themselves run only on a GPU.
@@ -843,3 +844,151 @@ def test_b1_takes_a_model(train_step_model_bench: dict[str, Any]) -> None:
     assert cases[(("model", "given"), ("n", 64), ("stage", "loss.perceptual"))]["count"] == 297
     bound = next(b for b in body["budgets"] if b["kind"] == "bound")
     assert bound["case"] == {"model": "given", "n": 64}
+
+
+# B-5, `ftgs bench adam` (§3.4, D-53; Q-168, Q-188): private tests of selective Adam's mask,
+# the seeded gradients and the budget entries, which run on the CPU.
+
+
+@pytest.mark.parametrize(
+    ("n", "fraction", "rows"), [(1000, 0.173, 173), (999, 0.17, 170), (20, 0.05, 1), (7, 1.0, 7)]
+)
+def test__visibility_holds_exactly_the_fraction_of_rows_seeded(
+    n: int, fraction: float, rows: int
+) -> None:
+    """Q-188: selective Adam's mask is a bool [N] with exactly round(f·N) rows true, chosen
+    by a seeded permutation: the same rows for the same seed, others for another."""
+    from openftgs.cli._bench import _visibility
+
+    mask = _visibility(n, fraction, seed=0, device="cpu")
+    assert mask.dtype == torch.bool and tuple(mask.shape) == (n,)
+    assert int(mask.sum()) == rows
+    assert torch.equal(mask, _visibility(n, fraction, seed=0, device="cpu"))
+    if rows < n:
+        assert not torch.equal(mask, _visibility(n, fraction, seed=1, device="cpu"))
+
+
+def test__visibility_spreads_the_rows_over_the_tensor() -> None:
+    """Q-188: the visible rows are spread at random, as a render leaves them, not one block:
+    each tenth of 100,000 rows holds the fraction within 0.01."""
+    from openftgs.cli._bench import _visibility
+
+    mask = _visibility(100_000, 0.17, seed=0, device="cpu")
+    for part in mask.view(10, -1):
+        assert abs(float(part.double().mean()) - 0.17) <= 0.01
+
+
+def test__seed_gradients_sets_all_nine_stored_tensors_seeded() -> None:
+    """#229, Q-188: "seeded gradients on all nine stored tensors", N(0, 1) and shaped as each
+    tensor: the same for the same seed, others for another."""
+    from openftgs.cli._bench import _seed_gradients
+
+    model = random_model(2000, seed=0, sh_degree=3)
+    _seed_gradients(model, seed=0)
+    first = {name: getattr(model, name).grad.clone() for name in PARAM_NAMES}
+    for name in PARAM_NAMES:
+        param = getattr(model, name)
+        assert first[name].shape == param.shape and first[name].dtype == param.dtype, name
+        assert first[name].device == param.device, name
+    every = torch.cat([g.flatten() for g in first.values()]).double()
+    assert abs(float(every.mean())) < 0.02 and abs(float(every.std()) - 1.0) < 0.02
+    _seed_gradients(model, seed=0)
+    for name in PARAM_NAMES:
+        torch.testing.assert_close(getattr(model, name).grad, first[name], rtol=0.0, atol=0.0)
+    _seed_gradients(model, seed=1)
+    grad = model.means.grad
+    assert grad is not None and not torch.equal(grad, first["means"])
+
+
+def test__adam_budgets_hold_fused_no_slower_than_foreach_at_each_n() -> None:
+    """§3.4 B-5's budget, "fused no slower than foreach" (Q-188, Q-180): per N a case
+    `{"n"}` with fused's median over foreach's, and a budget entry setting it against 1.0 that
+    passes at exactly 1.0, with no tolerance, and fails above it; selective Adam has no budget."""
+    from openftgs.cli._bench import _adam_budgets
+
+    medians = {
+        ("fused", 10): 0.5,
+        ("foreach", 10): 0.5,
+        ("selective", 10): 0.125,
+        ("fused", 20): 0.75,
+        ("foreach", 20): 0.5,
+        ("selective", 20): 0.25,
+        ("fused", 30): 0.25,
+        ("foreach", 30): 0.5,
+        ("selective", 30): 0.25,
+    }
+    cases, budgets = _adam_budgets(medians)
+    assert cases == [
+        {"case": {"n": 10}, "figures": {"fused_over_foreach": 1.0}},
+        {"case": {"n": 20}, "figures": {"fused_over_foreach": 1.5}},
+        {"case": {"n": 30}, "figures": {"fused_over_foreach": 0.5}},
+    ]
+    expected = [(10, 1.0, True), (20, 1.5, False), (30, 0.5, True)]
+    assert budgets == [
+        {
+            "case": {"n": n},
+            "figure": "fused_over_foreach",
+            "limit": 1.0,
+            "value": value,
+            "pass": passed,
+            "kind": "budget",
+        }
+        for n, value, passed in expected
+    ]
+
+
+# B-5 run on the small scene with reduced sizes, once for the test below.
+
+ADAM_CASES = ((300, 0.17), (400, 0.5))
+ADAM_KINDS = ("fused", "foreach", "selective")
+
+
+@pytest.fixture(scope="module")
+def adam_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench") / "B-5.json"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("openftgs.cli._bench._ADAM_CASES", ADAM_CASES)
+        assert _ftgs("bench", "adam", scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@pytest.mark.gpu
+def test_b5_times_each_adam_kind_at_each_n_and_holds_fused_against_foreach(
+    adam_bench: dict[str, Any],
+) -> None:
+    """§3.4 B-5 (D-53; #229, Q-188): `set_iteration` plus `step` of fused, foreach and
+    selective Adam at each N, with seeded gradients on all nine stored tensors, the median of 50
+    calls after a warm-up; selective Adam's mask at the visible fraction given for that N; per N
+    the budget "fused no slower than foreach" as fused's median over foreach's against 1.0,
+    which doesn't change the exit code (Q-166)."""
+    body = adam_bench
+    assert body["benchmark"] == "B-5"
+    assert body["command"][:3] == ["ftgs", "bench", "adam"]
+    setup = body["setup"]
+    assert setup["cases"] == [list(c) for c in ADAM_CASES]
+    assert setup["kinds"] == list(ADAM_KINDS)
+    assert (setup["warmup"], setup["repetitions"]) == (10, 50)
+    cases = _cases_by(body)
+    for n, fraction in ADAM_CASES:
+        for kind in ADAM_KINDS:
+            figures = cases[(("adam", kind), ("n", n))]
+            assert figures["repetitions"] == 50, (kind, n)
+            assert 0.0 < figures["step_s"] < 1.0 and figures["first_call_s"] > 0.0, (kind, n)
+            assert figures["peak_allocated_bytes"] > 0, (kind, n)
+        selective = cases[(("adam", "selective"), ("n", n))]
+        assert selective["visible_fraction"] == round(fraction * n) / n
+        fused = cases[(("adam", "fused"), ("n", n))]["step_s"]
+        foreach = cases[(("adam", "foreach"), ("n", n))]["step_s"]
+        assert cases[(("n", n),)]["fused_over_foreach"] == pytest.approx(fused / foreach)
+    assert body["budgets"] == [
+        {
+            "case": {"n": n},
+            "figure": "fused_over_foreach",
+            "limit": 1.0,
+            "value": cases[(("n", n),)]["fused_over_foreach"],
+            "pass": cases[(("n", n),)]["fused_over_foreach"] <= 1.0,
+            "kind": "budget",
+        }
+        for n, _ in ADAM_CASES
+    ]
