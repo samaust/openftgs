@@ -569,7 +569,13 @@ class Trainer:
         """Training image `index` on the device: from the frame cache when there is one, bitwise
         what `MultiViewVideo.load_image` decodes (D-51)."""
         if self._frames is None:
-            return self._dataset.load_image(index).to(self._device)
+            image = self._dataset.load_image(index)
+            if self._device.type != "cuda":
+                return image.to(self._device)
+            # §2.4 rule 3, D-51: a copy from pageable memory blocks the host, so the decoded image
+            # is staged in pinned memory and sent without blocking; PyTorch's pinned allocator
+            # keeps the staging block until the copy is done. The bytes are copied as they are.
+            return image.pin_memory().to(self._device, non_blocking=True)
         image = self._frames.take(index)
         self._schedule()
         return image
