@@ -2,29 +2,46 @@
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
-D-50, Q-13), B-5 (`bench adam`; D-53, Q-188), B-6 (`bench data`; D-51, Q-99, Q-178,
-Q-189), B-7 (`bench render`; D-55, Q-174, Q-T231.1, Q-T231.2), and the seeded model
-synthesizer of the benchmark setups (Q-168).
+D-50, Q-13), B-4 (`bench losses`; D-52, Q-173, Q-190), B-5 (`bench adam`; D-53, Q-188),
+B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), B-7 (`bench render`; D-55, Q-174, Q-T231.1,
+Q-T231.2), B-8 (`bench init` and `bench convert`; D-48,
+D-56, D-81, Q-169, Q-192, Q-193), and the seeded model synthesizer of the benchmark
+setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
-tests do (Q-125); the benchmarks themselves run only on a GPU.
+tests do (Q-125); the benchmarks themselves run only on a GPU, except `convert`.
 """
 
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
+import math
 import platform
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import pytest
 import torch
-from builders import look_at, random_model, ring, write_scene
+from builders import (
+    TexturedPlane,
+    look_at,
+    n3dv_source,
+    random_model,
+    ring,
+    write_plane_scene,
+    write_scene,
+)
 
 from openftgs.cli import main
-from openftgs.io import write_exchange
+from openftgs.data import convert_n3dv
+from openftgs.io import read_scene_manifest, write_exchange
 from openftgs.types import TimeNormalizer
 
 TIME = TimeNormalizer(0.0, 2.0 / 30.0)  # three frames at 30 FPS
@@ -350,13 +367,13 @@ def test__b7_times_spread_a_request_of_k_times_over_the_scene() -> None:
     """Q-T231.1: a request of k times takes the timestamps round(j(F − 1)/(k − 1)), rounded half
     up, j = 0 … k − 1, and the middle one for k = 1; the swept sizes are 1, 2, 3, 4, 6, 8, 12,
     16, 24, 32, 48, 64 and 128 below F, then F."""
-    from openftgs.cli._bench import _request_sizes, _spread
+    from openftgs.cli._bench import _request_sizes, _spread_times
 
-    assert _spread(300, 1) == [149]
-    assert _spread(300, 2) == [0, 299]
-    assert _spread(300, 3) == [0, 150, 299]  # 149.5 rounds up
-    assert _spread(300, 4) == [0, 100, 199, 299]
-    assert _spread(5, 5) == [0, 1, 2, 3, 4]
+    assert _spread_times(300, 1) == [149]
+    assert _spread_times(300, 2) == [0, 299]
+    assert _spread_times(300, 3) == [0, 150, 299]  # 149.5 rounds up
+    assert _spread_times(300, 4) == [0, 100, 199, 299]
+    assert _spread_times(5, 5) == [0, 1, 2, 3, 4]
     assert _request_sizes(300) == [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 300]
     assert _request_sizes(3) == [1, 2, 3]
     assert _request_sizes(1) == [1]
@@ -1316,6 +1333,439 @@ def test_b6_skips_the_gpu_placement_where_auto_would_not_choose_it(
     want = {"n": DATA_N, "placement": "mmap", "prefetch": 8}
     assert [c["case"] for c in body["cases"]] == [want]
     assert [b["case"] for b in body["budgets"]] == [want]
+
+
+# B-4, `ftgs bench losses` (§3.4, D-52; Q-42, Q-172, Q-173, Q-190): private tests of its
+# input images, of bf16's deviation figures and of the gains its turn-on rule reads.
+
+
+def test__loss_images_resize_the_first_training_image_and_add_seeded_noise(scene: Path) -> None:
+    """Q-190: the target is the scene's first training image resized to the benchmark size
+    (here 48×32 up to 96×80), [H, W, 3] float32; the prediction adds Gaussian noise of σ 0.05
+    drawn from a seeded generator, so the same seed gives the same pair."""
+    from openftgs.cli._bench import _loss_images
+    from openftgs.data import MultiViewVideo
+
+    video = MultiViewVideo.from_manifest(scene)
+    gt, pred = _loss_images(video, 96, 80, seed=0, device="cpu")
+    assert gt.shape == pred.shape == (80, 96, 3)
+    assert gt.dtype == pred.dtype == torch.float32
+    assert gt.is_contiguous() and pred.is_contiguous()
+    noise = pred - gt
+    assert abs(float(noise.std()) - 0.05) < 0.005 and abs(float(noise.mean())) < 0.005
+    again = _loss_images(video, 96, 80, seed=0, device="cpu")
+    assert torch.equal(again[0], gt) and torch.equal(again[1], pred)
+    assert not torch.equal(_loss_images(video, 96, 80, seed=1, device="cpu")[1], pred)
+    first = next(i for i, r in enumerate(video.records) if r.split == "train")
+    native = video.load_image(first)
+    height, width = native.shape[:2]
+    same, _ = _loss_images(video, width, height, seed=0, device="cpu")
+    assert torch.equal(same, native)  # at its own size, the image is not resampled
+
+
+def test__deviation_compares_value_and_gradient_with_ieee() -> None:
+    """Q-190: bf16's (and TF32's) deviation from IEEE float32: the relative difference of
+    the values, the gradients' relative L2 difference, and their largest difference over the
+    largest IEEE gradient element; worked by hand."""
+    from openftgs.cli._bench import _deviation
+
+    reference = torch.tensor([[3.0, -4.0]])
+    figures = _deviation(
+        torch.tensor(1.25), torch.tensor([[3.0, -4.5]]), torch.tensor(1.0), reference
+    )
+    assert figures == {
+        "value": 1.25,
+        "value_ieee": 1.0,
+        "value_relative": 0.25,
+        "gradient_relative_l2": 0.1,  # ‖(0, −0.5)‖ / ‖(3, −4)‖
+        "gradient_max_relative": 0.125,  # 0.5 / 4
+    }
+
+
+def test__comparison_gives_the_median_gain_of_a_variant() -> None:
+    """Q-173, Q-190: a variant's gain over its baseline is 1 − its median forward plus
+    backward over the baseline's: positive when the variant is faster."""
+    from openftgs.cli._bench import _comparison
+
+    assert _comparison({"forward_backward_s": 0.2}, {"forward_backward_s": 0.15}) == {
+        "baseline_s": 0.2,
+        "variant_s": 0.15,
+        "gain": pytest.approx(0.25, rel=1e-12),
+    }
+    slower = _comparison({"forward_backward_s": 0.1}, {"forward_backward_s": 0.125})
+    assert slower["gain"] == pytest.approx(-0.25, rel=1e-12)
+
+
+# B-4 itself, at two small sizes (VGG takes 16 px and more, source log 67; SSIM's valid window
+# 11) and 3 repetitions, so the test runs in seconds.
+LOSS_SIZES = ((64, 48), (80, 64))
+LOSS_REPETITIONS = 3
+PRECISIONS = ("ieee", "tf32", "bf16")
+LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
+COMPARISONS = {  # Q-190: (baseline, variant) as (precision, layout, autotuning)
+    "autotuning": (("tf32", "channels_last_inputs", False), ("tf32", "channels_last_inputs", True)),
+    "channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", "channels_last_inputs_and_weights", False),
+    ),
+    "autotuning_and_channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", "channels_last_inputs_and_weights", True),
+    ),
+    "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
+    "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
+}
+
+
+@pytest.fixture(scope="module")
+def losses_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench-losses") / "B-4.json"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("openftgs.cli._bench._LOSS_SIZES", LOSS_SIZES)
+        patch.setattr("openftgs.cli._bench._LOSS_REPETITIONS", LOSS_REPETITIONS)
+        assert _ftgs("bench", "losses", scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+def _lpips_case(width: int, height: int, precision: str, layout: str, autotuning: bool) -> Any:
+    case = {"loss": "lpips_vgg", "width": width, "height": height, "precision": precision}
+    case |= {"layout": layout, "autotuning": autotuning}
+    return tuple(sorted(case.items()))
+
+
+def _timed_figures_are_consistent(figures: dict[str, Any]) -> None:
+    assert figures["repetitions"] == LOSS_REPETITIONS
+    for name in ("forward_backward_s", "forward_s", "backward_s", "first_call_s"):
+        assert figures[name] > 0.0, name
+    # Each call's span holds its forward and its backward, so the medians keep that order.
+    assert figures["forward_backward_s"] >= max(figures["forward_s"], figures["backward_s"])
+    assert figures["peak_memory_bytes"] > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str, Any]) -> None:
+    """§3.4 B-4 (D-52; Q-190): LPIPS-VGG's forward and the prediction's backward for each of
+    {IEEE, TF32, bf16} × {NCHW, channels-last inputs, channels-last inputs and weights} ×
+    autotuning off and on; SSIM through fused-ssim, when it imports, and through the PyTorch
+    path, timed where fused-ssim can't be imported (PRD #220), with autotuning off and on; at
+    each size. Each autotuning setting runs in its own child process, since cuDNN's algorithm
+    cache would carry one setting's picks into the other. B-4 has no budget (§3.4: it sets
+    D-52's defaults)."""
+    import importlib.util
+
+    body = losses_bench
+    assert body["benchmark"] == "B-4" and body["budgets"] == []
+    assert body["command"][:3] == ["ftgs", "bench", "losses"]
+    setup = body["setup"]
+    assert setup["sizes"] == [list(size) for size in LOSS_SIZES]
+    assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
+    assert setup["precisions"] == list(PRECISIONS) and setup["layouts"] == list(LAYOUTS)
+    assert setup["training_layout"] == "channels_last_inputs"
+    fused = importlib.util.find_spec("fused_ssim") is not None
+    assert setup["fused_ssim"] == fused
+    assert "one child process per autotuning setting" in setup["processes"]
+    assert "fused_ssim can't be imported" in setup["processes"]
+    cases = _cases_by(body)
+    for width, height in LOSS_SIZES:
+        for precision in PRECISIONS:
+            for layout in LAYOUTS:
+                for autotuning in (False, True):
+                    key = _lpips_case(width, height, precision, layout, autotuning)
+                    _timed_figures_are_consistent(cases[key])
+        for autotuning in (False, True):
+            torch_case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
+            torch_case |= {"precision": "tf32", "autotuning": autotuning}
+            _timed_figures_are_consistent(cases[tuple(sorted(torch_case.items()))])
+        fused_key = (("height", height), ("loss", "ssim"), ("path", "fused"), ("width", width))
+        assert (fused_key in cases) == fused
+        if fused:
+            _timed_figures_are_consistent(cases[fused_key])
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b4_records_bf16s_deviation_and_the_gains_of_its_comparisons(
+    losses_bench: dict[str, Any],
+) -> None:
+    """§3.4 B-4, D-52, Q-173 (Q-190): bf16's and TF32's deviation from IEEE float32 in value
+    and gradient at each size, bf16's within the 5e-2 the bf16 step test allows; each
+    comparison's gain, 1 − variant / baseline of the medians, at each size, and whether its
+    smallest gain reaches Q-173's 3 %; fused-ssim's gain over the PyTorch path."""
+    import importlib.util
+
+    cases = _cases_by(losses_bench)
+    for width, height in LOSS_SIZES:
+        for precision in ("tf32", "bf16"):
+            key = (("deviation", precision), ("height", height), ("width", width))
+            figures = cases[key]
+            assert figures["value_ieee"] > 0.0
+            for name in ("value_relative", "gradient_relative_l2", "gradient_max_relative"):
+                assert 0.0 <= figures[name] < float("inf"), name
+        bf16 = cases[(("deviation", "bf16"), ("height", height), ("width", width))]
+        assert 0.0 < bf16["value_relative"] < 5e-2
+    for name, (base, variant) in COMPARISONS.items():
+        gains = []
+        for width, height in LOSS_SIZES:
+            figures = cases[(("comparison", name), ("height", height), ("width", width))]
+            expected_base = cases[_lpips_case(width, height, *base)]["forward_backward_s"]
+            expected_variant = cases[_lpips_case(width, height, *variant)]["forward_backward_s"]
+            assert (figures["baseline_s"], figures["variant_s"]) == (
+                expected_base,
+                expected_variant,
+            )
+            assert figures["gain"] == pytest.approx(1.0 - expected_variant / expected_base)
+            gains.append(figures["gain"])
+        summary = cases[(("comparison", name),)]
+        assert summary["smallest_gain"] == min(gains)
+        assert summary["meets_gain_threshold"] == (min(gains) >= 0.03)
+    assert losses_bench["setup"]["turn_on"] == ["autotuning", "channels_last_weights"]
+    assert losses_bench["setup"]["gain_threshold"] == 0.03
+    if importlib.util.find_spec("fused_ssim") is not None:
+        for width, height in LOSS_SIZES:
+            figures = cases[(("comparison", "fused_ssim"), ("height", height), ("width", width))]
+            torch_case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
+            torch_case |= {"precision": "tf32", "autotuning": False}
+            torch_key = tuple(sorted(torch_case.items()))
+            fused_key = (("height", height), ("loss", "ssim"), ("path", "fused"), ("width", width))
+            assert figures["baseline_s"] == cases[torch_key]["forward_backward_s"]
+            assert figures["variant_s"] == cases[fused_key]["forward_backward_s"]
+
+
+# B-8, `ftgs bench convert` (§3.4, D-48, D-81; Q-169): the scene's recorded converter rerun from
+# the `-i` paths of its ffmpeg commands, into a temporary directory, on small lavfi clips.
+
+needs_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="needs ffmpeg and ffprobe on PATH (D-48)",
+)
+
+
+@pytest.fixture
+def scratch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The default temporary folder of this test, so it can check what a run leaves there."""
+    folder = tmp_path / "scratch"
+    folder.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(folder))
+    return folder
+
+
+def _converted(root: Path, *, cameras: int = 2, frames: int = 2, **video: Any) -> Path:
+    """A Neural3DV source of lavfi clips and its conversion at resize ½, the scene for B-8."""
+    src = n3dv_source(root / "src", cameras=cameras, frames=frames + 1, **video)
+    return convert_n3dv(src, root / "scene", frames=frames, resize=0.5, jobs=1)
+
+
+def _bench_convert(manifest: Path, out: Path) -> dict[str, Any]:
+    assert _ftgs("bench", "convert", manifest, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@needs_ffmpeg
+def test_b8_convert_reruns_the_recorded_converter_per_camera_and_in_total(
+    tmp_path: Path, scratch: Path
+) -> None:
+    """B-8 (§3.4; Q-169): `bench convert` reruns the converter the manifest records, with its
+    options (frames, resize, ffmpeg and ffprobe) from the metadata and its source from the `-i`
+    paths of the recorded ffmpeg commands, into a temporary directory that it removes. It
+    reports the wall time per camera and in total, with each camera's decode and encode times,
+    once with `--hwaccel none`; without a CUDA device it doesn't run `cuda`, and says why. B-8
+    has no budget ("reported; regression rule only")."""
+    manifest = _converted(tmp_path)
+    recorded = read_scene_manifest(manifest).metadata
+    out = tmp_path / "bench" / "B-8-convert.json"
+    body = _bench_convert(manifest, out)
+    assert body["benchmark"] == "B-8"
+    assert body["command"] == ["ftgs", "bench", "convert", str(manifest), "--out", str(out)]
+    setup = body["setup"]
+    assert setup["converter"] == "n3dv"
+    assert setup["source"] == str(tmp_path / "src")
+    assert (setup["frames"], setup["resize"]) == (2, 0.5)
+    assert setup["ffmpeg"] == recorded["ffmpeg"]["path"]
+    assert setup["ffprobe"] == recorded["ffmpeg"]["ffprobe"]
+    assert setup["hwaccel"] == ["none"]
+    assert "CUDA" in setup["skipped"]["cuda"]  # why `cuda` didn't run
+    cases = {(c["case"]["hwaccel"], c["case"].get("camera")): c["figures"] for c in body["cases"]}
+    assert set(cases) == {("none", "cam00"), ("none", "cam01"), ("none", None)}
+    for camera in ("cam00", "cam01"):
+        figures = cases[("none", camera)]
+        assert figures["frames"] == 2
+        assert 0.0 < figures["decode_s"] < 60.0 and 0.0 < figures["encode_s"] < 60.0
+        assert 0.0 < figures["wall_s"] < 60.0
+    total = cases[("none", None)]
+    assert (total["cameras"], total["frames"]) == (2, 4)
+    assert total["wall_s"] >= max(cases[("none", c)]["wall_s"] for c in ("cam00", "cam01"))
+    assert body["budgets"] == []
+    assert list(scratch.iterdir()) == []  # the temporary conversion is removed
+
+
+@needs_ffmpeg
+def test_b8_convert_without_its_source_exits_2_naming_the_path(
+    tmp_path: Path, scratch: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B-8, Q-169, Q-166: when a source video recorded in the manifest's ffmpeg commands can't
+    be found, `bench convert` is exit 2, naming its path, and writes nothing."""
+    manifest = _converted(tmp_path)
+    missing = tmp_path / "src" / "cam01.mp4"
+    missing.rename(tmp_path / "elsewhere.mp4")
+    out = tmp_path / "bench.json"
+    assert _ftgs("bench", "convert", manifest, "--out", out) == 2
+    assert str(missing) in capsys.readouterr().err
+    assert not out.exists()
+    assert list(scratch.iterdir()) == []
+
+
+def test_b8_convert_needs_a_recorded_n3dv_conversion(
+    scene: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B-8, Q-169: a manifest whose metadata records no converter run with ffmpeg commands
+    (here one written by hand) has nothing to rerun, and one recorded by another converter than
+    Neural3DV's is refused (Q-193); both are exit 2, with nothing written."""
+    out = tmp_path / "bench.json"
+    assert _ftgs("bench", "convert", scene, "--out", out) == 2
+    assert "records no converter run" in capsys.readouterr().err
+    body = json.loads(scene.read_text(encoding="utf-8"))
+    body["metadata"] = {
+        "converter": "selfcap",
+        "ffmpeg": {"path": "ffmpeg", "ffprobe": "ffprobe", "commands": {"cam0": ["ffmpeg"]}},
+    }
+    selfcap = scene.with_name("selfcap.json")  # beside the images the manifest names
+    selfcap.write_text(json.dumps(body), encoding="utf-8")
+    assert _ftgs("bench", "convert", selfcap, "--out", out) == 2
+    assert "selfcap converter" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def _lists_cuda() -> bool:
+    """Whether the ffmpeg on PATH lists cuda among its hardware acceleration methods."""
+    listed = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    return "cuda" in listed
+
+
+@needs_ffmpeg
+@pytest.mark.gpu
+def test_b8_convert_keeps_the_cpu_run_when_cuda_refuses_the_stream(
+    tmp_path: Path, scratch: Path
+) -> None:
+    """B-8, D-81, Q-193: when the `cuda` run fails, here because D-81 refuses the lossless
+    clips' gbrp pixel format before ffmpeg starts, the `none` run's numbers stand and the setup
+    says why `cuda` has none; exit 0."""
+    if not _lists_cuda():
+        pytest.skip("this ffmpeg build has no cuda hwaccel")
+    manifest = _converted(tmp_path)
+    body = _bench_convert(manifest, tmp_path / "bench.json")
+    assert body["setup"]["hwaccel"] == ["none"]
+    reason = body["setup"]["skipped"]["cuda"]
+    assert reason.startswith("failed:") and "gbrp" in reason
+    assert {c["case"]["hwaccel"] for c in body["cases"]} == {"none"}
+    assert list(scratch.iterdir()) == []
+
+
+@needs_ffmpeg
+@pytest.mark.gpu
+def test_b8_convert_with_and_without_hardware_decoding(tmp_path: Path, scratch: Path) -> None:
+    """B-8 (§3.4: conversion "with and without hardware decoding"; D-81, Q-193): with a
+    CUDA device and an ffmpeg that lists cuda, `bench convert` also runs `--hwaccel cuda`,
+    reported per camera and in total like the CPU run. The clips are yuv420p H.264, which CUDA
+    decodes (D-81), as in U-27's GPU case."""
+    if not _lists_cuda():
+        pytest.skip("this ffmpeg build has no cuda hwaccel")
+    manifest = _converted(tmp_path, width=160, height=128, lossless=False)
+    body = _bench_convert(manifest, tmp_path / "bench.json")
+    assert body["setup"]["hwaccel"] == ["none", "cuda"] and body["setup"]["skipped"] == {}
+    cases = {(c["case"]["hwaccel"], c["case"].get("camera")): c["figures"] for c in body["cases"]}
+    assert set(cases) == {(h, c) for h in ("none", "cuda") for c in ("cam00", "cam01", None)}
+    for hwaccel in ("none", "cuda"):
+        for camera in ("cam00", "cam01"):
+            figures = cases[(hwaccel, camera)]
+            assert figures["frames"] == 2 and 0.0 < figures["decode_s"] < figures["wall_s"]
+        assert cases[(hwaccel, None)]["frames"] == 4 and cases[(hwaccel, None)]["wall_s"] > 0.0
+    assert list(scratch.iterdir()) == []
+
+
+# B-8, `ftgs bench init` (§3.4, D-56, D-58; Q-106, Q-192): `roma_init` on the wall clock.
+
+has_init_extra = all(importlib.util.find_spec(m) for m in ("einops", "loguru", "torchvision"))
+
+
+def test_b8_init_without_the_init_extra_or_the_weights_exits_2(
+    scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B-8, Q-166, Q-192: `bench init` needs the [init] extra and RoMa's weights already in
+    torch.hub's cache, and is exit 2 without either, with nothing written and nothing
+    downloaded. PyTorch is made to see a CUDA device, which these checks come before."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
+    out = tmp_path / "bench.json"
+    with monkeypatch.context() as without:  # the vendored RoMa can't be imported
+        without.setitem(sys.modules, "openftgs._vendor.romatch.models.model_zoo", None)
+        assert _ftgs("bench", "init", scene, "--out", out) == 2
+        assert "[init]" in capsys.readouterr().err
+    if not has_init_extra:
+        return
+    hub = tmp_path / "hub"
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(hub))
+    try:
+        assert _ftgs("bench", "init", scene, "--out", out) == 2
+    finally:
+        torch.hub.set_dir(previous)
+    error = capsys.readouterr().err
+    assert str(hub / "checkpoints" / "roma_outdoor.pth") in error
+    assert str(hub / "checkpoints" / "dinov2_vitl14_pretrain.pth") in error
+    assert not hub.exists()  # nothing downloaded
+    assert not out.exists()
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(not has_init_extra, reason="needs the [init] extra")
+def test_b8_init_times_matching_per_pair_and_gpu_triangulation_knn_and_the_run(
+    tmp_path: Path,
+) -> None:
+    """B-8 (§3.4: "RoMa per pair and per GPU, triangulation, k-NN"; D-56, Q-106, Q-192):
+    `bench init` runs `roma_init` once with the default settings on every visible GPU, on a
+    textured plane RoMa can match (four training cameras on an arc, 320 × 256 px, three
+    timestamps, as in the RoMa smoke test), and reports per GPU the pairs matched with their
+    time per pair and in total, the triangulation, the k-NN search of each of the three init
+    frames, and the whole call. B-8 has no budget. It needs the weights in torch.hub's cache,
+    which the weights tests fetch when downloads are allowed."""
+    plane = TexturedPlane(seed=3, velocity=(0.6, 0.3, 0.0))
+    images = []
+    for tau in (0.0, 1 / 30, 2 / 30):
+        for k, yaw in enumerate((-15.0, -5.0, 5.0, 15.0)):
+            theta = math.radians(yaw)
+            eye = (3.0 * math.sin(theta), -3.0 * math.cos(theta), 0.3)
+            camera = look_at(eye, width=320, height=256, focal=280.0, name=f"C{k}")
+            images.append((camera, tau, "train"))
+    manifest = write_plane_scene(tmp_path / "plane", plane, images)
+    out = tmp_path / "B-8-init.json"
+    assert _ftgs("bench", "init", manifest, "--out", out) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["benchmark"] == "B-8" and body["budgets"] == []
+    devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    assert body["setup"]["devices"] == devices
+    assert body["setup"]["roma_init"]["model"] == "roma_outdoor"
+    cases = {tuple(sorted(c["case"].items())): c["figures"] for c in body["cases"]}
+    run = cases[(("part", "roma_init"),)]
+    pairs = 0
+    for device in devices:
+        match = cases.get((("device", device), ("part", "init.match")))
+        if match is None:  # a device that got no pair
+            continue
+        triangulate = cases[(("device", device), ("part", "init.triangulate"))]
+        assert match["pairs"] == triangulate["pairs"] > 0
+        assert 0.0 < match["min_s"] <= match["median_s"] <= match["max_s"] <= match["total_s"]
+        assert 0.0 < triangulate["total_s"] < match["total_s"]
+        assert match["total_s"] <= run["wall_s"]
+        pairs += match["pairs"]
+    assert pairs == run["pairs"] >= 3  # at least one pair per init frame
+    knn = cases[(("part", "init.knn"),)]
+    assert knn["frames"] == run["init_frames"] == 3 and 0.0 < knn["total_s"] < run["wall_s"]
+    assert 0.0 < run["startup_s"] < run["wall_s"] and run["points"] > 0
 
 
 # B-7, `ftgs bench render` (§3.4, D-55; Q-174, Q-T231.1, Q-T231.2), run once on the GPU for the

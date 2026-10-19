@@ -2,10 +2,10 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55. Q-166 (BENCH.json
-and the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-178 and Q-189 (B-6), Q-174 (the
-index threshold T that B-7 sets), Q-T231.1 and Q-T231.2 (B-7).
-docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55, D-56, D-81.
+Q-166 (BENCH.json and the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-178 and Q-189
+(B-6), Q-174 (the index threshold T that B-7 sets), Q-T231.1 and Q-T231.2 (B-7), Q-169, Q-192
+and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
@@ -17,15 +17,20 @@ behaviour: it says so, writes nothing and returns 1. Adding one is a function an
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import importlib
 import importlib.metadata
 import itertools
+import json
 import os
 import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -1655,6 +1660,446 @@ def _budget(
     }
 
 
+# -- B-4: the losses' precisions and layouts (§3.4, D-52; Q-42, Q-172, Q-173, Q-190) -----------
+
+_LOSS_SIZES: tuple[tuple[int, int], ...] = ((1352, 1014), (1920, 1080))  # §3.4 B-4: width, height
+_LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52
+# Q-190: contiguous NCHW inputs; channels-last inputs, as `LPIPSLoss` passes a render (its
+# batch-first view of [..., H, W, 3] is channels-last), so training's path until #228; and both
+# the inputs and the network's weights channels-last.
+_LOSS_LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
+_LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
+_LOSS_REPETITIONS = 30  # Q-190
+_LOSS_NOISE = 0.05  # Q-190: the prediction's seeded Gaussian noise
+_GAIN_THRESHOLD = 0.03  # Q-173: a gain is at least 3 % at both sizes
+# Q-190: the comparisons the turn-on rule reads (Q-173), and the others reported beside
+# them, each as (baseline, variant) LPIPS cases `(precision, layout, autotuning)`.
+_LPIPS_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, bool]]] = {
+    "autotuning": (("tf32", "channels_last_inputs", False), ("tf32", "channels_last_inputs", True)),
+    "channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", "channels_last_inputs_and_weights", False),
+    ),
+    "autotuning_and_channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", "channels_last_inputs_and_weights", True),
+    ),
+    "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
+    "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
+}
+_TURN_ON = ("autotuning", "channels_last_weights")  # the exact options Q-173's rule decides
+# The child process of one autotuning setting (Q-190). cuDNN caches the algorithm it picked
+# for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off
+# and on can't be compared in one process. `fused_ssim` can't be imported there, so
+# `openftgs.losses.ssim` takes its PyTorch path without a change to its signature (PRD #220,
+# owner's decision): a None in sys.modules makes `import fused_ssim` raise ImportError.
+_CHILD = (
+    "import sys; sys.modules['fused_ssim'] = None; "
+    "from openftgs.cli._bench import _losses_child; _losses_child(sys.argv[1])"
+)
+
+
+def _loss_images(
+    video: MultiViewVideo, width: int, height: int, *, seed: int, device: str
+) -> tuple[Tensor, Tensor]:
+    """B-4's target and prediction, [height, width, 3] float32 on `device` (Q-190): the
+    scene's first training image, resized bilinearly with antialiasing when its size differs,
+    and that image plus Gaussian noise of σ 0.05 from a CPU generator seeded with `seed`."""
+    import torch
+    import torch.nn.functional as F
+
+    first = next(i for i, record in enumerate(video.records) if record.split == "train")
+    image = video.load_image(first)
+    if tuple(image.shape[:2]) != (height, width):
+        resized = F.interpolate(
+            image.permute(2, 0, 1)[None],
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        image = resized[0].permute(1, 2, 0).contiguous()
+    g = torch.Generator().manual_seed(seed)
+    noise = _LOSS_NOISE * torch.randn(image.shape, generator=g, dtype=torch.float32)
+    return image.to(device), (image + noise).to(device)
+
+
+def _deviation(
+    value: Tensor, grad: Tensor, value_ieee: Tensor, grad_ieee: Tensor
+) -> dict[str, Any]:
+    """Q-190: a precision's deviation from IEEE float32, in float64: the values and their
+    relative difference; the gradients' relative L2 difference, and their largest difference
+    over the largest IEEE gradient element."""
+    v, v_ieee = float(value), float(value_ieee)
+    g, g_ieee = grad.double(), grad_ieee.double()
+    return {
+        "value": v,
+        "value_ieee": v_ieee,
+        "value_relative": abs(v - v_ieee) / abs(v_ieee),
+        "gradient_relative_l2": float((g - g_ieee).norm() / g_ieee.norm()),
+        "gradient_max_relative": float((g - g_ieee).abs().max() / g_ieee.abs().max()),
+    }
+
+
+def _comparison(baseline: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any]:
+    """Q-173, Q-190: a variant's median forward plus backward against its baseline's, and
+    its gain, 1 − variant / baseline: positive when the variant is faster."""
+    base, other = baseline["forward_backward_s"], variant["forward_backward_s"]
+    return {"baseline_s": base, "variant_s": other, "gain": 1.0 - other / base}
+
+
+@contextlib.contextmanager
+def _cudnn_flags(*, tf32: bool, autotuning: bool) -> Iterator[None]:
+    """A B-4 case's process-global flags, restored afterwards: cuDNN's TF32 and autotuning as
+    given, its deterministic algorithms off, and float32 matrix products at "highest" (D-52),
+    as a training iteration sets them (Q-73)."""
+    import torch
+
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    matmul = torch.get_float32_matmul_precision()
+    try:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = autotuning, False, tf32
+        torch.set_float32_matmul_precision("highest")
+        yield
+    finally:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+        torch.set_float32_matmul_precision(matmul)
+
+
+def _lpips_networks() -> dict[bool, Any]:
+    """lpips 0.1.4's LPIPS-VGG on CUDA, frozen and in evaluation mode as `LPIPSLoss` keeps it
+    (Q-41), called directly (PRD #220); keyed by whether its weights are channels-last."""
+    import copy
+    import warnings
+
+    import lpips
+    import torch
+
+    with warnings.catch_warnings():
+        # As in `LPIPSLoss`: lpips passes torchvision's deprecated `pretrained=True`.
+        warnings.filterwarnings("ignore", "The parameter 'pretrained'", UserWarning)
+        warnings.filterwarnings("ignore", "Arguments other than a weight enum", UserWarning)
+        network = lpips.LPIPS(net="vgg", verbose=False)
+    network.requires_grad_(False)
+    network.eval()
+    network = network.to("cuda")
+    channels_last = copy.deepcopy(network).to(memory_format=torch.channels_last)
+    return {False: network, True: channels_last}
+
+
+def _lpips_forward(network: Any, x: Tensor, y: Tensor, precision: str) -> Tensor:
+    """LPIPS of [1, 3, H, W] images in [0, 1], mapped to [−1, 1] as `LPIPSLoss` maps them (D-68),
+    under bfloat16 autocast for "bf16" (Q-172), as float32."""
+    import torch
+
+    if precision == "bf16":
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            value = network(x, y, normalize=True).mean()
+    else:
+        value = network(x, y, normalize=True).mean()
+    out: Tensor = value.float()
+    return out
+
+
+def _lpips_inputs(gt: Tensor, pred: Tensor, layout: str) -> tuple[Tensor, Tensor]:
+    """The prediction, a leaf that requires its gradient, and the target, [1, 3, H, W] in the
+    layout's memory format."""
+    import torch
+
+    memory = torch.contiguous_format if layout == "nchw" else torch.channels_last
+    x = pred[None].permute(0, 3, 1, 2).clone(memory_format=memory).requires_grad_()
+    y = gt[None].permute(0, 3, 1, 2).clone(memory_format=memory)
+    return x, y
+
+
+def _lpips_call(
+    network: Any, gt: Tensor, pred: Tensor, *, precision: str, layout: str
+) -> Callable[[], None]:
+    """One B-4 LPIPS call: the forward on both images as the stage `loss.perceptual`, then the
+    prediction's gradient as the stage `backward`."""
+    import torch
+
+    from openftgs._stages import stage
+
+    x, y = _lpips_inputs(gt, pred, layout)
+
+    def call() -> None:
+        with stage("loss.perceptual"):
+            value = _lpips_forward(network, x, y, precision)
+        with stage("backward"):
+            torch.autograd.grad(value, x)
+
+    return call
+
+
+def _ssim_call(gt: Tensor, pred: Tensor) -> Callable[[], None]:
+    """One B-4 SSIM call: `openftgs.losses.ssim` with training's window, σ and padding
+    (`LossConfig`; E7, D-8), as the stage `loss.ssim`, then the prediction's gradient as the
+    stage `backward`. It takes fused-ssim when that imports (Q-42)."""
+    import torch
+
+    from openftgs._stages import stage
+    from openftgs.config import LossConfig
+    from openftgs.losses import ssim
+
+    cfg = LossConfig()
+    x, y = pred[None].clone().requires_grad_(), gt[None]
+
+    def call() -> None:
+        with stage("loss.ssim"):
+            value = ssim(
+                x, y, window=cfg.ssim_window, sigma=cfg.ssim_sigma, padding=cfg.ssim_padding
+            )
+        with stage("backward"):
+            torch.autograd.grad(value, x)
+
+    return call
+
+
+def _call_figures(call: Callable[[], None], forward: str, repetitions: int) -> dict[str, Any]:
+    """The figures of one B-4 case (Q-168, Q-190): the first call, then the medians of the
+    forward stage, the backward stage and the span from one's start to the other's end over
+    `repetitions` calls after the warm-up, and the peak allocated memory."""
+    import torch
+
+    torch.cuda.reset_peak_memory_stats()
+    first = _first_call(call)
+    timings = _repeat(call, repetitions)
+    forwards = [t for t in timings if t.name == forward]
+    backwards = [t for t in timings if t.name == "backward"]
+    return {
+        "forward_backward_s": _median(
+            [b.end - f.start for f, b in zip(forwards, backwards, strict=True)]
+        ),
+        "forward_s": _median([t.seconds for t in forwards]),
+        "backward_s": _median([t.seconds for t in backwards]),
+        "first_call_s": first,
+        "repetitions": len(forwards),
+        "peak_memory_bytes": torch.cuda.max_memory_allocated(),
+    }
+
+
+def _fused_ssim_importable() -> bool:
+    try:
+        importlib.import_module("fused_ssim")
+    except ImportError:
+        return False
+    return True
+
+
+def _losses_child(spec: str) -> None:
+    """B-4's cases of one cuDNN autotuning setting, run as `python -c _CHILD SPEC` (Q-190),
+    where `fused_ssim` can't be imported (PRD #220): `SPEC` is JSON with the scene's path, the
+    sizes, the seed, the repetitions and the setting. Every LPIPS case, then the PyTorch SSIM
+    path with TF32 on as in training (D-52), at every size. Prints its cases as one line of
+    JSON."""
+    if _fused_ssim_importable():
+        raise RuntimeError("fused_ssim can be imported in B-4's child process")
+    from openftgs.data import MultiViewVideo
+
+    given = json.loads(spec)
+    autotuning, repetitions = bool(given["autotuning"]), int(given["repetitions"])
+    video = MultiViewVideo.from_manifest(Path(given["scene"]))
+    images: _Images = {
+        (int(w), int(h)): _loss_images(video, int(w), int(h), seed=given["seed"], device="cuda")
+        for w, h in given["sizes"]
+    }
+    timed = _lpips_timed(_lpips_networks(), images, autotuning=autotuning, repetitions=repetitions)
+    cases = [{"case": _lpips_case(*key), "figures": figures} for key, figures in timed.items()]
+    for (width, height), (gt, pred) in images.items():
+        with _cudnn_flags(tf32=True, autotuning=autotuning):
+            figures = _call_figures(_ssim_call(gt, pred), "loss.ssim", repetitions)
+        case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
+        case |= {"precision": "tf32", "autotuning": autotuning}
+        cases.append({"case": case, "figures": figures})
+    print(json.dumps(cases))
+
+
+def _child_cases(
+    scene: Path, sizes: Sequence[tuple[int, int]], *, autotuning: bool
+) -> list[dict[str, Any]]:
+    """The cases of one autotuning setting, from a child process (`_losses_child`) running this
+    openftgs: the folder it is imported from goes first on the child's PYTHONPATH."""
+    import openftgs
+
+    root = str(Path(openftgs.__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (root, env.get("PYTHONPATH")) if p)
+    spec = {
+        "scene": str(scene.resolve()),
+        "sizes": [list(size) for size in sizes],
+        "seed": _SEED,
+        "repetitions": _LOSS_REPETITIONS,
+        "autotuning": autotuning,
+    }
+    done = subprocess.run(
+        [sys.executable, "-c", _CHILD, json.dumps(spec)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if done.returncode != 0:
+        raise RuntimeError(f"B-4's child process failed:\n{done.stderr[-4000:]}")
+    cases: list[dict[str, Any]] = json.loads(done.stdout.strip().splitlines()[-1])
+    return cases
+
+
+# B-4's images per (width, height), as (target, prediction); an LPIPS case's key.
+_Images = dict[tuple[int, int], tuple["Tensor", "Tensor"]]
+_LpipsKey = tuple[int, int, str, str, bool]
+
+
+def _lpips_case(
+    width: int, height: int, precision: str, layout: str, autotuning: bool
+) -> dict[str, Any]:
+    """An LPIPS case's parameters (Q-190, Q-180)."""
+    case = {"loss": "lpips_vgg", "width": width, "height": height, "precision": precision}
+    return case | {"layout": layout, "autotuning": autotuning}
+
+
+def _lpips_deviations(network: Any, images: _Images) -> list[dict[str, Any]]:
+    """Per size, TF32's and bf16's deviation from IEEE float32 in value and in the prediction's
+    gradient (Q-190), with the network as training runs it: NCHW weights, channels-last
+    inputs, autotuning off."""
+    import torch
+
+    cases: list[dict[str, Any]] = []
+    for (width, height), (gt, pred) in images.items():
+        results: dict[str, tuple[Tensor, Tensor]] = {}
+        for precision in _LOSS_PRECISIONS:
+            x, y = _lpips_inputs(gt, pred, "channels_last_inputs")
+            with _cudnn_flags(tf32=precision != "ieee", autotuning=False):
+                value = _lpips_forward(network, x, y, precision)
+                (grad,) = torch.autograd.grad(value, x)
+            results[precision] = (value.detach(), grad)
+        for precision in ("tf32", "bf16"):
+            figures = _deviation(*results[precision], *results["ieee"])
+            case = {"deviation": precision, "width": width, "height": height}
+            cases.append({"case": case, "figures": figures})
+    return cases
+
+
+def _lpips_timed(
+    networks: dict[bool, Any], images: _Images, *, autotuning: bool, repetitions: int
+) -> dict[_LpipsKey, dict[str, Any]]:
+    """Every LPIPS case's figures under one autotuning setting (Q-190)."""
+    timed: dict[_LpipsKey, dict[str, Any]] = {}
+    for (width, height), (gt, pred) in images.items():
+        for precision in _LOSS_PRECISIONS:
+            for layout in _LOSS_LAYOUTS:
+                network = networks[layout == "channels_last_inputs_and_weights"]
+                call = _lpips_call(network, gt, pred, precision=precision, layout=layout)
+                with _cudnn_flags(tf32=precision != "ieee", autotuning=autotuning):
+                    figures = _call_figures(call, "loss.perceptual", repetitions)
+                timed[(width, height, precision, layout, autotuning)] = figures
+    return timed
+
+
+def _ssim_fused_timed(images: _Images) -> dict[tuple[int, int], dict[str, Any]]:
+    """fused-ssim's figures per size, in this process (Q-42, Q-190)."""
+    timed: dict[tuple[int, int], dict[str, Any]] = {}
+    for size, (gt, pred) in images.items():
+        with _cudnn_flags(tf32=True, autotuning=False):
+            timed[size] = _call_figures(_ssim_call(gt, pred), "loss.ssim", _LOSS_REPETITIONS)
+    return timed
+
+
+def _losses(ctx: _Context) -> _Result:
+    """B-4 (§3.4, D-52): LPIPS-VGG's forward and the prediction's backward in IEEE float32,
+    TF32 and bfloat16, with NCHW inputs, channels-last inputs and channels-last inputs and
+    weights, with cuDNN autotuning off and on; SSIM through fused-ssim and through the PyTorch
+    path; bf16's (and TF32's) deviation from IEEE float32 in value and gradient; at 1352×1014
+    and 1920×1080 (Q-190). The deviations and fused-ssim run in this process, everything
+    else in one child process per autotuning setting. The gains Q-173's rule reads are cases
+    too; the rule's B-1 half is a rerun of B-1."""
+    import gc
+
+    import torch
+
+    sizes = [(int(w), int(h)) for w, h in _LOSS_SIZES]
+    with _environment_error("LPIPS networks"):  # exit 2 here, before any child starts
+        networks = _lpips_networks()
+    images = {size: _loss_images(ctx.video, *size, seed=_SEED, device="cuda") for size in sizes}
+    cases = _lpips_deviations(networks[False], images)
+    fused = _fused_ssim_importable()
+    ssim_fused = _ssim_fused_timed(images) if fused else {}
+    for (width, height), figures in ssim_fused.items():
+        case = {"loss": "ssim", "width": width, "height": height, "path": "fused"}
+        cases.append({"case": case, "figures": figures})
+    del networks, images
+    gc.collect()
+    torch.cuda.empty_cache()  # for the child processes
+    children: list[dict[str, Any]] = []
+    for autotuning in _LOSS_AUTOTUNING:
+        children += _child_cases(ctx.args.scene, sizes, autotuning=autotuning)
+    cases += children
+    timed = {
+        (c["width"], c["height"], c["precision"], c["layout"], c["autotuning"]): entry["figures"]
+        for entry in children
+        if (c := entry["case"])["loss"] == "lpips_vgg"
+    }
+    ssim_torch = [entry for entry in children if entry["case"]["loss"] == "ssim"]
+
+    def compare(name: str, pairs: list[tuple[dict[str, Any], dict[str, Any]]]) -> None:
+        gains = []
+        for (width, height), (base, variant) in zip(sizes, pairs, strict=True):
+            figures = _comparison(base, variant)
+            gains.append(figures["gain"])
+            case = {"comparison": name, "width": width, "height": height}
+            cases.append({"case": case, "figures": figures})
+        smallest = min(gains)
+        figures = {"smallest_gain": smallest, "meets_gain_threshold": smallest >= _GAIN_THRESHOLD}
+        cases.append({"case": {"comparison": name}, "figures": figures})
+
+    for name, (base, variant) in _LPIPS_COMPARISONS.items():
+        compare(name, [(timed[(*size, *base)], timed[(*size, *variant)]) for size in sizes])
+    if fused:
+        torch_off = {
+            (c["case"]["width"], c["case"]["height"]): c["figures"]
+            for c in ssim_torch
+            if not c["case"]["autotuning"]
+        }
+        compare("fused_ssim", [(torch_off[size], ssim_fused[size]) for size in sizes])
+
+    from openftgs.config import LossConfig
+
+    loss_cfg = LossConfig()
+    cfg_ssim = {
+        "window": loss_cfg.ssim_window,
+        "sigma": loss_cfg.ssim_sigma,
+        "padding": loss_cfg.ssim_padding,
+    }
+    setup = {
+        "sizes": [list(size) for size in sizes],
+        "images": (
+            "the scene's first training image, resized bilinearly with antialiasing, as the "
+            f"target; the prediction adds Gaussian noise of σ {_LOSS_NOISE} (Q-190)"
+        ),
+        "seed": _SEED,
+        "lpips": "lpips 0.1.4, VGG, called directly; inputs mapped to [−1, 1] (D-68)",
+        "precisions": list(_LOSS_PRECISIONS),
+        "layouts": list(_LOSS_LAYOUTS),
+        "training_layout": "channels_last_inputs",
+        "autotuning": list(_LOSS_AUTOTUNING),
+        "processes": (
+            "the deviations and fused-ssim in the benchmark's process; LPIPS and the PyTorch "
+            "SSIM path in one child process per autotuning setting, in which fused_ssim can't "
+            "be imported"
+        ),
+        "ssim": cfg_ssim,
+        "fused_ssim": fused,
+        "warmup": _WARMUP,
+        "repetitions": _LOSS_REPETITIONS,
+        "clock": "CUDA events: loss.perceptual or loss.ssim (forward), backward (the prediction's)",
+        "comparisons": {name: [list(b), list(v)] for name, (b, v) in _LPIPS_COMPARISONS.items()},
+        "turn_on": list(_TURN_ON),
+        "gain_threshold": _GAIN_THRESHOLD,
+    }
+    return _Result(setup, cases)
+
+
 # -- B-7: rendering at a time, with and without the temporal index (§3.4, D-55; Q-174, Q-T231.1,
 # Q-T231.2) ---------------------------------------------------------------------------------------
 
@@ -1703,7 +2148,7 @@ def _b7_camera(video: MultiViewVideo) -> Camera:
     )
 
 
-def _spread(count: int, k: int) -> list[int]:
+def _spread_times(count: int, k: int) -> list[int]:
     """Q-T231.1: k of `count` timestamps evenly spread, in order: round(j(count − 1)/(k − 1))
     rounded half up, j = 0 … k − 1, in integer arithmetic; the one at ⌊(count − 1)/2⌋ for
     k = 1."""
@@ -1918,7 +2363,7 @@ def _render(ctx: _Context) -> _Result:
         slice_impls.append(model.slice_impl)
         on_off: dict[int, tuple[float, float]] = {}
         for k in sizes:
-            request = _b7_request(camera, [taus[i] for i in _spread(count, k)], unit)
+            request = _b7_request(camera, [taus[i] for i in _spread_times(count, k)], unit)
             for device in _B7_OUTPUTS if k == count else _B7_OUTPUTS[:1]:
                 timed: dict[bool, float] = {}
                 for index in (True, False):
@@ -1989,16 +2434,295 @@ def _render(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-8: initialization on the wall clock (§3.4, D-56, D-58; Q-106, Q-192) ---------------------
+
+
+def _roma_weights() -> list[Path]:
+    """Q-192: where torch.hub keeps the checkpoints `roma_init` loads with the default
+    RomaInitConfig, D-58's roma_outdoor: RoMa's and DINOv2's, each under its URL's file name in
+    `get_dir()/checkpoints` (source log 178). ImportError without the [init] extra, which the
+    vendored RoMa needs (D-65)."""
+    import torch
+
+    zoo: Any = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
+    urls = (zoo.weight_urls["romatch"]["outdoor"], zoo.weight_urls["dinov2"])
+    folder = Path(torch.hub.get_dir()) / "checkpoints"
+    return [folder / Path(urllib.parse.urlparse(url).path).name for url in urls]
+
+
+def _spread(values: Sequence[float]) -> dict[str, float]:
+    return {
+        "total_s": float(sum(values)),
+        "median_s": _median(values),
+        "min_s": float(min(values)),
+        "max_s": float(max(values)),
+    }
+
+
+def _init(ctx: _Context) -> _Result:
+    """B-8's initialization (§3.4, D-56): `roma_init` with the default RomaInitConfig on every
+    visible GPU (Q-106), once, under the wall clock: matching per pair and in total per GPU
+    (`init.match`, which holds the pair's two image reads and its triangulation), triangulation
+    per GPU (`init.triangulate`), the k-NN searches of E15 (`init.knn`), and the whole call. It
+    needs the [init] extra and RoMa's weights in torch.hub's cache, and never downloads them, so
+    no download is timed (Q-192)."""
+    import torch
+
+    from openftgs._stages import Clock
+    from openftgs.init import RomaInitConfig, roma_init, roma_provenance
+
+    try:
+        weights = _roma_weights()
+    except ImportError as error:  # Q-142, Q-166
+        _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
+    missing = [str(path) for path in weights if not path.is_file()]
+    if missing:  # Q-166, Q-192
+        _fail(
+            "bench init needs RoMa's weights in torch.hub's cache and doesn't download them; "
+            f"missing {', '.join(missing)} (one `ftgs init roma` run fetches them)"
+        )
+    cfg = RomaInitConfig()  # D-58's defaults (Q-192)
+    devices = [str(torch.device("cuda", i)) for i in range(torch.cuda.device_count())]  # Q-106
+    try:
+        with _as_input_error("bench init: RoMa initialization"), Clock("wall") as clock:
+            start = time.perf_counter()
+            points = roma_init(ctx.video, cfg)  # devices None: every visible GPU (Q-106)
+            wall = time.perf_counter() - start
+    except ImportError as error:  # Q-142: the [init] extra, found missing only now
+        _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
+    timings = clock.read()
+
+    def of(name: str) -> dict[str | None, list[Timing]]:
+        by_key: dict[str | None, list[Timing]] = {}
+        for t in timings:
+            if t.name == name:
+                by_key.setdefault(t.key, []).append(t)
+        return by_key
+
+    cases: list[dict[str, Any]] = []
+    matches, triangulations = of("init.match"), of("init.triangulate")
+    for device in sorted(k for k in matches if k is not None):
+        seconds = [t.seconds for t in matches[device]]
+        figures = {"pairs": len(seconds), **_spread(seconds)}
+        cases.append({"case": {"part": "init.match", "device": device}, "figures": figures})
+    for device in sorted(k for k in triangulations if k is not None):
+        seconds = [t.seconds for t in triangulations[device]]
+        figures = {"pairs": len(seconds), **_spread(seconds)}
+        cases.append({"case": {"part": "init.triangulate", "device": device}, "figures": figures})
+    searches = [t.seconds for found in of("init.knn").values() for t in found]
+    if searches:
+        figures = {"frames": len(searches), **_spread(searches)}
+        cases.append({"case": {"part": "init.knn"}, "figures": figures})
+    pairs = [t for found in matches.values() for t in found]
+    frames = 0 if points.frame_ids is None else int(torch.unique(points.frame_ids).numel())
+    whole = {
+        "wall_s": wall,
+        # Loading the weights and building a model per GPU, before the first pair starts.
+        "startup_s": min((t.start for t in pairs), default=wall),
+        "pairs": len(pairs),
+        "init_frames": frames,
+        "points": int(points.positions.shape[0]),
+    }
+    cases.append({"case": {"part": "roma_init"}, "figures": whole})
+    setup = {
+        "roma_init": json.loads(roma_provenance(cfg)["roma_init"]),  # Q-107's record
+        "devices": devices,
+        "weights": [str(path) for path in weights],
+        "repetitions": 1,
+        "clock": "wall: init.match per camera pair, keyed by its shard's device, with "
+        "init.triangulate inside it; init.knn per init frame",
+    }
+    return _Result(setup, cases)
+
+
+# -- B-8: conversion on the wall clock (§3.4, D-48, D-81; Q-169, Q-193) -------------------------
+
+# Q-193: B-8's scene is a Neural3DV one; selfcap's recorded `-i` paths are inside the
+# conversion's own work folder, which it removes, so they can never be found again.
+_RERUNS = ("n3dv",)
+
+
+@dataclass(frozen=True)
+class _RecordedConversion:
+    """What a manifest records of the conversion that made it (Q-169): the converter, the source
+    folder its ffmpeg commands read, and the options to run it with again."""
+
+    converter: str
+    source: Path
+    frames: Any
+    resize: Any
+    ffmpeg: str
+    ffprobe: str
+
+
+def _recorded_conversion(ctx: _Context) -> _RecordedConversion:
+    """Q-169: the converter and its options from the manifest's metadata, and the source from
+    the `-i` paths of its ffmpeg commands; exit 2, naming the path, when one isn't there."""
+    where = f"scene manifest {ctx.args.scene}"
+    metadata = ctx.video.manifest.metadata
+    converter = metadata.get("converter")
+    ffmpeg = metadata.get("ffmpeg")
+    commands = ffmpeg.get("commands") if isinstance(ffmpeg, dict) else None
+    if not isinstance(converter, str) or not isinstance(commands, dict) or not commands:
+        _fail(f"{where}: its metadata records no converter run with ffmpeg commands (Q-169)")
+    if converter not in _RERUNS:
+        _fail(
+            f"{where}: recorded by the {converter} converter; bench convert reruns "
+            f"{', '.join(_RERUNS)} conversions (B-8, Q-193)"
+        )
+    assert isinstance(ffmpeg, dict)
+    sources: list[Path] = []
+    for camera, command in commands.items():
+        if not isinstance(command, list) or "-i" not in command[:-1]:
+            _fail(f"{where}: the recorded ffmpeg command of {camera} has no -i path (Q-169)")
+        path = Path(str(command[command.index("-i") + 1]))
+        if not path.is_file():
+            _fail(f"source video {path} not found (the ffmpeg command recorded for {camera})")
+        sources.append(path)
+    folders = sorted({str(path.parent) for path in sources})
+    if len(folders) != 1:
+        _fail(f"{where}: the recorded ffmpeg commands read from {len(folders)} folders: {folders}")
+    for key in ("path", "ffprobe"):
+        if not isinstance(ffmpeg.get(key), str):
+            _fail(f"{where}: its metadata records no ffmpeg {key} (Q-169)")
+    return _RecordedConversion(
+        converter=converter,
+        source=Path(folders[0]).resolve(),
+        frames=metadata.get("frames"),
+        resize=metadata.get("resize"),
+        ffmpeg=ffmpeg["path"],
+        ffprobe=ffmpeg["ffprobe"],
+    )
+
+
+def _cuda_decoding(ffmpeg: str) -> str | None:
+    """Q-193: None when the recorded ffmpeg can be asked to decode with CUDA here, otherwise
+    why not: a CUDA device must be visible, and the build must list `cuda` among its hardware
+    acceleration methods (source log 179)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return "not run: no CUDA device is visible"
+    listed = _run(ffmpeg, "-hide_banner", "-hwaccels")
+    if listed is None:
+        return f"not run: {ffmpeg} -hwaccels failed"
+    if "cuda" not in [line.strip() for line in listed.splitlines()[1:]]:
+        return f"not run: {ffmpeg} lists no cuda hardware acceleration"
+    return None
+
+
+@dataclass(frozen=True)
+class _Conversion:
+    """One run of a converter: its call's wall time and the stages it recorded."""
+
+    wall: float
+    timings: list[Timing]
+
+
+def _conversion(recorded: _RecordedConversion, hwaccel: Literal["none", "cuda"]) -> _Conversion:
+    """The recorded converter, run once with `hwaccel` into a temporary directory that is
+    removed afterwards, under the wall clock (§3.4 B-8). A ValueError of the converter (a
+    missing ffmpeg, an unreadable source, a pixel format CUDA can't decode) propagates."""
+    from openftgs._stages import Clock
+    from openftgs.data import convert_n3dv
+
+    with tempfile.TemporaryDirectory(prefix="ftgs-bench-convert-") as folder:
+        with _output(f"the temporary conversion in {folder}"), Clock("wall") as clock:
+            start = time.perf_counter()
+            convert_n3dv(
+                recorded.source,
+                Path(folder) / "scene",
+                frames=recorded.frames,
+                resize=recorded.resize,
+                ffmpeg=recorded.ffmpeg,
+                ffprobe=recorded.ffprobe,
+                hwaccel=hwaccel,
+            )  # jobs: the converter's default; the manifest doesn't record it (Q-193)
+            wall = time.perf_counter() - start
+        return _Conversion(wall, clock.read())
+
+
+def _conversion_cases(hwaccel: str, run: _Conversion) -> list[dict[str, Any]]:
+    """Per camera: its frames, the sum of its frames' reads from ffmpeg (`convert.decode`) and
+    of their processing and writing in the pool (`convert.encode`, measured in the pool's
+    processes, so they overlap), and its wall time, from its first read to its last frame
+    written. In total: the converter's call on the wall clock, and the sums."""
+    decode: dict[str, list[Timing]] = {}
+    encode: dict[str, list[Timing]] = {}
+    for t in run.timings:
+        parts = {"convert.decode": decode, "convert.encode": encode}.get(t.name)
+        if parts is not None and t.key is not None:
+            parts.setdefault(t.key, []).append(t)
+    cases: list[dict[str, Any]] = []
+    for camera in sorted(set(decode) | set(encode)):
+        mine = decode.get(camera, []) + encode.get(camera, [])
+        figures = {
+            "frames": len(encode.get(camera, [])),
+            "wall_s": max(t.end for t in mine) - min(t.start for t in mine),
+            "decode_s": sum(t.seconds for t in decode.get(camera, [])),
+            "encode_s": sum(t.seconds for t in encode.get(camera, [])),
+        }
+        cases.append({"case": {"hwaccel": hwaccel, "camera": camera}, "figures": figures})
+    total = {
+        "cameras": len(cases),
+        "frames": sum(c["figures"]["frames"] for c in cases),
+        "wall_s": run.wall,
+        "decode_s": sum(c["figures"]["decode_s"] for c in cases),
+        "encode_s": sum(c["figures"]["encode_s"] for c in cases),
+    }
+    return cases + [{"case": {"hwaccel": hwaccel}, "figures": total}]
+
+
+def _convert(ctx: _Context) -> _Result:
+    """B-8's conversion (§3.4, D-48, D-81): the scene's recorded converter rerun from its
+    recorded source, once with `--hwaccel none` and once with `cuda` when the recorded ffmpeg
+    supports it here, each into a temporary directory; the wall time per camera and in total.
+    It runs once: there is nothing to warm up in a conversion (Q-193)."""
+    recorded = _recorded_conversion(ctx)
+    where = f"bench convert: the {recorded.converter} converter on {recorded.source}"
+    with _as_input_error(where):  # Q-142: the converters' input and environment errors
+        runs = {"none": _conversion(recorded, "none")}
+    skipped: dict[str, str] = {}
+    reason = _cuda_decoding(recorded.ffmpeg)
+    if reason is None:
+        try:
+            runs["cuda"] = _conversion(recorded, "cuda")
+        except ValueError as error:  # Q-193: the CPU's numbers stand; the refusal is noted
+            reason = f"failed: {error}"
+    if reason is not None:
+        skipped["cuda"] = reason
+    cases = [case for hwaccel, run in runs.items() for case in _conversion_cases(hwaccel, run)]
+    version = _run(recorded.ffmpeg, "-version")
+    setup = {
+        "converter": recorded.converter,
+        "source": str(recorded.source),
+        "frames": recorded.frames,
+        "resize": recorded.resize,
+        "ffmpeg": recorded.ffmpeg,
+        "ffprobe": recorded.ffprobe,
+        "ffmpeg_version": version.splitlines()[0] if version else None,
+        "jobs": 0,  # the converter's default, one decoding process per four cores (§2.4)
+        "cpus": os.cpu_count(),
+        "temporary": tempfile.gettempdir(),
+        "hwaccel": list(runs),
+        "skipped": skipped,
+        "repetitions": 1,
+        "clock": "wall: convert.decode per frame read from ffmpeg, convert.encode per frame "
+        "processed and written in the pool, keyed by camera",
+    }
+    return _Result(setup, cases)
+
+
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
     "train-step": _Benchmark("B-1", 226, _train_step, model=True),
     "raster": _Benchmark("B-2", 227, _raster),
     "slice": _Benchmark("B-3", 225, _slice),
-    "losses": _Benchmark("B-4", 228),
+    "losses": _Benchmark("B-4", 228, _losses),
     "adam": _Benchmark("B-5", 229, _adam),
     "data": _Benchmark("B-6", 232, _data),
     "render": _Benchmark("B-7", 231, _render, model=True),
-    "init": _Benchmark("B-8", 234),
-    "convert": _Benchmark("B-8", 234, cuda=False),
+    "init": _Benchmark("B-8", 234, _init),
+    "convert": _Benchmark("B-8", 234, _convert, cuda=False),
 }
