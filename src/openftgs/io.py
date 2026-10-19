@@ -381,8 +381,8 @@ def _recorded_background(meta: Mapping[str, str], where: str) -> tuple[float, fl
         return (0.0, 0.0, 0.0)
     try:
         conventions = json.loads(meta["render_conventions"])
-    except ValueError:
-        _fail(where, "render_conventions must be a JSON object")  # Q-157
+    except (ValueError, RecursionError):
+        conventions = None
     if not isinstance(conventions, dict):
         _fail(where, "render_conventions must be a JSON object")  # Q-157
     if "background" not in conventions:
@@ -390,8 +390,11 @@ def _recorded_background(meta: Mapping[str, str], where: str) -> tuple[float, fl
     value = conventions["background"]
     numbers = isinstance(value, list) and len(value) == 3
     if not numbers or any(isinstance(c, bool) or not isinstance(c, int | float) for c in value):
-        _fail(where, f"render_conventions.background must be three numbers, got {value!r}")
-    return (float(value[0]), float(value[1]), float(value[2]))
+        _fail(where, f"background must be three numbers in [0, 1], got {value!r}")
+    try:
+        return (float(value[0]), float(value[1]), float(value[2]))
+    except OverflowError:  # an integer too large for a float (Q-26: a plain ValueError)
+        _fail(where, f"background must be three numbers in [0, 1], got {value!r}")
 
 
 def read_exchange(path: Path) -> ExchangeModel:

@@ -784,6 +784,7 @@ BAD_EXCHANGE_CASES = (
     "background string",
     "render_conventions not JSON",
     "render_conventions a list",
+    "background too large for a float",
 )
 
 
@@ -836,6 +837,7 @@ def bad_exchange(case: str) -> tuple[dict[str, Tensor], dict[str, str]]:
             "background of bools": [True, False, False],
             "background null": None,
             "background string": "white",
+            "background too large for a float": [10**400, 0, 0],
         }[case]
         meta["render_conventions"] = json.dumps({"background": value})
     elif case == "render_conventions not JSON":

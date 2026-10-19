@@ -32,14 +32,14 @@ from openftgs.types import Camera, ImageRecord, InitPoints
 FPS = 30.0
 FRAMES = 20  # §3.2 S-9
 WIDTH, HEIGHT = 128, 96  # §3.2 S-9
-FOCAL = 64.0  # Q-138: every sphere in view at the rig's radius of about 0.89
-RADIUS = 0.12  # sphere radius, world units (S ≈ 1): about 17 px across
-CENTER_RADIUS = 0.25  # centers at the middle time within this of the origin
-STEP = (0.004, 0.007)  # displacement per frame, below half the init lattice's spacing (E15)
+FOCAL = 72.0  # Q-138, Q-155: every sphere in view at the rig's radius of about 0.89
+RADIUS = 0.16  # Q-155: world units (S ≈ 1), about 26 px across; half spacing 0.0143 (300 pts)
+CENTER_RADIUS = 0.3  # centers at the middle time within this of the origin (three must fit)
+STEP = (0.008, 0.012)  # Q-138: per frame, below half the init lattice's spacing (E15, Q-155)
 CLEARANCE = 0.04  # surfaces this far apart at every frame
 EDGE_MARGIN = 4.0  # silhouettes this many pixels inside every image
 TEXTURE_WAVES = 6  # sinusoids per color channel
-TEXTURE_FREQUENCY = (2.0, 5.0)  # rad per unit of the local direction: smooth at RADIUS
+TEXTURE_FREQUENCY = (3.0, 8.0)  # Q-138: rad per unit of the local direction
 
 _TRAIN_ELEVATIONS = (15.0, 30.0, 45.0, 60.0)  # Q-138: 16 training cameras, four azimuths each
 _TEST_VIEWS = ((25.0, 56.25), (40.0, 146.25), (52.0, 236.25), (33.0, 326.25))  # (elev, azim)
