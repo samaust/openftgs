@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     from openftgs.model import FreeTimeGaussians
     from openftgs.types import TimeNormalizer
 
+__all__ = ["add_parser", "run"]  # what `openftgs.cli` takes from this private module
+
 _UNBUILT = 1  # Q-130: a benchmark whose ticket hasn't landed
 _FORMAT, _VERSION = "ftgs-bench", 1  # Q-166
 
