@@ -933,7 +933,7 @@ def test_a_model_path_that_does_not_exist_is_exit_code_2_naming_it_once(
     """§2.1 exit code 2 (an invalid input path): a MODEL that doesn't exist, as a mistyped
     checkpoint directory, is reported as missing, with its path named once, not as an
     unreadable FTGS-IF file; nothing is written."""
-    scene, _ = _trained(tmp_path)
+    scene = _scene(tmp_path / "scene", test=True)
     missing = tmp_path / "run" / "checkpoit"
     out = tmp_path / "out"
     if command == "render":
@@ -948,6 +948,29 @@ def test_a_model_path_that_does_not_exist_is_exit_code_2_naming_it_once(
     assert "No such file or directory" in err
     assert "checkpoint directory or an FTGS-IF file" in err
     assert "safetensors" not in err
+    assert not out.exists()
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs POSIX permissions")
+def test_a_model_that_exists_but_cannot_be_reached_keeps_its_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-142: a MODEL under a directory without search permission exists but can't be read; it
+    is exit 2 with the operating system's error, not reported as missing."""
+    scene, checkpoint = _trained(tmp_path)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    model = Path(shutil.move(checkpoint, locked / "checkpoint"))
+    out = tmp_path / "m.json"
+    locked.chmod(0)
+    try:
+        capsys.readouterr()
+        assert _ftgs("eval", model, scene, "--out", out) == 2
+        err = capsys.readouterr().err
+    finally:
+        locked.chmod(0o700)
+    assert "Permission denied" in err
+    assert "No such file or directory" not in err
     assert not out.exists()
 
 
@@ -1684,12 +1707,12 @@ def test_convert_selfcap_with_a_stub_colmap(tmp_path: Path) -> None:
 
 
 @needs_ffmpeg
-def test_convert_selfcap_with_a_missing_colmap_is_exit_code_2(
+def test_u37_without_colmap_is_exit_code_2(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """§2.1 exit code 2 ("a missing ffmpeg or COLMAP"), D-60: ftgs convert selfcap with
-    --undistort colmap and a --colmap path that doesn't exist names COLMAP and writes no
-    scene."""
+    """U-37 ("exit code 2 without COLMAP unless --undistort internal"), §2.1, D-60, Q-88: ftgs
+    convert selfcap with --undistort colmap and a --colmap path that doesn't exist says COLMAP
+    wasn't found and leaves OUT as it found it."""
     src = selfcap_archives(tmp_path, "mini")
     out = tmp_path / "out"
     args = (
@@ -1712,8 +1735,8 @@ def test_convert_selfcap_with_a_missing_colmap_is_exit_code_2(
     )
     capsys.readouterr()
     assert _ftgs(*args) == 2
-    assert "COLMAP" in capsys.readouterr().err
-    assert not (out / "scene.json").exists()
+    assert "COLMAP not found" in capsys.readouterr().err
+    assert not out.exists() or not any(out.iterdir())
 
 
 @needs_ffmpeg

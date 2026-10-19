@@ -651,13 +651,15 @@ def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
     exit 2 (Q-154). So is a model whose second hash can't be taken, and a read that fails while
     the hash changes, as when a save tears the read; a read that fails with the hash unchanged
     keeps the reader's error (Q-154 as answered)."""
-    if not path.exists():  # a mistyped checkpoint directory isn't an unreadable FTGS-IF file
-        _fail(
-            f"model {path}: No such file or directory; MODEL is a checkpoint directory or an "
-            "FTGS-IF file"
-        )
     changed_message = f"model {path} changed while it was read; evaluate it again"
     with _as_input_error(f"model {path}", OSError):  # Q-142, Q-154
+        try:  # a mistyped checkpoint directory isn't an unreadable FTGS-IF file
+            path.stat()
+        except FileNotFoundError:
+            _fail(
+                f"model {path}: No such file or directory; MODEL is a checkpoint directory or "
+                "an FTGS-IF file"
+            )
         before = _model_sha256(path) if hashed else None
         try:
             loaded = _read_model(path, device)
