@@ -737,10 +737,10 @@ def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str
                 for autotuning in (False, True):
                     key = _lpips_case(width, height, precision, layout, autotuning)
                     _timed_figures_are_consistent(cases[key])
-        size = (("height", height), ("loss", "ssim"), ("path", "torch"))
         for autotuning in (False, True):
-            key = tuple(sorted((*size, ("autotuning", autotuning), ("precision", "tf32"))))
-            _timed_figures_are_consistent(cases[key])
+            torch_case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
+            torch_case |= {"precision": "tf32", "autotuning": autotuning}
+            _timed_figures_are_consistent(cases[tuple(sorted(torch_case.items()))])
         fused_key = (("height", height), ("loss", "ssim"), ("path", "fused"), ("width", width))
         assert (fused_key in cases) == fused
         if fused:
