@@ -1151,7 +1151,7 @@ def test_render_request_through_small_buckets_stays_within_the_recompile_limit(
 
 def test_render_request_keeps_outputs_on_the_gpu_when_asked() -> None:
     """Q-174 (GPU): device="cuda" leaves every output on the GPU, with the values the default
-    CPU outputs hold, with and without the index."""
+    CPU outputs hold (within 1e-6, two gsplat runs), with and without the index."""
     model = _cuda(u32_scene())
     request = u32_request([0.2, 0.45, 0.8], [CAM_A, CAM_B])
     for temporal_index in (False, True):
@@ -1160,8 +1160,11 @@ def test_render_request_keeps_outputs_on_the_gpu_when_asked() -> None:
         on_cpu = render_request(model, request, **kw)
         for key in on_cpu.rgb:
             assert on_gpu.rgb[key].device.type == "cuda" == on_gpu.alpha[key].device.type
-            assert torch.equal(on_gpu.rgb[key].cpu(), on_cpu.rgb[key])
-            assert torch.equal(on_gpu.alpha[key].cpu(), on_cpu.alpha[key])
+        moved = Renders(
+            rgb={k: v.cpu() for k, v in on_gpu.rgb.items()},
+            alpha={k: v.cpu() for k, v in on_gpu.alpha.items()},
+        )
+        _assert_renders_close(moved, on_cpu, 1e-6)
 
 
 def test_render_request_builds_the_index_by_default_from_enough_times(
