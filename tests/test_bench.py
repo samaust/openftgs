@@ -419,8 +419,15 @@ VARIANTS = (  # packed × precull, D-57's default first
 
 
 @pytest.fixture(scope="module")
-def raster_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-    out = tmp_path_factory.mktemp("bench") / "B-2.json"
+def raster_bench(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """B-2 on four 384×256 ring cameras, three frames each: about half a minute. On `scene`'s
+    48×32 images, six tiles hold the millions of rows, so gsplat rasterizes them in six thread
+    blocks and the run takes over two minutes."""
+    root = tmp_path_factory.mktemp("raster")
+    cams = ring(4, radius=4.0, elevation=1.0, width_px=384, height_px=256, focal=352.0)
+    model = random_model(16, seed=0, sh_degree=1, time=TIME, spread=0.6)
+    scene = write_scene(root, model, [(cam, k / 30.0, "train") for k in range(3) for cam in cams])
+    out = root / "B-2.json"
     assert _ftgs("bench", "raster", scene, "--out", out) == 0
     body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
     return body
