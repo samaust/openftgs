@@ -21,8 +21,12 @@ import torch
 from builders import (
     C0,
     CAM_A,
+    CAM_B,
     U8_CASES,
+    U32_BOUND_TIME,
+    U32_WIDTH,
     UNIT_TIME,
+    index_lookups,
     logit_of,
     look_at,
     model_from_rows,
@@ -34,6 +38,9 @@ from builders import (
     sh0_for,
     sigmoid64,
     u8_scene,
+    u32_request,
+    u32_scene,
+    u32_times,
 )
 from real_sh import real_sh
 from torch import Tensor
@@ -1165,3 +1172,37 @@ def test_render_request_rejects_duplicate_ids() -> None:
     items = (RenderItem("x", 0.2, camera), RenderItem("x", 0.4, camera))
     with pytest.raises(ValueError, match="unique"):
         render_request(random_model(3, seed=2), RenderRequest(items, "s"), backend="reference")
+
+
+# U-32 · the temporal index leaves renders unchanged (D-55; Q-174)
+
+
+def test_u32_temporal_index_leaves_reference_renders_bitwise_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """U-32: a request rendered with the temporal index forced on (buckets 1/29 wide) and with
+    it off gives bitwise-identical images and alpha on the reference backend, at 100 times that
+    include 0, 1 and bucket edges ±1 ulp, for a scene with long rows, rows with 255σ ≤ 1, and rows
+    whose σ_eff is exactly float32(1/255) at one of the times or one float32 ulp either side.
+    Every row that passes the opacity cull at a time is among the rows the index passes then,
+    and at some times the index passes fewer rows than the model holds."""
+    model = u32_scene()
+    times = u32_times()
+    request = u32_request(times, [CAM_A, CAM_B])
+    seen = index_lookups(monkeypatch)
+    on = render_request(
+        model, request, backend="reference", temporal_index=True, frame_dt=U32_WIDTH
+    )
+    off = render_request(model, request, backend="reference", temporal_index=False)
+    for item in request.items:
+        assert torch.equal(on.rgb[item.id], off.rgb[item.id]), item.id
+        assert torch.equal(on.alpha[item.id], off.alpha[item.id]), item.id
+    assert sorted(seen) == sorted(times)
+    for t, rows in seen.items():
+        passing = torch.nonzero(model.at_time(t).passes_cull).squeeze(1)
+        assert set(passing.tolist()) <= set(rows.tolist()), t
+    assert min(len(rows) for rows in seen.values()) < model.num_gaussians
+    sigma = model.at_time(U32_BOUND_TIME).opacities_t
+    bound = torch.tensor(1.0 / 255.0, dtype=F32)
+    for value in (torch.nextafter(bound, -bound), bound, torch.nextafter(bound, 2 * bound)):
+        assert bool((sigma == value).any()), float(value)
