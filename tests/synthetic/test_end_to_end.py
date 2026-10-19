@@ -2,8 +2,9 @@
 """§3.2's end-to-end scenes on non-Gaussian data (M14, PRD #157): S-9 through the command line
 (ftgs train, export and render; ftgs init roma when the [init] extra is installed) and S-11's
 coverage of surfaces with no initial points, both on the textured spheres of the analytic ray
-caster in `raycast.py` (Q-138 to Q-140). Both train on the GPU: on the reference backend their
-320 images at 128×96 would far exceed Q-119's 3-minute CPU target, as S-5 did (Q-138).
+caster in `raycast.py` (Q-138 to Q-140), and S-5's effect of E8 on the same scene (#100, Q-165).
+All train on the GPU: on the reference backend their 320 images at 128×96 would far exceed
+Q-119's 3-minute CPU target, as M11's S-5 did (Q-138).
 
 Each test records its measured values with `record_property`, for the Calibration data table of
 docs/clean-room/questions.md; the thresholds are §3.2's and never loosened there.
@@ -24,10 +25,10 @@ import pytest
 import raycast
 import torch
 from builders import look_at, write_render_request
-from synthetic_scenes import load_seeds, smallest_spacing, synthetic_config
+from synthetic_scenes import load_seeds, mean_psnr, smallest_spacing, synthetic_config, train
 
 from openftgs.cli import main
-from openftgs.config import TrainConfig, config_to_dict
+from openftgs.config import GrowthConfig, LossConfig, TrainConfig, config_to_dict
 from openftgs.data import MultiViewVideo
 from openftgs.eval import psnr, ssim_k
 from openftgs.io import read_renders, write_init_points
@@ -42,6 +43,7 @@ PER_SPHERE = 300  # Q-140: lattice points per sphere and frame, 900 per frame (B
 S9_PSNR, S9_SSIM = 28.0, 0.9  # §3.2 S-9 (calibrated)
 S11_WITHIN_DB = 1.0  # §3.2 S-11 (calibrated)
 FILLER_OPACITY = 0.01  # Q-140: S-11's random low-opacity primitives
+S5_MAX_COST_DB = 0.5  # §3.2 S-5: "final PSNR not lower by more than 0.5 dB"
 
 has_init_extra = all(importlib.util.find_spec(m) for m in ("einops", "loguru", "torchvision"))
 Record = Callable[[str, object], None]
@@ -350,3 +352,107 @@ def test_s11_growth_covers_surfaces_with_no_initial_points(
         f"half+filler {p3:.2f} dB; N {full.model.num_gaussians}, {half.model.num_gaussians}"
     )
     assert abs(p2 - p1) <= S11_WITHIN_DB
+
+
+# S-5 (§3.2) on the ray-cast scene: the effect of E8 on dense textured surfaces (#100, Q-165).
+
+
+@dataclasses.dataclass(frozen=True)
+class _S5Runs:
+    opaque: dict[str, int]  # rows with σ > 0.9 at the end, per run
+    rows: dict[str, int]  # N at the end, per run
+    psnr: dict[str, float]  # held-out PSNR, E16 (criterion 2)
+    psnr_spheres: dict[str, float]  # over the pixels any ray hits a sphere in (Q-138), recorded
+    reg_term_reported: bool  # every iteration of the regularized run reported a nonzero L_reg
+    reg_term_last: float  # the regularized run's L_reg at its last iteration
+    seconds: float  # both runs, their held-out evaluations included
+
+
+def _sphere_psnr(
+    model: FreeTimeGaussians, video: MultiViewVideo, tests: list[int], scene: raycast.Scene
+) -> float:
+    """Q-138: the mean held-out PSNR over the pixels any ray of the caster hits a sphere in."""
+    values: list[float] = []
+    with torch.no_grad():
+        for i in tests:
+            record = video.records[i]
+            out = render(model, record.camera, record.timestamp, backend="gsplat")
+            mask = torch.from_numpy(scene.coverage[_view(record)] > 0).to("cuda")
+            values.append(_psnr_over(out.image[0], video.load_image(i).to("cuda"), mask))
+    return sum(values) / len(values)
+
+
+@pytest.fixture(scope="module")
+def s5_runs(scene: raycast.Scene) -> _S5Runs:
+    """Q-165: S-5's two runs on S-9's scene and initialization as they stand (N = 18,000), growth
+    "none" so N stays the same in both, relocation at its default, S-9's calendar, and
+    λ_reg = 0 against 10⁻² (E8, D-10) the only difference."""
+    started = time.perf_counter()
+    video = MultiViewVideo.from_manifest(scene.train_manifest)
+    scene_video, tests = _test_records(scene)  # both splits, for the held-out images
+    opaque: dict[str, int] = {}
+    rows: dict[str, int] = {}
+    psnrs: dict[str, float] = {}
+    spheres: dict[str, float] = {}
+    reported, last = False, 0.0
+    for name, lambda_reg in (("no_reg", 0.0), ("reg", 1e-2)):
+        # Q-165: growth "none" keeps N the same in both runs; λ_reg is the only difference.
+        cfg = _cfg(loss=LossConfig(lambda_reg=lambda_reg), growth=GrowthConfig(mode="none"))
+        trainer, logs = train(cfg, video, _full_init(scene), "cuda")
+        model = trainer.model
+        opaque[name] = int((torch.sigmoid(model.opacity_logits.detach()) > 0.9).sum())  # §1.1, D-5
+        rows[name] = model.num_gaussians
+        psnrs[name] = mean_psnr(model, scene_video, tests)
+        spheres[name] = _sphere_psnr(model, scene_video, tests, scene)
+        if lambda_reg > 0.0:
+            reported = all("reg" in log.losses and float(log.losses["reg"]) > 0.0 for log in logs)
+            last = float(logs[-1].losses["reg"]) if reported else 0.0
+    return _S5Runs(
+        opaque=opaque,
+        rows=rows,
+        psnr=psnrs,
+        psnr_spheres=spheres,
+        reg_term_reported=reported,
+        reg_term_last=last,
+        seconds=time.perf_counter() - started,
+    )
+
+
+@pytest.mark.gpu
+def test_s5_raycast_regularization_keeps_fewer_primitives_opaque(
+    s5_runs: _S5Runs, record_property: Record
+) -> None:
+    """S-5 on the ray-cast scene (Q-165): at the end of training the share of primitives with
+    σ > 0.9 is lower with λ_reg = 10⁻² than without, both runs keeping the same N (growth
+    "none"); the regularized run reports a nonzero L_reg at every iteration, so E8 entered its
+    loss."""
+    runs = s5_runs
+    for name in ("no_reg", "reg"):
+        record_property(f"s5_raycast_{name}_opaque", runs.opaque[name])
+        record_property(f"s5_raycast_{name}_rows", runs.rows[name])
+    record_property("s5_raycast_reg_term_last", runs.reg_term_last)
+    record_property("s5_raycast_seconds", runs.seconds)
+    print(
+        f"s5 raycast: σ > 0.9 in {runs.opaque['no_reg']} and {runs.opaque['reg']} of"
+        f" {runs.rows['no_reg']} and {runs.rows['reg']} rows"
+    )
+    assert runs.rows["no_reg"] == runs.rows["reg"]
+    assert runs.reg_term_reported and runs.reg_term_last > 0.0
+    assert runs.opaque["reg"] / runs.rows["reg"] < runs.opaque["no_reg"] / runs.rows["no_reg"]
+
+
+@pytest.mark.gpu
+def test_s5_raycast_regularization_costs_at_most_half_a_db(
+    s5_runs: _S5Runs, record_property: Record
+) -> None:
+    """S-5 on the ray-cast scene (Q-165): the final held-out PSNR with λ_reg = 10⁻² is not lower
+    than without by more than 0.5 dB; the sphere-coverage PSNR is recorded beside it (Q-138)."""
+    runs = s5_runs
+    for name in ("no_reg", "reg"):
+        record_property(f"s5_raycast_{name}_psnr", runs.psnr[name])
+        record_property(f"s5_raycast_{name}_psnr_spheres", runs.psnr_spheres[name])
+    print(
+        f"s5 raycast: held-out PSNR {runs.psnr['no_reg']:.2f} and {runs.psnr['reg']:.2f} dB"
+        f" (spheres {runs.psnr_spheres['no_reg']:.2f} and {runs.psnr_spheres['reg']:.2f})"
+    )
+    assert runs.psnr["reg"] >= runs.psnr["no_reg"] - S5_MAX_COST_DB
