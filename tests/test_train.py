@@ -1226,3 +1226,47 @@ def test_u30_cuda_training_reads_from_each_placement(
     logs = _run(trainer)
     assert len(logs) == 30 and _all_finite(logs)
     assert FrameCache.default_directory(video.manifest).is_dir()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("placement", ["off", "auto"])
+def test_u30_cuda_png_path_gives_the_first_losses_of_the_gpu_cache_bitwise(
+    tmp_path: Path, placement: Literal["off", "auto"]
+) -> None:
+    """U-30 (GPU), D-51, §2.4 rule 3: on CUDA the PNG path ("off", and "auto" until its first
+    iteration has chosen a placement) stages each decoded image in pinned memory and copies it
+    without blocking. Its first iteration gives bitwise the loss terms of a first iteration
+    reading the cache in GPU memory, before any update could make the runs differ (gsplat's
+    backward pass accumulates with atomic additions)."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    first = [
+        Trainer(_with_cache(ONE_EVENT, cache), video, _u21_model(video), device="cuda").step()
+        for cache in (placement, "gpu")
+    ]
+    assert first[0].image_index == first[1].image_index
+    assert first[0].losses.keys() == first[1].losses.keys()
+    for name, value in first[0].losses.items():
+        assert torch.equal(value, first[1].losses[name]), name
+
+
+@pytest.mark.gpu
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+@pytest.mark.parametrize("placement", ["off", "auto"])
+def test__image_on_cuda_is_the_decoded_png_bitwise_and_never_synchronizes(
+    tmp_path: Path, placement: Literal["off", "auto"]
+) -> None:
+    """D-51, §2.4 rule 3: on the PNG path the trainer's CUDA image of every training record is
+    bitwise what `MultiViewVideo.load_image` decodes, and taking it makes no host–device
+    synchronization (torch's sync debug mode)."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    trainer = Trainer(_with_cache(ONE_EVENT, placement), video, _u21_model(video), device="cuda")
+    training = [i for i, record in enumerate(video.records) if record.split == "train"]
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        images = [trainer._image(index) for index in training]
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    for index, image in zip(training, images, strict=True):
+        assert image.device.type == "cuda"
+        assert torch.equal(image, video.load_image(index).cuda()), index
