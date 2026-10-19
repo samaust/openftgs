@@ -416,8 +416,7 @@ def test_ftgs_if_reader_accepts_revision_549_render_conventions(tmp_path: Path) 
     assert set(back.arrays) == set(arrays)
     for key, value in arrays.items():
         assert torch.equal(back.arrays[key], value), key
-    want = tuple(float(c) for c in _REVISION_549_CONVENTIONS["background"])
-    assert back.background == want
+    assert back.background == (0.0, 0.0, 0.0)  # the block's own entry
 
 
 def test_ftgs_if_writer_validates_before_writing(tmp_path: Path) -> None:
