@@ -529,7 +529,7 @@ def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
 class _Loaded:
     model: FreeTimeGaussians
     iteration: int | None  # a checkpoint's
-    # D-84: a checkpoint's configuration's background, else black until #187
+    # D-84: a checkpoint's configuration's background, or the one an exchange file records
     background: tuple[float, float, float]
     # Q-136 (as answered): an exchange model's file, or a checkpoint's manifest.json, which
     # holds every other file's SHA-256 (§2.2, Q-25); only when asked for
@@ -559,10 +559,11 @@ def _read_model(path: Path, device: str) -> _Loaded:
     from openftgs.model import FreeTimeGaussians
 
     if not path.is_dir():
+        exchange = read_exchange(path)
         return _Loaded(
-            FreeTimeGaussians.from_exchange(read_exchange(path), device=device),
+            FreeTimeGaussians.from_exchange(exchange, device=device),
             None,
-            (0.0, 0.0, 0.0),
+            exchange.background,  # D-84
             None,
         )
     state = load_checkpoint(path)

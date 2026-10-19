@@ -326,17 +326,46 @@ def test_ftgs_if_metadata_follows_section_2_2(tmp_path: Path) -> None:
     }
 
 
-def test_ftgs_if_records_the_exchange_models_background(tmp_path: Path) -> None:
-    """D-84: render_conventions records the exchange model's `background`, black by default
-    (D-34); the reader ignores it until #187, so the model read back is still black."""
+def test_ftgs_if_records_and_returns_the_exchange_models_background(tmp_path: Path) -> None:
+    """D-84, U-22: render_conventions records the exchange model's `background`, black by
+    default (D-34), and the reader returns it, so the round trip is exact for it too."""
     model = ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t", background=(1.0, 0.5, 0.0))
     path = tmp_path / "model.safetensors"
     write_exchange(model, path)
     with safe_open(str(path), framework="pt") as f:
         conventions = json.loads(f.metadata()["render_conventions"])
     assert conventions["background"] == [1.0, 0.5, 0.0]
+    assert read_exchange(path).background == (1.0, 0.5, 0.0)
+    write_exchange(ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t"), path)
     assert read_exchange(path).background == (0.0, 0.0, 0.0)
-    assert ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t").background == (0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    "conventions",
+    [None, "{}", '{"rasterize_mode": "classic"}'],
+    ids=["absent", "empty", "other entries"],
+)
+def test_ftgs_if_reader_reads_black_without_a_recorded_background(
+    tmp_path: Path, conventions: str | None
+) -> None:
+    """D-84, Q-157: a file with no render_conventions, or a block without `background`, reads
+    as black, so files of other implementations still read."""
+    path = tmp_path / "model.safetensors"
+    meta = exchange_metadata()
+    if conventions is not None:
+        meta["render_conventions"] = conventions
+    save_file(exchange_arrays(), str(path), metadata=meta)
+    assert read_exchange(path).background == (0.0, 0.0, 0.0)
+
+
+def test_ftgs_if_reader_reads_an_integer_background_as_floats(tmp_path: Path) -> None:
+    """D-84: JSON integers are numbers, returned as floats."""
+    path = tmp_path / "model.safetensors"
+    meta = exchange_metadata(render_conventions='{"background": [0, 1, 0]}')
+    save_file(exchange_arrays(), str(path), metadata=meta)
+    background = read_exchange(path).background
+    assert background == (0.0, 1.0, 0.0)
+    assert all(type(c) is float for c in background)
 
 
 @pytest.mark.parametrize(
@@ -361,9 +390,9 @@ def test_u22_ftgs_if_validator_rejects_invalid_files(tmp_path: Path, case: str) 
         read_exchange(path)
 
 
-def test_ftgs_if_reader_ignores_unknown_keys_and_render_conventions(tmp_path: Path) -> None:
-    """§2.2: unknown optional keys are ignored; render_conventions is accepted and ignored (Q-24);
-    a unit rotation with w < 0 is accepted on read."""
+def test_ftgs_if_reader_ignores_unknown_keys_and_other_render_conventions(tmp_path: Path) -> None:
+    """§2.2: unknown optional keys are ignored, and so are render_conventions' entries other than
+    the background (Q-24, D-84); a unit rotation with w < 0 is accepted on read."""
     arrays = exchange_arrays()
     arrays["rotation"][0] = -arrays["rotation"][0]
     arrays["confidence"] = torch.ones(6)
@@ -377,8 +406,8 @@ def test_ftgs_if_reader_ignores_unknown_keys_and_render_conventions(tmp_path: Pa
 
 def test_ftgs_if_reader_accepts_revision_549_render_conventions(tmp_path: Path) -> None:
     """§2.2 introduction, D-73: a file whose render_conventions holds only the eight entries of
-    spec revision 549 (no clamp margin, extent rule or rasterize mode) still reads, the block
-    ignored, so D-73 needs no version bump."""
+    spec revision 549 (no clamp margin, extent rule or rasterize mode) still reads, its
+    background returned (D-84) and its other entries ignored, so D-73 needs no version bump."""
     arrays = exchange_arrays()
     old_block = json.dumps(_REVISION_549_CONVENTIONS, separators=(",", ":"))
     path = tmp_path / "model.safetensors"
@@ -387,6 +416,7 @@ def test_ftgs_if_reader_accepts_revision_549_render_conventions(tmp_path: Path) 
     assert set(back.arrays) == set(arrays)
     for key, value in arrays.items():
         assert torch.equal(back.arrays[key], value), key
+    assert back.background == (0.0, 0.0, 0.0)  # the block's own entry
 
 
 def test_ftgs_if_writer_validates_before_writing(tmp_path: Path) -> None:

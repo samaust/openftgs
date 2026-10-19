@@ -971,6 +971,23 @@ def _body(report: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in report.items() if k not in ("producer", "model", "renders")}
 
 
+def _assert_close(a: Any, b: Any, path: str = "body") -> None:
+    """Equal JSON trees, floats within 1e-6, relative or absolute (U-22's render tolerance, for
+    metrics of renders in [0, 1]; Q-162)."""
+    if isinstance(a, dict):
+        assert isinstance(b, dict) and a.keys() == b.keys(), path
+        for key in a:
+            _assert_close(a[key], b[key], f"{path}.{key}")
+    elif isinstance(a, list):
+        assert isinstance(b, list) and len(a) == len(b), path
+        for k, (x, y) in enumerate(zip(a, b, strict=True)):
+            _assert_close(x, y, f"{path}[{k}]")
+    elif isinstance(a, float):
+        assert b == pytest.approx(a, rel=1e-6, abs=1e-6), path
+    else:
+        assert a == b, path
+
+
 def _renders_dir(tmp_path: Path, checkpoint: Path, items: list[tuple[str, float, Any]]) -> Path:
     """DIR of Q-137: request.json and its renders by the reference backend."""
     directory = tmp_path / "supplied"
@@ -1037,7 +1054,8 @@ def test_eval_of_a_model_that_changes_while_it_is_read_is_exit_code_2(
 @pytest.mark.weights
 def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) -> None:
     """D-84, Q-74: ftgs eval of a checkpoint renders against its configuration's background,
-    so a white-background run's report body equals Trainer.evaluate's."""
+    so a white-background run's report body equals Trainer.evaluate's; its export records that
+    background and ftgs eval of the exchange model gives the same body."""
     from openftgs.data import MultiViewVideo
 
     scene, checkpoint = _trained(tmp_path, background=(1.0, 1.0, 1.0))
@@ -1049,6 +1067,14 @@ def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) ->
     got = json.loads(out.read_text())
     assert _body(got) == _body(want)
     assert set(got) == set(want) and set(got["model"]) == set(want["model"])  # Q-136
+    # D-84: the exported model records the background, and ftgs eval renders it on that.
+    exchange = tmp_path / "white.safetensors"
+    assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
+    exported = tmp_path / "exported.json"
+    assert _ftgs("eval", exchange, scene, "--out", exported) == 0
+    # Q-162: the exchange model stores opacities and durations, not their logits, so its
+    # renders match the checkpoint's within U-22's 1e-6, and the bodies are compared there.
+    _assert_close(_body(json.loads(exported.read_text())), _body(got))
 
 
 @pytest.mark.weights

@@ -369,9 +369,34 @@ def write_exchange(model: ExchangeModel, path: Path) -> None:
     _replace_with_safetensors({k: model.arrays[k] for k in _IF_KEYS}, Path(path), meta)
 
 
+def _recorded_background(meta: Mapping[str, str], where: str) -> tuple[float, float, float]:
+    """D-84: render_conventions' background, black when the block or the entry is absent; its
+    range is validate_exchange's to check."""
+    if "render_conventions" not in meta:
+        return (0.0, 0.0, 0.0)
+    try:
+        conventions = json.loads(meta["render_conventions"])
+    except (ValueError, RecursionError):
+        conventions = None
+    if not isinstance(conventions, dict):
+        _fail(where, "render_conventions must be a JSON object")  # Q-157
+    if "background" not in conventions:
+        return (0.0, 0.0, 0.0)
+    value = conventions["background"]
+    numbers = isinstance(value, list) and len(value) == 3
+    if not numbers or any(isinstance(c, bool) or not isinstance(c, int | float) for c in value):
+        _fail(where, f"background must be three numbers in [0, 1], got {value!r}")
+    try:
+        return (float(value[0]), float(value[1]), float(value[2]))
+    except OverflowError:  # an integer too large for a float (Q-26: a plain ValueError)
+        _fail(where, f"background must be three numbers in [0, 1], got {value!r}")
+
+
 def read_exchange(path: Path) -> ExchangeModel:
-    """Read and validate a ftgs-if file (§2.2; Q-22). Unknown keys and render_conventions are
-    ignored (Q-24)."""
+    """Read and validate a ftgs-if file (§2.2; Q-22). Unknown keys are ignored, and so are the
+    entries of render_conventions other than `background` (Q-24), which is returned: black
+    when the block or the entry is absent, a ValueError when it isn't three numbers in [0, 1]
+    or the block isn't a JSON object (D-84, Q-157)."""
     tensors, meta = _read_safetensors(Path(path))
     where = str(path)
     _check_header(meta, _IF, where)
@@ -390,6 +415,7 @@ def read_exchange(path: Path) -> ExchangeModel:
         tau1=tau1,
         time_unit=meta["time_unit"],
         producer=meta.get("producer", ""),
+        background=_recorded_background(meta, where),
     )
     try:
         validate_exchange(model)
