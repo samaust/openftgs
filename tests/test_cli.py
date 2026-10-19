@@ -581,7 +581,7 @@ def test_train_evaluates_the_test_split_at_the_end(tmp_path: Path) -> None:
     out = tmp_path / "run"
     assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 0
     report = json.loads((out / "METRICS.json").read_text())
-    assert report["model"] == {"path": None, "iteration": ITERATIONS}
+    assert report["model"] == {"path": None, "iteration": ITERATIONS, "sha256": None}
     assert report["split"] == "test" and set(report["entire"]["scene"]) == set(METRIC_NAMES)
 
 
@@ -986,14 +986,16 @@ def _renders_dir(tmp_path: Path, checkpoint: Path, items: list[tuple[str, float,
 @pytest.mark.weights
 def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Path) -> None:
     """§2.1, Q-63, Q-136: METRICS.json with every metric under `entire`, `dynamic` for a masked
-    split (with no image missing a mask, Q-135), and the header: `model` = {path, iteration},
-    the iteration null for an exchange model, and the scene manifest."""
+    split (with no image missing a mask, Q-135), and the header: `model` = {path, iteration,
+    sha256}, the iteration null for an exchange model, the hash that of the exchange file or of
+    the checkpoint's manifest.json (Q-136 as answered), and the scene manifest."""
     scene, checkpoint = _trained(tmp_path, masks=True)
     out = tmp_path / "m.json"
     assert _ftgs("eval", checkpoint, scene, "--split", "test", "--out", out) == 0
     report = json.loads(out.read_text())
     assert report["format"] == "ftgs-metrics" and report["split"] == "test"
-    assert report["model"] == {"path": str(checkpoint), "iteration": 10}
+    manifest_sha = hashlib.sha256((checkpoint / "manifest.json").read_bytes()).hexdigest()
+    assert report["model"] == {"path": str(checkpoint), "iteration": 10, "sha256": manifest_sha}
     assert report["manifest"]["sha256"] == hashlib.sha256(scene.read_bytes()).hexdigest()
     assert set(report["entire"]["scene"]) == set(METRIC_NAMES)
     assert len(report["entire"]["images"]) == 3
@@ -1002,7 +1004,34 @@ def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Pa
     exchange = tmp_path / "m.safetensors"
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
     assert _ftgs("eval", exchange, scene, "--out", out) == 0
-    assert json.loads(out.read_text())["model"] == {"path": str(exchange), "iteration": None}
+    assert json.loads(out.read_text())["model"] == {
+        "path": str(exchange),
+        "iteration": None,
+        "sha256": hashlib.sha256(exchange.read_bytes()).hexdigest(),
+    }
+
+
+def test_eval_of_a_model_that_changes_while_it_is_read_is_exit_code_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-154, Q-136: ftgs eval hashes MODEL before and after reading it; a checkpoint whose
+    manifest.json changes in between, as a periodic save changes RUN_DIR/checkpoint (D-83),
+    is exit 2 and nothing is written, before any LPIPS weights are needed."""
+    import openftgs.io
+
+    scene, checkpoint = _trained(tmp_path)
+    original = openftgs.io.load_checkpoint
+
+    def saved_meanwhile(directory: Path) -> Any:
+        state = original(directory)
+        manifest = Path(directory) / "manifest.json"
+        manifest.write_bytes(manifest.read_bytes() + b"\n")
+        return state
+
+    monkeypatch.setattr("openftgs.io.load_checkpoint", saved_meanwhile)
+    out = tmp_path / "m.json"
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert not out.exists()
 
 
 @pytest.mark.weights
@@ -1036,6 +1065,8 @@ def test_eval_scores_supplied_renders_as_its_own(tmp_path: Path) -> None:
     sha = hashlib.sha256((directory / "request.json").read_bytes()).hexdigest()
     assert report["renders"]["request_sha256"] == sha
     assert report["renders"]["producer"].startswith("openftgs")
+    manifest_sha = hashlib.sha256((checkpoint / "manifest.json").read_bytes()).hexdigest()
+    assert report["model"]["sha256"] == manifest_sha  # Q-136: still MODEL's
 
 
 def _broken_first_render(

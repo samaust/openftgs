@@ -1049,7 +1049,7 @@ def test_evaluate_returns_scene_means_and_writes_the_metrics_report(tmp_path: Pa
     assert set(result) == set(METRIC_NAMES) | {f"dynamic/{name}" for name in METRIC_NAMES}
     report = json.loads((tmp_path / "out" / "METRICS.json").read_text())
     assert report["format"] == "ftgs-metrics" and report["split"] == "test"
-    assert report["model"] == {"path": None, "iteration": 5}  # Q-136
+    assert report["model"] == {"path": None, "iteration": 5, "sha256": None}  # Q-136
     assert report["manifest"] == {
         "path": str(video.manifest.path),
         "sha256": video.manifest.sha256,
