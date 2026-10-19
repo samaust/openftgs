@@ -1,6 +1,6 @@
 # Render backends in `openftgs.render`
 
-How `render()` meets its §2.1 row for E2, E5 and E6, and how its two render backends are built: the pure-PyTorch reference and the gsplat version §2.3 pins. The temporal index (D-55) arrives in M15 and is meant to reuse the front half described here. The keywords `precull` (Q-31) and `packed` (Q-36) and the semantics §2.1 leaves open (Q-32, Q-33) are provisional decisions or owner answers recorded in `docs/clean-room/questions.md`; the gsplat backend's are now in the spec as D-75 and D-76 (revision 549b).
+How `render()` meets its §2.1 row for E2, E5 and E6, and how its two render backends are built: the pure-PyTorch reference and the gsplat version §2.3 pins; and how `render_request` answers a render request, with the temporal index of D-55, which reuses the front half described here. The keywords `precull` (Q-31) and `packed` (Q-36) and the semantics §2.1 leaves open (Q-32, Q-33) are provisional decisions or owner answers recorded in `docs/clean-room/questions.md`; the gsplat backend's are now in the spec as D-75 and D-76 (revision 549b).
 
 ## The front half, shared by every backend
 
@@ -73,13 +73,43 @@ The pinned gsplat cannot take a per-camera background in packed mode, so the bac
 
 ### Host synchronization
 
-A render synchronizes where gsplat reads back the number of tile intersections and, in packed mode, the number of visible pairs; with compaction, `render()`'s own selection of kept rows synchronizes too (D-57). The backend adds nothing else (§2.4 rule 3): its view matrices, the packed visibility scatter and the default background are filled on the device, never written from the host, and a GPU test checks that every synchronization torch's debug mode reports comes from gsplat. Cameras or a background held on the host are copied to the device in every render, which synchronizes, so a caller that renders repeatedly, like the trainer, keeps them on the device.
+A render synchronizes where gsplat reads back the number of tile intersections and, in packed mode, the number of visible pairs; with compaction, `render()`'s own selection of kept rows synchronizes too (D-57). The backend adds nothing else (§2.4 rule 3): its view matrices, the packed visibility scatter and the default background are filled on the device, never written from the host, and a GPU test checks that every synchronization torch's debug mode reports comes from gsplat. Cameras or a background held on the host are copied to the device in every render, which synchronizes, so a caller that renders repeatedly, like the trainer, keeps them on the device; `render_request` does that for its callers (below).
 
 ## Rendering a request
 
-`render_request` answers a render request (§2.2, D-55, Q-57). Items that share a timestamp and an image size render in one `render()` call, since `render()` refuses cameras of different sizes (Q-32). Outputs are keyed by item id, which must be unique, never by camera name: a request built from a scene manifest's cameras repeats one camera at many times. The request's background and SH degree pass through. Its time unit must be the model's (Q-17). The whole request runs under inference mode, and the outputs are moved to the CPU in request order, so a large request doesn't hold every image on the GPU.
+`render_request` answers a render request (§2.2, D-55, Q-57). Items that share a timestamp and an image size render in one call, since `render()` refuses cameras of different sizes (Q-32). Outputs are keyed by item id, which must be unique, never by camera name: a request built from a scene manifest's cameras repeats one camera at many times. The request's background and SH degree pass through. Its time unit must be the model's (Q-17). The whole request runs under inference mode.
 
-Each call still runs the temporal slice for its time. The temporal index of D-55, and with it "activations computed once per model" (§2.4), go inside this function in M15, so its callers (the trainer's evaluation, `ftgs render`, `ftgs eval`) won't change. Two copies synchronize and are M15's to weigh with B-7: each output's copy to the CPU, and the request background, built on the CPU and copied to the device in every call; a keyword-only `device` for the outputs and a background built on the model's device would remove them without changing any caller (Q-57).
+Three keyword-only arguments come from Q-174, so no caller had to change: `temporal_index` and `frame_dt`, below, and `device`, which places the outputs. By default they go to the CPU in request order, so a large request doesn't hold every image on the GPU; the model's device leaves them where they were rendered, with no copy.
+
+### Once per request
+
+Before its first render, a request builds what doesn't change with time (§2.4, "activations computed once per model"; Q-174):
+
+- the background, in float32 as requests have always passed it, on the model's device, filled there rather than copied from the host;
+- the cameras: on a CUDA model, every camera held on the host goes to the device in one copy for the whole request, staged in pinned memory and sent without blocking, with its values unchanged;
+- with the index on, the SH coefficients cut to the request's degree, concatenated as `at_time` concatenates them, and the temporal index.
+
+The other activations are not precomputed: the temporal slice recomputes σ, the scales and the unit quaternions at every render, in the same fused kernel and at no extra memory traffic, so a row at the 1/255 bound keeps the bits it has without the index (Q-174).
+
+### The temporal index
+
+D-55 renders a time from the rows that can pass the opacity cull then. Normalized time is cut into buckets of one width, and time t falls in bucket ⌊t·(1/width)⌋. A row's reach is the stretch of time around its time center in which its effective opacity can reach 1/255, widened by D-55's margins and computed in float64: |t − μt| ≤ s·√(2 ln(255σ(1 + 10⁻⁴))) + 10⁻⁶. The relative margin covers the slice's float32 rounding of σ_eff; the absolute one covers the slice evaluating at float32(t) rather than t. A row with 255σ(1 + 10⁻⁴) ≤ 1 can never pass the cull and is never listed, nor is a row whose reach misses [0, 1]. A row whose reach covers more than 8 buckets of [0, 1] goes on one long list that every render takes; every other row is listed in each bucket its reach touches. The buckets of a reach's ends are found with the same float64 multiply and floor as a lookup, so a time inside a row's reach always falls in one of that row's buckets. Only the buckets of the request's own times are kept.
+
+A render at t in [0, 1] takes the bucket's rows and the long rows, sorted ascending, so that rows tied in depth composite in row order, as they do without the index (Q-33). On gsplat, the temporal slice runs on the gathered rows with the model's implementation (`slice_impl`, Q-66), and gsplat's own opacity cull then decides, so the image is unchanged: U-32 holds it within 1e-6. The reference backend runs the full slice and keeps the listed rows after, since CPU kernels can give other bits on a subset of rows ("Bitwise stability under row subsets"); U-32 holds it bitwise. Both backends get the rows through the `rows=` path that compaction uses, so their outputs stay indexed by model row. Timestamps outside the training span, whose normalized times leave [0, 1], render through `render()` as without the index, and it warns about them as before (Q-9); the request tells the two kinds apart without converting, so it never touches the process's warning filters, which other threads share.
+
+An empty selection doesn't run the slice and gives Q-38's empty render, the background with alpha 0, composited as both backends composite it, so its bits are theirs with nothing drawn. Skipping it also keeps dynamo from specializing a graph for zero rows; a selection of one row still gets its own graph, so the gathered slice compiles at most two graphs, within U-28's limit of two recompilations. Under `slice_impl = "auto"`, reaching the recompile limit would make the eager slice stick for the rest of the process (Q-13), which a GPU test guards against with selections of 0, 1 and many rows.
+
+Should U-32 on gsplat ever differ at the cull bound, the fallback is one switch, `_GSPLAT_FULL_SLICE`, which makes gsplat take the full slice too (Q-174).
+
+### The switch and the width
+
+`temporal_index` True or False forces the index on or off. None, the default, turns it on for the gsplat backend when the request has at least `_INDEX_MIN_TIMES` distinct times in [0, 1]. That threshold is 8 for now, a provisional value until B-7 (#231) weighs the build against the renders it speeds up; it is at least 2, so a request at a single time, as `evaluate_images` sends one per timestamp (Q-68), never builds an index. The reference backend never turns it on by default.
+
+The width is `frame_dt`, in normalized time. `ftgs render` and `ftgs eval` pass a checkpoint's Δt_f (E14, through `evaluate_images` for `ftgs eval`, Q-183); an exchange model carries none. Without `frame_dt`, the width is the median gap between the request's distinct times in [0, 1], and 1 for a single time, the value E14 gives Δt_f for a single timestamp. It never goes below 2⁻³⁰, which keeps bucket numbers small integers. The width changes only the speed: the images are the same at any width.
+
+### Where a request synchronizes
+
+On a GPU, a request synchronizes inside gsplat's calls, as every render does, and while the index is built, which reads counts back from the device. Nothing else does: the background is filled on the device; host cameras are sent once, without blocking; a bucket's rows are a slice whose length the host knows, so even an empty selection is found without reading the device; and with `device` set to the model's device the outputs aren't copied. A GPU test checks this under torch's debug mode. With the default CPU outputs, each output's copy to the CPU synchronizes as well.
 
 ## Where the backends differ
 
