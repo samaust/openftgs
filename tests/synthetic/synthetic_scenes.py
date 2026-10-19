@@ -391,31 +391,6 @@ def _gt_s4(seed: int) -> ExchangeModel:
     )
 
 
-CLUTTER_COUNT = 2_000
-CLUTTER_SCALES = (0.005, 0.015)  # Q-78: smaller than the objects', the "small" Gaussians
-CLUTTER_OPACITY = (0.3, 0.99)  # Q-78: up to about 1, so an unregularized fit can saturate
-
-
-def _gt_clutter(seed: int, gt: ExchangeModel) -> ExchangeModel:
-    """S-5's 2,000 small random Gaussians (Q-78): static (v = 0) and always present (s = 2 in
-    normalized time, as S-2's objects), uniform in the view volume, with uniform time centers,
-    log-uniform scales in CLUTTER_SCALES, uniform opacities in CLUTTER_OPACITY and colors."""
-    g = torch.Generator().manual_seed(seed)
-    span = gt.tau1 - gt.tau0
-    n = CLUTTER_COUNT
-    arrays = {
-        "position": _uniform(g, -VOLUME, VOLUME, n, 3),
-        "time_center": _uniform(g, 0.0, span, n),
-        "duration": torch.full((n,), 2.0 * span, dtype=F64),
-        "velocity": torch.zeros(n, 3, dtype=F64),
-        "scale": _log_uniform(g, *CLUTTER_SCALES, n, 3),
-        "rotation": _rotations(g, n),
-        "opacity": _uniform(g, *CLUTTER_OPACITY, n),
-        "sh": sh_of(_uniform(g, 0.2, 0.9, n, 3)),
-    }
-    return exchange(arrays, tau0=gt.tau0, tau1=gt.tau1, degree=0)
-
-
 CLUSTER_SIZE = 3  # D-87: each S-2 object and two companions
 CLUSTER_OFFSET = 1.5  # D-87: companions this many of the object's largest scales away
 CLUSTER_SCALE = 0.8  # D-87: a companion's scales, as a fraction of the object's
@@ -453,22 +428,20 @@ GROUND_TRUTH_FILES = {
     "s2": "s2_gt.safetensors",
     "s3": "s3_gt.safetensors",
     "s4": "s4_gt.safetensors",
-    "s5": "s5_gt.safetensors",
     "s6": "s6_gt.safetensors",
 }
 
 
 def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, ExchangeModel]:
-    """The ground truth of S-1 to S-6 from the committed seeds: S-4's is three spheres of
-    Gaussians (Q-119); S-5's is S-2's 8 Gaussians (its first rows) followed by 2,000 small ones
-    (Q-78); S-6's is S-2's objects as clusters of three (D-87); S-7 and S-8 reuse S-2's."""
+    """The ground truth of S-1 to S-4 and S-6 from the committed seeds: S-4's is three spheres of
+    Gaussians (Q-119); S-6's is S-2's objects as clusters of three (D-87); S-7 and S-8 reuse S-2's.
+    S-5 runs on the ray-cast scene, whose analytic caster is its ground truth (D-86)."""
     s2 = _gt_s2(seeds["s2"]["ground_truth"])
     return {
         "s1": _gt_s1(seeds["s1"]["ground_truth"]),
         "s2": s2,
         "s3": _gt_s3(seeds["s3"]["ground_truth"]),
         "s4": _gt_s4(seeds["s4"]["ground_truth"]),
-        "s5": concatenated(s2, _gt_clutter(seeds["s5"]["clutter"], s2)),
         "s6": _gt_s6(seeds["s6"]["ground_truth"], s2),
     }
 
@@ -515,11 +488,6 @@ def replaced(model: ExchangeModel, **arrays: Tensor) -> ExchangeModel:
     for key, value in arrays.items():
         new[key] = value.to(model.arrays[key].dtype)
     return dataclasses.replace(model, arrays=new)
-
-
-def rows(model: ExchangeModel, index: slice) -> ExchangeModel:
-    """The model's rows selected by `index`."""
-    return dataclasses.replace(model, arrays={k: v[index] for k, v in model.arrays.items()})
 
 
 def concatenated(first: ExchangeModel, second: ExchangeModel) -> ExchangeModel:
