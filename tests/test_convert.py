@@ -14,6 +14,7 @@ import json
 import shutil
 import subprocess
 import tarfile
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
@@ -34,6 +35,7 @@ from builders import (
 )
 from PIL import Image
 
+from openftgs import _stages
 from openftgs.data import (
     camera_from_llff,
     camera_from_opencv,
@@ -143,6 +145,27 @@ def test_n3dv_outputs_do_not_depend_on_jobs(tmp_path: Path) -> None:
         )
     a, b = json.loads(one.read_text()), json.loads(two.read_text())
     assert a["images"] == b["images"] and a["cameras"] == b["cameras"]
+
+
+@needs_ffmpeg
+def test_n3dv_decoding_and_encoding_are_stages_per_camera(tmp_path: Path) -> None:
+    """§3.4 B-8 (PRD #220): under a wall clock, every frame read from ffmpeg is the stage
+    "convert.decode" in its camera's thread, and every frame processed and written in the pool
+    is the stage "convert.encode", its duration measured in the pool's process; both are keyed
+    by camera."""
+    src = n3dv_source(tmp_path / "s", cameras=3, frames=3)
+    with _stages.Clock("wall") as clock:
+        convert_n3dv(src, tmp_path / "out", frames=3, resize=0.5, jobs=2)
+    timings = clock.read()
+    cameras = ["cam00", "cam01", "cam02"]
+    for name in ("convert.decode", "convert.encode"):
+        mine = [t for t in timings if t.name == name]
+        assert sorted(str(t.key) for t in mine) == sorted(cameras * 3), name
+        assert all(t.seconds > 0.0 for t in mine), name
+    for camera in cameras:
+        threads = {t.thread for t in timings if t.name == "convert.decode" and t.key == camera}
+        assert len(threads) == 1 and threads != {threading.current_thread().name}
+    assert {t.name for t in timings} == {"convert.decode", "convert.encode"}
 
 
 @needs_ffmpeg
