@@ -86,7 +86,7 @@ def render(
     rows: Tensor | None = None
     if precull == "compact":
         # Q-31, D-57: compaction after the temporal slice, in ascending row order.
-        rows = _kept_rows(g)
+        rows = _kept_rows(g)  # Q-171: the one synchronization compaction adds
         g = _take_rows(g, rows)
     gaussian_ids: Tensor | None = None
     if backend == "gsplat":
