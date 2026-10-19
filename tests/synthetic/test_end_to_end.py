@@ -363,9 +363,9 @@ class _S5Runs:
     rows: dict[str, int]  # N at the end, per run
     psnr: dict[str, float]  # held-out PSNR, E16 (criterion 2)
     psnr_spheres: dict[str, float]  # over the pixels any ray hits a sphere in (Q-138), recorded
-    reg_term_reported: bool  # every iteration of the regularized run reported L_reg
+    reg_term_reported: bool  # every iteration of the regularized run reported a nonzero L_reg
     reg_term_last: float  # the regularized run's L_reg at its last iteration
-    seconds: float  # both runs
+    seconds: float  # both runs, their held-out evaluations included
 
 
 def _sphere_psnr(
@@ -389,22 +389,23 @@ def s5_runs(scene: raycast.Scene) -> _S5Runs:
     λ_reg = 0 against 10⁻² (E8, D-10) the only difference."""
     started = time.perf_counter()
     video = MultiViewVideo.from_manifest(scene.train_manifest)
-    held_out, tests = _test_records(scene)
+    scene_video, tests = _test_records(scene)  # both splits, for the held-out images
     opaque: dict[str, int] = {}
     rows: dict[str, int] = {}
     psnrs: dict[str, float] = {}
     spheres: dict[str, float] = {}
     reported, last = False, 0.0
     for name, lambda_reg in (("no_reg", 0.0), ("reg", 1e-2)):
+        # Q-165: growth "none" keeps N the same in both runs; λ_reg is the only difference.
         cfg = _cfg(loss=LossConfig(lambda_reg=lambda_reg), growth=GrowthConfig(mode="none"))
         trainer, logs = train(cfg, video, _full_init(scene), "cuda")
         model = trainer.model
-        opaque[name] = int((torch.sigmoid(model.opacity_logits.detach()) > 0.9).sum())  # E3
+        opaque[name] = int((torch.sigmoid(model.opacity_logits.detach()) > 0.9).sum())  # §1.1, D-5
         rows[name] = model.num_gaussians
-        psnrs[name] = mean_psnr(model, held_out, tests)
-        spheres[name] = _sphere_psnr(model, held_out, tests, scene)
+        psnrs[name] = mean_psnr(model, scene_video, tests)
+        spheres[name] = _sphere_psnr(model, scene_video, tests, scene)
         if lambda_reg > 0.0:
-            reported = all("reg" in log.losses for log in logs)
+            reported = all("reg" in log.losses and float(log.losses["reg"]) > 0.0 for log in logs)
             last = float(logs[-1].losses["reg"]) if reported else 0.0
     return _S5Runs(
         opaque=opaque,
