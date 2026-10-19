@@ -481,10 +481,12 @@ def _train(args: argparse.Namespace) -> int:
             temporary.unlink(missing_ok=True)
     log_path = run_dir / "train_log.jsonl"
     trace_failure: _Failure | None = None  # Q-142: reported once the checkpoint is safe
+    log_failure: _Failure | None = None  # Q-159 (as answered): reported once the checkpoint is safe
 
     def save() -> None:
-        """D-83: every save, periodic, final or on a signal, checks the state first (Q-133) and
-        rotates the run directory's kept checkpoints."""
+        """D-83: every save, periodic, final, on a signal or after a train_log.jsonl that
+        can't be written (Q-159 as answered), checks the state first (Q-133) and rotates the run
+        directory's kept checkpoints."""
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
         # Q-159: no further save is attempted; Q-150 (as answered): a rotation refused onto an
@@ -509,6 +511,7 @@ def _train(args: argparse.Namespace) -> int:
                 trace_failure = failure
 
     def record(_: Trainer, log: StepLog) -> bool:
+        nonlocal log_failure
         if profile is not None:
             end_profile(lambda: profile.step_done(log.iteration), failed=False)
         if log.mean_losses is not None:  # Q-132: read every log_every iterations, no extra sync
@@ -517,8 +520,12 @@ def _train(args: argparse.Namespace) -> int:
                 "losses": log.mean_losses,
                 "num_gaussians": log.num_gaussians,
             }
-            with _output(str(log_path)), log_path.open("a", encoding="utf-8") as f:  # Q-159
-                f.write(json.dumps(row, allow_nan=False) + "\n")
+            try:
+                with _output(str(log_path)), log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, allow_nan=False) + "\n")
+            except _Failure as failure:  # Q-159 (as answered): stop here, as a signal does
+                log_failure = failure
+                return True
             total = sum(log.mean_losses.values())
             print(
                 f"iteration {log.iteration}/{last}  loss {total:.6g}  N {log.num_gaussians}",
@@ -542,17 +549,36 @@ def _train(args: argparse.Namespace) -> int:
         except torch.OutOfMemoryError:  # Q-142: the step in progress is lost; nothing is saved
             _fail(_out_of_memory(trainer.iteration, run_dir, args.resume))
         finally:
-            if profile is not None:  # Q-144: a window cut short is still written
-                end_profile(profile.finish, failed=failed)
+            if profile is not None:  # Q-144: a window cut short is still written; Q-160
+                end_profile(profile.finish, failed=failed or log_failure is not None)
         try:
             save()
-        except _Failure:
+        except _Failure as failure:
             if trace_failure is not None:
                 print(f"warning: {trace_failure}", file=sys.stderr)
-            raise
-    if signals.received is not None and trainer.iteration < last:  # Q-133; a finished run goes on
-        if trace_failure is not None:  # the signal's exit code stands (Q-133)
+            if log_failure is None:
+                raise
+            # Q-159 (as answered): the log's failure is the error, the save's a warning after
+            # it; a diverged state (Q-133) is exit 3 still, the log's failure its warning.
+            if failure.code == _NUMERIC:
+                failure.add_note(str(log_failure))
+                raise
+            log_failure.add_note(str(failure))
+            raise log_failure from failure
+    stopped = signals.received is not None and trainer.iteration < last  # Q-133
+    # Q-159 (as answered): not a finished run, so no evaluation; Q-164: a signal's exit code
+    # stands over it, as over a trace failure (Q-160).
+    if log_failure is not None and not stopped:
+        if trace_failure is not None:  # Q-160, Q-164: after a training failure, a warning
             print(f"warning: {trace_failure}", file=sys.stderr)
+        _fail(
+            f"{log_failure}; training stopped at iteration {trainer.iteration}, "
+            f"checkpoint in {run_dir / 'checkpoint'}"
+        )
+    if stopped and signals.received is not None:  # Q-133; a finished run goes on
+        for warned in (trace_failure, log_failure):  # the signal's exit code stands (Q-133)
+            if warned is not None:
+                print(f"warning: {warned}", file=sys.stderr)
         print(
             f"stopped by signal {signals.received} at iteration {trainer.iteration}; "
             f"checkpoint in {run_dir / 'checkpoint'}",
@@ -940,6 +966,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         code: int = args.run(args)
     except _Failure as failure:
         print(f"ftgs {args.command}: error: {failure}", file=sys.stderr)
+        for note in getattr(failure, "__notes__", ()):  # Q-159: failures that followed it
+            print(f"warning: {note}", file=sys.stderr)
         return failure.code
     return code
 

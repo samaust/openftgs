@@ -1939,6 +1939,18 @@ def test_out_of_memory_or_a_read_error_elsewhere_keeps_its_traceback(
         _train(run, tmp_path / "b", "--config", run["config"])
 
 
+def _unwritable_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every append to train_log.jsonl fails as on a full disk; other files open as usual."""
+    original = Path.open
+
+    def full(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == "train_log.jsonl":
+            raise OSError(28, "No space left on device")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", full)
+
+
 def test_a_checkpoint_that_cannot_be_written_is_exit_code_2(
     run: dict[str, Path],
     tmp_path: Path,
@@ -1983,20 +1995,108 @@ def test_a_train_log_that_cannot_be_written_is_exit_code_2(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Q-142 (as answered), Q-159: an OSError while appending to train_log.jsonl is exit code 2
-    naming it, at once: no checkpoint is saved after it."""
+    """Q-142 (as answered), Q-159 (as answered): an OSError while appending to train_log.jsonl
+    stops training after that iteration, as a signal does; the checkpoint is saved there, and
+    the command exits 2 naming the log and the checkpoint's iteration, with no final evaluation
+    although the scene has a test split. A resume from it gives bitwise the run that never
+    stopped (§2.2). The first append is at iteration 5 (log_every = 5)."""
+    tested = {**run, "scene": _scene(tmp_path / "tested", test=True)}
+    evaluated: list[str] = []
+    monkeypatch.setattr(Trainer, "evaluate", lambda self, split, **_: evaluated.append(split))
+    out = tmp_path / "run"
+    capsys.readouterr()
+    with monkeypatch.context() as m:
+        _unwritable_log(m)
+        assert _train(tested, out, "--config", run["config"]) == 2
+    err = capsys.readouterr().err
+    assert "train_log.jsonl" in err and "iteration 5" in err and str(out / "checkpoint") in err
+    assert load_checkpoint(out / "checkpoint").iteration == 5
+    assert evaluated == []
+    assert _train(tested, tmp_path / "straight", "--config", run["config"]) == 0
+    resumed = tmp_path / "resumed"
+    assert _train(tested, resumed, "--resume", out / "checkpoint") == 0
+    assert evaluated == ["test", "test"]  # the finished runs are evaluated
+    _assert_same_run(tmp_path / "straight" / "checkpoint", resumed / "checkpoint")
+
+
+def test_a_signal_with_a_train_log_failure_keeps_its_exit_code(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-164, Q-133: a signal recorded in the iteration whose train_log.jsonl append fails
+    keeps its exit code, as over a trace failure (Q-160); the checkpoint is saved there and the
+    log's failure is a warning."""
+    _unwritable_log(monkeypatch)
+    _sigterm_at(monkeypatch, 5)
+    out = tmp_path / "run"
+    capsys.readouterr()
+    assert _train(run, out, "--config", run["config"]) == 128 + signal.SIGTERM
+    err = capsys.readouterr().err
+    assert "warning: cannot write" in err and "train_log.jsonl" in err
+    assert load_checkpoint(out / "checkpoint").iteration == 5
+
+
+def test_a_train_log_and_a_checkpoint_that_cannot_be_written_name_the_log_first(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-159 (as answered): when the checkpoint saved after a failed train_log.jsonl append
+    can't be written either, the command still exits 2, the log's failure is the error and the
+    save's follows it as a warning; the kept checkpoint survives and no temporary is left
+    (Q-25, Q-151). The run resumes at 10 into its own run directory, so the first append that
+    fails is at 15 (log_every = 5)."""
+    out = _cut_at_ten(run, tmp_path / "run", monkeypatch)
+
+    def no_space(*args: Any, **kwargs: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    _unwritable_log(monkeypatch)
+    monkeypatch.setattr("openftgs.io.save_file", no_space)
+    capsys.readouterr()
+    assert _train(run, out, "--resume", out / "checkpoint") == 2
+    err = capsys.readouterr().err
+    log, warning = err.find("train_log.jsonl"), err.find("warning:")
+    assert 0 <= log < warning < err.find(f"a checkpoint in {out}"), err
+    assert load_checkpoint(out / "checkpoint").iteration == 10
+    assert not [p.name for p in out.iterdir() if p.name.startswith(".")]
+
+
+def test_a_train_log_failure_saves_no_diverged_state(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-159 (as answered), Q-133: the save after a failed train_log.jsonl append checks the
+    state first, so a model that turned NaN after the trainer's own check (Q-69) is exit code
+    3 with nothing saved, the log's failure a warning after it."""
+    trainers: list[Trainer] = []
+    step = Trainer.step
+
+    def keeping(self: Trainer) -> Any:
+        trainers.append(self)
+        return step(self)
+
     original = Path.open
 
-    def full(self: Path, *args: Any, **kwargs: Any) -> Any:
+    def full_and_diverged(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self.name == "train_log.jsonl":
+            with torch.no_grad():
+                trainers[-1].model.means[0, 0] = float("nan")
             raise OSError(28, "No space left on device")
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", full)
+    monkeypatch.setattr(Trainer, "step", keeping)
+    monkeypatch.setattr(Path, "open", full_and_diverged)
     out = tmp_path / "run"
     capsys.readouterr()
-    assert _train(run, out, "--config", run["config"]) == 2
-    assert "train_log.jsonl" in capsys.readouterr().err
+    assert _train(run, out, "--config", run["config"]) == 3
+    err = capsys.readouterr().err
+    assert "diverged" in err and "warning: cannot write" in err and "train_log.jsonl" in err
     assert not (out / "checkpoint").exists()
 
 
@@ -2089,6 +2189,47 @@ def test_out_of_memory_with_an_unwritable_trace_reports_the_out_of_memory(
     assert _train(run, out, "--resume", cut / "checkpoint", "--profile", "12:5") == 2
     err = capsys.readouterr().err
     assert "out of GPU memory" in err and "warning" in err
+
+
+def test_a_train_log_failure_with_an_unwritable_trace_reports_the_log(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-159 (as answered), Q-160: a train_log.jsonl append that fails inside a profile window
+    is one of the training failures after which the trace's own failure is a warning: the
+    command saves the checkpoint and exits 2 naming the log. The first append after the resume
+    at 10 is at 15 (log_every = 5)."""
+    cut = _cut_at_ten(run, tmp_path / "cut", monkeypatch)
+    out = _blocked_profile(cut, tmp_path / "resumed")
+    _unwritable_log(monkeypatch)
+    capsys.readouterr()
+    assert _train(run, out, "--resume", cut / "checkpoint", "--profile", "12:5") == 2
+    err = capsys.readouterr().err
+    assert "error: cannot write" in err and "train_log.jsonl" in err
+    assert "warning: cannot write the profile trace" in err
+    assert load_checkpoint(out / "checkpoint").iteration == 15
+
+
+def test_an_earlier_trace_failure_is_a_warning_after_a_train_log_failure(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-164, Q-160: a trace that couldn't be written at its window's end (12) and a later
+    train_log.jsonl failure (15) are both exit 2; the log's failure, which stopped training,
+    is the error and the trace's a warning before it."""
+    cut = _cut_at_ten(run, tmp_path / "cut", monkeypatch)
+    out = _blocked_profile(cut, tmp_path / "resumed")
+    _unwritable_log(monkeypatch)
+    capsys.readouterr()
+    assert _train(run, out, "--resume", cut / "checkpoint", "--profile", "11:2") == 2
+    err = capsys.readouterr().err
+    trace, log = err.find("warning: cannot write the profile trace"), err.find("error: cannot")
+    assert 0 <= trace < log and "train_log.jsonl" in err[log:], err
+    assert load_checkpoint(out / "checkpoint").iteration == 15
 
 
 def test_out_of_memory_in_a_profile_window_writes_the_trace(
