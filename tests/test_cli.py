@@ -1192,6 +1192,46 @@ def test_eval_of_a_checkpoint_moved_away_by_a_save_says_it_changed(
     assert not out.exists()
 
 
+def test_eval_of_a_checkpoint_moved_away_after_its_read_says_it_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered): a checkpoint read whole and then renamed away by a save, before the
+    second hash, is a model that changed while it was read too: the hash can't be taken again,
+    so exit 2 with that message and no METRICS.json, rather than a missing manifest."""
+    import openftgs.io
+
+    scene, checkpoint = _trained(tmp_path)
+    original = openftgs.io.load_checkpoint
+
+    def set_aside_after(directory: Path) -> Any:
+        state = original(directory)
+        Path(directory).rename(tmp_path / "set-aside")
+        return state
+
+    monkeypatch.setattr("openftgs.io.load_checkpoint", set_aside_after)
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert "changed while it was read" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_eval_of_a_model_absent_before_its_read_keeps_its_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered): a MODEL already absent before the first hash was never read, so it
+    is exit 2 naming the missing path, not a model that changed while it was read."""
+    scene, _ = _trained(tmp_path)
+    missing = tmp_path / "no-checkpoint"
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", missing, scene, "--out", out) == 2
+    err = capsys.readouterr().err
+    assert "No such file or directory" in err and str(missing) in err
+    assert "changed while it was read" not in err
+    assert not out.exists()
+
+
 def test_eval_of_a_checkpoint_replaced_during_its_read_says_it_changed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
