@@ -500,6 +500,12 @@ class _TemporalIndex:
     def _bucket(self, t: float) -> int:
         return math.floor(t * self._scale)
 
+    @property
+    def num_long(self) -> int:
+        """The number of rows on the long list, which every render takes; its length is known
+        on the host. B-7 reports their share (`ftgs bench render`, Q-T231.1)."""
+        return int(self._long.shape[0])
+
     def rows(self, t: float) -> Tensor:
         """The ascending model rows to render at normalized time t, one of the times the index
         was built for: its bucket's rows and the long rows, a superset of the rows that pass the

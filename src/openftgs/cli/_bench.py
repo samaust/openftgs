@@ -2,9 +2,10 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50. Q-166 (BENCH.json and the
-exit codes), Q-167 (`--model`), Q-168 (the setups). docs/modules/cli/benchmarks.md maps each
-subcommand to its B-n.
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-55. Q-166 (BENCH.json and
+the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-174 (the index threshold T that B-7
+sets), Q-T231.1 and Q-T231.2 (B-7). docs/modules/cli/benchmarks.md maps each subcommand to its
+B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
@@ -24,7 +25,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,14 +42,16 @@ from openftgs.cli import (
     _output,
     _scene,
 )
+from openftgs.cli import _environment as _environment_error  # Q-142: a download's OSError
 
 if TYPE_CHECKING:
     from torch import Tensor
 
     from openftgs._stages import Timing
     from openftgs.data import MultiViewVideo
+    from openftgs.eval import Evaluator
     from openftgs.model import FreeTimeGaussians
-    from openftgs.types import TimeNormalizer
+    from openftgs.types import Camera, RenderRequest, TimeNormalizer
 
 __all__ = ["add_parser", "run"]  # what `openftgs.cli` takes from this private module
 
@@ -611,6 +614,387 @@ def _slice(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-7: rendering at a time, with and without the temporal index (§3.4, D-55; Q-174, Q-T231.1,
+# Q-T231.2) ---------------------------------------------------------------------------------------
+
+_B7_WIDTH, _B7_HEIGHT = 1920, 1080  # §3.4 B-7
+_B7_SIZES = (1_000_000, 3_000_000)  # #231: N = 1M and 3M
+# Q-T231.1: on kitchen's one-frame buckets a 1 % row spans about 4 buckets, the 5 % and 20 %
+# rows 17 and 76, which puts them on the long list.
+_B7_ACTIVE = (0.01, 0.05, 0.2)
+_B7_REPETITIONS = 10  # Q-T231.1: the median of 10 requests
+# Q-T231.1: the request sizes below F that the index's break-even is read from; then F.
+_B7_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128)
+_B7_OUTPUTS = ("cuda", "cpu")  # #231: `render_request`'s outputs on the GPU and on the CPU
+_B7_BUDGET_FPS = 450.0  # §3.4 B-7: ≥ 450 FPS on an RTX 4090 (calibrated)
+_B7_THRESHOLD_FLOOR = 2  # Q-T231.2: a request at a single time never builds an index
+
+
+def _b7_camera(video: MultiViewVideo) -> Camera:
+    """B-7's camera (Q-168, Q-T231.1): the pose of the first camera in the manifest's camera
+    order that has test images, else of the first camera; its fx and fy scaled by 1080/H, H
+    its height, and the principal point at the centre of the 1920×1080 image."""
+    import torch
+
+    from openftgs.types import Camera
+
+    by_name: dict[str, list[bool]] = {}
+    sources: dict[str, Camera] = {}
+    for record in video.records:
+        by_name.setdefault(record.camera.name, []).append(record.split == "test")
+        sources.setdefault(record.camera.name, record.camera)
+    names = [name for name in video.manifest.camera_names if name in by_name]
+    tested = [name for name in names if any(by_name[name])]
+    source = sources[(tested or names)[0]]
+    scale = _B7_HEIGHT / source.height
+    K = source.K.to(torch.float64)
+    intrinsics = [
+        [float(K[0, 0]) * scale, 0.0, _B7_WIDTH / 2.0],
+        [0.0, float(K[1, 1]) * scale, _B7_HEIGHT / 2.0],
+        [0.0, 0.0, 1.0],
+    ]
+    return Camera(
+        torch.tensor(intrinsics, dtype=torch.float32),
+        source.world_to_camera.clone(),
+        _B7_WIDTH,
+        _B7_HEIGHT,
+        source.name,
+    )
+
+
+def _spread(count: int, k: int) -> list[int]:
+    """Q-T231.1: k of `count` timestamps evenly spread, in order: round(j(count − 1)/(k − 1))
+    rounded half up, j = 0 … k − 1, in integer arithmetic; the one at ⌊(count − 1)/2⌋ for
+    k = 1."""
+    if k == 1:
+        return [(count - 1) // 2]
+    return [(2 * j * (count - 1) + (k - 1)) // (2 * (k - 1)) for j in range(k)]
+
+
+def _request_sizes(count: int) -> list[int]:
+    """Q-T231.1: the sizes of B-7's requests on a scene of `count` distinct training times."""
+    return [k for k in _B7_REQUEST_SIZES if k < count] + [count]
+
+
+def _index_figures(
+    model: FreeTimeGaussians, frame_dt: float, times: Sequence[float]
+) -> dict[str, Any]:
+    """D-55's temporal index of `model` at the normalized `times`, built as `render_request`
+    builds it (Q-174, Q-T231.1): the buckets' width; the means over the times of the rows passed
+    to a render (the bucket's and the long list), of the bucket's own rows and of the rows that
+    pass the opacity cull (D-32), and the long rows, each over N."""
+    import torch
+
+    # B-7 measures `render`'s private index: its rows are what `render_request` passes to each
+    # render, which the public interface doesn't return.
+    from openftgs.render import _bucket_width, _TemporalIndex
+
+    inside = sorted(set(times))
+    width = _bucket_width(frame_dt, inside)
+    n = model.num_gaussians
+    with torch.inference_mode():
+        index = _TemporalIndex(model, width, inside)
+        passed = [int(index.rows(t).shape[0]) for t in inside]
+        active = [int(model.at_time(t, sh_degree=0).passes_cull.sum()) for t in inside]
+    mean_passed = statistics.fmean(passed)
+    return {
+        "bucket_width": width,
+        "passed_share_mean": mean_passed / n,
+        "bucket_share_mean": (mean_passed - index.num_long) / n,
+        "long_share": index.num_long / n,
+        "active_share_mean": statistics.fmean(active) / n,
+    }
+
+
+def _build_figures(
+    model: FreeTimeGaussians, frame_dt: float, times: Sequence[float]
+) -> dict[str, Any]:
+    """The time of building D-55's index of `model` at the normalized `times` as `render_request`
+    builds it (Q-174, Q-T231.1): its first call, then the median of `_B7_REPETITIONS`, each on
+    the wall clock; the build reads counts back from the device, so it synchronizes anyway."""
+    import torch
+
+    from openftgs.render import _bucket_width, _TemporalIndex  # as in `_index_figures`
+
+    inside = sorted(set(times))
+    width = _bucket_width(frame_dt, inside)
+
+    def build() -> None:
+        with torch.inference_mode():
+            _TemporalIndex(model, width, inside)
+
+    first = _first_call(build)
+    return {
+        "build_first_call_s": first,
+        "build_s": _median(_wall_calls(build, _B7_REPETITIONS)),
+    }
+
+
+def _break_even(times: dict[int, tuple[float, float]]) -> int | None:
+    """Q-T231.2: the smallest request size at which the request with the index takes no longer
+    than without it (`times` maps a size to the two times, with and without), there and at every
+    larger size; None when the index is slower at the largest."""
+    found = None
+    for k in sorted(times, reverse=True):
+        on, off = times[k]
+        if on > off:
+            break
+        found = k
+    return found
+
+
+def _threshold(break_evens: Sequence[int | None]) -> int | None:
+    """Q-T231.2: T, the largest break-even over the models that have one, and at least
+    `_B7_THRESHOLD_FLOOR`; None when no model has one."""
+    known = [k for k in break_evens if k is not None]
+    return max(*known, _B7_THRESHOLD_FLOOR) if known else None
+
+
+def _wall_calls(body: Callable[[], None], repetitions: int) -> list[float]:
+    """`_WARMUP` calls of `body`, then `repetitions` calls, each timed on the wall clock from a
+    synchronized device to a synchronize after it (Q-T231.1): a render request synchronizes
+    inside every render anyway, and its outputs on the GPU are complete only then."""
+    import torch
+
+    for _ in range(_WARMUP):
+        body()
+    seconds = []
+    for _ in range(repetitions):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        body()
+        torch.cuda.synchronize()
+        seconds.append(time.perf_counter() - start)
+    return seconds
+
+
+def _b7_request(camera: Camera, timestamps: Sequence[float], time_unit: str) -> RenderRequest:
+    """One item per raw timestamp, ids "0", "1", …, each with `camera`, whose tensors stay on
+    the host as a request file gives them (Q-T231.1); black background, the model's SH degree."""
+    from openftgs.types import RenderItem, RenderRequest
+
+    items = tuple(RenderItem(str(j), tau, camera) for j, tau in enumerate(timestamps))
+    return RenderRequest(items, time_unit=time_unit)
+
+
+def _request_figures(
+    model: FreeTimeGaussians,
+    request: RenderRequest,
+    *,
+    index: bool,
+    frame_dt: float,
+    device: str,
+) -> dict[str, Any]:
+    """B-7's figures of one request (Q-T231.1): the first call, then the medians of
+    `_B7_REPETITIONS` timed calls of `render_request`: the request's time, FPS and the time
+    per render; the peak allocated memory."""
+    import torch
+
+    from openftgs.render import render_request
+
+    def call() -> None:
+        render_request(
+            model,
+            request,
+            backend="gsplat",
+            temporal_index=index,
+            frame_dt=frame_dt,
+            device=device,
+        )
+
+    torch.cuda.reset_peak_memory_stats()
+    first = _first_call(call)
+    seconds = _median(_wall_calls(call, _B7_REPETITIONS))
+    renders = len(request.items)
+    return {
+        "fps": renders / seconds,
+        "request_s": seconds,
+        "render_s": seconds / renders,
+        "renders": renders,
+        "first_call_s": first,
+        "repetitions": _B7_REPETITIONS,
+        "peak_memory_bytes": torch.cuda.max_memory_allocated(),
+    }
+
+
+def _evaluation_figures(
+    model: FreeTimeGaussians,
+    video: MultiViewVideo,
+    evaluator: Evaluator,
+    split: str,
+    frame_dt: float,
+) -> dict[str, Any]:
+    """The share of `evaluate_images` spent rendering (PRD #220's 10 % rule, Q-T231.1): the
+    evaluation of `split` on the wall clock, once, against the render requests it sends, one
+    per timestamp with the split's own cameras and the outputs on the CPU, timed once the same
+    way; both after a warm-up of the first request and one Evaluator call."""
+    import torch
+
+    from openftgs.eval import evaluate_images
+    from openftgs.render import render_request
+    from openftgs.types import RenderItem, RenderRequest
+
+    groups: dict[float, list[int]] = {}
+    for i, record in enumerate(video.records):
+        if record.split == split:
+            groups.setdefault(record.timestamp, []).append(i)
+    requests = [
+        RenderRequest(
+            tuple(RenderItem(str(i), tau, video.records[i].camera) for i in group),
+            time_unit=video.manifest.time_unit,
+        )
+        for tau, group in groups.items()
+    ]
+
+    def render_all() -> None:
+        for request in requests:
+            render_request(model, request, backend="gsplat", frame_dt=frame_dt)
+
+    first = requests[0].items[0]
+    warm = render_request(model, requests[0], backend="gsplat", frame_dt=frame_dt)
+    evaluator(warm.rgb[first.id], video.load_image(int(first.id)))
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    render_all()
+    torch.cuda.synchronize()
+    rendering = time.perf_counter() - start
+    start = time.perf_counter()
+    images = evaluate_images(
+        model, video, evaluator, split=split, backend="gsplat", frame_dt=frame_dt
+    )
+    torch.cuda.synchronize()
+    evaluation = time.perf_counter() - start
+    return {
+        "evaluation_s": evaluation,
+        "render_s": rendering,
+        "render_share": rendering / evaluation,
+        "images": len(images),
+        "requests": len(requests),
+    }
+
+
+def _render(ctx: _Context) -> _Result:
+    """B-7: the speed of `render.render_request` from one 1920×1080 camera at every distinct
+    training time, with the temporal index on and off and the outputs on the GPU and on the CPU,
+    and with the index on and off at fewer times, on synthesized models at N = 1M and 3M with
+    1 %, 5 % and 20 % of rows active, or on the model given with `--model` (Q-167); per model the
+    index's build time and bucket statistics, its break-even and the share of evaluation spent
+    rendering; then T, the number of distinct times from which "auto" builds the index (Q-174,
+    Q-T231.1, Q-T231.2)."""
+    from openftgs.eval import Evaluator
+    from openftgs.render import _INDEX_MIN_TIMES  # the T in force, beside the T measured
+
+    video = ctx.video
+    unit = video.manifest.time_unit
+    if ctx.model is not None and ctx.model.model.time_unit != unit:
+        _fail(f"the model's time unit {ctx.model.model.time_unit!r} isn't the scene's {unit!r}")
+    with _environment_error("LPIPS networks"):  # as `ftgs eval` builds them; found before the run
+        evaluator = Evaluator(device="cuda")
+    camera = _b7_camera(video)
+    taus = sorted({r.timestamp for r in video.records if r.split == "train"})
+    count = len(taus)
+    sizes = _request_sizes(count)
+    # D-55: buckets one training frame interval wide, a checkpoint's Δt_f or the scene's.
+    frame_dt = video.frame_dt
+    if ctx.model is not None and ctx.model.frame_dt is not None:
+        frame_dt = ctx.model.frame_dt
+    split = "test" if any(r.split == "test" for r in video.records) else "train"
+
+    def models() -> Iterator[tuple[dict[str, Any], FreeTimeGaussians]]:
+        if ctx.model is not None:
+            yield {"n": ctx.model.model.num_gaussians, "active": None}, ctx.model.model
+            return
+        with _as_input_error(f"scene manifest {ctx.args.scene}"):
+            volume = _volume(video)
+        for n in _B7_SIZES:
+            for active in _B7_ACTIVE:
+                yield (
+                    {"n": n, "active": active},
+                    _synthesize(volume, n, active=active, seed=_SEED, device="cuda"),
+                )
+
+    cases: list[dict[str, Any]] = []
+    budgets: list[dict[str, Any]] = []
+    break_evens: list[int | None] = []
+    slice_impls: list[str] = []
+    for base, model in models():
+        slice_impls.append(model.slice_impl)
+        on_off: dict[int, tuple[float, float]] = {}
+        for k in sizes:
+            request = _b7_request(camera, [taus[i] for i in _spread(count, k)], unit)
+            for device in _B7_OUTPUTS if k == count else _B7_OUTPUTS[:1]:
+                timed: dict[bool, float] = {}
+                for index in (True, False):
+                    case = {**base, "times": k, "index": index, "outputs": device}
+                    figures = _request_figures(
+                        model, request, index=index, frame_dt=frame_dt, device=device
+                    )
+                    timed[index] = figures["request_s"]
+                    cases.append({"case": case, "figures": figures})
+                    if k == count and device == "cuda":
+                        budgets.append(
+                            {
+                                "case": case,
+                                "figure": "fps",
+                                "limit": _B7_BUDGET_FPS,
+                                "value": figures["fps"],
+                                "pass": figures["fps"] >= _B7_BUDGET_FPS,
+                                "kind": "budget",
+                            }
+                        )
+                if device == "cuda":
+                    on_off[k] = (timed[True], timed[False])
+        break_even = _break_even(on_off)
+        break_evens.append(break_even)
+        span = model.time
+        inside = sorted({span.to_t(tau) for tau in taus if span.tau0 <= tau <= span.tau1})
+        index_figures: dict[str, Any] = {"break_even_times": break_even}
+        if inside:  # a given model's span may miss the scene's times; then no index is built
+            index_figures |= _build_figures(model, frame_dt, inside)
+            index_figures |= _index_figures(model, frame_dt, inside)
+        cases.append({"case": base, "figures": index_figures})
+        cases.append(
+            {
+                "case": {**base, "evaluation": split},
+                "figures": _evaluation_figures(model, video, evaluator, split, frame_dt),
+            }
+        )
+        del model
+    cases.append(
+        {"case": {"threshold": "T"}, "figures": {"distinct_times": _threshold(break_evens)}}
+    )
+    setup = {
+        "model": (
+            "synthesized (Q-168, Q-181)" if ctx.model is None else f"given: {ctx.args.model}"
+        ),
+        "seed": _SEED if ctx.model is None else None,
+        "sizes": list(_B7_SIZES) if ctx.model is None else [ctx.model.model.num_gaussians],
+        "active_fractions": list(_B7_ACTIVE) if ctx.model is None else None,
+        "slice_impl": sorted(set(slice_impls)),
+        "camera": {
+            "pose": camera.name,
+            "width": camera.width,
+            "height": camera.height,
+            "K": camera.K.tolist(),
+        },
+        "times": count,
+        "request_sizes": sizes,
+        "frame_dt": frame_dt,
+        "outputs": list(_B7_OUTPUTS),
+        "warmup": _WARMUP,
+        "repetitions": _B7_REPETITIONS,
+        "clock": "wall clock, from a synchronized device to a synchronize after each request",
+        "budget_fps": _B7_BUDGET_FPS,
+        "threshold_rule": (
+            "Q-T231.2: the largest break-even over the models that have one, at least "
+            f"{_B7_THRESHOLD_FLOOR}; outputs on the GPU"
+        ),
+        "threshold_in_force": _INDEX_MIN_TIMES,
+        "evaluation_split": split,
+    }
+    return _Result(setup, cases, budgets)
+
+
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
@@ -620,7 +1004,7 @@ _BENCHMARKS: dict[str, _Benchmark] = {
     "losses": _Benchmark("B-4", 228),
     "adam": _Benchmark("B-5", 229),
     "data": _Benchmark("B-6", 232),
-    "render": _Benchmark("B-7", 231, model=True),
+    "render": _Benchmark("B-7", 231, _render, model=True),
     "init": _Benchmark("B-8", 234),
     "convert": _Benchmark("B-8", 234, cuda=False),
 }
