@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168 and Q-180 to Q-182.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-178, Q-180 to Q-182, Q-185, Q-187, Q-188 and Q-189.
 
 ## Subcommands
 
@@ -187,3 +187,34 @@ B-5 times the optimizer's part of a training iteration, `FTGSOptimizer.set_itera
 ## B-5's first run
 
 On kitchen (Calibration data, #229), a call takes 2.05 / 4.51 / 0.67 ms at 1M rows and 6.03 / 13.56 / 2.00 ms at 3M for fused / foreach / selective Adam. Fused takes 45 % of foreach's time at both N (`fused_over_foreach` 0.454 and 0.445), so the budget passes and the default stays `"fused"`. Fused agrees with B-1's `adam` stage (2.11 and 6.22 ms at 1.02M and 3.06M rows, `zero_grad` included). Selective Adam, with its mask at 17 % of the rows, takes a third of fused's time, about 4 ms less per iteration at 3M; it stays opt-in, being approximate (§2.4 rule 2, D-53). Fused and selective Adam allocate nothing beyond the parameters, gradients and moments (1,024 B per row); foreach adds about 180 B per row in temporaries.
+
+## B-6: `ftgs bench data`
+
+B-6 times the data wait, the `data` stage of a training iteration, for each placement of the frame cache (§3.4, D-51; #232, Q-189 for the details). It runs B-1's configuration on B-1's synthesized model at 1M rows with 20 % active (seed 0), once per case:
+
+| Case | `frame_cache` | `prefetch` | Budget |
+| --- | --- | --- | --- |
+| `{"n": 1000000, "placement": "gpu"}` | "gpu" | (takes its frames in place) | < 1 % |
+| `{"n": 1000000, "placement": "mmap", "prefetch": 8}` | "mmap" | 8, the default | < 1 % |
+| `{"n": 1000000, "placement": "mmap", "prefetch": 0}` | "mmap" | 0: each image read when it is taken | < 1 % |
+| `{"n": 1000000, "placement": "off"}` | "off" | (decodes a PNG every iteration) | none |
+| `{"n": 3000000, "placement": "gpu"}` | "gpu" | | none: Q-99's note |
+
+**Per case**, a fresh trainer runs iterations 1 to 120 untimed (B-1's warm-up, the event at 100 included), 121 to 320 under the stage clock's CUDA events, read once after 320, and 321 to 420 under the wall clock. The frame cache is built before the first case, so a case only opens it.
+
+**The figure**, `data_share`, is the `data` stage's mean over the `iteration` stage's mean over the 198 timed iterations without an event, a ratio of means as B-1's shares; the events at 200 and 300 are left out, which can only make the share larger. Its budget entry (`kind: "budget"`) holds it under 1 % for every case that reads the cache at 1M rows. Beside it: the data stage's mean and median, the mean iteration, and peak allocated and reserved memory from the first iteration on.
+
+**The host window.** The CUDA events see a wait only when the training stream stops for it. A wait on the host, as decoding a PNG, reading a memory-mapped frame or, at prefetch 0, waiting on a pinned buffer's previous copy (`docs/modules/train/trainer.md`), happens while the GPU still works through the previous iteration's losses and backward pass, about 100 ms of work on kitchen (B-1) queued after gsplat's read-back in the render, so the events can't see it unless it outlasts that backlog. The wall window gives the host time of the data stage and of an iteration over its 99 iterations without an event, to say how much of that backlog a wait uses. It is a diagnostic, not the B-6 figure.
+
+**The GPU placement** is measured only where "auto" would choose it (Q-99, Q-178). Before each `gpu` case a probe trainer of the same configuration decodes PNGs for one iteration, the path "auto" takes on its first CUDA iteration, and then the free memory (`mem_get_info`'s, plus what the allocator holds unused), the growth to N_max and the cache's size are read as the trainer's rule reads them. They are read once `step()` has returned, while the rule reads them inside it with the iteration's render output, loss and image still held, so the probe's free memory is larger by those tensors, under 1 % of it. A cache above ½·free − growth is skipped: `setup.skipped` lists the case with its reason and that estimate, and it gets no case or budget. On kitchen, whose cache is 23.4 GB, both `gpu` cases are skipped, so `gpu` is measured on its 60-frame conversion (Q-178), where every case runs. A `gpu` case's figures add the estimate (`auto_free_bytes`, `auto_growth_bytes`, `auto_allocated_bytes`, `auto_reserved_bytes`, `cache_bytes`, `auto_limit_bytes`), the device's total memory (`auto_total_bytes`), what lies outside this process's allocator (`auto_outside_bytes`, total − free − allocated: other processes, such as a desktop session, and the CUDA context), and Q-99's margin:
+
+- `beyond_estimate_bytes`: the run's peak reserved memory, less what was allocated after the probe's iteration, the cache and the growth: what the run took beyond the rule's estimate;
+- `margin_used`: that over ½·free, the share of the margin the rule leaves for it. At most 1 means a cache at the rule's limit would still have fit, judged from reserved memory, so conservatively; above 1, the ½ margin is too small, which goes to the owner as a decision change.
+
+## B-6's first run
+
+On kitchen and its 60-frame conversion (Calibration data, #232), the data wait takes 0.035 % of an iteration with the GPU cache, 0.035 % with the memory-mapped cache at prefetch 8 and 0.044 % at prefetch 0, all at 1M rows; every budget passes, about 23 times under 1 %. In each cache case the stage's median is 0.036 ms, the conversion of the frame to float32. Decoding PNGs (`off`, no budget) takes 1.95 %, 2.06 ms of an iteration's 105.9, which holds the copy of the decoded float32 image, four times a cached frame's bytes. Kitchen's `gpu` cases were skipped as expected: its 23.44 GB cache is above half the 23.40 GB free after a warm-up iteration.
+
+The host window shows why prefetch 0 still passes: its synchronous read, with the wait on a pinned buffer's event that the debug mode can't see (`docs/modules/train/trainer.md`), takes 0.44 ms of host time against 0.06 ms at prefetch 8, and runs while the GPU works through the previous iteration's losses and backward pass, so the training stream waits 0.01 ms more on average. PNG decoding takes 36 ms of host time, hidden the same way. The prefetcher stays as it is (PRD #220).
+
+Q-99's margin holds at N_max: at 3M rows with the cache on the GPU, the run took 8.57 GiB of reserved memory beyond the rule's estimate after the warm-up iteration (5.43 GiB allocated), 84 % of the 10.16 GiB the ½ margin leaves (54 % from allocated memory). That is close enough to the edge that the rule isn't tightened, and nothing goes to the owner. The device's memory outside PyTorch's allocator was 0.97 GiB, the desktop session's 0.49 GiB and the CUDA context.

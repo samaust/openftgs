@@ -2,8 +2,8 @@
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
-D-50, Q-13), B-5 (`bench adam`; D-53, Q-188), and the seeded model synthesizer of the
-benchmark setups (Q-168).
+D-50, Q-13), B-5 (`bench adam`; D-53, Q-188), B-6 (`bench data`; D-51, Q-99, Q-178,
+Q-189), and the seeded model synthesizer of the benchmark setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
 tests do (Q-125); the benchmarks themselves run only on a GPU.
@@ -16,7 +16,7 @@ import platform
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -992,3 +992,241 @@ def test_b5_times_each_adam_kind_at_each_n_and_holds_fused_against_foreach(
         }
         for n, _ in ADAM_CASES
     ]
+
+
+# B-6, `ftgs bench data` (§3.4, D-51; Q-99, Q-178, Q-189): private tests of its
+# configuration, of the figures of its two windows, of Q-99's rule and of its budgets.
+
+
+def test__data_config_is_b1s_with_the_case_placement() -> None:
+    """#232: B-6 runs B-1's configuration (#226) with each case's frame-cache placement and
+    prefetch depth, and nothing else changed; no depth keeps the default."""
+    import dataclasses
+
+    from openftgs.cli._bench import _data_config, _train_step_config
+    from openftgs.config import PerfConfig
+
+    b1 = _train_step_config(1_000_000)
+    cases: tuple[tuple[Literal["gpu", "mmap", "off"], int | None], ...] = (
+        ("gpu", None),
+        ("mmap", 8),
+        ("mmap", 0),
+        ("off", None),
+    )
+    for placement, prefetch in cases:
+        cfg = _data_config(1_000_000, placement, prefetch)
+        want = PerfConfig().prefetch if prefetch is None else prefetch
+        assert (cfg.perf.frame_cache, cfg.perf.prefetch) == (placement, want)
+        assert dataclasses.replace(cfg, perf=b1.perf) == b1
+
+
+def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
+    """Q-99 (D-51): "auto" puts the cache on the GPU when it fits in half the GPU memory free
+    after a warm-up iteration, minus what growth to N_max adds, the boundary included. Q-99's
+    note (Q-189): what a run with the cache on the GPU then took beyond the cache and the
+    growth, from its peak reserved memory and the memory allocated after that iteration,
+    against the half of the free memory the rule leaves for it. With the device's total, what
+    lies outside this process's allocator (other processes, the CUDA context), which the free
+    memory leaves out."""
+    import dataclasses
+
+    from openftgs.cli._bench import _AutoEstimate
+
+    gib = 2**30
+    rule = _AutoEstimate(
+        free=10 * gib,
+        growth=gib,
+        cache=4 * gib,
+        allocated=3 * gib,
+        reserved=5 * gib,
+        total=24 * gib,
+    )
+    assert rule.limit == 4 * gib and rule.fits
+    assert not dataclasses.replace(rule, cache=4 * gib + 1).fits
+    # Free on the device: 10 − (5 − 3) = 8 GiB; so 24 − 8 − 5 reserved = 11 GiB lie outside.
+    assert rule.figures() == {
+        "auto_free_bytes": 10 * gib,
+        "auto_growth_bytes": gib,
+        "auto_allocated_bytes": 3 * gib,
+        "auto_reserved_bytes": 5 * gib,
+        "auto_total_bytes": 24 * gib,
+        "auto_outside_bytes": 11 * gib,
+        "cache_bytes": 4 * gib,
+        "auto_limit_bytes": 4 * gib,
+    }
+    # 11 GiB reserved at the peak less the 3 allocated after the warm-up iteration is 8 GiB, of
+    # which the cache takes 4 and growth 1: 3 GiB beyond the estimate, of the 5 the rule leaves.
+    assert rule.margin(peak_reserved=11 * gib) == {
+        "beyond_estimate_bytes": 3 * gib,
+        "margin_used": 0.6,
+    }
+
+
+def test__data_figures_share_the_data_wait_over_iterations_without_an_event() -> None:
+    """§3.4 B-6 (Q-189): the figure is the data stage's CUDA-event time over the iteration's,
+    a ratio of means over the timed iterations without an event, as B-1's shares (Q-185); the
+    wall clock's window gives the host time of both, a diagnostic."""
+    from openftgs.cli._bench import _data_figures
+
+    timed = [
+        {"iteration": 10.0, "data": 1.0},
+        {"iteration": 20.0, "data": 5.0, "events": 8.0},  # an event: left out
+        {"iteration": 14.0, "data": 3.0},
+    ]
+    host = [{"iteration": 0.2, "data": 0.01}, {"iteration": 0.3, "data": 0.03}]
+    figures = _data_figures(timed, [False, True, False], host, [False, False])
+    assert figures == {
+        "data_share": 2.0 / 12.0,
+        "data_mean_s": 2.0,
+        "data_median_s": 2.0,
+        "iteration_mean_s": 12.0,
+        "iterations": 2,
+        "data_host_mean_s": pytest.approx(0.02),
+        "iteration_host_mean_s": pytest.approx(0.25),
+        "host_iterations": 2,
+    }
+
+
+def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
+    """§3.4 B-6, D-51 (#232): the data wait's share is under 1 % for the cache's placements,
+    "gpu" and "mmap" at either prefetch depth, at B-6's N; decoding PNGs ("off") and Q-99's
+    case at 3M rows have no budget. A failed budget is recorded, not an error (Q-166)."""
+    from openftgs.cli._bench import _data_budgets
+
+    def case(placement: str, n: int, share: float, **extra: int) -> dict[str, Any]:
+        return {
+            "case": {"n": n, "placement": placement, **extra},
+            "figures": {"data_share": share, "data_mean_s": 0.001},
+        }
+
+    cases = [
+        case("gpu", 1_000, 0.001),
+        case("mmap", 1_000, 0.002, prefetch=8),
+        case("mmap", 1_000, 0.02, prefetch=0),
+        case("off", 1_000, 0.3),
+        case("gpu", 3_000, 0.001),
+    ]
+    assert _data_budgets(cases, n=1_000) == [
+        {
+            "case": c["case"],
+            "figure": "data_share",
+            "limit": 0.01,
+            "value": c["figures"]["data_share"],
+            "pass": passed,
+            "kind": "budget",
+        }
+        for c, passed in zip(cases[:3], (True, True, False), strict=True)
+    ]
+
+
+# B-6 run on the small scene with reduced sizes, as B-1's tests (#226): every placement at 300
+# rows and the GPU cache at 400 for Q-99's note; then with a cache too large for "auto" to place
+# on the GPU. The default configuration holds LPIPS-VGG, so these need its weights.
+
+DATA_N, MEMORY_N = 300, 400
+
+
+@pytest.fixture(scope="module")
+def data_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench") / "B-6.json"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("openftgs.cli._bench._DATA_N", DATA_N)
+        patch.setattr("openftgs.cli._bench._MEMORY_N", MEMORY_N)
+        assert _ftgs("bench", "data", scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b6_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> None:
+    """§3.4 B-6, D-51 (#232, Q-189): with B-1's configuration, the data stage's share of an
+    iteration, from the stage clock's CUDA events over iterations 121 to 320 (the 198 without an
+    event), and its host time over 321 to 420 under the wall clock (the 99 without an event),
+    for the GPU cache, the memory-mapped cache at prefetch depths 8 and 0 and PNG decoding; then
+    the GPU cache at a larger N with peak memory against what "auto" estimated (Q-99's note).
+    The cache's placements are held to 1 % as budget entries, which don't change the exit
+    code (Q-166)."""
+    body = data_bench
+    assert body["benchmark"] == "B-6"
+    assert body["command"][:3] == ["ftgs", "bench", "data"]
+    setup = body["setup"]
+    assert setup["warmup"] == 120 and setup["timed"] == [121, 320] and setup["host"] == [321, 420]
+    assert setup["events"] == [200, 300, 400] and setup["share_limit"] == 0.01
+    assert setup["skipped"] == []
+    want = [
+        {"n": DATA_N, "placement": "gpu"},
+        {"n": DATA_N, "placement": "mmap", "prefetch": 8},
+        {"n": DATA_N, "placement": "mmap", "prefetch": 0},
+        {"n": DATA_N, "placement": "off"},
+        {"n": MEMORY_N, "placement": "gpu"},
+    ]
+    assert [c["case"] for c in body["cases"]] == want
+    for entry in body["cases"]:
+        case, figures = entry["case"], entry["figures"]
+        assert figures["iterations"] == 198 and figures["host_iterations"] == 99, case
+        assert 0.0 < figures["data_share"] < 1.0, case
+        assert figures["data_share"] == pytest.approx(
+            figures["data_mean_s"] / figures["iteration_mean_s"]
+        )
+        for name in ("data_median_s", "data_host_mean_s", "iteration_host_mean_s"):
+            assert figures[name] > 0.0, (case, name)
+        assert figures["peak_reserved_bytes"] >= figures["peak_allocated_bytes"] > 0, case
+        if case["placement"] != "gpu":
+            assert "auto_free_bytes" not in figures, case
+            continue
+        # Q-99: "auto" would have placed the cache on the GPU, which then holds it.
+        assert figures["cache_bytes"] <= figures["auto_limit_bytes"], case
+        assert figures["auto_limit_bytes"] == pytest.approx(
+            0.5 * figures["auto_free_bytes"] - figures["auto_growth_bytes"]
+        )
+        assert figures["auto_growth_bytes"] > 0  # n_max = ⌈1.02·N⌉ > N
+        assert figures["auto_total_bytes"] == torch.cuda.mem_get_info()[1]
+        assert 0 < figures["auto_outside_bytes"] < figures["auto_total_bytes"]  # the context
+        assert figures["peak_allocated_bytes"] >= figures["cache_bytes"], case
+        assert figures["beyond_estimate_bytes"] == (
+            figures["peak_reserved_bytes"]
+            - figures["auto_allocated_bytes"]
+            - figures["cache_bytes"]
+            - figures["auto_growth_bytes"]
+        )
+        assert figures["margin_used"] == pytest.approx(
+            figures["beyond_estimate_bytes"] / (0.5 * figures["auto_free_bytes"])
+        )
+    budgets = body["budgets"]
+    assert [b["case"] for b in budgets] == want[:3]
+    for budget, entry in zip(budgets, body["cases"], strict=False):
+        assert (budget["figure"], budget["limit"], budget["kind"]) == ("data_share", 0.01, "budget")
+        assert budget["value"] == entry["figures"]["data_share"]
+        assert budget["pass"] == (budget["value"] <= 0.01)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b6_skips_the_gpu_placement_where_auto_would_not_choose_it(
+    scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-178, Q-99 (Q-189): the GPU placement is measured only where "auto" would place the
+    cache there after a warm-up iteration; a cache too large for that, as kitchen's on a 24 GiB
+    GPU, is skipped at either N, with what "auto" estimated, and gets no case or budget."""
+    from openftgs.data import FrameCache
+
+    monkeypatch.setattr("openftgs.cli._bench._DATA_N", DATA_N)
+    monkeypatch.setattr("openftgs.cli._bench._MEMORY_N", MEMORY_N)
+    monkeypatch.setattr("openftgs.cli._bench._DATA_PLACEMENTS", (("gpu", None), ("mmap", 8)))
+    monkeypatch.setattr(FrameCache, "size_of", staticmethod(lambda dataset: 2**50))
+    out = tmp_path / "B-6.json"
+    assert _ftgs("bench", "data", scene, "--out", out) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    skipped = body["setup"]["skipped"]
+    assert [s["case"] for s in skipped] == [
+        {"n": DATA_N, "placement": "gpu"},
+        {"n": MEMORY_N, "placement": "gpu"},
+    ]
+    for entry in skipped:
+        assert "auto" in entry["reason"]
+        estimate = entry["estimate"]
+        assert estimate["cache_bytes"] == 2**50 > estimate["auto_limit_bytes"]
+    want = {"n": DATA_N, "placement": "mmap", "prefetch": 8}
+    assert [c["case"] for c in body["cases"]] == [want]
+    assert [b["case"] for b in body["budgets"]] == [want]
