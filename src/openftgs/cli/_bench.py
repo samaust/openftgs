@@ -1253,6 +1253,65 @@ def _ssim_torch_cases(scene: Path, sizes: Sequence[tuple[int, int]]) -> list[dic
     return cases
 
 
+# B-4's images per (width, height), as (target, prediction); an LPIPS case's key.
+_Images = dict[tuple[int, int], tuple["Tensor", "Tensor"]]
+_LpipsKey = tuple[int, int, str, str, bool]
+
+
+def _lpips_case(
+    width: int, height: int, precision: str, layout: str, autotuning: bool
+) -> dict[str, Any]:
+    """An LPIPS case's parameters (Q-T228.1, Q-180)."""
+    case = {"loss": "lpips_vgg", "width": width, "height": height, "precision": precision}
+    return case | {"layout": layout, "autotuning": autotuning}
+
+
+def _lpips_deviations(network: Any, images: _Images) -> list[dict[str, Any]]:
+    """Per size, TF32's and bf16's deviation from IEEE float32 in value and in the prediction's
+    gradient (Q-T228.1), with the network as training runs it: NCHW weights, channels-last
+    inputs, autotuning off."""
+    import torch
+
+    cases: list[dict[str, Any]] = []
+    for (width, height), (gt, pred) in images.items():
+        results: dict[str, tuple[Tensor, Tensor]] = {}
+        for precision in _LOSS_PRECISIONS:
+            x, y = _lpips_inputs(gt, pred, "channels_last_inputs")
+            with _cudnn_flags(tf32=precision != "ieee", autotuning=False):
+                value = _lpips_forward(network, x, y, precision)
+                (grad,) = torch.autograd.grad(value, x)
+            results[precision] = (value.detach(), grad)
+        for precision in ("tf32", "bf16"):
+            figures = _deviation(*results[precision], *results["ieee"])
+            case = {"deviation": precision, "width": width, "height": height}
+            cases.append({"case": case, "figures": figures})
+    return cases
+
+
+def _lpips_timed(networks: dict[bool, Any], images: _Images) -> dict[_LpipsKey, dict[str, Any]]:
+    """Every LPIPS case's figures, every case without autotuning first (Q-T228.1)."""
+    timed: dict[_LpipsKey, dict[str, Any]] = {}
+    for autotuning in _LOSS_AUTOTUNING:
+        for (width, height), (gt, pred) in images.items():
+            for precision in _LOSS_PRECISIONS:
+                for layout in _LOSS_LAYOUTS:
+                    network = networks[layout == "channels_last_inputs_and_weights"]
+                    call = _lpips_call(network, gt, pred, precision=precision, layout=layout)
+                    with _cudnn_flags(tf32=precision != "ieee", autotuning=autotuning):
+                        figures = _call_figures(call, "loss.perceptual", _LOSS_REPETITIONS)
+                    timed[(width, height, precision, layout, autotuning)] = figures
+    return timed
+
+
+def _ssim_fused_timed(images: _Images) -> dict[tuple[int, int], dict[str, Any]]:
+    """fused-ssim's figures per size, in this process (Q-42, Q-T228.1)."""
+    timed: dict[tuple[int, int], dict[str, Any]] = {}
+    for size, (gt, pred) in images.items():
+        with _cudnn_flags(tf32=True, autotuning=False):
+            timed[size] = _call_figures(_ssim_call(gt, pred), "loss.ssim", _LOSS_REPETITIONS)
+    return timed
+
+
 def _losses(ctx: _Context) -> _Result:
     """B-4 (§3.4, D-52): LPIPS-VGG's forward and the prediction's backward in IEEE float32,
     TF32 and bfloat16, with NCHW inputs, channels-last inputs and channels-last inputs and
@@ -1268,53 +1327,19 @@ def _losses(ctx: _Context) -> _Result:
     with _environment_error("LPIPS networks"):
         networks = _lpips_networks()
     images = {size: _loss_images(ctx.video, *size, seed=_SEED, device="cuda") for size in sizes}
-    cases: list[dict[str, Any]] = []
-
     # Deviations first, before any case with autotuning, which could leave its algorithms in
-    # cuDNN's cache: the network as training runs it, NCHW weights, channels-last inputs.
-    for width, height in sizes:
-        gt, pred = images[(width, height)]
-        results: dict[str, tuple[Tensor, Tensor]] = {}
-        for precision in _LOSS_PRECISIONS:
-            x, y = _lpips_inputs(gt, pred, "channels_last_inputs")
-            with _cudnn_flags(tf32=precision != "ieee", autotuning=False):
-                value = _lpips_forward(networks[False], x, y, precision)
-                (grad,) = torch.autograd.grad(value, x)
-            results[precision] = (value.detach(), grad)
-        for precision in ("tf32", "bf16"):
-            figures = _deviation(*results[precision], *results["ieee"])
-            case = {"deviation": precision, "width": width, "height": height}
-            cases.append({"case": case, "figures": figures})
-        del results
-
-    timed: dict[tuple[int, int, str, str, bool], dict[str, Any]] = {}
-    for autotuning in _LOSS_AUTOTUNING:  # every case without autotuning first
-        for width, height in sizes:
-            gt, pred = images[(width, height)]
-            for precision in _LOSS_PRECISIONS:
-                for layout in _LOSS_LAYOUTS:
-                    network = networks[layout == "channels_last_inputs_and_weights"]
-                    call = _lpips_call(network, gt, pred, precision=precision, layout=layout)
-                    with _cudnn_flags(tf32=precision != "ieee", autotuning=autotuning):
-                        figures = _call_figures(call, "loss.perceptual", _LOSS_REPETITIONS)
-                    timed[(width, height, precision, layout, autotuning)] = figures
-                    case = {"loss": "lpips_vgg", "width": width, "height": height}
-                    case |= {"precision": precision, "layout": layout, "autotuning": autotuning}
-                    cases.append({"case": case, "figures": figures})
-
+    # cuDNN's cache; then every case without autotuning before any with it.
+    cases = _lpips_deviations(networks[False], images)
+    timed = _lpips_timed(networks, images)
+    cases += [{"case": _lpips_case(*key), "figures": figures} for key, figures in timed.items()]
     fused = _fused_ssim_importable()
-    ssim_fused: dict[tuple[int, int], dict[str, Any]] = {}
-    if fused:
-        for width, height in sizes:
-            gt, pred = images[(width, height)]
-            with _cudnn_flags(tf32=True, autotuning=False):
-                figures = _call_figures(_ssim_call(gt, pred), "loss.ssim", _LOSS_REPETITIONS)
-            ssim_fused[(width, height)] = figures
-            case = {"loss": "ssim", "width": width, "height": height, "path": "fused"}
-            cases.append({"case": case, "figures": figures})
+    ssim_fused = _ssim_fused_timed(images) if fused else {}
+    for (width, height), figures in ssim_fused.items():
+        case = {"loss": "ssim", "width": width, "height": height, "path": "fused"}
+        cases.append({"case": case, "figures": figures})
     del networks, images
     gc.collect()
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()  # for the child process
     ssim_torch = _ssim_torch_cases(ctx.args.scene, sizes)
     cases += ssim_torch
 
