@@ -40,6 +40,7 @@ from openftgs.types import (
 )
 
 __all__ = [
+    "check_run_checkpoints",
     "load_checkpoint",
     "read_exchange",
     "read_init_points",
@@ -660,9 +661,19 @@ def _earlier_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
     found: list[tuple[int, Path]] = []
     for path in run_dir.glob("checkpoint-*"):
         match = _EARLIER_NAME.fullmatch(path.name)
-        if match is not None and path.is_dir() and _is_checkpoint(path):
+        if match is not None and _counts_as_kept(path):
             found.append((int(match.group(1)), path))
     return sorted(found)
+
+
+def _counts_as_kept(path: Path) -> bool:
+    """Q-150: a checkpoint-<n> entry is a kept checkpoint when it is a checkpoint directory."""
+    return path.is_dir() and _is_checkpoint(path)
+
+
+def _check_keep(keep: int) -> None:
+    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+        raise ValueError(f"keep must be an integer of at least 1, got {keep!r}")
 
 
 # D-83, Q-152: the saves of ftgs train, rotated through the run directory.
@@ -675,8 +686,7 @@ def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) ->
     replaced in place, the others removed first (Q-149). Only checkpoints are counted or
     removed, and a rename onto anything else is refused with ValueError (Q-150, Q-25). A save
     that fails puts the previous latest back. Returns RUN_DIR/checkpoint."""
-    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
-        raise ValueError(f"keep must be an integer of at least 1, got {keep!r}")
+    _check_keep(keep)
     run_dir = Path(run_dir)
     latest = run_dir / _LATEST
     _recover_set_aside(latest)  # Q-25: a killed save's checkpoint is the latest again
@@ -686,7 +696,7 @@ def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) ->
     if current is not None and current < state.iteration and keep > 1:
         renamed = run_dir / f"checkpoint-{current}"
         if renamed.exists() or renamed.is_symlink():
-            if not (renamed.is_dir() and _is_checkpoint(renamed)):  # Q-150
+            if not _counts_as_kept(renamed):  # Q-150
                 raise ValueError(f"{renamed} exists and is not a checkpoint; refusing to rotate")
             abandoned.append(renamed)  # Q-149: one save per iteration, the newer one kept
     for path in abandoned:
@@ -703,6 +713,24 @@ def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) ->
     for _, path in earlier[: max(len(earlier) - (keep - 1), 0)]:  # Q-151: after the new save
         shutil.rmtree(path)
     return latest
+
+
+# Q-163: ftgs train's check before training (Q-150 as answered).
+def check_run_checkpoints(run_dir: Path, *, keep: int = 1) -> None:
+    """Raise ValueError naming the first RUN_DIR/checkpoint-<n>, by n, that isn't a checkpoint
+    (Q-150) when `keep` > 1, since a save of `save_run_checkpoint` with that `keep` would refuse
+    to rename onto it. Only each manifest's format is read, and nothing changes."""
+    _check_keep(keep)
+    if keep == 1:
+        return
+    blocking = []
+    for path in Path(run_dir).glob("checkpoint-*"):
+        match = _EARLIER_NAME.fullmatch(path.name)
+        if match is not None and not _counts_as_kept(path):
+            blocking.append((int(match.group(1)), path))
+    if blocking:
+        _, first = min(blocking)
+        raise ValueError(f"{first} exists and is not a checkpoint; a save would refuse to rotate")
 
 
 def load_checkpoint(directory: Path) -> TrainerState:

@@ -402,7 +402,12 @@ def _train(args: argparse.Namespace) -> int:
     import torch
 
     from openftgs.config import config_from_dict, config_to_dict, resume_conflicts
-    from openftgs.io import load_checkpoint, read_init_points, save_run_checkpoint
+    from openftgs.io import (
+        check_run_checkpoints,
+        load_checkpoint,
+        read_init_points,
+        save_run_checkpoint,
+    )
     from openftgs.train import Trainer
 
     if args.force and args.resume is None:
@@ -439,6 +444,8 @@ def _train(args: argparse.Namespace) -> int:
             cfg = given
     if args.resume is not None:  # Q-134: the run being resumed, or a new run directory
         _check_resume_dir(run_dir, cfg)
+    with _as_input_error("--keep-checkpoints", OSError):  # Q-150 (as answered), Q-163
+        check_run_checkpoints(run_dir, keep=args.keep_checkpoints)
     if cfg.perf.deterministic:  # Q-131 (Q-73 note 2), before any CUDA call
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     device = _device()
@@ -480,7 +487,12 @@ def _train(args: argparse.Namespace) -> int:
         rotates the run directory's kept checkpoints."""
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
-        with _output(f"a checkpoint in {run_dir}"):  # Q-159: no further save is attempted
+        # Q-159: no further save is attempted; Q-150 (as answered): a rotation refused onto an
+        # entry that appeared since the check before training is exit 2 too, not a traceback.
+        with (
+            _output(f"a checkpoint in {run_dir}"),
+            _as_input_error(f"cannot write a checkpoint in {run_dir}"),
+        ):
             save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
 
     def end_profile(stage: Callable[[], None], *, failed: bool) -> None:

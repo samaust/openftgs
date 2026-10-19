@@ -731,6 +731,122 @@ def test_a_signal_save_follows_the_rotation(
     assert _kept(out) == want
 
 
+def _contents(directory: Path) -> dict[str, bytes | None]:
+    """Every entry under `directory`, by its relative path: a file's bytes, None for a
+    directory."""
+    return {
+        p.relative_to(directory).as_posix(): p.read_bytes() if p.is_file() else None
+        for p in sorted(directory.rglob("*"))
+    }
+
+
+def _with_a_stray_checkpoint_15(run: dict[str, Path], out: Path) -> dict[str, bytes | None]:
+    """A K = 3 run directory (checkpoint at 20, checkpoint-10, checkpoint-15) whose
+    checkpoint-15 is then replaced by a plain file; returns the directory's contents."""
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 3)
+    assert _train(run, out, "--config", run["config"], *keep) == 0
+    shutil.rmtree(out / "checkpoint-15")
+    (out / "checkpoint-15").write_text("not a checkpoint")
+    return _contents(out)
+
+
+def test_a_stray_checkpoint_name_is_exit_code_2_before_training(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-150 (as answered), Q-163: with K > 1, a run directory holding a checkpoint-<n> that
+    isn't a checkpoint, which the rotation would refuse to rename onto at a later save, is
+    exit code 2 before the first iteration, naming it, with the run directory unchanged."""
+    out = tmp_path / "run"
+    before = _with_a_stray_checkpoint_15(run, out)
+    steps: list[int] = []
+    step = Trainer.step
+
+    def counting(self: Trainer) -> Any:
+        steps.append(self.iteration)
+        return step(self)
+
+    monkeypatch.setattr(Trainer, "step", counting)
+    capsys.readouterr()
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 3)
+    assert _train(run, out, "--resume", out / "checkpoint-10", *keep) == 2
+    assert "checkpoint-15" in capsys.readouterr().err
+    assert steps == []
+    assert _contents(out) == before
+
+
+def test_a_stray_checkpoint_name_is_ignored_with_one_kept(
+    run: dict[str, Path], tmp_path: Path
+) -> None:
+    """Q-150, Q-163: with K = 1 no save renames, so the same run directory trains to T_it and
+    exits 0, the stray entry untouched."""
+    out = tmp_path / "run"
+    _with_a_stray_checkpoint_15(run, out)
+    assert _train(run, out, "--resume", out / "checkpoint-10") == 0
+    assert (out / "checkpoint-15").read_text() == "not a checkpoint"
+    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+
+
+def test_a_rotation_refused_during_the_run_is_exit_code_2(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-150 (as answered), Q-159: a checkpoint-<n> that isn't a checkpoint, appearing after the
+    check before training, makes the save that would rename onto it exit code 2 naming it, not
+    a traceback; no further save is attempted and the kept checkpoint is as it was."""
+    import openftgs.io
+
+    save_run_checkpoint = openftgs.io.save_run_checkpoint
+
+    def then_a_stray_entry(state: Any, run_dir: Path, *, keep: int = 1) -> Path:
+        latest = save_run_checkpoint(state, run_dir, keep=keep)
+        if state.iteration == 5:
+            (Path(run_dir) / "checkpoint-5").write_text("not a checkpoint")
+        return latest
+
+    monkeypatch.setattr("openftgs.io.save_run_checkpoint", then_a_stray_entry)
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    capsys.readouterr()
+    assert _train(run, out, "--config", run["config"], *keep) == 2
+    err = capsys.readouterr().err
+    assert "checkpoint-5" in err and "Traceback" not in err
+    assert load_checkpoint(out / "checkpoint").iteration == 5
+    assert sorted(p.name for p in out.iterdir() if p.name.startswith(("checkpoint", "."))) == [
+        "checkpoint",
+        "checkpoint-5",
+    ]
+
+
+def test_a_stray_entry_no_save_renames_onto_leaves_the_run_going(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-150 (as answered), Q-163: a checkpoint-<n> that isn't a checkpoint, appearing during the
+    run under a name no save renames onto, stops nothing: the saves the rotation accepts,
+    the final one included, go on, the run exits 0, and the entry is untouched."""
+    import openftgs.io
+
+    save_run_checkpoint = openftgs.io.save_run_checkpoint
+
+    def then_a_stray_entry(state: Any, run_dir: Path, *, keep: int = 1) -> Path:
+        latest = save_run_checkpoint(state, run_dir, keep=keep)
+        if state.iteration == 5:
+            (Path(run_dir) / "checkpoint-7").write_text("not a checkpoint")
+        return latest
+
+    monkeypatch.setattr("openftgs.io.save_run_checkpoint", then_a_stray_entry)
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, "--config", run["config"], *keep) == 0
+    assert (out / "checkpoint-7").read_text() == "not a checkpoint"
+    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+    assert load_checkpoint(out / "checkpoint-15").iteration == 15
+
+
 # Models for render, eval and export: a checkpoint trained through the Python API on the CPU.
 
 

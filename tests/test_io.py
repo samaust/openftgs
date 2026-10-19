@@ -27,6 +27,7 @@ from torch import Tensor
 
 from openftgs.config import TrainConfig, config_to_dict
 from openftgs.io import (
+    check_run_checkpoints,
     load_checkpoint,
     read_exchange,
     read_init_points,
@@ -1022,6 +1023,41 @@ def test_save_run_checkpoint_that_fails_partway_keeps_the_earlier_ones(
         save_run_checkpoint(_at(15), tmp_path, keep=2)
     assert _kept(tmp_path) == {"checkpoint": 10, "checkpoint-5": 5}
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+
+
+def test_check_run_checkpoints_names_an_entry_the_rotation_would_refuse(tmp_path: Path) -> None:
+    """Q-163, Q-150: with K > 1 a RUN_DIR/checkpoint-<n> that isn't a checkpoint, which a save
+    would refuse to rename onto, is a ValueError naming it, and nothing changes; with K = 1,
+    when no save renames, the check passes. Of several, the one of the lowest n is named."""
+    (tmp_path / "checkpoint-15").write_text("mine")
+    (tmp_path / "checkpoint-100").mkdir()
+    with pytest.raises(ValueError, match="checkpoint-15 exists"):
+        check_run_checkpoints(tmp_path, keep=3)
+    check_run_checkpoints(tmp_path, keep=1)
+    check_run_checkpoints(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["checkpoint-100", "checkpoint-15"]
+    assert (tmp_path / "checkpoint-15").read_text() == "mine"
+
+
+def test_check_run_checkpoints_passes_what_the_rotation_counts_or_ignores(tmp_path: Path) -> None:
+    """Q-163, Q-150: a checkpoint passes, one whose manifest reads but whose file doesn't match
+    its SHA-256 included, since Q-150 counts it as a checkpoint (load_checkpoint would refuse
+    it); a name other than checkpoint-<decimal> is ignored."""
+    save_checkpoint(_at(5), tmp_path / "checkpoint-5")
+    damaged = save_checkpoint(_at(15), tmp_path / "checkpoint-15")
+    (damaged / "sampler.json").write_text("{}")
+    with pytest.raises(ValueError, match="SHA-256"):
+        load_checkpoint(damaged)
+    (tmp_path / "checkpoint-xyz").write_text("mine")
+    (tmp_path / "checkpoint-007").mkdir()
+    check_run_checkpoints(tmp_path, keep=3)
+
+
+@pytest.mark.parametrize("keep", [0, -1, True])
+def test_check_run_checkpoints_needs_at_least_one_kept(tmp_path: Path, keep: int) -> None:
+    """Q-163, D-83: `keep` is an integer of at least 1, as for save_run_checkpoint."""
+    with pytest.raises(ValueError, match="keep"):
+        check_run_checkpoints(tmp_path, keep=keep)
 
 
 def test_ftgs_init_reader_requires_time_unit_metadata(tmp_path: Path) -> None:
