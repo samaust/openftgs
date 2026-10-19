@@ -13,7 +13,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `init roma` | `RomaInitConfig`, `roma_init`, `io.write_init_points` with `roma_provenance(cfg)` as metadata (Q-107) |
 | `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.save_checkpoint`, `Trainer.evaluate` |
 | `render` | the model as `FreeTimeGaussians.load` reads it, `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
-| `eval` | the model, `evaluate_images`, `check_nan_metrics`, `metrics_report`, `eval.write_metrics` (Q-136, Q-148) |
+| `eval` | the model, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
 | `bench` | a stub until M15: it checks its arguments and returns 1 (Q-130) |
 
@@ -28,10 +28,10 @@ Single-file outputs, the init points, the renders, METRICS.json and the exchange
 | 0 | success |
 | 1 | an unexpected exception, with its traceback; `ftgs bench` until M15 |
 | 2 | invalid input or environment: a usage error, a file that fails validation, a missing ffmpeg, ffprobe or COLMAP, a configuration this build can't run, a missing `[init]` extra, LPIPS weights that can't be downloaded, a frame cache that doesn't fit in GPU memory |
-| 3 | a numerical failure: training diverged, a render isn't finite, or a metric of `ftgs eval` or of `ftgs train`'s final evaluation is NaN |
+| 3 | a numerical failure: training diverged, or a render isn't finite (in `ftgs render`, `ftgs eval` or `ftgs train`'s final evaluation) |
 | 130, 143 | `ftgs train` stopped by SIGINT or SIGTERM, after saving its checkpoint |
 
-Exit code 2 comes from the `ValueError`s of the calls that read or check user input, and from the CLI's own checks; a `ValueError` anywhere else is a bug and keeps its traceback (Q-26, Q-142). Divergence is the trainer's `FloatingPointError` (Q-69). So is a NaN metric, raised by `eval.check_nan_metrics` before anything is written, in `ftgs eval` and through `Trainer.evaluate` in `ftgs train` (Q-129, Q-147, Q-148).
+Exit code 2 comes from the `ValueError`s of the calls that read or check user input, and from the CLI's own checks; a `ValueError` anywhere else is a bug and keeps its traceback (Q-26, Q-142). Divergence is the trainer's `FloatingPointError` (Q-69). A render that isn't finite in an evaluation raises the same exception, from `eval.evaluate_images` before anything is written, in `ftgs eval` and through `Trainer.evaluate` in `ftgs train` (Q-129, Q-147).
 
 ## The run directory
 
@@ -40,7 +40,7 @@ Exit code 2 comes from the `ValueError`s of the calls that read or check user in
 - `config.json`, the resolved configuration, after `--seed`;
 - `train_log.jsonl`, one row per log read: the iteration, the mean of each loss term since the last read, and N, the columns §3.3 asks of an adapter;
 - `checkpoint/`, saved when training reaches T_it and when a signal stops it, and nowhere else;
-- `METRICS.json`, the evaluation of the test split at the end, when the scene has one; it runs after the checkpoint is saved, so a failed evaluation loses no training, and a NaN metric writes no METRICS.json and exits 3 (Q-129);
+- `METRICS.json`, the evaluation of the test split at the end, when the scene has one; it runs after the checkpoint is saved, so a failed evaluation loses no training, and a render that isn't finite writes no METRICS.json and exits 3 (Q-129);
 - `profile/trace.json`, with `--profile START:COUNT`: a `torch.profiler` trace of those iterations, which must lie inside the iterations the command runs; a window cut short still writes what it recorded (Q-144). NVTX ranges per stage come with M15.
 
 With `perf.deterministic`, `ftgs train` sets `CUBLAS_WORKSPACE_CONFIG` before CUDA starts, unless the environment already sets it (Q-131).
@@ -53,4 +53,4 @@ While training runs, SIGINT and SIGTERM are recorded rather than acted on at onc
 
 ## Evaluation
 
-`ftgs eval MODEL SCENE.json` renders the split (`--split test`, the default, or `train`; Q-143) with the model and scores it. A checkpoint is rendered against its configuration's background, an exchange model against black until #187, when it renders against the background its file records (D-84). With `--renders-dir DIR` it instead scores the renders in DIR (`request.json` and `renders.safetensors`), matching each image of the split to one request item by timestamp, image size and camera, the camera within a relative 1e-6 (Q-137). `ftgs render --backend reference` followed by `ftgs eval --renders-dir` scores the reference backend. Supplied renders are scored as given, so their request should use the background the model was trained with (Q-141): renders made on black of a model trained on white score that mismatch, which `ftgs eval` can't detect from the files. A split with masks on some images but not all is refused (Q-135). A NaN metric of any image, in the entire image or its dynamic region, can only come from a render that isn't finite: it is exit 3, naming up to five images, and no METRICS.json is written. A null in METRICS.json therefore always means "not defined here" (a perfect render's PSNR, a mean over no images), never a failed render. A supplied renders file that isn't finite is refused by `read_renders`, exit 2, since the file is the input (Q-129).
+`ftgs eval MODEL SCENE.json` renders the split (`--split test`, the default, or `train`; Q-143) with the model and scores it. A checkpoint is rendered against its configuration's background, an exchange model against black until #187, when it renders against the background its file records (D-84). With `--renders-dir DIR` it instead scores the renders in DIR (`request.json` and `renders.safetensors`), matching each image of the split to one request item by timestamp, image size and camera, the camera within a relative 1e-6 (Q-137). `ftgs render --backend reference` followed by `ftgs eval --renders-dir` scores the reference backend. Supplied renders are scored as given, so their request should use the background the model was trained with (Q-141): renders made on black of a model trained on white score that mismatch, which `ftgs eval` can't detect from the files. A split with masks on some images but not all is refused (Q-135). A render that isn't finite, NaN or ±Inf in its colors or alpha, is exit 3, naming up to five images, and no METRICS.json is written: E16's clamp would otherwise score an Inf render as a plausible image. A null in METRICS.json therefore always means "not defined here" (a perfect render's PSNR, a mean over no images), never a failed render. A supplied renders file that isn't finite is refused by `read_renders`, exit 2, since the file is the input (Q-129).

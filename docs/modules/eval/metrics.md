@@ -1,6 +1,6 @@
 # Metrics in `openftgs.eval`
 
-How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's, with `check_nan_metrics` (Q-148). `eval` imports only `losses`. It never renders: renders come from `render.render_request` (Q-57), so the metrics stay pure tensor functions that run on the CPU.
+How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's. `eval` imports only `losses`. It never renders: renders come from `render.render_request` (Q-57), so the metrics stay pure tensor functions that run on the CPU.
 
 ## The metrics
 
@@ -34,7 +34,7 @@ Each metric is computed per test image, averaged over a scene's test images, the
 
 The `dynamic` block counts under `missing` the images of the split that have no mask, 0 for a full set, so a partial set is visible in the report (Q-135); `ftgs eval` and `ftgs train` refuse a partial set before doing any work.
 
-A null in the report means "not defined here": a perfect render's PSNR, a mean over no images, a dynamic region that was skipped (Q-61). It never stands for a failed render: `check_nan_metrics` raises `FloatingPointError`, naming up to five images, when a metric of an image's entire frame or dynamic region is NaN, which only a render that isn't finite gives, and `Trainer.evaluate` and `ftgs eval` call it before anything is written (Q-129, Q-147, Q-148).
+A null in the report means "not defined here": a perfect render's PSNR, a mean over no images, a dynamic region that was skipped (Q-61). It never stands for a failed render, which `evaluate_images` refuses before any report is built (below; Q-129, Q-147).
 
 ## The Fastest-10 frames
 
@@ -42,4 +42,4 @@ The selection itself is not in `eval`. D-69 has the converter store the range in
 
 ## Evaluating a model on a scene
 
-`evaluate_images` evaluates a model on the images of one data split of a multi-view video, for `Trainer.evaluate` now and `ftgs eval` in M14 (Q-68). It renders through `render.render_request`, one request per timestamp, so cameras that share a time render in one call (D-55) and only one time's renders are held at once; it never calls the render backends itself. Each image is evaluated by the `Evaluator` the caller passes, which holds the LPIPS networks, with the test image's mask when it has one. The results come back as `ImageMetrics` in the manifest's order, each with its path relative to the manifest, as the metrics report lists them. Given `renders`, a prediction for every record of the split by record index, it renders nothing and scores those instead; `ftgs eval --renders-dir` uses it, so supplied renders and the model's own go through the same evaluator and report (Q-137).
+`evaluate_images` evaluates a model on the images of one data split of a multi-view video, for `Trainer.evaluate` now and `ftgs eval` in M14 (Q-68). It renders through `render.render_request`, one request per timestamp, so cameras that share a time render in one call (D-55) and only one time's renders are held at once; it never calls the render backends itself. Each image is evaluated by the `Evaluator` the caller passes, which holds the LPIPS networks, with the test image's mask when it has one. The results come back as `ImageMetrics` in the manifest's order, each with its path relative to the manifest, as the metrics report lists them. Given `renders`, a prediction for every record of the split by record index, it renders nothing and scores those instead; `ftgs eval --renders-dir` uses it, so supplied renders and the model's own go through the same evaluator and report (Q-137). A render of the model that isn't finite, NaN or ±Inf in its colors or its alpha, is not scored: E16's clamp would turn an Inf into a plausible color, and the metrics never see alpha. Once the whole split is rendered, `evaluate_images` raises `FloatingPointError` naming up to five such images in the manifest's order, the error `ftgs eval` and `ftgs train` report as exit 3. A supplied render that isn't finite is input, so it is a `ValueError`, checked before anything is scored, as `read_renders` refuses such a file (Q-129, Q-147).
