@@ -273,7 +273,7 @@ What one training iteration reports to its caller: its image, times, active SH d
 _Avoid_: metrics (reserved for E16), history, training record
 
 **Stage**:
-One named part of a training iteration that benchmarks time and profilers show by name: the data wait, the temporal slice, rasterization forward, each loss, the backward pass, the statistics, Adam, the event and the log read. §2.4, §3.4 B-1
+One named part of a training iteration, of initialization or of conversion that benchmarks time and profilers show by name: in an iteration, the data wait, the temporal slice, rasterization forward, each loss, the backward pass, the statistics, Adam, the event and the log read; in initialization, matching, triangulation and the k-NN search; in conversion, decoding and encoding. §2.4, §3.4 B-1, B-8
 _Avoid_: phase, step (reserved for Adam's per-tensor step counter), section
 
 **Data wait**:
