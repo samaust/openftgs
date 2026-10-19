@@ -2,9 +2,9 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50. Q-166 (BENCH.json and the
-exit codes), Q-167 (`--model`), Q-168 (the setups). docs/modules/cli/benchmarks.md maps each
-subcommand to its B-n.
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-56, D-81. Q-166 (BENCH.json
+and the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-169, Q-T234.1 and Q-T234.2 (B-8).
+docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
