@@ -435,7 +435,7 @@ GROUND_TRUTH_FILES = {
 def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, ExchangeModel]:
     """The ground truth of S-1 to S-4 and S-6 from the committed seeds: S-4's is three spheres of
     Gaussians (Q-119); S-6's is S-2's objects as clusters of three (D-87); S-7 and S-8 reuse S-2's.
-    S-5 runs on the ray-cast scene, whose analytic caster is its ground truth (D-86)."""
+    S-5 needs none: it compares two runs on the ray-cast scene (D-86)."""
     s2 = _gt_s2(seeds["s2"]["ground_truth"])
     return {
         "s1": _gt_s1(seeds["s1"]["ground_truth"]),

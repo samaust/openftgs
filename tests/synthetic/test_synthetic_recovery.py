@@ -5,7 +5,7 @@ S-4 (M13, PRD #133). S-5 runs on the ray-cast scene, in `test_end_to_end.py` (D-
 Each scene trains from an initial model derived from committed ground truth and checks what was
 recovered against §3.2's pass criteria, on the CPU with the reference backend and on the GPU with
 gsplat. S-4 instead starts from init points sampled on its moving spheres, with E15 velocities or
-none (Q-119). The setup choices §3.2 leaves open are Q-77 to Q-79 and Q-119, the measures Q-80;
+none (Q-119). The setup choices §3.2 leaves open are Q-77, Q-79 and Q-119, the measures Q-80;
 S-1 departs from §3.2's row where the owner decided (Q-81), and S-6 runs on D-87's clusters.
 Every test records its measured values with `record_property`, for the Calibration data table of
 docs/clean-room/questions.md; no criterion is loosened there.
