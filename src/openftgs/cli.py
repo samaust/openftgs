@@ -484,8 +484,9 @@ def _train(args: argparse.Namespace) -> int:
     log_failure: _Failure | None = None  # Q-159 (as answered): reported once the checkpoint is safe
 
     def save() -> None:
-        """D-83: every save, periodic, final or on a signal, checks the state first (Q-133) and
-        rotates the run directory's kept checkpoints."""
+        """D-83: every save, periodic, final, on a signal or after a train_log.jsonl that
+        can't be written (Q-159 as answered), checks the state first (Q-133) and rotates the run
+        directory's kept checkpoints."""
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
         # Q-159: no further save is attempted; Q-150 (as answered): a rotation refused onto an
@@ -564,16 +565,20 @@ def _train(args: argparse.Namespace) -> int:
                 raise
             log_failure.add_note(str(failure))
             raise log_failure from failure
-    if log_failure is not None:  # Q-159 (as answered): not a finished run, so no evaluation
-        if trace_failure is not None:  # Q-160: after a training failure, a warning
+    stopped = signals.received is not None and trainer.iteration < last  # Q-133
+    # Q-159 (as answered): not a finished run, so no evaluation; Q-164: a signal's exit code
+    # stands over it, as over a trace failure (Q-160).
+    if log_failure is not None and not stopped:
+        if trace_failure is not None:  # Q-160, Q-164: after a training failure, a warning
             print(f"warning: {trace_failure}", file=sys.stderr)
         _fail(
             f"{log_failure}; training stopped at iteration {trainer.iteration}, "
             f"checkpoint in {run_dir / 'checkpoint'}"
         )
-    if signals.received is not None and trainer.iteration < last:  # Q-133; a finished run goes on
-        if trace_failure is not None:  # the signal's exit code stands (Q-133)
-            print(f"warning: {trace_failure}", file=sys.stderr)
+    if stopped and signals.received is not None:  # Q-133; a finished run goes on
+        for warned in (trace_failure, log_failure):  # the signal's exit code stands (Q-133)
+            if warned is not None:
+                print(f"warning: {warned}", file=sys.stderr)
         print(
             f"stopped by signal {signals.received} at iteration {trainer.iteration}; "
             f"checkpoint in {run_dir / 'checkpoint'}",
