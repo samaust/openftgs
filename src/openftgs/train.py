@@ -278,7 +278,8 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 # Global PyTorch flags around a training iteration (Q-73).
 
 # Q-173: cuDNN autotuning during a training iteration that isn't deterministic, turned on only
-# when B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52; Calibration data, #228).
+# when B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +4.3 % and
+# −1.0 % at its two sizes (Calibration data, #228).
 _AUTOTUNE = False
 
 
@@ -313,8 +314,9 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
 
 
 # Q-173: the training perceptual network's weights in channels-last memory, turned on only when
-# B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52; Calibration data, #228). Its inputs
-# are channels-last already: `LPIPSLoss` views a render's [..., H, W, 3] batch first.
+# B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
+# at its two sizes (Calibration data, #228). Its inputs are channels-last already: `LPIPSLoss`
+# views a render's [..., H, W, 3] batch first.
 _CHANNELS_LAST_WEIGHTS = False
 
 

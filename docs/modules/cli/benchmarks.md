@@ -203,9 +203,13 @@ B-4 times the two image losses whose cost D-52 decides, LPIPS-VGG and SSIM, at 1
 
 **Decision rule** (Q-173): an exact option without a `PerfConfig` field is turned on when its smallest gain is at least 3 % and a rerun of B-1 with it on is no slower than B-1's recorded iteration time.
 
+## B-4's first run
+
+On kitchen's first training image (Calibration data, #228), training's LPIPS-VGG path, TF32 with channels-last inputs and NCHW weights, takes 101.6 ms at 1352×1014 (forward 54.9, backward 46.6) and 150.6 ms at 1920×1080, which matches B-1's 52.7 ms of `loss.perceptual` and 44.9 ms of `backward.losses`. Neither exact option reaches Q-173's 3 % at both sizes: autotuning gains 4.3 % and −1.0 %, channels-last weights 1.0 % and 2.9 %, so both stay off and B-1 wasn't rerun. Reported beside them: both together 6.0 % and 3.1 %, and NCHW inputs with autotuning 7.2 % and 3.9 %, combinations the rule doesn't decide, which go to the owner; IEEE float32 is 12 % and 17 % slower than TF32, and slower with channels-last inputs than with NCHW; bf16 is 33 % and 30 % faster than TF32, its value within 2.2·10⁻³ relative and its gradient 17 to 18 % off in L2 (TF32: 3 %). fused-ssim takes 0.41 and 0.66 ms against the PyTorch path's 8.5 and 13.2 ms, about 95 % less. With autotuning, a configuration's first call takes 1 to 27 s. The run took 4 min 13 s.
+
 ## B-1's first run
 
-On kitchen (Calibration data, #226), an iteration without an event takes 102, 104 and 115 ms at 0.5M, 1M and 3M rows with 20 % active, and 112 ms at 3M with 5 %. LPIPS-VGG dominates: its forward takes 52.7 ms and every loss's backward 44.9 ms, whatever N. The temporal slice takes at most 1.24 % of an iteration, so D-50's CUDA operator isn't written; the SH concat at most 1.66 % and `loss.reg` 0.11 %, both under 5 %. The bound on a default run is 3,462 s at 3M rows, under the 3,600 s budget by 4 %, with cuDNN autotuning off and NCHW LPIPS as the defaults stood (B-4, #228, decides those). The clock's cost was inside the run-to-run spread: window B was 0.08 to 0.26 ms slower than window A, the iterations being GPU-bound.
+On kitchen (Calibration data, #226), an iteration without an event takes 102, 104 and 115 ms at 0.5M, 1M and 3M rows with 20 % active, and 112 ms at 3M with 5 %. LPIPS-VGG dominates: its forward takes 52.7 ms and every loss's backward 44.9 ms, whatever N. The temporal slice takes at most 1.24 % of an iteration, so D-50's CUDA operator isn't written; the SH concat at most 1.66 % and `loss.reg` 0.11 %, both under 5 %. The bound on a default run is 3,462 s at 3M rows, under the 3,600 s budget by 4 %, with cuDNN autotuning off and NCHW LPIPS weights as the defaults stood; its inputs were channels-last already (source log T228.3). B-4 (#228) kept both defaults. The clock's cost was inside the run-to-run spread: window B was 0.08 to 0.26 ms slower than window A, the iterations being GPU-bound.
 
 ## B-5: `ftgs bench adam`
 

@@ -747,7 +747,7 @@ def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_pat
         torch.set_float32_matmul_precision(matmul)
 
 
-# Q-173: whether B-4 turned cuDNN autotuning on for training steps (Calibration data, #228).
+# Q-173: B-4 left cuDNN autotuning off for training steps (Calibration data, #228).
 AUTOTUNING = False
 
 
