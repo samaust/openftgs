@@ -690,6 +690,9 @@ def _intersections(model: FreeTimeGaussians, camera: Camera, timestamp: float) -
             packed=False,
             opacities=g.opacities_t,  # E6, D-32: the opacity cull and the extent
         )
+        visible_rows = (radii > 0).all(dim=-1)
+        # As `render` does: gsplat leaves the 2D means of culled rows unwritten (D-75).
+        means2d = torch.where(visible_rows[..., None], means2d, torch.zeros_like(means2d))
         tile = 16  # D-57
         _, isect_ids, _ = gsplat.isect_tiles(
             means2d,
@@ -702,7 +705,7 @@ def _intersections(model: FreeTimeGaussians, camera: Camera, timestamp: float) -
             n_images=1,
         )
         active = int(g.passes_cull.sum())
-        visible = int((radii > 0).all(dim=-1).sum())
+        visible = int(visible_rows.sum())
     return [active, visible, int(isect_ids.shape[0])]
 
 
