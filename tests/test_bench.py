@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
-codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-3 (`bench
-slice`; D-50, Q-13), and the seeded model synthesizer of the benchmark setups (Q-168).
+codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
+train-step`; D-49, D-50, Q-T226.2), B-3 (`bench slice`; D-50, Q-13), and the seeded model
+synthesizer of the benchmark setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
 tests do (Q-125); the benchmarks themselves run only on a GPU.
