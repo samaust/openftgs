@@ -731,16 +731,16 @@ def test_a_signal_save_follows_the_rotation(
     assert _kept(out) == want
 
 
-def _contents(directory: Path) -> dict[str, bytes]:
-    """Every file under `directory`, by its relative path, with its bytes."""
+def _contents(directory: Path) -> dict[str, bytes | None]:
+    """Every entry under `directory`, by its relative path: a file's bytes, None for a
+    directory."""
     return {
-        p.relative_to(directory).as_posix(): p.read_bytes()
+        p.relative_to(directory).as_posix(): p.read_bytes() if p.is_file() else None
         for p in sorted(directory.rglob("*"))
-        if p.is_file()
     }
 
 
-def _with_a_stray_checkpoint_15(run: dict[str, Path], out: Path) -> dict[str, bytes]:
+def _with_a_stray_checkpoint_15(run: dict[str, Path], out: Path) -> dict[str, bytes | None]:
     """A K = 3 run directory (checkpoint at 20, checkpoint-10, checkpoint-15) whose
     checkpoint-15 is then replaced by a plain file; returns the directory's contents."""
     keep = ("--checkpoint-every", 5, "--keep-checkpoints", 3)
@@ -813,12 +813,38 @@ def test_a_rotation_refused_during_the_run_is_exit_code_2(
     keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
     capsys.readouterr()
     assert _train(run, out, "--config", run["config"], *keep) == 2
-    assert "checkpoint-5" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "checkpoint-5" in err and "Traceback" not in err
     assert load_checkpoint(out / "checkpoint").iteration == 5
     assert sorted(p.name for p in out.iterdir() if p.name.startswith(("checkpoint", "."))) == [
         "checkpoint",
         "checkpoint-5",
     ]
+
+
+def test_a_stray_entry_no_save_renames_onto_leaves_the_run_going(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-150 (as answered), Q-163: a checkpoint-<n> that isn't a checkpoint, appearing during the
+    run under a name no save renames onto, stops nothing: the saves the rotation accepts,
+    the final one included, go on, the run exits 0, and the entry is untouched."""
+    import openftgs.io
+
+    save_run_checkpoint = openftgs.io.save_run_checkpoint
+
+    def then_a_stray_entry(state: Any, run_dir: Path, *, keep: int = 1) -> Path:
+        latest = save_run_checkpoint(state, run_dir, keep=keep)
+        if state.iteration == 5:
+            (Path(run_dir) / "checkpoint-7").write_text("not a checkpoint")
+        return latest
+
+    monkeypatch.setattr("openftgs.io.save_run_checkpoint", then_a_stray_entry)
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, "--config", run["config"], *keep) == 0
+    assert (out / "checkpoint-7").read_text() == "not a checkpoint"
+    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+    assert load_checkpoint(out / "checkpoint-15").iteration == 15
 
 
 # Models for render, eval and export: a checkpoint trained through the Python API on the CPU.

@@ -444,7 +444,7 @@ def _train(args: argparse.Namespace) -> int:
             cfg = given
     if args.resume is not None:  # Q-134: the run being resumed, or a new run directory
         _check_resume_dir(run_dir, cfg)
-    with _as_input_error(f"run directory {run_dir}", OSError):  # Q-150 (as answered), Q-163
+    with _as_input_error("--keep-checkpoints", OSError):  # Q-150 (as answered), Q-163
         check_run_checkpoints(run_dir, keep=args.keep_checkpoints)
     if cfg.perf.deterministic:  # Q-131 (Q-73 note 2), before any CUDA call
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -487,11 +487,12 @@ def _train(args: argparse.Namespace) -> int:
         rotates the run directory's kept checkpoints."""
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
-        # Q-150 (as answered), Q-163: an entry the rotation would refuse, appeared since the
-        # check before training, is exit 2 like an unwritable checkpoint (Q-159).
-        with _as_input_error(f"run directory {run_dir}", OSError):
-            check_run_checkpoints(run_dir, keep=args.keep_checkpoints)
-        with _output(f"a checkpoint in {run_dir}"):  # Q-159: no further save is attempted
+        # Q-159: no further save is attempted; Q-150 (as answered): a rotation refused onto an
+        # entry that appeared since the check before training is exit 2 too, not a traceback.
+        with (
+            _output(f"a checkpoint in {run_dir}"),
+            _as_input_error(f"cannot write a checkpoint in {run_dir}"),
+        ):
             save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
 
     def end_profile(stage: Callable[[], None], *, failed: bool) -> None:
