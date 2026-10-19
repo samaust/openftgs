@@ -723,6 +723,43 @@ _RASTER_VARIANTS: tuple[_RasterVariant, ...] = (
 _SPOT_LIMIT = 1e-6  # U-8 on the GPU: images within 1e-6
 
 
+def _spot_check(
+    model: FreeTimeGaussians, camera: Camera, timestamps: list[float]
+) -> dict[_RasterVariant, dict[str, Any]]:
+    """B-2's spot check (#227, Q-T227.1), under `no_grad` at every time: each variant's image
+    against packed/internal's, its largest absolute difference and the pixels where some channel
+    differs by more than 1e-6, summed over the times; and each compacted image against the same
+    layout's internal one, U-8 itself."""
+    import torch
+
+    from openftgs.render import render
+
+    default = _RASTER_VARIANTS[0]
+    checks: dict[_RasterVariant, dict[str, Any]] = {
+        variant: {"image_max_abs_diff": 0.0, "image_pixels_over_limit": 0}
+        for variant in _RASTER_VARIANTS[1:]
+    }
+    with torch.no_grad():
+        for timestamp in timestamps:
+            images = {
+                variant: render(
+                    model, camera, timestamp, packed=variant[0], precull=variant[1]
+                ).image
+                for variant in _RASTER_VARIANTS
+            }
+            for variant, check in checks.items():
+                diff = (images[variant] - images[default]).abs().amax(dim=-1)
+                check["image_max_abs_diff"] = max(check["image_max_abs_diff"], float(diff.max()))
+                check["image_pixels_over_limit"] += int((diff > _SPOT_LIMIT).sum())
+                packed, precull = variant
+                if precull == "compact":
+                    same = float((images[variant] - images[(packed, "internal")]).abs().max())
+                    check["precull_max_abs_diff"] = max(
+                        check.get("precull_max_abs_diff", 0.0), same
+                    )
+    return checks
+
+
 def _raster_call(
     model: FreeTimeGaussians,
     camera: Camera,
@@ -758,13 +795,13 @@ def _raster(ctx: _Context) -> _Result:
     """B-2: `render` forward plus an L1 backward for every `packed` × `precull` combination
     (D-57), on synthesized models at N = 1M and 3M with 5 %, 20 % and 100 % of rows active, from
     one training camera at 10 fixed times (Q-T227.1). Per model, the rows active, the rows
-    visible and the tile intersections at each time, and a spot check of each variant's image
-    against packed/internal's at every time, held to U-8's 1e-6; per variant, the first call and
-    the medians of 50 calls, and the peak allocated memory."""
+    visible and the tile intersections at each time, and the spot check (`_spot_check`), each
+    image held to 1e-6 of packed/internal's (#227) and each compacted one to 1e-6 of its layout's
+    internal one (U-8); per variant, the first call and the medians of 50 calls, and the peak
+    allocated memory."""
     import torch
 
     from openftgs.config import PerfConfig
-    from openftgs.render import render
 
     with _as_input_error(f"scene manifest {ctx.args.scene}"):
         volume = _volume(ctx.video)
@@ -796,20 +833,7 @@ def _raster(ctx: _Context) -> _Result:
                     },
                 }
             )
-            # The spot check (#227): every variant's image at every time against the default's.
-            worst = dict.fromkeys(_RASTER_VARIANTS[1:], 0.0)
-            with torch.no_grad():
-                for timestamp, _ in frames:
-                    reference = None
-                    for packed, precull in _RASTER_VARIANTS:
-                        image = render(
-                            model, camera, timestamp, packed=packed, precull=precull
-                        ).image
-                        if reference is None:
-                            reference = image
-                            continue
-                        diff = float((image - reference).abs().max())
-                        worst[(packed, precull)] = max(worst[(packed, precull)], diff)
+            spot = _spot_check(model, camera, [timestamp for timestamp, _ in frames])
             for variant in _RASTER_VARIANTS:
                 packed, precull = variant
                 case = {"n": n, "active": active, "packed": packed, "precull": precull}
@@ -819,19 +843,21 @@ def _raster(ctx: _Context) -> _Result:
                 figures = _raster_figures(_repeat(call, _RASTER_REPETITIONS))
                 figures["first_call_s"] = first
                 figures["peak_memory_bytes"] = torch.cuda.max_memory_allocated()
-                if variant in worst:
-                    value = worst[variant]
-                    figures["image_max_abs_diff"] = value
-                    budgets.append(
-                        {
-                            "case": case,
-                            "figure": "image_max_abs_diff",
-                            "limit": _SPOT_LIMIT,
-                            "value": value,
-                            "pass": value <= _SPOT_LIMIT,
-                            "kind": "limit",
-                        }
-                    )
+                checked = spot.get(variant, {})
+                figures |= checked
+                for name in ("image_max_abs_diff", "precull_max_abs_diff"):
+                    if name in checked:
+                        value = checked[name]
+                        budgets.append(
+                            {
+                                "case": case,
+                                "figure": name,
+                                "limit": _SPOT_LIMIT,
+                                "value": value,
+                                "pass": value <= _SPOT_LIMIT,
+                                "kind": "limit",
+                            }
+                        )
                 cases.append({"case": case, "figures": figures})
             del model
     setup = {

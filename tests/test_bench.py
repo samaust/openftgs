@@ -499,24 +499,35 @@ def test_b2_counts_tile_intersections_per_time(raster_bench: dict[str, Any]) -> 
 @pytest.mark.gpu
 def test_b2_spot_checks_each_image_against_packed_internal(raster_bench: dict[str, Any]) -> None:
     """B-2 (§3.4 "images identical (U-8)"; D-57, Q-T227.1): at every time, each variant's image
-    is within 1e-6 of the packed/internal one (D-57's default), recorded per case and held to
-    U-8's bound as a `limit` entry, which doesn't change the exit code (Q-166)."""
+    against the packed/internal one (D-57's default), its largest difference and the pixels over
+    1e-6, held to 1e-6 by a `limit` entry (#227); and each compacted image against the same
+    layout's internal one, U-8 itself, within 1e-6 and held to it by a `limit` entry too.
+    Neither entry changes the exit code (Q-166)."""
     timed = [c for c in raster_bench["cases"] if "packed" in c["case"]]
     others = [c for c in timed if (c["case"]["packed"], c["case"]["precull"]) != VARIANTS[0]]
     assert len(others) == 18
-    budgets = raster_bench["budgets"]
-    assert [b["case"] for b in budgets] == [c["case"] for c in others]
-    for case, budget in zip(others, budgets, strict=True):
-        value = case["figures"]["image_max_abs_diff"]
-        assert budget == {
-            "case": case["case"],
-            "figure": "image_max_abs_diff",
-            "limit": 1e-6,
-            "value": value,
-            "pass": value <= 1e-6,
-            "kind": "limit",
-        }
-        assert value <= 1e-6, case["case"]  # U-8
+    expected = []
+    for case in others:
+        figures = case["figures"]
+        names = ["image_max_abs_diff"]
+        if case["case"]["precull"] == "compact":
+            names.append("precull_max_abs_diff")
+            assert figures["precull_max_abs_diff"] <= 1e-6, case["case"]  # U-8
+        for name in names:
+            value = figures[name]
+            expected.append(
+                {
+                    "case": case["case"],
+                    "figure": name,
+                    "limit": 1e-6,
+                    "value": value,
+                    "pass": value <= 1e-6,
+                    "kind": "limit",
+                }
+            )
+        over = figures["image_pixels_over_limit"]
+        assert isinstance(over, int) and (over == 0) == (figures["image_max_abs_diff"] <= 1e-6)
+    assert raster_bench["budgets"] == expected
 
 
 @pytest.mark.gpu
