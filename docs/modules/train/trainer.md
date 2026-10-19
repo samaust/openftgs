@@ -6,7 +6,7 @@ How `Trainer` meets its §2.1 row: the training iteration of §1.3, the calendar
 
 `step()` runs §1.3's seven steps in order at iteration it = `iteration` + 1:
 
-1. The sampler gives the next training image (D-26); its file is decoded and copied to the device.
+1. The sampler gives the next training image (D-26), from the frame cache or, without one, decoded from its file (D-51).
 2. Its normalized time t and the active SH degree come from the time normalizer (E14) and the calendar entry (E13).
 3. `render` builds the per-time arrays and renders, with the 2D means' gradient retained (Q-32). `PerfConfig.precull` and `packed` pass through (Q-31, Q-36).
 4. `total_loss` evaluates E9 with the perceptual network built once, only when λ_perc > 0 (D-77).
@@ -24,7 +24,29 @@ The backend follows the device: gsplat on a CUDA device, which D-76 requires of 
 
 A step returns a `StepLog`. Its loss terms are the detached tensors `total_loss` returns, on the device and unread, so a step makes no host synchronization outside gsplat's render, the events and the log reads (§2.4 rule 3, D-49). The trainer adds the terms into device-side sums and reads their means once every `PerfConfig.log_every` iterations; the same read checks the model's validity. After a resume the first window covers only the iterations since the resume; logs never feed back into training.
 
-Every training record's camera is copied to the device when the trainer is built, so a training iteration's render reads no camera from the host. Unless `frame_cache` is "off", each training iteration's image comes from the frame cache: on the GPU directly, or through the prefetcher, which copies it from pinned memory on a side stream ahead of time (D-51, `docs/modules/data/frame-cache.md`).
+Every training record's camera is copied to the device when the trainer is built, so a training iteration's render reads no camera from the host. Unless `frame_cache` is "off", each training iteration's image comes from the frame cache: on the GPU directly, or through the prefetcher, which copies it from pinned memory on a side stream ahead of time (D-51, `docs/modules/data/frame-cache.md`). Without a cache, which includes the first iteration under "auto" on CUDA, the decoded image is staged in pinned memory and copied to the GPU without blocking; PyTorch's pinned allocator holds the staging block until the copy is done. A copy from pageable memory would block the host (§2.4 rule 3). The bytes are copied as they are, so the image is bitwise the decoded one (U-30).
+
+## Where a training iteration synchronizes
+
+§2.4 rule 3 allows a training iteration host–device synchronizations only inside gsplat's stage functions and, with compaction, at the selection of the kept rows (D-57); events and log reads synchronize anyway, at their own iterations. U-29 checks the iterations between them (`tests/test_synchronization.py`), and Q-171 says which frames count as inside gsplat's render call. On CUDA a training iteration synchronizes at:
+
+| Where | Packed mode | Unpacked mode |
+| --- | --- | --- |
+| gsplat's tile intersection (`isect_tiles`), which reads back its number of intersections | once | once |
+| gsplat's projection, which reads back its number of visible primitive–camera pairs | once | — |
+| with compaction, `render`'s `_kept_rows`, which reads back the number of rows kept (Q-31) | once | once |
+
+None of the other settings adds one: fused, foreach or selective Adam, the eager or compiled slice, any cache placement and prefetch depth, the perceptual loss, either SSIM path, deterministic mode (U-29's cases). Everything else an iteration does stays on the device or in host values that need no read-back:
+
+- the image comes as the step-log section above says, without blocking the host;
+- cameras and the background are on the device from construction;
+- the loss terms are detached device tensors, summed on the device until the log read (D-77);
+- the gradient statistics are masked sums or scatter-adds on the device (U-16);
+- Adam's rates are Python floats; fused Adam keeps its step counters on the device, foreach and selective Adam on the CPU, where advancing them reads nothing from the GPU (Q-45).
+
+One wait blocks a host thread without the debug mode reporting it: before reusing a pinned buffer, the prefetcher waits on the event of that buffer's previous copy, an earlier image's, on its worker thread or, when `prefetch` is 0, on the training thread. And once per run, after the first "auto" iteration on CUDA, choosing and opening the cache placement reads the free GPU memory and, for the GPU placement, loads the whole cache onto the device (Q-99).
+
+How U-29 sees a synchronization: the debug mode's C++ warning becomes a Python warning only during a call through one of torch's Python bindings, from the frame that made the call. gsplat's projection runs inside an autograd Function, so its warning arrives that way; the tile intersection is a direct call into gsplat's compiled module, so its warning is only printed on standard error, and U-29's recorder charges it to the Python stack that made the call. A C++ synchronization in a backward pass would arrive from torch's own backward frame when backward returns, which U-29 refuses whoever made it; none occurs.
 
 ## Divergence
 
@@ -77,7 +99,7 @@ What each field does in M10 (Q-73):
 | `deterministic` | during each training iteration: cuDNN autotuning off, cuDNN's deterministic algorithms, and PyTorch's deterministic kernels, warning only where none exists; fused-ssim stays in use, since its backward pass writes each gradient element once, with no atomics (source log #73, answering Q-42's note). Off, the cuDNN flags are left alone; autotuning waits for its benchmark (B-4, M15). cuBLAS's matrix products are deterministic only when `CUBLAS_WORKSPACE_CONFIG` is set before CUDA starts, which the trainer can't do: `ftgs train` sets it (Q-131), and a Python caller sets it before its first CUDA call, for example `CUBLAS_WORKSPACE_CONFIG=:4096:8` in the environment |
 | `perc_precision` | "tf32" or "ieee": cuDNN's TF32 flag during each training iteration (D-52); "bf16" raises `NotImplementedError` (M15). The float32 matmul precision is "highest" during each training iteration whatever the setting, so TF32 never reaches matrix products (D-52) |
 | `images_per_step` | above 1 raises `NotImplementedError` (D-54, M15) |
-| `frame_cache` | "gpu" or "mmap" places the frame cache there; "auto" chooses after the first iteration (mmap on a CPU device); "off" decodes the image file at every training iteration (D-51, Q-99) |
+| `frame_cache` | "gpu" or "mmap" places the frame cache there; "auto" chooses after the first iteration (mmap on a CPU device); "off" decodes the image file at every training iteration and, on CUDA, copies it through pinned memory without blocking (D-51, Q-99) |
 | `prefetch` | how many images the prefetcher keeps in flight; 0 reads each one when it is needed (Q-99) |
 
 The global flags are set around each training iteration and restored afterwards, so training leaves the caller's process as it was.
