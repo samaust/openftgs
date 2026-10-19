@@ -24,7 +24,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from openftgs.config import TrainConfig
     from openftgs.data import MultiViewVideo
     from openftgs.model import FreeTimeGaussians
+    from openftgs.optim import FTGSOptimizer
     from openftgs.train import StepLog, Trainer
     from openftgs.types import TimeNormalizer
 
@@ -959,6 +960,149 @@ def _train_step(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-5: the Adam kinds (§3.4, D-53; Q-168, Q-T229.1) --------------------------------------------
+
+
+def _visibility(n: int, fraction: float, *, seed: int, device: str) -> Tensor:
+    """Q-T229.1: selective Adam's mask, a bool [n] with exactly round(`fraction`·n) rows true,
+    chosen by a seeded permutation, so the visible rows are spread over the tensors as a render
+    leaves them."""
+    import torch
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    mask = torch.zeros(n, dtype=torch.bool, device=device)
+    mask[torch.randperm(n, generator=g, device=device)[: round(fraction * n)]] = True
+    return mask
+
+
+def _seed_gradients(model: FreeTimeGaussians, *, seed: int) -> None:
+    """#229, Q-T229.1: a seeded N(0, 1) gradient on each of the model's nine stored tensors."""
+    import torch
+
+    g = torch.Generator(device=model.means.device).manual_seed(seed)
+    for name in model.PARAM_NAMES:
+        param = getattr(model, name)
+        param.grad = torch.randn(param.shape, generator=g, dtype=param.dtype, device=param.device)
+
+
+_ADAM_LIMIT = 1.0  # §3.4 B-5: fused no slower than foreach, with no tolerance (Q-T229.1)
+
+
+def _adam_budgets(
+    medians: Mapping[tuple[str, int], float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """§3.4 B-5's budget (Q-T229.1): from the median of each `(kind, n)`, per N in the order
+    given a case `{"n"}` with fused's median over foreach's, and its budget entry against 1.0."""
+    cases: list[dict[str, Any]] = []
+    budgets: list[dict[str, Any]] = []
+    for n in dict.fromkeys(n for _, n in medians):
+        case = {"n": n}
+        figures = {"fused_over_foreach": medians["fused", n] / medians["foreach", n]}
+        cases.append({"case": case, "figures": figures})
+        budgets.append(_budget(case, figures, "fused_over_foreach", _ADAM_LIMIT, "budget"))
+    return cases, budgets
+
+
+_AdamKind = Literal["fused", "foreach", "selective"]
+_ADAM_KINDS: tuple[_AdamKind, ...] = ("fused", "foreach", "selective")  # D-53, PerfConfig.adam
+# #229: N = 1M and 3M, each with selective Adam's mask at the visible fraction B-1 measured at
+# that N with 20 % of the rows active, to three decimals (Calibration data, Q-185; Q-T229.1).
+_ADAM_CASES: tuple[tuple[int, float], ...] = ((1_000_000, 0.173), (3_000_000, 0.170))
+_ADAM_ACTIVE = 0.2  # Q-T229.1: B-1's models at these N
+_ADAM_REPETITIONS = 50  # #229: the median of 50
+
+
+def _adam_call(optimizer: FTGSOptimizer, visibility: Tensor | None) -> Callable[[], None]:
+    """One B-5 call (#229): the next iteration's rates, then one Adam step, as the stage
+    `adam`; the gradients stay, since no `zero_grad` clears them (Q-T229.1)."""
+    import itertools
+
+    from openftgs._stages import stage
+
+    iterations = itertools.count(1)
+
+    def call() -> None:
+        it = next(iterations)
+        with stage("adam"):
+            optimizer.set_iteration(it)
+            if visibility is None:
+                optimizer.step()
+            else:
+                optimizer.step(visibility=visibility)
+
+    return call
+
+
+def _adam(ctx: _Context) -> _Result:
+    """B-5: `FTGSOptimizer.set_iteration` plus `step` for fused, foreach and selective Adam
+    (D-53) at N = 1M and 3M, on B-1's synthesized models with seeded gradients on all nine
+    stored tensors: the time of the first call, then the median of 50 calls after a warm-up;
+    selective Adam's mask at the visible fraction B-1 measured; and per N the budget, fused no
+    slower than foreach (#229, Q-T229.1)."""
+    import gc
+
+    import torch
+
+    from openftgs.config import OptimConfig
+    from openftgs.optim import build_optimizer
+
+    with _as_input_error(f"scene manifest {ctx.args.scene}"):
+        volume = _volume(ctx.video)
+    cases: list[dict[str, Any]] = []
+    medians: dict[tuple[str, int], float] = {}
+    for n, fraction in _ADAM_CASES:
+        model = _synthesize(volume, n, active=_ADAM_ACTIVE, seed=_SEED, device="cuda")
+        _seed_gradients(model, seed=_SEED)
+        mask = _visibility(n, fraction, seed=_SEED, device="cuda")
+        for kind in _ADAM_KINDS:
+            # The same model for every kind: Adam's cost doesn't depend on the values.
+            optimizer = build_optimizer(
+                model,
+                OptimConfig(),
+                spatial_scale=volume.spatial_scale,
+                frame_dt=ctx.video.frame_dt,
+                adam=kind,
+            )
+            call = _adam_call(optimizer, mask if kind == "selective" else None)
+            torch.cuda.reset_peak_memory_stats()
+            first = _first_call(call)
+            timings = [t for t in _repeat(call, _ADAM_REPETITIONS) if t.name == "adam"]
+            figures: dict[str, Any] = {
+                "step_s": _median([t.seconds for t in timings]),
+                "first_call_s": first,
+                "repetitions": len(timings),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            }
+            if kind == "selective":
+                figures["visible_fraction"] = round(fraction * n) / n
+            medians[kind, n] = figures["step_s"]
+            cases.append({"case": {"adam": kind, "n": n}, "figures": figures})
+            del optimizer, call
+        del model, mask
+        gc.collect()
+        torch.cuda.empty_cache()
+    compared, budgets = _adam_budgets(medians)
+    setup = {
+        "model": "synthesized (Q-168, Q-181)",
+        "seed": _SEED,
+        "active_fraction": _ADAM_ACTIVE,
+        "cases": [[n, fraction] for n, fraction in _ADAM_CASES],
+        "kinds": list(_ADAM_KINDS),
+        "configuration": "OptimConfig() with the scene's S (D-27) and Δt_f",
+        "gradients": "N(0, 1), seeded, on all nine stored tensors, set once and kept",
+        "call": "set_iteration(it) then step(), it = 1, 2, …, without zero_grad",
+        "visibility": (
+            "selective Adam's mask: round(f·N) rows chosen by a seeded permutation, f being "
+            "B-1's visible fraction at N with 20 % active (Calibration data, Q-185)"
+        ),
+        "warmup": _WARMUP,
+        "repetitions": _ADAM_REPETITIONS,
+        "clock": "CUDA events: adam",
+        "budget": f"fused_over_foreach ≤ {_ADAM_LIMIT} at each N",
+    }
+    return _Result(setup, cases + compared, budgets)
+
+
 def _budget(
     case: dict[str, Any], figures: dict[str, Any], figure: str, limit: float, kind: str
 ) -> dict[str, Any]:
@@ -981,7 +1125,7 @@ _BENCHMARKS: dict[str, _Benchmark] = {
     "raster": _Benchmark("B-2", 227),
     "slice": _Benchmark("B-3", 225, _slice),
     "losses": _Benchmark("B-4", 228),
-    "adam": _Benchmark("B-5", 229),
+    "adam": _Benchmark("B-5", 229, _adam),
     "data": _Benchmark("B-6", 232),
     "render": _Benchmark("B-7", 231, model=True),
     "init": _Benchmark("B-8", 234),
