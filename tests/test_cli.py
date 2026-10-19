@@ -8,6 +8,7 @@ The tests call `main(argv)` in process, on the CPU unless marked gpu: `torch.cud
 is patched for the CLI to read False (Q-125). A few subprocess tests run the real entry points.
 """
 
+import dataclasses
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -1164,6 +1165,145 @@ def test_eval_of_a_model_that_changes_while_it_is_read_is_exit_code_2(
     monkeypatch.setattr("openftgs.io.load_checkpoint", saved_meanwhile)
     out = tmp_path / "m.json"
     assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert not out.exists()
+
+
+def test_eval_of_a_checkpoint_moved_away_by_a_save_says_it_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered): a checkpoint renamed away after the first hash and before the read,
+    as between a save's two renames (Q-25), fails the read; the hash can't be taken again, so
+    the model changed while it was read, exit 2 with no METRICS.json, rather than the
+    reader's missing manifest."""
+    import openftgs.io
+
+    scene, checkpoint = _trained(tmp_path)
+    original = openftgs.io.load_checkpoint
+
+    def set_aside_meanwhile(directory: Path) -> Any:
+        Path(directory).rename(tmp_path / "set-aside")
+        return original(directory)
+
+    monkeypatch.setattr("openftgs.io.load_checkpoint", set_aside_meanwhile)
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert "changed while it was read" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_eval_of_a_checkpoint_moved_away_after_its_read_says_it_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered): a checkpoint read whole and then renamed away by a save, before the
+    second hash, is a model that changed while it was read too: the hash can't be taken again,
+    so exit 2 with that message and no METRICS.json, rather than a missing manifest."""
+    import openftgs.io
+
+    scene, checkpoint = _trained(tmp_path)
+    original = openftgs.io.load_checkpoint
+
+    def set_aside_after(directory: Path) -> Any:
+        state = original(directory)
+        Path(directory).rename(tmp_path / "set-aside")
+        return state
+
+    monkeypatch.setattr("openftgs.io.load_checkpoint", set_aside_after)
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert "changed while it was read" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_eval_of_a_model_absent_before_its_read_keeps_its_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered): a MODEL already absent before the first hash was never read, so it
+    is exit 2 naming the missing path, not a model that changed while it was read."""
+    scene, _ = _trained(tmp_path)
+    missing = tmp_path / "no-checkpoint"
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", missing, scene, "--out", out) == 2
+    err = capsys.readouterr().err
+    assert "No such file or directory" in err and str(missing) in err
+    assert "changed while it was read" not in err
+    assert not out.exists()
+
+
+def test_eval_of_a_checkpoint_replaced_during_its_read_says_it_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered): a save's renames landing inside the read, after manifest.json is
+    read and before the files are checked, make the reader see one checkpoint's manifest and
+    another's files; the hash taken again differs, so the model changed while it was read,
+    exit 2 with no METRICS.json, rather than a SHA-256 mismatch."""
+    scene, checkpoint = _trained(tmp_path)
+    state = load_checkpoint(checkpoint)
+    later = {k: v + 0.001 if k == "means" else v for k, v in state.params.items()}
+    newer = save_checkpoint(
+        dataclasses.replace(state, iteration=state.iteration + 5, params=later),
+        tmp_path / ".checkpoint.tmp-1",
+    )
+    iterdir = Path.iterdir
+    saved: list[Path] = []
+
+    def saved_meanwhile(self: Path) -> Any:
+        if self == checkpoint and not saved:  # load_checkpoint lists the files after the manifest
+            saved.append(checkpoint.rename(tmp_path / ".checkpoint.old-1"))
+            newer.rename(checkpoint)
+        return iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", saved_meanwhile)
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert saved, "the save never landed inside the read"
+    assert "changed while it was read" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_eval_of_an_exchange_model_replaced_during_its_read_says_it_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered), Q-126: an exchange model replaced after the first hash, as a new
+    ftgs export to the same path replaces it, and read as something the reader refuses, is
+    a model that changed while it was read: exit 2 with no METRICS.json."""
+    import openftgs.io
+
+    scene, checkpoint = _trained(tmp_path)
+    exchange = tmp_path / "model.safetensors"
+    assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
+    original = openftgs.io.read_exchange
+
+    def replaced_meanwhile(path: Path) -> Any:
+        temporary = tmp_path / ".model.safetensors.tmp-1"
+        temporary.write_bytes(b"the start of another export")
+        temporary.replace(path)
+        return original(path)
+
+    monkeypatch.setattr("openftgs.io.read_exchange", replaced_meanwhile)
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", exchange, scene, "--out", out) == 2
+    assert "changed while it was read" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_eval_of_a_damaged_checkpoint_keeps_the_readers_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-154 (as answered): a checkpoint with a damaged file that doesn't change during the
+    read keeps the reader's own message, naming the file whose SHA-256 doesn't match."""
+    scene, checkpoint = _trained(tmp_path)
+    (checkpoint / "sampler.json").write_text("{}")
+    out = tmp_path / "m.json"
+    capsys.readouterr()
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    err = capsys.readouterr().err
+    assert "sampler.json does not match its SHA-256" in err
+    assert "changed while it was read" not in err
     assert not out.exists()
 
 
