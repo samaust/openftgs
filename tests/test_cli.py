@@ -1011,6 +1011,29 @@ def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Pa
     }
 
 
+def test_eval_of_a_model_that_changes_while_it_is_read_is_exit_code_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-154, Q-136: ftgs eval hashes MODEL before and after reading it; a checkpoint whose
+    manifest.json changes in between, as a periodic save changes RUN_DIR/checkpoint (D-83),
+    is exit 2 and nothing is written, before any LPIPS weights are needed."""
+    import openftgs.io
+
+    scene, checkpoint = _trained(tmp_path)
+    original = openftgs.io.load_checkpoint
+
+    def saved_meanwhile(directory: Path) -> Any:
+        state = original(directory)
+        manifest = Path(directory) / "manifest.json"
+        manifest.write_bytes(manifest.read_bytes() + b"\n")
+        return state
+
+    monkeypatch.setattr("openftgs.io.load_checkpoint", saved_meanwhile)
+    out = tmp_path / "m.json"
+    assert _ftgs("eval", checkpoint, scene, "--out", out) == 2
+    assert not out.exists()
+
+
 @pytest.mark.weights
 def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) -> None:
     """D-84, Q-74: ftgs eval of a checkpoint renders against its configuration's background,

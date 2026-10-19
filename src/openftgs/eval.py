@@ -465,7 +465,9 @@ def write_metrics(
     """Writes METRICS.json: the header (`producer`; `model` as {path, iteration, sha256}, any of
     which may be null, the hash being of an exchange model's file or of a checkpoint's
     manifest.json; the scene manifest as `manifest`, {path, sha256}; `renders` when given,
-    Q-137), then `body`, the `metrics_report` dict, as JSON without NaN or Infinity (Q-25)."""
+    Q-137), then `body`, the `metrics_report` dict, as JSON without NaN or Infinity (Q-25).
+    A body holding header keys, or a `model_sha256` that isn't 64 lowercase hex digits, is a
+    ValueError, raised before anything is written."""
     clash = [key for key in _HEADER if key in body]
     if clash:
         raise ValueError(f"the report body holds header keys {clash}")
