@@ -10,6 +10,7 @@ import importlib.metadata
 import json
 import math
 import os
+import re
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -337,6 +338,7 @@ def _finite(*tensors: Tensor) -> bool:
 
 
 _REPORT = "ftgs-metrics"  # Q-63
+_SHA256 = re.compile(r"[0-9a-f]{64}")  # Q-136, as Q-56 spells a digest
 _FASTEST_COUNT = 10  # §2.2: metadata.fastest_10 holds [n0, n0 + 10) (D-69)
 
 
@@ -458,18 +460,26 @@ def write_metrics(
     model_path: Path | None = None,
     iteration: int | None = None,
     renders: Mapping[str, Any] | None = None,
+    model_sha256: str | None = None,
 ) -> None:
-    """Writes METRICS.json: the header (`producer`; `model` as {path, iteration}, either of
-    which may be null; the scene manifest as `manifest`, {path, sha256}; `renders` when given,
+    """Writes METRICS.json: the header (`producer`; `model` as {path, iteration, sha256}, any of
+    which may be null, the hash being of an exchange model's file or of a checkpoint's
+    manifest.json; the scene manifest as `manifest`, {path, sha256}; `renders` when given,
     Q-137), then `body`, the `metrics_report` dict, as JSON without NaN or Infinity (Q-25)."""
     clash = [key for key in _HEADER if key in body]
     if clash:
         raise ValueError(f"the report body holds header keys {clash}")
+    # Q-136 (as answered), Q-56: 64 lowercase hex digits, as the scene manifest's.
+    if model_sha256 is not None and not (
+        isinstance(model_sha256, str) and _SHA256.fullmatch(model_sha256)
+    ):
+        raise ValueError(f"model_sha256 must be 64 lowercase hex digits, got {model_sha256!r}")
     header: dict[str, Any] = {
         "producer": _producer(),
         "model": {
             "path": None if model_path is None else str(model_path),
             "iteration": iteration,
+            "sha256": model_sha256,
         },
         "manifest": {"path": str(manifest.path), "sha256": manifest.sha256},
     }

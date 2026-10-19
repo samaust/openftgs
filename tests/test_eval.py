@@ -544,15 +544,15 @@ def _manifest(tmp_path: Path) -> MultiViewVideo:
 
 def test_write_metrics_writes_the_header_and_the_body(tmp_path: Path) -> None:
     """Q-136 (Q-63, Q-74 note 1): one writer of METRICS.json: `producer`, `model` as {path,
-    iteration}, either of which may be null, `manifest` as {path, sha256}, `renders` only when
-    given, then the report body; parent folders are created and the JSON has no NaN."""
+    iteration, sha256}, any of which may be null, `manifest` as {path, sha256}, `renders` only
+    when given, then the report body; parent folders are created and the JSON has no NaN."""
     video = _manifest(tmp_path / "scene")
     body = metrics_report([_image(0, frame=0)], split="test", metadata={})
     out = tmp_path / "out" / "deep" / "METRICS.json"
     write_metrics(out, body, manifest=video.manifest, iteration=7)
     written = json.loads(out.read_text())
     assert written["producer"].startswith("openftgs")
-    assert written["model"] == {"path": None, "iteration": 7}
+    assert written["model"] == {"path": None, "iteration": 7, "sha256": None}
     assert written["manifest"] == {
         "path": str(video.manifest.path),
         "sha256": video.manifest.sha256,
@@ -561,13 +561,34 @@ def test_write_metrics_writes_the_header_and_the_body(tmp_path: Path) -> None:
     assert {k: written[k] for k in body} == json.loads(json.dumps(body))
     renders = {"dir": "r", "request_sha256": "0" * 64, "producer": "other 1.0"}
     write_metrics(
-        out, body, manifest=video.manifest, model_path=Path("m.safetensors"), renders=renders
+        out,
+        body,
+        manifest=video.manifest,
+        model_path=Path("m.safetensors"),
+        renders=renders,
+        model_sha256="ab" * 32,
     )
     again = json.loads(out.read_text())
-    assert again["model"] == {"path": "m.safetensors", "iteration": None}
+    assert again["model"] == {"path": "m.safetensors", "iteration": None, "sha256": "ab" * 32}
     assert again["renders"] == renders
     with pytest.raises(ValueError, match="header"):
         write_metrics(out, {**body, "model": 1}, manifest=video.manifest)
+
+
+@pytest.mark.parametrize(
+    "digest",
+    ["AB" * 32, "a" * 63, "a" * 65, "g" * 64, b"a" * 64, 7],
+    ids=["uppercase", "short", "long", "not-hex", "bytes", "int"],
+)
+def test_write_metrics_refuses_a_malformed_model_sha256(tmp_path: Path, digest: Any) -> None:
+    """Q-136 (as answered), Q-56: the model's SHA-256 is 64 lowercase hex digits, as the scene
+    manifest's is; anything else is a ValueError and nothing is written."""
+    video = _manifest(tmp_path / "scene")
+    body = metrics_report([_image(0, frame=0)], split="test", metadata={})
+    out = tmp_path / "METRICS.json"
+    with pytest.raises(ValueError, match="sha256"):
+        write_metrics(out, body, manifest=video.manifest, model_sha256=digest)
+    assert not out.exists()
 
 
 class _Unused:
