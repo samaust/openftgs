@@ -972,8 +972,8 @@ def _body(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def _assert_close(a: Any, b: Any, path: str = "body") -> None:
-    """Equal JSON trees, floats within 1e-6 relative (U-22's render tolerance, Q-162) or 1e-9
-    absolute."""
+    """Equal JSON trees, floats within 1e-6, relative or absolute (U-22's render tolerance, for
+    metrics of renders in [0, 1]; Q-162)."""
     if isinstance(a, dict):
         assert isinstance(b, dict) and a.keys() == b.keys(), path
         for key in a:
@@ -983,7 +983,7 @@ def _assert_close(a: Any, b: Any, path: str = "body") -> None:
         for k, (x, y) in enumerate(zip(a, b, strict=True)):
             _assert_close(x, y, f"{path}[{k}]")
     elif isinstance(a, float):
-        assert b == pytest.approx(a, rel=1e-6, abs=1e-9), path
+        assert b == pytest.approx(a, rel=1e-6, abs=1e-6), path
     else:
         assert a == b, path
 
