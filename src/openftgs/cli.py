@@ -493,7 +493,10 @@ def _train(args: argparse.Namespace) -> int:
         return 128 + signals.received
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
         with _environment("LPIPS networks"):
-            trainer.evaluate("test", out_dir=run_dir)
+            try:
+                trainer.evaluate("test", out_dir=run_dir)
+            except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; no file
+                _fail(str(error), _NUMERIC)
     return 0
 
 
@@ -666,15 +669,18 @@ def _eval(args: argparse.Namespace) -> int:
         supplied, entry = _match_renders(video, args.split, args.renders_dir)
     with _environment("LPIPS networks"):
         evaluator = Evaluator(device=device)
-    images = evaluate_images(
-        loaded.model,
-        video,
-        evaluator,
-        split=args.split,
-        backend=_backend(device),
-        background=loaded.background,
-        renders=supplied,
-    )
+    try:
+        images = evaluate_images(
+            loaded.model,
+            video,
+            evaluator,
+            split=args.split,
+            backend=_backend(device),
+            background=loaded.background,
+            renders=supplied,
+        )
+    except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; nothing is written
+        _fail(str(error), _NUMERIC)
     body = metrics_report(images, split=args.split, metadata=video.manifest.metadata)
     write_metrics(
         args.out,

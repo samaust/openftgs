@@ -723,7 +723,8 @@ class Trainer:
     def evaluate(self, split: str = "test", *, out_dir: Path | None = None) -> dict[str, float]:
         """The E16 metrics of a data split's images: the scene means of the entire images, and
         under "dynamic/<name>" those of the dynamic regions when there are any. With `out_dir`,
-        METRICS.json is written there (Q-63, Q-74)."""
+        METRICS.json is written there (Q-63, Q-74). A render that isn't finite raises
+        FloatingPointError from evaluate_images, before anything is written (Q-129, Q-147)."""
         if self._evaluator is None:
             self._evaluator = Evaluator(device=self._device)
         images = evaluate_images(

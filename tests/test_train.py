@@ -14,7 +14,7 @@ import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -29,6 +29,7 @@ from builders import (
     write_scene,
 )
 
+import openftgs.render
 from openftgs.config import (
     GrowthConfig,
     InitConfig,
@@ -44,7 +45,7 @@ from openftgs.io import load_checkpoint, save_checkpoint
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer, _Sampler, calendar_entry
-from openftgs.types import Camera, InitPoints, TimeNormalizer, TrainerState
+from openftgs.types import Camera, InitPoints, Renders, TimeNormalizer, TrainerState
 
 F64 = torch.float64
 TAU1 = 4.0 / 30.0  # five frames at 30 FPS
@@ -937,6 +938,43 @@ def test_evaluate_returns_scene_means_and_writes_the_metrics_report(tmp_path: Pa
             result[f"dynamic/{name}"], rel=1e-12
         )
     assert len(report["entire"]["images"]) == 3
+
+
+def _nan_first_render(monkeypatch: pytest.MonkeyPatch, video: MultiViewVideo) -> list[str]:
+    """Patch the evaluation's renderer so that its first render is NaN; the list receives the
+    manifest path of that render's image."""
+    original = openftgs.render.render_request  # the object openftgs.eval imports
+    paths: list[str] = []
+
+    def nan(*args: Any, **kwargs: Any) -> Renders:
+        renders = original(*args, **kwargs)
+        if not paths:
+            key = next(iter(renders.rgb))
+            renders.rgb[key] = torch.full_like(renders.rgb[key], math.nan)
+            image = video.records[int(key)].image_path
+            paths.append(image.relative_to(video.manifest.path.parent).as_posix())
+        return renders
+
+    monkeypatch.setattr("openftgs.eval.render_request", nan)
+    return paths
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("written", [False, True])
+def test_evaluate_refuses_a_render_that_is_not_finite_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, written: bool
+) -> None:
+    """Q-147, Q-129: a NaN render makes evaluate raise FloatingPointError naming its image,
+    before writing anything, with or without out_dir."""
+    video = _evaluation_scene(tmp_path / "scene")
+    trainer = Trainer(_no_perceptual(), video, _init_points(), device="cpu")
+    _run(trainer, 5)
+    paths = _nan_first_render(monkeypatch, video)
+    out = tmp_path / "out"
+    with pytest.raises(FloatingPointError) as raised:
+        trainer.evaluate(out_dir=out if written else None)
+    assert paths and paths[0] in str(raised.value)
+    assert not (out / "METRICS.json").exists()
 
 
 @pytest.mark.weights
