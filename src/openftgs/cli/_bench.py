@@ -1717,58 +1717,14 @@ def _request_sizes(count: int) -> list[int]:
     return [k for k in _B7_REQUEST_SIZES if k < count] + [count]
 
 
-def _index_figures(
-    model: FreeTimeGaussians, frame_dt: float, times: Sequence[float]
-) -> dict[str, Any]:
-    """D-55's temporal index of `model` at the normalized `times`, built as `render_request`
-    builds it (Q-174, Q-T231.1): the buckets' width; the means over the times of the rows passed
-    to a render (the bucket's and the long list), of the bucket's own rows and of the rows that
-    pass the opacity cull (D-32), and the long rows, each over N."""
-    import torch
-
-    # B-7 measures `render`'s private index: its rows are what `render_request` passes to each
-    # render, which the public interface doesn't return.
-    from openftgs.render import _bucket_width, _TemporalIndex
-
-    inside = sorted(set(times))
-    width = _bucket_width(frame_dt, inside)
-    n = model.num_gaussians
-    with torch.inference_mode():
-        index = _TemporalIndex(model, width, inside)
-        passed = [int(index.rows(t).shape[0]) for t in inside]
-        active = [int(model.at_time(t, sh_degree=0).passes_cull.sum()) for t in inside]
-    mean_passed = statistics.fmean(passed)
-    return {
-        "bucket_width": width,
-        "passed_share_mean": mean_passed / n,
-        "bucket_share_mean": (mean_passed - index.num_long) / n,
-        "long_share": index.num_long / n,
-        "active_share_mean": statistics.fmean(active) / n,
-    }
-
-
-def _build_figures(
-    model: FreeTimeGaussians, frame_dt: float, times: Sequence[float]
-) -> dict[str, Any]:
-    """The time of building D-55's index of `model` at the normalized `times` as `render_request`
-    builds it (Q-174, Q-T231.1): its first call, then the median of `_B7_REPETITIONS`, each on
-    the wall clock; the build reads counts back from the device, so it synchronizes anyway."""
-    import torch
-
-    from openftgs.render import _bucket_width, _TemporalIndex  # as in `_index_figures`
-
-    inside = sorted(set(times))
-    width = _bucket_width(frame_dt, inside)
-
-    def build() -> None:
-        with torch.inference_mode():
-            _TemporalIndex(model, width, inside)
-
-    first = _first_call(build)
-    return {
-        "build_first_call_s": first,
-        "build_s": _median(_wall_calls(build, _B7_REPETITIONS)),
-    }
+def _index_figures(times: dict[int, tuple[float, float]]) -> dict[str, Any]:
+    """One model's index figures (Q-T231.1, Q-T231.2), from its median request times with the
+    index on and off by request size, outputs on the GPU: the build time, the one-time request
+    with the index forced on less the same request forced off (owner answer: `render_request`
+    alone, no private name of `render`), which the render's own saving can make negative; and
+    the break-even."""
+    on, off = times[1]
+    return {"build_s": on - off, "break_even_times": _break_even(times)}
 
 
 def _break_even(times: dict[int, tuple[float, float]]) -> int | None:
@@ -1919,11 +1875,11 @@ def _render(ctx: _Context) -> _Result:
     training time, with the temporal index on and off and the outputs on the GPU and on the CPU,
     and with the index on and off at fewer times, on synthesized models at N = 1M and 3M with
     1 %, 5 % and 20 % of rows active, or on the model given with `--model` (Q-167); per model the
-    index's build time and bucket statistics, its break-even and the share of evaluation spent
-    rendering; then T, the number of distinct times from which "auto" builds the index (Q-174,
-    Q-T231.1, Q-T231.2)."""
+    index's build time, its break-even and the share of evaluation spent rendering; then T, the
+    number of distinct times from which "auto" builds the index (Q-174, Q-T231.1, Q-T231.2).
+    Everything goes through `render_request` and `evaluate_images`, public names only (Q-153;
+    the owner's answer in Q-T231.1)."""
     from openftgs.eval import Evaluator
-    from openftgs.render import _INDEX_MIN_TIMES  # the T in force, beside the T measured
 
     video = ctx.video
     unit = video.manifest.time_unit
@@ -1985,14 +1941,8 @@ def _render(ctx: _Context) -> _Result:
                         )
                 if device == "cuda":
                     on_off[k] = (timed[True], timed[False])
-        break_even = _break_even(on_off)
-        break_evens.append(break_even)
-        span = model.time
-        inside = sorted({span.to_t(tau) for tau in taus if span.tau0 <= tau <= span.tau1})
-        index_figures: dict[str, Any] = {"break_even_times": break_even}
-        if inside:  # a given model's span may miss the scene's times; then no index is built
-            index_figures |= _build_figures(model, frame_dt, inside)
-            index_figures |= _index_figures(model, frame_dt, inside)
+        index_figures = _index_figures(on_off)
+        break_evens.append(index_figures["break_even_times"])
         cases.append({"case": base, "figures": index_figures})
         cases.append(
             {
@@ -2026,11 +1976,14 @@ def _render(ctx: _Context) -> _Result:
         "repetitions": _B7_REPETITIONS,
         "clock": "wall clock, from a synchronized device to a synchronize after each request",
         "budget_fps": _B7_BUDGET_FPS,
+        "build_time": (
+            "Q-T231.1 as answered: the one-time request with the index forced on less the same "
+            "request forced off, outputs on the GPU"
+        ),
         "threshold_rule": (
             "Q-T231.2: the largest break-even over the models that have one, at least "
             f"{_B7_THRESHOLD_FLOOR}; outputs on the GPU"
         ),
-        "threshold_in_force": _INDEX_MIN_TIMES,
         "evaluation_split": split,
     }
     return _Result(setup, cases, budgets)

@@ -362,51 +362,16 @@ def test__b7_times_spread_a_request_of_k_times_over_the_scene() -> None:
     assert _request_sizes(1) == [1]
 
 
-def _rows_model(mu: list[float], reach: list[float], sigma: list[float]) -> Any:
-    """A model of one row per entry at the origin, at rest, with time centre μt, opacity σ and
-    the duration s for which E3's σ·σt(t) reaches 1/255 exactly at |t − μt| = reach (E4), over
-    the unit time span."""
-    import math
-
-    from openftgs.model import FreeTimeGaussians
-
-    n = len(mu)
-    spread = [math.sqrt(2.0 * math.log(255.0 * s)) if 255.0 * s > 1.0 else 1.0 for s in sigma]
-    duration = [r / f for r, f in zip(reach, spread, strict=True)]
-    params = {
-        "means": torch.zeros(n, 3),
-        "times": torch.tensor(mu),
-        "log_durations": torch.log(torch.tensor(duration)),
-        "velocities": torch.zeros(n, 3),
-        "log_scales": torch.full((n, 3), -3.0),
-        "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]] * n),
-        "opacity_logits": torch.logit(torch.tensor(sigma, dtype=torch.float64)).float(),
-        "sh0": torch.zeros(n, 1, 3),
-        "shN": torch.zeros(n, 0, 3),
-    }
-    return FreeTimeGaussians(params, sh_degree=0, time=TimeNormalizer(0.0, 1.0), time_unit="s")
-
-
-def test__index_figures_reports_the_buckets_the_long_list_and_the_active_rows() -> None:
-    """Q-T231.1, D-55: with buckets 0.1 wide, a row of reach 0.02 at μt = 0.25 lies in bucket 2
-    alone, one of reach 0.06 at 0.75 in buckets 6 to 8, one of reach 0.5 at 0.5 covers all 11
-    buckets of [0, 1] and goes to the long list, and one with 255σ < 1 is never listed. At the
-    times 0.25 and 0.75, each render is passed its bucket's row and the long row: 2 of 4 rows,
-    1 of them the bucket's own; the long list holds 1 of 4; and 2 of 4 rows pass the opacity
-    cull at each time."""
+def test__index_figures_take_the_build_from_the_one_time_requests() -> None:
+    """Q-T231.1 (owner answer: public API only): the index's build time is the one-time request
+    with the index forced on less the same request forced off; with it, the break-even
+    (Q-T231.2)."""
     from openftgs.cli._bench import _index_figures
 
-    model = _rows_model(
-        mu=[0.25, 0.5, 0.5, 0.75], reach=[0.02, 0.5, 0.3, 0.06], sigma=[0.5, 0.5, 0.003, 0.5]
-    )
-    figures = _index_figures(model, 0.1, [0.25, 0.75])
-    assert figures == {
-        "bucket_width": 0.1,
-        "passed_share_mean": 0.5,
-        "bucket_share_mean": 0.25,
-        "long_share": 0.25,
-        "active_share_mean": 0.5,
-    }
+    figures = _index_figures({1: (0.010, 0.004), 2: (0.012, 0.013), 3: (0.014, 0.020)})
+    assert figures["build_s"] == pytest.approx(0.006, rel=1e-12)
+    assert figures["break_even_times"] == 2
+    assert set(figures) == {"build_s", "break_even_times"}
 
 
 def test__break_even_is_the_smallest_size_from_which_the_index_pays() -> None:
@@ -1406,22 +1371,17 @@ def test_b7_renders_every_training_time_with_and_without_the_index_on_both_devic
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b7_reports_the_index_build_and_its_buckets(render_bench: dict[str, Any]) -> None:
-    """B-7 (#231, Q-T231.1, D-55): per model, the index's build time and, at the 3 times, the
-    rows passed to a render (a superset of those that pass the opacity cull, U-32), the bucket's
-    own and the long rows, each over N: passed = bucket + long; and the model's break-even."""
+def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, Any]) -> None:
+    """B-7 (#231, Q-T231.1 as answered, Q-T231.2): per model, the index's build time is the
+    one-time request with the index forced on less the same request forced off (outputs on the
+    GPU), and the break-even is a request size or None; no bucket statistics."""
     cases = _b7_cases(render_bench)
     for n, active in B7_MODELS:
         figures = cases[(n, active, None, None, None, None, None)]
-        assert figures["build_s"] > 0.0 and figures["build_first_call_s"] > 0.0
-        assert figures["bucket_width"] == pytest.approx(0.5)
-        for name in ("passed_share_mean", "bucket_share_mean", "long_share", "active_share_mean"):
-            assert 0.0 <= figures[name] <= 1.0, name
-        assert figures["passed_share_mean"] == pytest.approx(
-            figures["bucket_share_mean"] + figures["long_share"]
-        )
-        assert figures["passed_share_mean"] >= figures["active_share_mean"]
-        assert abs(figures["active_share_mean"] - active) <= 0.01  # Q-181's synthesizer
+        assert set(figures) == {"build_s", "break_even_times"}
+        on = cases[(n, active, 1, True, "cuda", None, None)]["request_s"]
+        off = cases[(n, active, 1, False, "cuda", None, None)]["request_s"]
+        assert figures["build_s"] == pytest.approx(on - off)
         assert figures["break_even_times"] in (None, 1, 2, 3)
 
 
