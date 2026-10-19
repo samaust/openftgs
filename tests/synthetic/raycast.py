@@ -8,8 +8,9 @@ Each pixel averages `supersample`² rays through the continuous-convention pixel
 (i, j) covers [i, i + 1) × [j, j + 1), its center at i + ½), each hitting the nearest sphere or
 the black background (D-34). A sphere's surface is emissive and view-independent, colored by a
 smooth procedural texture of the sphere-local direction, colors in [0.1, 0.9] (Q-138). The
-caster also returns, per pixel, the share of its rays that hit a sphere's local z < 0 half, the
-half S-11 leaves without initial points.
+caster also returns, per pixel, the share of its rays that hit any sphere (its coverage, over
+which S-9's sphere-coverage PSNR is taken, Q-138) and the share that hit a sphere's local x < 0
+half, the half S-11 leaves without initial points (Q-140).
 """
 
 import dataclasses
@@ -31,14 +32,14 @@ from openftgs.types import Camera, ImageRecord, InitPoints
 FPS = 30.0
 FRAMES = 20  # §3.2 S-9
 WIDTH, HEIGHT = 128, 96  # §3.2 S-9
-FOCAL = 64.0  # Q-138: every sphere in view at the rig's radius of about 0.89
-RADIUS = 0.12  # sphere radius, world units (S ≈ 1): about 17 px across
-CENTER_RADIUS = 0.25  # centers at the middle time within this of the origin
-STEP = (0.004, 0.007)  # displacement per frame, below half the init lattice's spacing (E15)
+FOCAL = 72.0  # Q-138, Q-155: every sphere in view at the rig's radius of about 0.89
+RADIUS = 0.16  # Q-155: world units (S ≈ 1), about 26 px across; half spacing 0.0143 (300 pts)
+CENTER_RADIUS = 0.3  # Q-138: centers at the middle time within this of the origin (from 0.25)
+STEP = (0.008, 0.012)  # Q-138: per frame, below half the init lattice's spacing (E15, Q-155)
 CLEARANCE = 0.04  # surfaces this far apart at every frame
 EDGE_MARGIN = 4.0  # silhouettes this many pixels inside every image
 TEXTURE_WAVES = 6  # sinusoids per color channel
-TEXTURE_FREQUENCY = (2.0, 5.0)  # rad per unit of the local direction: smooth at RADIUS
+TEXTURE_FREQUENCY = (3.0, 8.0)  # Q-138: rad per unit of the local direction
 
 _TRAIN_ELEVATIONS = (15.0, 30.0, 45.0, 60.0)  # Q-138: 16 training cameras, four azimuths each
 _TEST_VIEWS = ((25.0, 56.25), (40.0, 146.25), (52.0, 236.25), (33.0, 326.25))  # (elev, azim)
@@ -155,11 +156,16 @@ def spheres(seed: int, cameras: Sequence[Camera]) -> list[Sphere]:
     raise AssertionError("no three spheres fit the rig")
 
 
-def cast(
-    scene: Sequence[Sphere], camera: Camera, t: float, *, supersample: int = 3
-) -> tuple[np.ndarray, np.ndarray]:
-    """The image [H, W, 3] in [0, 1] (float64) at raw time `t`, and per pixel the share of rays
-    that hit a sphere's local z < 0 half [H, W]."""
+@dataclasses.dataclass(frozen=True)
+class Cast:
+    image: np.ndarray  # [H, W, 3] in [0, 1], float64
+    half: np.ndarray  # [H, W]: the share of a pixel's rays that hit a local x < 0 half (Q-140)
+    coverage: np.ndarray  # [H, W]: the share of a pixel's rays that hit any sphere (Q-138)
+
+
+def cast(scene: Sequence[Sphere], camera: Camera, t: float, *, supersample: int = 3) -> Cast:
+    """The image at raw time `t`, with per pixel the shares of rays that hit a sphere's local
+    x < 0 half and that hit any sphere."""
     w2c = camera.world_to_camera.double().numpy()
     K = camera.K.double().numpy()
     R, translation = w2c[:3, :3], w2c[:3, 3]
@@ -173,7 +179,7 @@ def cast(
     directions /= np.linalg.norm(directions, axis=-1, keepdims=True)
     best = np.full(uu.shape, np.inf)
     color = np.zeros((*uu.shape, 3))
-    lower = np.zeros(uu.shape)
+    negative = np.zeros(uu.shape)
     for sphere in scene:
         center = sphere.center_at(t)
         oc = origin - center
@@ -187,11 +193,15 @@ def cast(
         local = (origin + depth[nearer, None] * directions[nearer] - center) / RADIUS
         best[nearer] = depth[nearer]
         color[nearer] = sphere.color(local)
-        lower[nearer] = (local[:, 2] < 0.0).astype(np.float64)
+        negative[nearer] = (local[:, 0] < 0.0).astype(np.float64)  # Q-140: a vertical split
     s = supersample
-    image = color.reshape(camera.height, s, camera.width, s, 3).mean(axis=(1, 3))
-    half = lower.reshape(camera.height, s, camera.width, s).mean(axis=(1, 3))
-    return image, half
+
+    def per_pixel(rays: np.ndarray) -> np.ndarray:
+        shares: np.ndarray = rays.reshape(camera.height, s, camera.width, s, *rays.shape[2:])
+        return shares.mean(axis=(1, 3))
+
+    hit = np.isfinite(best).astype(np.float64)
+    return Cast(per_pixel(color), per_pixel(negative), per_pixel(hit))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,7 +210,8 @@ class Scene:
     train_manifest: Path  # the training images only
     spheres: list[Sphere]
     rig: Rig
-    halves: dict[tuple[str, int], np.ndarray]  # (camera, frame) → local z < 0 share, test views
+    halves: dict[tuple[str, int], np.ndarray]  # (camera, frame) → local x < 0 share, test views
+    coverage: dict[tuple[str, int], np.ndarray]  # (camera, frame) → sphere coverage, test views
 
 
 def write_scene(root: Path, seed: int) -> Scene:
@@ -210,24 +221,26 @@ def write_scene(root: Path, seed: int) -> Scene:
     scene = spheres(seed, cameras.train + cameras.test)
     records: list[ImageRecord] = []
     halves: dict[tuple[str, int], np.ndarray] = {}
+    coverage: dict[tuple[str, int], np.ndarray] = {}
     for k in range(FRAMES):
         for split, group in (("train", cameras.train), ("test", cameras.test)):
             for camera in group:
-                image, half = cast(scene, camera, tau(k))
+                result = cast(scene, camera, tau(k))
                 path = root / "images" / camera.name / f"{k:06d}.png"
                 path.parent.mkdir(parents=True, exist_ok=True)
-                pixels = np.round(np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8)
+                pixels = np.round(np.clip(result.image, 0.0, 1.0) * 255.0).astype(np.uint8)
                 Image.fromarray(pixels, "RGB").save(path)
                 kind: Literal["train", "test"] = "train" if split == "train" else "test"
                 records.append(ImageRecord(camera, tau(k), path, kind, k))
                 if kind == "test":
-                    halves[(camera.name, k)] = half
+                    halves[(camera.name, k)] = result.half
+                    coverage[(camera.name, k)] = result.coverage
     metadata = {"source": "synthetic/raycast"}
     full = write_scene_manifest(root / "scene.json", records, metadata=metadata)
     train = write_scene_manifest(
         root / "train.json", [r for r in records if r.split == "train"], metadata=metadata
     )
-    return Scene(full.path, train.path, scene, cameras, halves)
+    return Scene(full.path, train.path, scene, cameras, halves, coverage)
 
 
 def _lattice(g: torch.Generator, n: int) -> torch.Tensor:
@@ -246,16 +259,16 @@ def _lattice(g: torch.Generator, n: int) -> torch.Tensor:
 
 
 def surface_samples(
-    scene: Sequence[Sphere], seed: int, per_sphere: int, *, upper_only: bool = False
+    scene: Sequence[Sphere], seed: int, per_sphere: int, *, positive_x_only: bool = False
 ) -> InitPoints:
     """Init points from the surfaces (Q-140, after Q-119's S-4): one fixed lattice per sphere,
     translated with it to each frame, colored by the texture, with frame ids and E15 velocities
-    (`knn_velocities` against the next frame, backward on the last, D-23). With `upper_only`,
-    only the lattice points of each sphere's local z ≥ 0 half (S-11)."""
+    (`knn_velocities` against the next frame, backward on the last, D-23). With
+    `positive_x_only`, only the lattice points of each sphere's local x ≥ 0 half (S-11, Q-140)."""
     g = torch.Generator().manual_seed(seed)
     lattices = [_lattice(g, per_sphere) for _ in scene]
-    if upper_only:
-        lattices = [lattice[lattice[:, 2] >= 0.0] for lattice in lattices]
+    if positive_x_only:
+        lattices = [lattice[lattice[:, 0] >= 0.0] for lattice in lattices]
     colors = torch.cat(
         [torch.from_numpy(s.color(lat.numpy())) for s, lat in zip(scene, lattices, strict=True)]
     ).to(torch.float32)
