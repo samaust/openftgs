@@ -712,8 +712,10 @@ def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str
     """§3.4 B-4 (D-52; Q-T228.1): LPIPS-VGG's forward and the prediction's backward for each of
     {IEEE, TF32, bf16} × {NCHW, channels-last inputs, channels-last inputs and weights} ×
     autotuning off and on; SSIM through fused-ssim, when it imports, and through the PyTorch
-    path, timed in a child process that can't import fused-ssim (PRD #220), with autotuning off
-    and on; at each size. B-4 has no budget (§3.4: it sets D-52's defaults)."""
+    path, timed where fused-ssim can't be imported (PRD #220), with autotuning off and on; at
+    each size. Each autotuning setting runs in its own child process, since cuDNN's algorithm
+    cache would carry one setting's picks into the other. B-4 has no budget (§3.4: it sets
+    D-52's defaults)."""
     import importlib.util
 
     body = losses_bench
@@ -726,7 +728,8 @@ def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str
     assert setup["training_layout"] == "channels_last_inputs"
     fused = importlib.util.find_spec("fused_ssim") is not None
     assert setup["fused_ssim"] == fused
-    assert "fused_ssim can't be imported" in setup["ssim_torch_path"]
+    assert "one child process per autotuning setting" in setup["processes"]
+    assert "fused_ssim can't be imported" in setup["processes"]
     cases = _cases_by(body)
     for width, height in LOSS_SIZES:
         for precision in PRECISIONS:

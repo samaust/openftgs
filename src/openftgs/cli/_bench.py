@@ -985,7 +985,7 @@ _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52
 # batch-first view of [..., H, W, 3] is channels-last), so training's path until #228; and both
 # the inputs and the network's weights channels-last.
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
-_LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning; every case without it runs first
+_LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
 _LOSS_REPETITIONS = 30  # Q-T228.1
 _LOSS_NOISE = 0.05  # Q-T228.1: the prediction's seeded Gaussian noise
 _GAIN_THRESHOLD = 0.03  # Q-173: a gain is at least 3 % at both sizes
@@ -1005,12 +1005,14 @@ _LPIPS_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, bool]
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
 }
 _TURN_ON = ("autotuning", "channels_last_weights")  # the exact options Q-173's rule decides
-# The child process that times the PyTorch SSIM path: `fused_ssim` can't be imported there, so
-# `openftgs.losses.ssim` takes its fallback without a change to its signature (PRD #220, owner's
-# decision). A None in sys.modules makes `import fused_ssim` raise ImportError.
-_SSIM_CHILD = (
+# The child process of one autotuning setting (Q-T228.1). cuDNN caches the algorithm it picked
+# for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off
+# and on can't be compared in one process. `fused_ssim` can't be imported there, so
+# `openftgs.losses.ssim` takes its PyTorch path without a change to its signature (PRD #220,
+# owner's decision): a None in sys.modules makes `import fused_ssim` raise ImportError.
+_CHILD = (
     "import sys; sys.modules['fused_ssim'] = None; "
-    "from openftgs.cli._bench import _ssim_torch_child; _ssim_torch_child(sys.argv[1])"
+    "from openftgs.cli._bench import _losses_child; _losses_child(sys.argv[1])"
 )
 
 
@@ -1203,32 +1205,39 @@ def _fused_ssim_importable() -> bool:
     return True
 
 
-def _ssim_torch_child(spec: str) -> None:
-    """B-4's PyTorch SSIM path, run as `python -c _SSIM_CHILD SPEC`, where `fused_ssim` can't be
-    imported (PRD #220, owner's decision): `SPEC` is JSON with the scene's path, the sizes, the
-    seed and the repetitions. Prints its cases as one line of JSON, with TF32 on as in
-    training (D-52), cuDNN autotuning off at every size and then on."""
+def _losses_child(spec: str) -> None:
+    """B-4's cases of one cuDNN autotuning setting, run as `python -c _CHILD SPEC` (Q-T228.1),
+    where `fused_ssim` can't be imported (PRD #220): `SPEC` is JSON with the scene's path, the
+    sizes, the seed, the repetitions and the setting. Every LPIPS case, then the PyTorch SSIM
+    path with TF32 on as in training (D-52), at every size. Prints its cases as one line of
+    JSON."""
     if _fused_ssim_importable():
         raise RuntimeError("fused_ssim can be imported in B-4's child process")
     from openftgs.data import MultiViewVideo
 
     given = json.loads(spec)
+    autotuning, repetitions = bool(given["autotuning"]), int(given["repetitions"])
     video = MultiViewVideo.from_manifest(Path(given["scene"]))
-    cases: list[dict[str, Any]] = []
-    for autotuning in _LOSS_AUTOTUNING:
-        for width, height in given["sizes"]:
-            gt, pred = _loss_images(video, width, height, seed=given["seed"], device="cuda")
-            with _cudnn_flags(tf32=True, autotuning=autotuning):
-                figures = _call_figures(_ssim_call(gt, pred), "loss.ssim", given["repetitions"])
-            case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
-            case |= {"precision": "tf32", "autotuning": autotuning}
-            cases.append({"case": case, "figures": figures})
+    images: _Images = {
+        (int(w), int(h)): _loss_images(video, int(w), int(h), seed=given["seed"], device="cuda")
+        for w, h in given["sizes"]
+    }
+    timed = _lpips_timed(_lpips_networks(), images, autotuning=autotuning, repetitions=repetitions)
+    cases = [{"case": _lpips_case(*key), "figures": figures} for key, figures in timed.items()]
+    for (width, height), (gt, pred) in images.items():
+        with _cudnn_flags(tf32=True, autotuning=autotuning):
+            figures = _call_figures(_ssim_call(gt, pred), "loss.ssim", repetitions)
+        case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
+        case |= {"precision": "tf32", "autotuning": autotuning}
+        cases.append({"case": case, "figures": figures})
     print(json.dumps(cases))
 
 
-def _ssim_torch_cases(scene: Path, sizes: Sequence[tuple[int, int]]) -> list[dict[str, Any]]:
-    """The cases of the PyTorch SSIM path, from a child process (`_ssim_torch_child`) running
-    this openftgs: the folder it is imported from goes first on the child's PYTHONPATH."""
+def _child_cases(
+    scene: Path, sizes: Sequence[tuple[int, int]], *, autotuning: bool
+) -> list[dict[str, Any]]:
+    """The cases of one autotuning setting, from a child process (`_losses_child`) running this
+    openftgs: the folder it is imported from goes first on the child's PYTHONPATH."""
     import openftgs
 
     root = str(Path(openftgs.__file__).resolve().parent.parent)
@@ -1239,16 +1248,17 @@ def _ssim_torch_cases(scene: Path, sizes: Sequence[tuple[int, int]]) -> list[dic
         "sizes": [list(size) for size in sizes],
         "seed": _SEED,
         "repetitions": _LOSS_REPETITIONS,
+        "autotuning": autotuning,
     }
     done = subprocess.run(
-        [sys.executable, "-c", _SSIM_CHILD, json.dumps(spec)],
+        [sys.executable, "-c", _CHILD, json.dumps(spec)],
         capture_output=True,
         text=True,
         env=env,
         check=False,
     )
     if done.returncode != 0:
-        raise RuntimeError(f"B-4's PyTorch SSIM child process failed:\n{done.stderr[-4000:]}")
+        raise RuntimeError(f"B-4's child process failed:\n{done.stderr[-4000:]}")
     cases: list[dict[str, Any]] = json.loads(done.stdout.strip().splitlines()[-1])
     return cases
 
@@ -1288,18 +1298,19 @@ def _lpips_deviations(network: Any, images: _Images) -> list[dict[str, Any]]:
     return cases
 
 
-def _lpips_timed(networks: dict[bool, Any], images: _Images) -> dict[_LpipsKey, dict[str, Any]]:
-    """Every LPIPS case's figures, every case without autotuning first (Q-T228.1)."""
+def _lpips_timed(
+    networks: dict[bool, Any], images: _Images, *, autotuning: bool, repetitions: int
+) -> dict[_LpipsKey, dict[str, Any]]:
+    """Every LPIPS case's figures under one autotuning setting (Q-T228.1)."""
     timed: dict[_LpipsKey, dict[str, Any]] = {}
-    for autotuning in _LOSS_AUTOTUNING:
-        for (width, height), (gt, pred) in images.items():
-            for precision in _LOSS_PRECISIONS:
-                for layout in _LOSS_LAYOUTS:
-                    network = networks[layout == "channels_last_inputs_and_weights"]
-                    call = _lpips_call(network, gt, pred, precision=precision, layout=layout)
-                    with _cudnn_flags(tf32=precision != "ieee", autotuning=autotuning):
-                        figures = _call_figures(call, "loss.perceptual", _LOSS_REPETITIONS)
-                    timed[(width, height, precision, layout, autotuning)] = figures
+    for (width, height), (gt, pred) in images.items():
+        for precision in _LOSS_PRECISIONS:
+            for layout in _LOSS_LAYOUTS:
+                network = networks[layout == "channels_last_inputs_and_weights"]
+                call = _lpips_call(network, gt, pred, precision=precision, layout=layout)
+                with _cudnn_flags(tf32=precision != "ieee", autotuning=autotuning):
+                    figures = _call_figures(call, "loss.perceptual", repetitions)
+                timed[(width, height, precision, layout, autotuning)] = figures
     return timed
 
 
@@ -1316,22 +1327,19 @@ def _losses(ctx: _Context) -> _Result:
     """B-4 (§3.4, D-52): LPIPS-VGG's forward and the prediction's backward in IEEE float32,
     TF32 and bfloat16, with NCHW inputs, channels-last inputs and channels-last inputs and
     weights, with cuDNN autotuning off and on; SSIM through fused-ssim and through the PyTorch
-    path, in a child process; bf16's (and TF32's) deviation from IEEE float32 in value and
-    gradient; at 1352×1014 and 1920×1080 (Q-T228.1). The gains Q-173's rule reads are cases
+    path; bf16's (and TF32's) deviation from IEEE float32 in value and gradient; at 1352×1014
+    and 1920×1080 (Q-T228.1). The deviations and fused-ssim run in this process, everything
+    else in one child process per autotuning setting. The gains Q-173's rule reads are cases
     too; the rule's B-1 half is a rerun of B-1."""
     import gc
 
     import torch
 
     sizes = [(int(w), int(h)) for w, h in _LOSS_SIZES]
-    with _environment_error("LPIPS networks"):
+    with _environment_error("LPIPS networks"):  # exit 2 here, before any child starts
         networks = _lpips_networks()
     images = {size: _loss_images(ctx.video, *size, seed=_SEED, device="cuda") for size in sizes}
-    # Deviations first, before any case with autotuning, which could leave its algorithms in
-    # cuDNN's cache; then every case without autotuning before any with it.
     cases = _lpips_deviations(networks[False], images)
-    timed = _lpips_timed(networks, images)
-    cases += [{"case": _lpips_case(*key), "figures": figures} for key, figures in timed.items()]
     fused = _fused_ssim_importable()
     ssim_fused = _ssim_fused_timed(images) if fused else {}
     for (width, height), figures in ssim_fused.items():
@@ -1339,9 +1347,17 @@ def _losses(ctx: _Context) -> _Result:
         cases.append({"case": case, "figures": figures})
     del networks, images
     gc.collect()
-    torch.cuda.empty_cache()  # for the child process
-    ssim_torch = _ssim_torch_cases(ctx.args.scene, sizes)
-    cases += ssim_torch
+    torch.cuda.empty_cache()  # for the child processes
+    children: list[dict[str, Any]] = []
+    for autotuning in _LOSS_AUTOTUNING:
+        children += _child_cases(ctx.args.scene, sizes, autotuning=autotuning)
+    cases += children
+    timed = {
+        (c["width"], c["height"], c["precision"], c["layout"], c["autotuning"]): entry["figures"]
+        for entry in children
+        if (c := entry["case"])["loss"] == "lpips_vgg"
+    }
+    ssim_torch = [entry for entry in children if entry["case"]["loss"] == "ssim"]
 
     def compare(name: str, pairs: list[tuple[dict[str, Any], dict[str, Any]]]) -> None:
         gains = []
@@ -1384,10 +1400,13 @@ def _losses(ctx: _Context) -> _Result:
         "layouts": list(_LOSS_LAYOUTS),
         "training_layout": "channels_last_inputs",
         "autotuning": list(_LOSS_AUTOTUNING),
-        "order": "deviations first; then every case without autotuning before any with it",
+        "processes": (
+            "the deviations and fused-ssim in the benchmark's process; LPIPS and the PyTorch "
+            "SSIM path in one child process per autotuning setting, in which fused_ssim can't "
+            "be imported"
+        ),
         "ssim": cfg_ssim,
         "fused_ssim": fused,
-        "ssim_torch_path": "a child process in which fused_ssim can't be imported",
         "warmup": _WARMUP,
         "repetitions": _LOSS_REPETITIONS,
         "clock": "CUDA events: loss.perceptual or loss.ssim (forward), backward (the prediction's)",
