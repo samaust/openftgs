@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-3 (`bench
-slice`; D-50, Q-13), and the seeded model synthesizer of the benchmark setups (Q-168).
+slice`; D-50, Q-13), B-8 (`bench convert` and `bench init`; D-48, D-56, D-81, Q-169), and the
+seeded model synthesizer of the benchmark setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
-tests do (Q-125); the benchmarks themselves run only on a GPU.
+tests do (Q-125); the benchmarks themselves run only on a GPU, except `convert`.
 """
 
 import hashlib
@@ -12,16 +13,20 @@ import importlib.metadata
 import json
 import platform
 import re
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
-from builders import look_at, random_model, ring, write_scene
+from builders import look_at, n3dv_source, random_model, ring, write_scene
 
 from openftgs.cli import main
-from openftgs.io import write_exchange
+from openftgs.data import convert_n3dv
+from openftgs.io import read_scene_manifest, write_exchange
 from openftgs.types import TimeNormalizer
 
 TIME = TimeNormalizer(0.0, 2.0 / 30.0)  # three frames at 30 FPS
@@ -345,3 +350,157 @@ def test_bench_slice_refuses_a_single_timestamp_scene_and_an_unwritable_out(
     blocker.write_text("not a folder")
     assert _ftgs("bench", "slice", scene, "--out", blocker / "bench.json") == 2
     assert "cannot write BENCH.json" in capsys.readouterr().err
+
+
+# B-8, `ftgs bench convert` (§3.4, D-48, D-81; Q-169): the scene's recorded converter rerun from
+# the `-i` paths of its ffmpeg commands, into a temporary directory, on small lavfi clips.
+
+needs_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="needs ffmpeg and ffprobe on PATH (D-48)",
+)
+
+
+@pytest.fixture
+def scratch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The default temporary folder of this test, so it can check what a run leaves there."""
+    folder = tmp_path / "scratch"
+    folder.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(folder))
+    return folder
+
+
+def _converted(root: Path, *, cameras: int = 2, frames: int = 2, **video: Any) -> Path:
+    """A Neural3DV source of lavfi clips and its conversion at resize ½, the scene for B-8."""
+    src = n3dv_source(root / "src", cameras=cameras, frames=frames + 1, **video)
+    return convert_n3dv(src, root / "scene", frames=frames, resize=0.5, jobs=1)
+
+
+def _bench_convert(manifest: Path, out: Path) -> dict[str, Any]:
+    assert _ftgs("bench", "convert", manifest, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+@needs_ffmpeg
+def test_b8_convert_reruns_the_recorded_converter_per_camera_and_in_total(
+    tmp_path: Path, scratch: Path
+) -> None:
+    """B-8 (§3.4; Q-169): `bench convert` reruns the converter the manifest records, with its
+    options (frames, resize, ffmpeg and ffprobe) from the metadata and its source from the `-i`
+    paths of the recorded ffmpeg commands, into a temporary directory that it removes. It
+    reports the wall time per camera and in total, with each camera's decode and encode times,
+    once with `--hwaccel none`; without a CUDA device it doesn't run `cuda`, and says why. B-8
+    has no budget ("reported; regression rule only")."""
+    manifest = _converted(tmp_path)
+    recorded = read_scene_manifest(manifest).metadata
+    out = tmp_path / "bench" / "B-8-convert.json"
+    body = _bench_convert(manifest, out)
+    assert body["benchmark"] == "B-8"
+    assert body["command"] == ["ftgs", "bench", "convert", str(manifest), "--out", str(out)]
+    setup = body["setup"]
+    assert setup["converter"] == "n3dv"
+    assert setup["source"] == str(tmp_path / "src")
+    assert (setup["frames"], setup["resize"]) == (2, 0.5)
+    assert setup["ffmpeg"] == recorded["ffmpeg"]["path"]
+    assert setup["ffprobe"] == recorded["ffmpeg"]["ffprobe"]
+    assert setup["hwaccel"] == ["none"]
+    assert "CUDA" in setup["skipped"]["cuda"]  # why `cuda` didn't run
+    cases = {(c["case"]["hwaccel"], c["case"].get("camera")): c["figures"] for c in body["cases"]}
+    assert set(cases) == {("none", "cam00"), ("none", "cam01"), ("none", None)}
+    for camera in ("cam00", "cam01"):
+        figures = cases[("none", camera)]
+        assert figures["frames"] == 2
+        assert 0.0 < figures["decode_s"] < 60.0 and 0.0 < figures["encode_s"] < 60.0
+        assert 0.0 < figures["wall_s"] < 60.0
+    total = cases[("none", None)]
+    assert (total["cameras"], total["frames"]) == (2, 4)
+    assert total["wall_s"] >= max(cases[("none", c)]["wall_s"] for c in ("cam00", "cam01"))
+    assert body["budgets"] == []
+    assert list(scratch.iterdir()) == []  # the temporary conversion is removed
+
+
+@needs_ffmpeg
+def test_b8_convert_without_its_source_exits_2_naming_the_path(
+    tmp_path: Path, scratch: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B-8, Q-169, Q-166: when a source video recorded in the manifest's ffmpeg commands can't
+    be found, `bench convert` is exit 2, naming its path, and writes nothing."""
+    manifest = _converted(tmp_path)
+    missing = tmp_path / "src" / "cam01.mp4"
+    missing.rename(tmp_path / "elsewhere.mp4")
+    out = tmp_path / "bench.json"
+    assert _ftgs("bench", "convert", manifest, "--out", out) == 2
+    assert str(missing) in capsys.readouterr().err
+    assert not out.exists()
+    assert list(scratch.iterdir()) == []
+
+
+def test_b8_convert_needs_a_recorded_n3dv_conversion(
+    scene: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B-8, Q-169: a manifest whose metadata records no converter run with ffmpeg commands
+    (here one written by hand) has nothing to rerun, and one recorded by another converter than
+    Neural3DV's is refused (Q-T234.2); both are exit 2, with nothing written."""
+    out = tmp_path / "bench.json"
+    assert _ftgs("bench", "convert", scene, "--out", out) == 2
+    assert "records no converter run" in capsys.readouterr().err
+    body = json.loads(scene.read_text(encoding="utf-8"))
+    body["metadata"] = {
+        "converter": "selfcap",
+        "ffmpeg": {"path": "ffmpeg", "ffprobe": "ffprobe", "commands": {"cam0": ["ffmpeg"]}},
+    }
+    selfcap = scene.with_name("selfcap.json")  # beside the images the manifest names
+    selfcap.write_text(json.dumps(body), encoding="utf-8")
+    assert _ftgs("bench", "convert", selfcap, "--out", out) == 2
+    assert "selfcap converter" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def _lists_cuda() -> bool:
+    """Whether the ffmpeg on PATH lists cuda among its hardware acceleration methods."""
+    listed = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    return "cuda" in listed
+
+
+@needs_ffmpeg
+@pytest.mark.gpu
+def test_b8_convert_keeps_the_cpu_run_when_cuda_refuses_the_stream(
+    tmp_path: Path, scratch: Path
+) -> None:
+    """B-8, D-81, Q-T234.2: when the `cuda` run fails, here because D-81 refuses the lossless
+    clips' gbrp pixel format before ffmpeg starts, the `none` run's numbers stand and the setup
+    says why `cuda` has none; exit 0."""
+    if not _lists_cuda():
+        pytest.skip("this ffmpeg build has no cuda hwaccel")
+    manifest = _converted(tmp_path)
+    body = _bench_convert(manifest, tmp_path / "bench.json")
+    assert body["setup"]["hwaccel"] == ["none"]
+    reason = body["setup"]["skipped"]["cuda"]
+    assert reason.startswith("failed:") and "gbrp" in reason
+    assert {c["case"]["hwaccel"] for c in body["cases"]} == {"none"}
+    assert list(scratch.iterdir()) == []
+
+
+@needs_ffmpeg
+@pytest.mark.gpu
+def test_b8_convert_with_and_without_hardware_decoding(tmp_path: Path, scratch: Path) -> None:
+    """B-8 (§3.4: conversion "with and without hardware decoding"; D-81, Q-T234.2): with a
+    CUDA device and an ffmpeg that lists cuda, `bench convert` also runs `--hwaccel cuda`,
+    reported per camera and in total like the CPU run. The clips are yuv420p H.264, which CUDA
+    decodes (D-81), as in U-27's GPU case."""
+    if not _lists_cuda():
+        pytest.skip("this ffmpeg build has no cuda hwaccel")
+    manifest = _converted(tmp_path, width=160, height=128, lossless=False)
+    body = _bench_convert(manifest, tmp_path / "bench.json")
+    assert body["setup"]["hwaccel"] == ["none", "cuda"] and body["setup"]["skipped"] == {}
+    cases = {(c["case"]["hwaccel"], c["case"].get("camera")): c["figures"] for c in body["cases"]}
+    assert set(cases) == {(h, c) for h in ("none", "cuda") for c in ("cam00", "cam01", None)}
+    for hwaccel in ("none", "cuda"):
+        for camera in ("cam00", "cam01"):
+            figures = cases[(hwaccel, camera)]
+            assert figures["frames"] == 2 and 0.0 < figures["decode_s"] < figures["wall_s"]
+        assert cases[(hwaccel, None)]["frames"] == 4 and cases[(hwaccel, None)]["wall_s"] > 0.0
+    assert list(scratch.iterdir()) == []

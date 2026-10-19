@@ -23,6 +23,7 @@ import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -611,6 +612,184 @@ def _slice(ctx: _Context) -> _Result:
     return _Result(setup, cases, budgets)
 
 
+# -- B-8: conversion on the wall clock (§3.4, D-48, D-81; Q-169, Q-T234.2) -------------------------
+
+# Q-T234.2: B-8's scene is a Neural3DV one; selfcap's recorded `-i` paths are inside the
+# conversion's own work folder, which it removes, so they can never be found again.
+_RERUNS = ("n3dv",)
+
+
+@dataclass(frozen=True)
+class _RecordedConversion:
+    """What a manifest records of the conversion that made it (Q-169): the converter, the source
+    folder its ffmpeg commands read, and the options to run it with again."""
+
+    converter: str
+    source: Path
+    frames: Any
+    resize: Any
+    ffmpeg: str
+    ffprobe: str
+
+
+def _recorded_conversion(ctx: _Context) -> _RecordedConversion:
+    """Q-169: the converter and its options from the manifest's metadata, and the source from
+    the `-i` paths of its ffmpeg commands; exit 2, naming the path, when one isn't there."""
+    where = f"scene manifest {ctx.args.scene}"
+    metadata = ctx.video.manifest.metadata
+    converter = metadata.get("converter")
+    ffmpeg = metadata.get("ffmpeg")
+    commands = ffmpeg.get("commands") if isinstance(ffmpeg, dict) else None
+    if not isinstance(converter, str) or not isinstance(commands, dict) or not commands:
+        _fail(f"{where}: its metadata records no converter run with ffmpeg commands (Q-169)")
+    if converter not in _RERUNS:
+        _fail(
+            f"{where}: recorded by the {converter} converter; bench convert reruns "
+            f"{', '.join(_RERUNS)} conversions (B-8, Q-T234.2)"
+        )
+    assert isinstance(ffmpeg, dict)
+    sources: list[Path] = []
+    for camera, command in commands.items():
+        if not isinstance(command, list) or "-i" not in command[:-1]:
+            _fail(f"{where}: the recorded ffmpeg command of {camera} has no -i path (Q-169)")
+        path = Path(str(command[command.index("-i") + 1]))
+        if not path.is_file():
+            _fail(f"source video {path} not found (the ffmpeg command recorded for {camera})")
+        sources.append(path)
+    folders = sorted({str(path.parent) for path in sources})
+    if len(folders) != 1:
+        _fail(f"{where}: the recorded ffmpeg commands read from {len(folders)} folders: {folders}")
+    for key in ("path", "ffprobe"):
+        if not isinstance(ffmpeg.get(key), str):
+            _fail(f"{where}: its metadata records no ffmpeg {key} (Q-169)")
+    return _RecordedConversion(
+        converter=converter,
+        source=Path(folders[0]).resolve(),
+        frames=metadata.get("frames"),
+        resize=metadata.get("resize"),
+        ffmpeg=ffmpeg["path"],
+        ffprobe=ffmpeg["ffprobe"],
+    )
+
+
+def _cuda_decoding(ffmpeg: str) -> str | None:
+    """Q-T234.2: None when the recorded ffmpeg can be asked to decode with CUDA here, otherwise
+    why not: a CUDA device must be visible, and the build must list `cuda` among its hardware
+    acceleration methods (source log T234.2)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return "not run: no CUDA device is visible"
+    listed = _run(ffmpeg, "-hide_banner", "-hwaccels")
+    if listed is None:
+        return f"not run: {ffmpeg} -hwaccels failed"
+    if "cuda" not in [line.strip() for line in listed.splitlines()[1:]]:
+        return f"not run: {ffmpeg} lists no cuda hardware acceleration"
+    return None
+
+
+@dataclass(frozen=True)
+class _Conversion:
+    """One run of a converter: its call's wall time and the stages it recorded."""
+
+    wall: float
+    timings: list[Timing]
+
+
+def _conversion(recorded: _RecordedConversion, hwaccel: Literal["none", "cuda"]) -> _Conversion:
+    """The recorded converter, run once with `hwaccel` into a temporary directory that is
+    removed afterwards, under the wall clock (§3.4 B-8). A ValueError of the converter (a
+    missing ffmpeg, an unreadable source, a pixel format CUDA can't decode) propagates."""
+    from openftgs._stages import Clock
+    from openftgs.data import convert_n3dv
+
+    with tempfile.TemporaryDirectory(prefix="ftgs-bench-convert-") as folder:
+        with _output(f"the temporary conversion in {folder}"), Clock("wall") as clock:
+            start = time.perf_counter()
+            convert_n3dv(
+                recorded.source,
+                Path(folder) / "scene",
+                frames=recorded.frames,
+                resize=recorded.resize,
+                ffmpeg=recorded.ffmpeg,
+                ffprobe=recorded.ffprobe,
+                hwaccel=hwaccel,
+            )  # jobs: the converter's default; the manifest doesn't record it (Q-T234.2)
+            wall = time.perf_counter() - start
+        return _Conversion(wall, clock.read())
+
+
+def _conversion_cases(hwaccel: str, run: _Conversion) -> list[dict[str, Any]]:
+    """Per camera: its frames, the sum of its frames' reads from ffmpeg (`convert.decode`) and
+    of their processing and writing in the pool (`convert.encode`, measured in the pool's
+    processes, so they overlap), and its wall time, from its first read to its last frame
+    written. In total: the converter's call on the wall clock, and the sums."""
+    decode: dict[str, list[Timing]] = {}
+    encode: dict[str, list[Timing]] = {}
+    for t in run.timings:
+        parts = {"convert.decode": decode, "convert.encode": encode}.get(t.name)
+        if parts is not None and t.key is not None:
+            parts.setdefault(t.key, []).append(t)
+    cases: list[dict[str, Any]] = []
+    for camera in sorted(set(decode) | set(encode)):
+        mine = decode.get(camera, []) + encode.get(camera, [])
+        figures = {
+            "frames": len(encode.get(camera, [])),
+            "wall_s": max(t.end for t in mine) - min(t.start for t in mine),
+            "decode_s": sum(t.seconds for t in decode.get(camera, [])),
+            "encode_s": sum(t.seconds for t in encode.get(camera, [])),
+        }
+        cases.append({"case": {"hwaccel": hwaccel, "camera": camera}, "figures": figures})
+    total = {
+        "cameras": len(cases),
+        "frames": sum(c["figures"]["frames"] for c in cases),
+        "wall_s": run.wall,
+        "decode_s": sum(c["figures"]["decode_s"] for c in cases),
+        "encode_s": sum(c["figures"]["encode_s"] for c in cases),
+    }
+    return cases + [{"case": {"hwaccel": hwaccel}, "figures": total}]
+
+
+def _convert(ctx: _Context) -> _Result:
+    """B-8's conversion (§3.4, D-48, D-81): the scene's recorded converter rerun from its
+    recorded source, once with `--hwaccel none` and once with `cuda` when the recorded ffmpeg
+    supports it here, each into a temporary directory; the wall time per camera and in total.
+    It runs once: there is nothing to warm up in a conversion (Q-T234.2)."""
+    recorded = _recorded_conversion(ctx)
+    where = f"bench convert: the {recorded.converter} converter on {recorded.source}"
+    with _as_input_error(where):  # Q-142: the converters' input and environment errors
+        runs = {"none": _conversion(recorded, "none")}
+    skipped: dict[str, str] = {}
+    reason = _cuda_decoding(recorded.ffmpeg)
+    if reason is None:
+        try:
+            runs["cuda"] = _conversion(recorded, "cuda")
+        except ValueError as error:  # Q-T234.2: the CPU's numbers stand; the refusal is noted
+            reason = f"failed: {error}"
+    if reason is not None:
+        skipped["cuda"] = reason
+    cases = [case for hwaccel, run in runs.items() for case in _conversion_cases(hwaccel, run)]
+    version = _run(recorded.ffmpeg, "-version")
+    setup = {
+        "converter": recorded.converter,
+        "source": str(recorded.source),
+        "frames": recorded.frames,
+        "resize": recorded.resize,
+        "ffmpeg": recorded.ffmpeg,
+        "ffprobe": recorded.ffprobe,
+        "ffmpeg_version": version.splitlines()[0] if version else None,
+        "jobs": 0,  # the converter's default, one decoding process per four cores (§2.4)
+        "cpus": os.cpu_count(),
+        "temporary": tempfile.gettempdir(),
+        "hwaccel": list(runs),
+        "skipped": skipped,
+        "repetitions": 1,
+        "clock": "wall: convert.decode per frame read from ffmpeg, convert.encode per frame "
+        "processed and written in the pool, keyed by camera",
+    }
+    return _Result(setup, cases)
+
+
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
@@ -622,5 +801,5 @@ _BENCHMARKS: dict[str, _Benchmark] = {
     "data": _Benchmark("B-6", 232),
     "render": _Benchmark("B-7", 231, model=True),
     "init": _Benchmark("B-8", 234),
-    "convert": _Benchmark("B-8", 234, cuda=False),
+    "convert": _Benchmark("B-8", 234, _convert, cuda=False),
 }
