@@ -300,26 +300,21 @@ def _read_config(path: Path | None, seed: int | None) -> TrainConfig:
     return cfg
 
 
-def _flat(tree: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in tree.items():
-        if isinstance(value, Mapping):
-            out |= _flat(value, f"{prefix}{key}.")
-        else:
-            out[f"{prefix}{key}"] = value
-    return out
-
-
-def _check_resume_dir(run_dir: Path, config: Mapping[str, Any]) -> None:
+def _check_resume_dir(run_dir: Path, cfg: TrainConfig) -> None:
     """Q-134: a resumed run writes into an absent or empty directory, or into the run directory
-    of its own configuration (its config.json)."""
+    of its own configuration: its config.json differs at most in the performance settings a
+    resume may change (Q-134 as answered, Q-153)."""
+    from openftgs.config import config_from_dict, resume_conflicts
+
     if not run_dir.exists() or (run_dir.is_dir() and not any(run_dir.iterdir())):
         return
     try:
-        recorded = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        recorded = config_from_dict(
+            json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        )
     except (OSError, ValueError):
         recorded = None
-    if recorded != json.loads(json.dumps(config)):
+    if recorded is None or resume_conflicts(recorded, cfg):
         _fail(f"run directory {run_dir} isn't this run's: its config.json differs or is missing")
 
 
@@ -394,7 +389,7 @@ class _Profile:
 
 
 def _train(args: argparse.Namespace) -> int:
-    from openftgs.config import config_from_dict, config_to_dict
+    from openftgs.config import config_from_dict, config_to_dict, resume_conflicts
     from openftgs.io import load_checkpoint, read_init_points, save_run_checkpoint
     from openftgs.train import Trainer
 
@@ -417,20 +412,21 @@ def _train(args: argparse.Namespace) -> int:
         cfg = _read_config(args.config, args.seed)
     else:
         with _as_input_error(f"checkpoint {args.resume}"):
-            stored = load_checkpoint(args.resume).config
-            cfg = config_from_dict(stored)
+            cfg = config_from_dict(load_checkpoint(args.resume).config)
         if args.config is not None or args.seed is not None:  # Q-134
             if args.config is not None:
-                given = config_to_dict(_read_config(args.config, args.seed))
+                given = _read_config(args.config, args.seed)
             else:
                 with _as_input_error("--seed"):
-                    given = config_to_dict(dataclasses.replace(cfg, seed=args.seed))
-            want, have = _flat(json.loads(json.dumps(stored))), _flat(given)
-            differ = sorted(k for k in want.keys() | have.keys() if want.get(k) != have.get(k))
+                    given = dataclasses.replace(cfg, seed=args.seed)
+            # Q-134 (as answered), Q-153: only the performance settings that change no number
+            # may differ, and the resumed run uses the given ones.
+            differ = resume_conflicts(cfg, given)
             if differ:
                 _fail(f"--resume continues the checkpoint's configuration; these differ: {differ}")
+            cfg = given
     if args.resume is not None:  # Q-134: the run being resumed, or a new run directory
-        _check_resume_dir(run_dir, config_to_dict(cfg))
+        _check_resume_dir(run_dir, cfg)
     if cfg.perf.deterministic:  # Q-131 (Q-73 note 2), before any CUDA call
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     device = _device()
@@ -439,7 +435,9 @@ def _train(args: argparse.Namespace) -> int:
             trainer = Trainer(cfg, video, points, device=device)
     else:
         with _as_input_error(f"resume from {args.resume}", NotImplementedError):
-            trainer = Trainer.from_checkpoint(args.resume, video, device=device, force=args.force)
+            trainer = Trainer.from_checkpoint(
+                args.resume, video, device=device, force=args.force, perf=cfg.perf
+            )
     last = cfg.optim.iterations
     profile = None
     if args.profile is not None:

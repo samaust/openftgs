@@ -338,22 +338,100 @@ def test_resume_refuses_a_changed_manifest_unless_forced(
     assert _train(run, tmp_path / "fresh", "--force") == 2
 
 
+@pytest.mark.parametrize(
+    ("override", "key"),
+    [
+        ({"loss": {"lambda_perc": 0.0, "lambda_reg": 0.5}}, "loss.lambda_reg"),
+        ({"perf": {"log_every": 5, "adam": "foreach"}}, "perf.adam"),  # D-53
+        ({"perf": {"log_every": 5, "perc_precision": "ieee"}}, "perf.perc_precision"),  # D-52
+        ({"perf": {"log_every": 5, "images_per_step": 2}}, "perf.images_per_step"),  # D-54
+    ],
+    ids=["loss", "adam", "perc_precision", "images_per_step"],
+)
 def test_resume_refuses_another_configuration(
-    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: dict[str, Any],
+    key: str,
 ) -> None:
-    """Q-134: beside --resume, --config and --seed must give the checkpoint's configuration,
-    PerfConfig included; giving it unchanged is accepted."""
+    """Q-134 (as answered), Q-153: beside --resume, --config and --seed must give the
+    checkpoint's configuration outside the PerfConfig fields that change no number:
+    perc_precision, adam and images_per_step must match, as must every other field; a
+    difference is exit 2 naming its dotted key, and giving the configuration unchanged is
+    accepted."""
     with monkeypatch.context() as m:
         _sigterm_at(m, 10)
         _train(run, tmp_path / "cut", "--config", run["config"])
     ckpt = tmp_path / "cut" / "checkpoint"
-    other_loss = _config_file(
-        tmp_path / "loss.json", _cfg(), loss={"lambda_perc": 0.0, "lambda_reg": 0.5}
-    )
-    other_perf = _config_file(tmp_path / "perf.json", _cfg(perf=PerfConfig(log_every=4)))
-    for extra in (("--config", other_loss), ("--config", other_perf), ("--seed", 3)):
-        assert _train(run, tmp_path / "cut", "--resume", ckpt, *extra) == 2
+    other = _config_file(tmp_path / "other.json", _cfg(), **override)
+    capsys.readouterr()
+    assert _train(run, tmp_path / "cut", "--resume", ckpt, "--config", other) == 2
+    assert key in capsys.readouterr().err
+    assert _train(run, tmp_path / "cut", "--resume", ckpt, "--seed", 3) == 2
+    assert "seed" in capsys.readouterr().err
     assert _train(run, tmp_path / "cut", "--resume", ckpt, "--config", run["config"]) == 0
+
+
+def test_a_resume_may_change_the_exact_performance_settings(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-134 (as answered), §2.2: a run cut by a signal and resumed into its own run directory
+    with a --config that changes only exact PerfConfig fields (the frame cache placement, the
+    prefetch depth and the log period) exits 0, gives bitwise the straight run, and its
+    config.json and checkpoint record the new settings."""
+    assert _train(run, tmp_path / "straight", "--config", run["config"]) == 0
+    with monkeypatch.context() as m:
+        _sigterm_at(m, 10)
+        assert _train(run, tmp_path / "cut", "--config", run["config"]) == 128 + signal.SIGTERM
+    perf = PerfConfig(log_every=4, frame_cache="mmap", prefetch=2)
+    new = _config_file(tmp_path / "mmap.json", _cfg(perf=perf))
+    checkpoint = tmp_path / "cut" / "checkpoint"
+    assert _train(run, tmp_path / "cut", "--resume", checkpoint, "--config", new) == 0
+    _assert_same_run(tmp_path / "straight" / "checkpoint", checkpoint)
+    recorded = json.loads((tmp_path / "cut" / "config.json").read_text())
+    assert recorded == config_to_dict(_cfg(perf=perf))
+    assert load_checkpoint(checkpoint).config == recorded
+
+
+def test_a_resume_into_its_own_directory_accepts_other_exact_settings(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-134 (as answered): the run-directory check compares only the fields that must match,
+    so a run directory whose config.json differs from the checkpoint's only in exact
+    PerfConfig fields is the run's own; one differing elsewhere is not, and is exit 2."""
+    with monkeypatch.context() as m:
+        _sigterm_at(m, 10)
+        _train(run, tmp_path / "cut", "--config", run["config"])
+    recorded = tmp_path / "cut" / "config.json"
+    data = json.loads(recorded.read_text())
+    data["perf"]["prefetch"] = 3
+    recorded.write_text(json.dumps(data))
+    checkpoint = tmp_path / "cut" / "checkpoint"
+    data["seed"] = 7
+    elsewhere = tmp_path / "elsewhere"
+    shutil.copytree(tmp_path / "cut", elsewhere)
+    (elsewhere / "config.json").write_text(json.dumps(data))
+    assert _train(run, elsewhere, "--resume", checkpoint) == 2
+    assert _train(run, tmp_path / "cut", "--resume", checkpoint) == 0
+
+
+def test_a_resume_that_turns_deterministic_on_sets_the_cublas_workspace(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-131, Q-134 (as answered): the process-wide setting follows the configuration the
+    resumed run uses, so a resume whose --config turns deterministic on sets
+    CUBLAS_WORKSPACE_CONFIG when the environment doesn't."""
+    with monkeypatch.context() as m:
+        _sigterm_at(m, 10)
+        _train(run, tmp_path / "cut", "--config", run["config"])
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", "restored after the test")
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG")
+    on = _config_file(tmp_path / "on.json", _cfg(perf=PerfConfig(log_every=5, deterministic=True)))
+    checkpoint = tmp_path / "cut" / "checkpoint"
+    assert _train(run, tmp_path / "cut", "--resume", checkpoint, "--config", on) == 0
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
 
 
 def test_profile_writes_a_trace_of_its_window(run: dict[str, Path], tmp_path: Path) -> None:
