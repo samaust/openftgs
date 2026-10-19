@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-178, Q-180 to Q-182, Q-185, Q-187 and Q-T232.1.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-178, Q-180 to Q-182, Q-185, Q-187, Q-188 and Q-T232.1.
 
 ## Subcommands
 
@@ -171,6 +171,22 @@ That run is superseded. Under `dynamic=True` dynamo had made the 3 and the 4 of 
 ## B-1's first run
 
 On kitchen (Calibration data, #226), an iteration without an event takes 102, 104 and 115 ms at 0.5M, 1M and 3M rows with 20 % active, and 112 ms at 3M with 5 %. LPIPS-VGG dominates: its forward takes 52.7 ms and every loss's backward 44.9 ms, whatever N. The temporal slice takes at most 1.24 % of an iteration, so D-50's CUDA operator isn't written; the SH concat at most 1.66 % and `loss.reg` 0.11 %, both under 5 %. The bound on a default run is 3,462 s at 3M rows, under the 3,600 s budget by 4 %, with cuDNN autotuning off and NCHW LPIPS as the defaults stood (B-4, #228, decides those). The clock's cost was inside the run-to-run spread: window B was 0.08 to 0.26 ms slower than window A, the iterations being GPU-bound.
+
+## B-5: `ftgs bench adam`
+
+B-5 times the optimizer's part of a training iteration, `FTGSOptimizer.set_iteration` followed by `step`, for the three Adam kinds of D-53 (`docs/modules/optim/schedules-and-state.md`), at N = 1M and 3M rows (#229; Q-188 for the details below).
+
+**Setup.** Per N, B-1's synthesized model at that N (seed 0, 20 % active, SH degree 3, so 64 floats per row over the nine stored tensors), with N(0, 1) gradients, seeded, set once on all nine stored tensors. Each kind, in the order fused, foreach, selective, gets a new optimizer from `build_optimizer` with `OptimConfig`'s defaults and the scene's S and Δt_f, on that same model, since Adam's cost doesn't depend on the values. A call sets the next iteration's rates (`it` = 1, 2, …) and takes one step, inside the stage `adam`. It never calls `zero_grad`, which would clear the gradients: the trainer's `adam` stage holds `zero_grad` as well, which only sets the nine gradients to None.
+
+**Selective Adam's mask** is fixed: exactly round(f·N) rows true, chosen by a seeded permutation, so they are spread over the tensors as a render leaves them, where f is the visible fraction B-1 measured at that N with 20 % active, to three decimals: 0.173 at 1M and 0.170 at 3M (Calibration data, Q-185). Its time includes the optimizer's own step counting after gsplat's kernel (Q-45).
+
+**Figures.** Per case (`{"adam", "n"}`): the median over 50 calls after the first call and 10 warm-up calls (`step_s`), the first call, the count, the peak allocated memory, and for selective Adam the mask's fraction. Per N (`{"n"}`): `fused_over_foreach`, fused's median over foreach's.
+
+**Budget** (§3.4, `kind: "budget"`): fused no slower than foreach, one entry per N, `fused_over_foreach` against 1.0 with no tolerance. If fused is slower at either N, the numbers go to the owner as a spec-change request, and the default stays `"fused"` meanwhile (#229, PRD #220).
+
+## B-5's first run
+
+On kitchen (Calibration data, #229), a call takes 2.05 / 4.51 / 0.67 ms at 1M rows and 6.03 / 13.56 / 2.00 ms at 3M for fused / foreach / selective Adam. Fused takes 45 % of foreach's time at both N (`fused_over_foreach` 0.454 and 0.445), so the budget passes and the default stays `"fused"`. Fused agrees with B-1's `adam` stage (2.11 and 6.22 ms at 1.02M and 3.06M rows, `zero_grad` included). Selective Adam, with its mask at 17 % of the rows, takes a third of fused's time, about 4 ms less per iteration at 3M; it stays opt-in, being approximate (§2.4 rule 2, D-53). Fused and selective Adam allocate nothing beyond the parameters, gradients and moments (1,024 B per row); foreach adds about 180 B per row in temporaries.
 
 ## B-6: `ftgs bench data`
 
