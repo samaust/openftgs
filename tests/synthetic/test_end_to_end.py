@@ -23,7 +23,7 @@ import pytest
 import raycast
 import torch
 from builders import look_at, write_render_request
-from synthetic_scenes import load_seeds, synthetic_config
+from synthetic_scenes import fibonacci_sphere, load_seeds, synthetic_config
 
 from openftgs.cli import main
 from openftgs.config import TrainConfig, config_to_dict
@@ -70,34 +70,58 @@ def _test_records(scene: raycast.Scene) -> tuple[MultiViewVideo, list[int]]:
 def test_cast_sees_each_sphere_where_the_camera_projects_its_center() -> None:
     """For one sphere at a time, the pixel nearest its projected center (K and world_to_camera
     of §1.4, continuous convention) shows the texture where the line toward the camera meets the
-    surface, within the texture's slope over that pixel; seen from below, the hit pixels show
-    the local z < 0 half, from above the z ≥ 0 half."""
+    surface, within the texture's slope over that pixel: the colors are 0.5 + 0.4 × a mean of
+    sinusoids, so they change by at most 0.4 × the top texture frequency per radian of the local
+    direction, and one pixel spans depth / focal / radius radians there. Every hit pixel has a
+    positive coverage, the pixel at a sphere's center a full one."""
     rig = raycast.rig()
     scene = raycast.spheres(load_seeds()["s9"]["spheres"], rig.train + rig.test)
     for camera in (rig.train[0], rig.train[9], rig.test[2]):
         w2c, K = camera.world_to_camera.double().numpy(), camera.K.double().numpy()
         eye = -w2c[:3, :3].T @ w2c[:3, 3]
         for sphere in scene:
-            image, _ = raycast.cast([sphere], camera, 0.0, supersample=1)
+            cast = raycast.cast([sphere], camera, 0.0, supersample=1)
             center = sphere.center_at(0.0)
             pix = K @ (w2c[:3, :3] @ center + w2c[:3, 3])
             u, v = math.floor(pix[0] / pix[2]), math.floor(pix[1] / pix[2])
             toward = (eye - center) / np.linalg.norm(eye - center)
-            # A pixel is about 0.014 world units at this depth, 0.12 rad of the local direction,
-            # over which the texture (slope ≤ 0.4 · 5 per rad) changes by at most 0.24.
-            assert np.abs(image[v, u] - sphere.color(toward)).max() < 0.24
-    # From straight below a sphere every visible point has local z < 0, from above z > 0.
+            depth = float(np.linalg.norm(eye - center)) - raycast.RADIUS
+            footprint = depth / raycast.FOCAL / raycast.RADIUS  # rad of the local direction
+            slope = 0.4 * raycast.TEXTURE_FREQUENCY[1]
+            assert np.abs(cast.image[v, u] - sphere.color(toward)).max() < slope * footprint
+            assert np.array_equal(cast.coverage > 0, cast.image.sum(axis=-1) > 0)
+            assert raycast.cast([sphere], camera, 0.0).coverage[v, u] == 1.0
+    # Q-140: seen from the -x side of a sphere every visible point has local x < 0, from +x
+    # every one has x > 0.
     center = scene[0].center_at(0.0)
-    for side, lower in ((-1.0, True), (1.0, False)):
-        eye = tuple(float(c) for c in center + np.array([0.0, 0.0, side]))
-        camera = look_at(eye, target=tuple(center), up=(0, 1, 0), width=128, height=96, focal=64.0)
-        image, half = raycast.cast(scene[:1], camera, 0.0)
-        hit = image.sum(axis=-1) > 0
+    for side, negative in ((-1.0, True), (1.0, False)):
+        eye = tuple(float(c) for c in center + np.array([side, 0.0, 0.0]))
+        camera = look_at(
+            eye, target=tuple(center), up=(0, 0, 1), width=128, height=96, focal=raycast.FOCAL
+        )
+        cast = raycast.cast(scene[:1], camera, 0.0)
+        hit = cast.coverage > 0
         assert hit.sum() > 100
         # `half` is the share of all of a pixel's rays, so a silhouette pixel shows below 1.
-        assert np.array_equal(half > 0, hit) if lower else not half.any()
-        if lower:
-            assert float(np.median(half[hit])) == 1.0
+        assert np.array_equal(cast.half > 0, hit) if negative else not cast.half.any()
+        if negative:
+            assert float(np.median(cast.half[hit])) == 1.0
+
+
+def test_motion_stays_below_half_the_init_lattice_spacing(record_property: Record) -> None:
+    """§3.2 S-4's precondition as Q-119 applies it to S-9 (D-23, Q-155, Q-156): every sphere's
+    displacement per frame is below half the smallest spacing of the lattice the init samples
+    (PER_SPHERE points on the sphere), so E15's nearest neighbour of a point in the next frame
+    is its own moved copy; the ratio reached is recorded."""
+    rig = raycast.rig()
+    scene = raycast.spheres(load_seeds()["s9"]["spheres"], rig.train + rig.test)
+    lattice = fibonacci_sphere(PER_SPHERE).double().numpy() * raycast.RADIUS
+    gaps = np.linalg.norm(lattice[:, None] - lattice[None], axis=-1)
+    np.fill_diagonal(gaps, np.inf)
+    half = 0.5 * float(np.min(gaps))
+    step = max(float(np.linalg.norm(s.velocity)) / raycast.FPS for s in scene)
+    record_property("s9_step_over_half_spacing", step / half)
+    assert step < half
 
 
 # S-9 (§3.2): end-to-end quality on non-Gaussian data, through the command line.
@@ -164,7 +188,7 @@ def test_s9_textured_spheres_end_to_end_from_roma(
 
 
 def _masked_psnr(model: FreeTimeGaussians, scene: raycast.Scene) -> float:
-    """Q-140: held-out PSNR over the pixels where at least half the rays hit a local z < 0 half,
+    """Q-140: held-out PSNR over the pixels where at least half the rays hit a local x < 0 half,
     per image (E16's clamp), averaged over the images that show any."""
     video, tests = _test_records(scene)
     values: list[float] = []
@@ -231,7 +255,7 @@ def _filled(
 def test_s11_growth_covers_surfaces_with_no_initial_points(
     scene: raycast.Scene, record_property: Record
 ) -> None:
-    """S-11: initialized on each sphere's local z ≥ 0 half only, growth "gradient" ends within
+    """S-11: initialized on each sphere's local x ≥ 0 half only, growth "gradient" ends within
     1 dB of a fully initialized run in held-out PSNR on the uninitialized half (calibrated); the
     same metric is reported for growth "none" started at the same final N, the missing points
     replaced by random low-opacity primitives (Q-140)."""
@@ -240,7 +264,7 @@ def test_s11_growth_covers_surfaces_with_no_initial_points(
     full = Trainer(cfg, video, _full_init(scene), device="cuda")
     full.train()
     half_points = raycast.surface_samples(
-        scene.spheres, load_seeds()["s9"]["lattice"], PER_SPHERE, upper_only=True
+        scene.spheres, load_seeds()["s9"]["lattice"], PER_SPHERE, positive_x_only=True
     )
     half = Trainer(cfg, video, half_points, device="cuda")
     half.train()
