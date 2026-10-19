@@ -13,7 +13,7 @@ Each command parses its options with argparse and calls the library. Nothing is 
 | `init roma` | `RomaInitConfig`, `roma_init`, `io.write_init_points` with `roma_provenance(cfg)` as metadata (Q-107) |
 | `train` | `config_from_dict`, `read_init_points`, `Trainer` or `Trainer.from_checkpoint`, `Trainer.train`, `io.save_run_checkpoint` (D-83, Q-152), `Trainer.evaluate` |
 | `render` | the model as `FreeTimeGaussians.load` reads it, `io.read_render_request`, `render.render_request`, `io.write_renders` with the SHA-256 of the request's bytes |
-| `eval` | the model, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
+| `eval` | the model, with the SHA-256 of its file or of its checkpoint's `manifest.json`, `evaluate_images`, `metrics_report`, `eval.write_metrics` (Q-136) |
 | `export` | `io.load_checkpoint`, the model, `to_exchange` with the configuration's background, `io.write_exchange` (D-84) |
 | `bench` | a stub until M15: it checks its arguments and returns 1 (Q-130) |
 
