@@ -19,7 +19,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -811,10 +811,13 @@ def test_eval_scores_supplied_renders_as_its_own(tmp_path: Path) -> None:
 
 
 def _broken_first_render(
-    monkeypatch: pytest.MonkeyPatch, scene: Path, value: float = math.nan
+    monkeypatch: pytest.MonkeyPatch,
+    scene: Path,
+    value: float = math.nan,
+    part: Literal["rgb", "alpha"] = "rgb",
 ) -> list[str]:
-    """Patch the evaluation's renderer so that its first render is all `value`; the list
-    receives the manifest path of that render's image. Training renders through another
+    """Patch the evaluation's renderer so that its first render's `part` is all `value`; the
+    list receives the manifest path of that render's image. Training renders through another
     function, so only evaluations see the patch."""
     import openftgs.render
     from openftgs.data import MultiViewVideo
@@ -826,8 +829,9 @@ def _broken_first_render(
     def broken(*args: Any, **kwargs: Any) -> Renders:
         renders = original(*args, **kwargs)
         if not paths:
-            key = next(iter(renders.rgb))
-            renders.rgb[key] = torch.full_like(renders.rgb[key], value)
+            tensors = getattr(renders, part)
+            key = next(iter(tensors))
+            tensors[key] = torch.full_like(tensors[key], value)
             image = video.records[int(key)].image_path
             paths.append(image.relative_to(scene.parent).as_posix())
         return renders
@@ -837,18 +841,24 @@ def _broken_first_render(
 
 
 @pytest.mark.weights
-@pytest.mark.parametrize("value", [math.nan, math.inf], ids=["nan", "inf"])
+@pytest.mark.parametrize(
+    ("part", "value"),
+    [("rgb", math.nan), ("rgb", math.inf), ("rgb", -math.inf), ("alpha", math.nan)],
+    ids=["nan", "inf", "-inf", "alpha-nan"],
+)
 @pytest.mark.parametrize("existing", [True, False], ids=["existing", "absent"])
 def test_eval_of_a_render_that_is_not_finite_is_exit_code_3(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     existing: bool,
+    part: Literal["rgb", "alpha"],
     value: float,
 ) -> None:
-    """Q-129 (as answered), Q-147: a NaN or Inf render makes ftgs eval exit 3, naming the image,
-    and write no METRICS.json, leaving an existing one as it was (Q-126). An Inf render would
-    score as a plausible image after E16's clamp."""
+    """Q-129 (as answered), Q-147: a render with NaN or ±Inf colors, or a NaN alpha, makes
+    ftgs eval exit 3, naming the image, and write no METRICS.json, leaving an existing one as
+    it was (Q-126). An Inf render would score as a plausible image after E16's clamp, and the
+    metrics never see alpha."""
     scene, checkpoint = _trained(tmp_path)
     out = tmp_path / "metrics" / "METRICS.json"
     before = None
@@ -857,7 +867,7 @@ def test_eval_of_a_render_that_is_not_finite_is_exit_code_3(
         before = out.read_bytes()
     else:
         out.parent.mkdir()
-    paths = _broken_first_render(monkeypatch, scene, value)
+    paths = _broken_first_render(monkeypatch, scene, value, part)
     capsys.readouterr()
     assert _ftgs("eval", checkpoint, scene, "--out", out) == 3
     assert paths and paths[0] in capsys.readouterr().err

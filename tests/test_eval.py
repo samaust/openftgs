@@ -626,7 +626,7 @@ def test_evaluate_images_refuses_a_render_that_is_not_finite(
 def test_evaluate_images_names_up_to_five_renders_that_are_not_finite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Q-129, Q-147: the whole split is rendered first, so the message gives the number of
+    """Q-129, Q-147: the whole data split is rendered first, so the message gives the number of
     images whose render isn't finite, here 7 at 7 timestamps, and names the first five in the
     manifest's order."""
     cams = ring(2, width_px=8, height_px=6, focal=8.0)

@@ -267,8 +267,9 @@ def evaluate_images(
     record of the split by record index, nothing is rendered and those are scored (Q-137); one
     that isn't finite is a ValueError.
 
-    A render of the model that isn't finite, in its colors or its alpha, is not scored: once
-    the split is rendered, FloatingPointError names up to five such images (Q-129, Q-147)."""
+    A render of the model that isn't finite, in its colors or its alpha, is not scored, nor is
+    anything after it: once the whole data split is rendered, FloatingPointError names up to
+    five such images (Q-129, Q-147)."""
     indices = [i for i, record in enumerate(dataset.records) if record.split == split]
     if not indices:
         raise ValueError(f"the data split {split!r} holds no images")
@@ -278,9 +279,9 @@ def evaluate_images(
         if absent:
             names = _image_names(dataset, absent)
             raise ValueError(f"no supplied render for {len(absent)} image(s): {names[:5]}")
-        unusable = [i for i in indices if not _finite(renders[i])]
-        if unusable:  # Q-147: input, as read_renders would refuse it (Q-142)
-            names = _image_names(dataset, unusable)
+        broken = [i for i in indices if not _finite(renders[i])]
+        if broken:  # Q-147: input, as read_renders would refuse it (Q-142)
+            names = _image_names(dataset, broken)
             raise ValueError(
                 f"supplied renders that aren't finite for {len(names)} image(s): {names[:5]}"
             )
@@ -288,21 +289,23 @@ def evaluate_images(
     for i in indices:
         groups.setdefault(dataset.records[i].timestamp, []).append(i)
     results: dict[int, ImageMetrics] = {}
-    broken: list[int] = []
+    broken = []
     for timestamp, group in groups.items():
         if renders is None:
             items = tuple(RenderItem(str(i), timestamp, dataset.records[i].camera) for i in group)
             request = RenderRequest(
                 items, time_unit=dataset.manifest.time_unit, background=background
             )
-            out = render_request(model, request, backend=backend)
-            predictions = {i: out.rgb[str(i)] for i in group}
+            rendered = render_request(model, request, backend=backend)
+            predictions = {i: rendered.rgb[str(i)] for i in group}
             # Q-147: before E16's clamp, which would turn ±Inf into a plausible color.
-            broken += [i for i in group if not _finite(out.rgb[str(i)], out.alpha[str(i)])]
+            broken += [
+                i for i in group if not _finite(rendered.rgb[str(i)], rendered.alpha[str(i)])
+            ]
         else:
             predictions = {i: renders[i] for i in group}
         for i in group:
-            if i in broken:
+            if broken:  # Q-147: the data split fails, so nothing more is scored
                 continue
             record = dataset.records[i]
             mask = dataset.load_mask(i)
