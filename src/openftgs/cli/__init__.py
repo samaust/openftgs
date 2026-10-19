@@ -978,6 +978,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _physical_cores() -> int:
+    """The distinct (package, core) pairs of Linux's CPU topology; the logical CPUs where it
+    can't be read."""
+    cores: set[tuple[str, str]] = set()
+    try:
+        for topology in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology"):
+            package = (topology / "physical_package_id").read_text().strip()
+            cores.add((package, (topology / "core_id").read_text().strip()))
+    except OSError:
+        cores.clear()
+    return len(cores) or os.cpu_count() or 1
+
+
+# Q-176: §2.4 "Threads and processes", set at startup by the entry point (as Q-131 sets
+# CUBLAS_WORKSPACE_CONFIG); the library leaves the setting alone. After parsing, so --help stays
+# fast; PyTorch has already taken either variable, when set, at its own start.
+def _set_intra_op_threads() -> None:
+    if "OMP_NUM_THREADS" in os.environ or "MKL_NUM_THREADS" in os.environ:
+        return
+    import torch
+
+    torch.set_num_threads(_physical_cores())
+
+
 # Q-124: the module's one public name; the ftgs console script and `python -m openftgs.cli`.
 def main(argv: Sequence[str] | None = None) -> int:
     """Run `ftgs` with `argv` (the process's arguments by default) and return its exit code."""
@@ -986,6 +1010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as stop:  # argparse: --help is 0, a usage error 2 (§2.1)
         return stop.code if isinstance(stop.code, int) else _INPUT
+    _set_intra_op_threads()
     try:
         code: int = args.run(args)
     except _Failure as failure:
