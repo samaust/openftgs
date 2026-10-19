@@ -395,11 +395,15 @@ class _Profile:
 
 def _train(args: argparse.Namespace) -> int:
     from openftgs.config import config_from_dict, config_to_dict
-    from openftgs.io import load_checkpoint, read_init_points, save_checkpoint
+    from openftgs.io import load_checkpoint, read_init_points, save_run_checkpoint
     from openftgs.train import Trainer
 
     if args.force and args.resume is None:
         _fail("--force only applies with --resume")
+    if args.checkpoint_every < 0:  # D-83
+        _fail(f"--checkpoint-every must be at least 0, got {args.checkpoint_every}")
+    if args.keep_checkpoints < 1:  # D-83
+        _fail(f"--keep-checkpoints must be at least 1, got {args.keep_checkpoints}")
     run_dir: Path = args.out
     if args.resume is None:
         _empty_or_absent(run_dir, "run directory")  # Q-132
@@ -452,6 +456,13 @@ def _train(args: argparse.Namespace) -> int:
     (run_dir / "config.json").write_text(_json_text(config_to_dict(cfg)), encoding="utf-8")
     log_path = run_dir / "train_log.jsonl"
 
+    def save() -> None:
+        """D-83: every save, periodic, final or on a signal, checks the state first (Q-133) and
+        rotates the run directory's kept checkpoints."""
+        state = trainer.state_dict()
+        _check_finite(trainer, state.stats)
+        save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
+
     def record(trainer: Trainer, log: StepLog) -> bool:
         if profile is not None:
             profile.step_done(log.iteration)
@@ -468,6 +479,9 @@ def _train(args: argparse.Namespace) -> int:
                 f"iteration {log.iteration}/{last}  loss {total:.6g}  N {log.num_gaussians}",
                 file=sys.stderr,
             )
+        every = args.checkpoint_every
+        if every and log.iteration % every == 0 and log.iteration < last:  # D-83
+            save()
         return signals.received is not None
 
     if profile is not None:
@@ -481,9 +495,7 @@ def _train(args: argparse.Namespace) -> int:
         finally:
             if profile is not None:
                 profile.finish()  # Q-144: a window cut short by a signal is still written
-        state = trainer.state_dict()
-        _check_finite(trainer, state.stats)
-        save_checkpoint(state, run_dir / "checkpoint")
+        save()
     if signals.received is not None and trainer.iteration < last:  # Q-133; a finished run goes on
         print(
             f"stopped by signal {signals.received} at iteration {trainer.iteration}; "
@@ -784,6 +796,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, metavar="S")
     p.add_argument("--resume", type=Path, metavar="CKPT_DIR")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--checkpoint-every", type=int, default=0, metavar="N")  # D-83
+    p.add_argument("--keep-checkpoints", type=int, default=1, metavar="K")  # D-83
     p.add_argument("--profile", type=_pair, metavar="START:COUNT")
     p.set_defaults(run=_train)
 
