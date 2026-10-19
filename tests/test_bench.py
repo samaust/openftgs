@@ -2,8 +2,9 @@
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
-D-50, Q-13), B-5 (`bench adam`; D-53, Q-188), B-6 (`bench data`; D-51, Q-99, Q-178,
-Q-189), and the seeded model synthesizer of the benchmark setups (Q-168).
+D-50, Q-13), B-4 (`bench losses`; D-52, Q-173, Q-190), B-5 (`bench adam`; D-53, Q-188),
+B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), and the seeded model synthesizer of the
+benchmark setups (Q-168).
 
 The tests call `main(argv)` in process. CPU tests make PyTorch see no CUDA device, as the CLI
 tests do (Q-125); the benchmarks themselves run only on a GPU.
@@ -1230,3 +1231,201 @@ def test_b6_skips_the_gpu_placement_where_auto_would_not_choose_it(
     want = {"n": DATA_N, "placement": "mmap", "prefetch": 8}
     assert [c["case"] for c in body["cases"]] == [want]
     assert [b["case"] for b in body["budgets"]] == [want]
+
+
+# B-4, `ftgs bench losses` (§3.4, D-52; Q-42, Q-172, Q-173, Q-190): private tests of its
+# input images, of bf16's deviation figures and of the gains its turn-on rule reads.
+
+
+def test__loss_images_resize_the_first_training_image_and_add_seeded_noise(scene: Path) -> None:
+    """Q-190: the target is the scene's first training image resized to the benchmark size
+    (here 48×32 up to 96×80), [H, W, 3] float32; the prediction adds Gaussian noise of σ 0.05
+    drawn from a seeded generator, so the same seed gives the same pair."""
+    from openftgs.cli._bench import _loss_images
+    from openftgs.data import MultiViewVideo
+
+    video = MultiViewVideo.from_manifest(scene)
+    gt, pred = _loss_images(video, 96, 80, seed=0, device="cpu")
+    assert gt.shape == pred.shape == (80, 96, 3)
+    assert gt.dtype == pred.dtype == torch.float32
+    assert gt.is_contiguous() and pred.is_contiguous()
+    noise = pred - gt
+    assert abs(float(noise.std()) - 0.05) < 0.005 and abs(float(noise.mean())) < 0.005
+    again = _loss_images(video, 96, 80, seed=0, device="cpu")
+    assert torch.equal(again[0], gt) and torch.equal(again[1], pred)
+    assert not torch.equal(_loss_images(video, 96, 80, seed=1, device="cpu")[1], pred)
+    first = next(i for i, r in enumerate(video.records) if r.split == "train")
+    native = video.load_image(first)
+    height, width = native.shape[:2]
+    same, _ = _loss_images(video, width, height, seed=0, device="cpu")
+    assert torch.equal(same, native)  # at its own size, the image is not resampled
+
+
+def test__deviation_compares_value_and_gradient_with_ieee() -> None:
+    """Q-190: bf16's (and TF32's) deviation from IEEE float32: the relative difference of
+    the values, the gradients' relative L2 difference, and their largest difference over the
+    largest IEEE gradient element; worked by hand."""
+    from openftgs.cli._bench import _deviation
+
+    reference = torch.tensor([[3.0, -4.0]])
+    figures = _deviation(
+        torch.tensor(1.25), torch.tensor([[3.0, -4.5]]), torch.tensor(1.0), reference
+    )
+    assert figures == {
+        "value": 1.25,
+        "value_ieee": 1.0,
+        "value_relative": 0.25,
+        "gradient_relative_l2": 0.1,  # ‖(0, −0.5)‖ / ‖(3, −4)‖
+        "gradient_max_relative": 0.125,  # 0.5 / 4
+    }
+
+
+def test__comparison_gives_the_median_gain_of_a_variant() -> None:
+    """Q-173, Q-190: a variant's gain over its baseline is 1 − its median forward plus
+    backward over the baseline's: positive when the variant is faster."""
+    from openftgs.cli._bench import _comparison
+
+    assert _comparison({"forward_backward_s": 0.2}, {"forward_backward_s": 0.15}) == {
+        "baseline_s": 0.2,
+        "variant_s": 0.15,
+        "gain": pytest.approx(0.25, rel=1e-12),
+    }
+    slower = _comparison({"forward_backward_s": 0.1}, {"forward_backward_s": 0.125})
+    assert slower["gain"] == pytest.approx(-0.25, rel=1e-12)
+
+
+# B-4 itself, at two small sizes (VGG takes 16 px and more, source log 67; SSIM's valid window
+# 11) and 3 repetitions, so the test runs in seconds.
+LOSS_SIZES = ((64, 48), (80, 64))
+LOSS_REPETITIONS = 3
+PRECISIONS = ("ieee", "tf32", "bf16")
+LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
+COMPARISONS = {  # Q-190: (baseline, variant) as (precision, layout, autotuning)
+    "autotuning": (("tf32", "channels_last_inputs", False), ("tf32", "channels_last_inputs", True)),
+    "channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", "channels_last_inputs_and_weights", False),
+    ),
+    "autotuning_and_channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", "channels_last_inputs_and_weights", True),
+    ),
+    "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
+    "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
+}
+
+
+@pytest.fixture(scope="module")
+def losses_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench-losses") / "B-4.json"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("openftgs.cli._bench._LOSS_SIZES", LOSS_SIZES)
+        patch.setattr("openftgs.cli._bench._LOSS_REPETITIONS", LOSS_REPETITIONS)
+        assert _ftgs("bench", "losses", scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+def _lpips_case(width: int, height: int, precision: str, layout: str, autotuning: bool) -> Any:
+    case = {"loss": "lpips_vgg", "width": width, "height": height, "precision": precision}
+    case |= {"layout": layout, "autotuning": autotuning}
+    return tuple(sorted(case.items()))
+
+
+def _timed_figures_are_consistent(figures: dict[str, Any]) -> None:
+    assert figures["repetitions"] == LOSS_REPETITIONS
+    for name in ("forward_backward_s", "forward_s", "backward_s", "first_call_s"):
+        assert figures[name] > 0.0, name
+    # Each call's span holds its forward and its backward, so the medians keep that order.
+    assert figures["forward_backward_s"] >= max(figures["forward_s"], figures["backward_s"])
+    assert figures["peak_memory_bytes"] > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str, Any]) -> None:
+    """§3.4 B-4 (D-52; Q-190): LPIPS-VGG's forward and the prediction's backward for each of
+    {IEEE, TF32, bf16} × {NCHW, channels-last inputs, channels-last inputs and weights} ×
+    autotuning off and on; SSIM through fused-ssim, when it imports, and through the PyTorch
+    path, timed where fused-ssim can't be imported (PRD #220), with autotuning off and on; at
+    each size. Each autotuning setting runs in its own child process, since cuDNN's algorithm
+    cache would carry one setting's picks into the other. B-4 has no budget (§3.4: it sets
+    D-52's defaults)."""
+    import importlib.util
+
+    body = losses_bench
+    assert body["benchmark"] == "B-4" and body["budgets"] == []
+    assert body["command"][:3] == ["ftgs", "bench", "losses"]
+    setup = body["setup"]
+    assert setup["sizes"] == [list(size) for size in LOSS_SIZES]
+    assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
+    assert setup["precisions"] == list(PRECISIONS) and setup["layouts"] == list(LAYOUTS)
+    assert setup["training_layout"] == "channels_last_inputs"
+    fused = importlib.util.find_spec("fused_ssim") is not None
+    assert setup["fused_ssim"] == fused
+    assert "one child process per autotuning setting" in setup["processes"]
+    assert "fused_ssim can't be imported" in setup["processes"]
+    cases = _cases_by(body)
+    for width, height in LOSS_SIZES:
+        for precision in PRECISIONS:
+            for layout in LAYOUTS:
+                for autotuning in (False, True):
+                    key = _lpips_case(width, height, precision, layout, autotuning)
+                    _timed_figures_are_consistent(cases[key])
+        for autotuning in (False, True):
+            torch_case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
+            torch_case |= {"precision": "tf32", "autotuning": autotuning}
+            _timed_figures_are_consistent(cases[tuple(sorted(torch_case.items()))])
+        fused_key = (("height", height), ("loss", "ssim"), ("path", "fused"), ("width", width))
+        assert (fused_key in cases) == fused
+        if fused:
+            _timed_figures_are_consistent(cases[fused_key])
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b4_records_bf16s_deviation_and_the_gains_of_its_comparisons(
+    losses_bench: dict[str, Any],
+) -> None:
+    """§3.4 B-4, D-52, Q-173 (Q-190): bf16's and TF32's deviation from IEEE float32 in value
+    and gradient at each size, bf16's within the 5e-2 the bf16 step test allows; each
+    comparison's gain, 1 − variant / baseline of the medians, at each size, and whether its
+    smallest gain reaches Q-173's 3 %; fused-ssim's gain over the PyTorch path."""
+    import importlib.util
+
+    cases = _cases_by(losses_bench)
+    for width, height in LOSS_SIZES:
+        for precision in ("tf32", "bf16"):
+            key = (("deviation", precision), ("height", height), ("width", width))
+            figures = cases[key]
+            assert figures["value_ieee"] > 0.0
+            for name in ("value_relative", "gradient_relative_l2", "gradient_max_relative"):
+                assert 0.0 <= figures[name] < float("inf"), name
+        bf16 = cases[(("deviation", "bf16"), ("height", height), ("width", width))]
+        assert 0.0 < bf16["value_relative"] < 5e-2
+    for name, (base, variant) in COMPARISONS.items():
+        gains = []
+        for width, height in LOSS_SIZES:
+            figures = cases[(("comparison", name), ("height", height), ("width", width))]
+            expected_base = cases[_lpips_case(width, height, *base)]["forward_backward_s"]
+            expected_variant = cases[_lpips_case(width, height, *variant)]["forward_backward_s"]
+            assert (figures["baseline_s"], figures["variant_s"]) == (
+                expected_base,
+                expected_variant,
+            )
+            assert figures["gain"] == pytest.approx(1.0 - expected_variant / expected_base)
+            gains.append(figures["gain"])
+        summary = cases[(("comparison", name),)]
+        assert summary["smallest_gain"] == min(gains)
+        assert summary["meets_gain_threshold"] == (min(gains) >= 0.03)
+    assert losses_bench["setup"]["turn_on"] == ["autotuning", "channels_last_weights"]
+    assert losses_bench["setup"]["gain_threshold"] == 0.03
+    if importlib.util.find_spec("fused_ssim") is not None:
+        for width, height in LOSS_SIZES:
+            figures = cases[(("comparison", "fused_ssim"), ("height", height), ("width", width))]
+            torch_case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
+            torch_case |= {"precision": "tf32", "autotuning": False}
+            torch_key = tuple(sorted(torch_case.items()))
+            fused_key = (("height", height), ("loss", "ssim"), ("path", "fused"), ("width", width))
+            assert figures["baseline_s"] == cases[torch_key]["forward_backward_s"]
+            assert figures["variant_s"] == cases[fused_key]["forward_backward_s"]
