@@ -2,7 +2,7 @@
 """§3.2's end-to-end scenes on non-Gaussian data (M14, PRD #157): S-9 through the command line
 (ftgs train, export and render; ftgs init roma when the [init] extra is installed) and S-11's
 coverage of surfaces with no initial points, both on the textured spheres of the analytic ray
-caster in `raycast.py` (Q-138 to Q-140), and S-5's effect of E8 on the same scene (#100, Q-165).
+caster in `raycast.py` (Q-138 to Q-140), and S-5's effect of E8 on the same scene (#100, D-86).
 All train on the GPU: on the reference backend their 320 images at 128×96 would far exceed
 Q-119's 3-minute CPU target, as M11's S-5 did (Q-138).
 
@@ -354,7 +354,7 @@ def test_s11_growth_covers_surfaces_with_no_initial_points(
     assert abs(p2 - p1) <= S11_WITHIN_DB
 
 
-# S-5 (§3.2) on the ray-cast scene: the effect of E8 on dense textured surfaces (#100, Q-165).
+# S-5 (§3.2) on the ray-cast scene: the effect of E8 on dense textured surfaces (#100, D-86).
 
 
 @dataclasses.dataclass(frozen=True)
@@ -384,7 +384,7 @@ def _sphere_psnr(
 
 @pytest.fixture(scope="module")
 def s5_runs(scene: raycast.Scene) -> _S5Runs:
-    """Q-165: S-5's two runs on S-9's scene and initialization as they stand (N = 18,000), growth
+    """D-86: S-5's two runs on S-9's scene and initialization as they stand (N = 18,000), growth
     "none" so N stays the same in both, relocation at its default, S-9's calendar, and
     λ_reg = 0 against 10⁻² (E8, D-10) the only difference."""
     started = time.perf_counter()
@@ -396,7 +396,7 @@ def s5_runs(scene: raycast.Scene) -> _S5Runs:
     spheres: dict[str, float] = {}
     reported, last = False, 0.0
     for name, lambda_reg in (("no_reg", 0.0), ("reg", 1e-2)):
-        # Q-165: growth "none" keeps N the same in both runs; λ_reg is the only difference.
+        # D-86: growth "none" keeps N the same in both runs; λ_reg is the only difference.
         cfg = _cfg(loss=LossConfig(lambda_reg=lambda_reg), growth=GrowthConfig(mode="none"))
         trainer, logs = train(cfg, video, _full_init(scene), "cuda")
         model = trainer.model
@@ -422,7 +422,7 @@ def s5_runs(scene: raycast.Scene) -> _S5Runs:
 def test_s5_raycast_regularization_keeps_fewer_primitives_opaque(
     s5_runs: _S5Runs, record_property: Record
 ) -> None:
-    """S-5 on the ray-cast scene (Q-165): at the end of training the share of primitives with
+    """S-5 on the ray-cast scene (D-86): at the end of training the share of primitives with
     σ > 0.9 is lower with λ_reg = 10⁻² than without, both runs keeping the same N (growth
     "none"); the regularized run reports a nonzero L_reg at every iteration, so E8 entered its
     loss."""
@@ -445,7 +445,7 @@ def test_s5_raycast_regularization_keeps_fewer_primitives_opaque(
 def test_s5_raycast_regularization_costs_at_most_half_a_db(
     s5_runs: _S5Runs, record_property: Record
 ) -> None:
-    """S-5 on the ray-cast scene (Q-165): the final held-out PSNR with λ_reg = 10⁻² is not lower
+    """S-5 on the ray-cast scene (D-86): the final held-out PSNR with λ_reg = 10⁻² is not lower
     than without by more than 0.5 dB; the sphere-coverage PSNR is recorded beside it (Q-138)."""
     runs = s5_runs
     for name in ("no_reg", "reg"):

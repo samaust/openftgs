@@ -7,7 +7,7 @@ recovered against §3.2's pass criteria, on the CPU with the reference backend a
 gsplat (S-5 on the GPU only, Q-78). S-4 instead starts from init points sampled on its moving
 spheres, with E15 velocities or none (Q-119). The setup choices §3.2 leaves open are Q-77 to
 Q-79 and Q-119, the measures Q-80; S-1, S-5 and S-6 depart from §3.2's rows where the owner
-decided (Q-81, Q-78, Q-83), and S-5's PSNR criterion stays verbatim under a strict xfail (Q-78).
+decided (Q-81, Q-78, D-87), and S-5's PSNR criterion stays verbatim under a strict xfail (Q-78).
 Every test records its measured values with `record_property`, for the Calibration data table of
 docs/clean-room/questions.md; no criterion is loosened there.
 """
@@ -554,8 +554,8 @@ class _S6Runs:
 @functools.cache
 def _s6_runs(device: str) -> _S6Runs:
     """S-6's two runs on `device` (relocation on and off), shared by its two tests: the
-    clustered ground truth (Q-83), initialized as S-2 (one live row per object, at its center)
-    plus 8 dead rows (N = 16, Q-78)."""
+    clustered ground truth (D-87), initialized as S-2 (one live row per object, at its center)
+    plus 8 dead rows (N = 16, D-87)."""
     with tempfile.TemporaryDirectory() as root:
         _, video, taus = _s2_scene(Path(root), device, "s6")
         objects = ground_truth("s2")
@@ -569,7 +569,7 @@ def _s6_runs(device: str) -> _S6Runs:
         def check_event(trainer: Trainer, log: StepLog) -> None:
             if log.relocation is not None:
                 events.append(log)
-                # Q-78: right after an event, where E11's lower clamp leaves no dead row.
+                # D-87: right after an event, where E11's lower clamp leaves no dead row.
                 if not bool((trainer.model.opacity_logits.detach() >= DEAD_LOGIT).all()):
                     dead_after.append(log.iteration)
 
@@ -596,10 +596,10 @@ def _s6_runs(device: str) -> _S6Runs:
 def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(
     device: str, record_property: Record
 ) -> None:
-    """S-6: S-2's objects as clusters of three Gaussians (Q-83), S-2's initialization plus as
-    many dead primitives (σ = 10⁻³) away from the objects, N = 16 (Q-78), relocation on, growth
+    """S-6: S-2's objects as clusters of three Gaussians (D-87), S-2's initialization plus as
+    many dead primitives (σ = 10⁻³) away from the objects, N = 16 (D-87), relocation on, growth
     off. N stays constant; the first relocation event moves all 8 dead rows; right after each
-    event no row is dead (Q-78)."""
+    event no row is dead (D-87)."""
     runs = _s6_runs(device)
     _record(
         record_property,
@@ -620,7 +620,7 @@ def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(
 def test_s6_relocation_gains_one_db(device: str, record_property: Record) -> None:
     """S-6: PSNR with relocation ≥ PSNR without + 1 dB (calibrated; the measured gain goes to
     the Calibration data table), on the clustered ground truth whose clusters one live row
-    can't fit (Q-83)."""
+    can't fit (D-87)."""
     runs = _s6_runs(device)
     gain = runs.psnr_on - runs.psnr_off
     _record(
