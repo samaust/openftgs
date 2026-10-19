@@ -476,7 +476,7 @@ def test_b2_counts_tile_intersections_per_time(raster_bench: dict[str, Any]) -> 
     and gsplat's tile intersections, which every variant shares; more rows active at a time give
     more of each, and the active share is near the fraction asked. The memory resident before
     the variants run is the model's and the targets' alone: about the same at every active
-    fraction of one N, and more at 3M than at 1M by at least the 2M rows' 64 float32 values."""
+    fraction of one N, and more at 3M than at 1M by about the 2M rows' 64 float32 values."""
     counted = {
         (c["case"]["n"], c["case"]["active"]): c["figures"]
         for c in raster_bench["cases"]
@@ -501,7 +501,44 @@ def test_b2_counts_tile_intersections_per_time(raster_bench: dict[str, Any]) -> 
         resident = [counted[(n, active)]["resident_memory_bytes"] for active in ACTIVE]
         assert max(resident) - min(resident) <= n * 64 * 4 // 10, (n, resident)
     small, large = (counted[(n, ACTIVE[0])]["resident_memory_bytes"] for n in SIZES)
-    assert large - small >= (SIZES[1] - SIZES[0]) * 64 * 4  # §1.1 at SH degree 3 (Q-168)
+    added = (SIZES[1] - SIZES[0]) * 64 * 4  # §1.1 at SH degree 3 (Q-168)
+    assert abs((large - small) - added) <= added // 10, (small, large)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("packed", [True, False], ids=["packed", "unpacked"])
+def test__raster_call_synchronizes_only_inside_gsplat(scene: Path, packed: bool) -> None:
+    """Q-T227.1, §2.4 rule 3: a B-2 call given the scene's camera, held on the host, times what a
+    training iteration runs, so with the opacity cull inside gsplat's projection it synchronizes
+    only inside gsplat's own calls, as `Trainer.step` does with its cameras on the device: every
+    synchronization torch's debug mode reports comes from gsplat's files."""
+    import warnings
+
+    from openftgs.cli._bench import _raster_call, _raster_frames, _synthesize, _volume
+    from openftgs.data import MultiViewVideo
+
+    video = MultiViewVideo.from_manifest(scene)
+    record = video.records[_raster_frames(video)[0]]
+    assert record.camera.K.device.type == "cpu"
+    model = _synthesize(_volume(video), 2000, active=0.2, seed=0, device="cuda")
+    model.slice_impl = "eager"
+    target = torch.zeros(1, record.camera.height, record.camera.width, 3, device="cuda")
+    call = _raster_call(model, record.camera, [(record.timestamp, target)], (packed, "internal"))
+    call()
+    torch.cuda.synchronize()
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            call()
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+    sites = {
+        f"{r.filename}:{r.lineno}"
+        for r in records
+        if "synchronizing CUDA operation" in str(r.message)
+    }
+    assert all("/gsplat/" in site for site in sites), sites
 
 
 @pytest.mark.gpu

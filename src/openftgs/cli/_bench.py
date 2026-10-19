@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
@@ -767,8 +767,9 @@ def _raster_call(
     variant: _RasterVariant,
 ) -> Callable[[], None]:
     """One B-2 call (Q-T227.1): `render` at the next of `frames` (raw τ and its training image
-    [1, H, W, 3]), the L1 loss against that image, then its backward into the model's nine stored
-    tensors, as the stage `backward`; `torch.autograd.grad` accumulates nothing between calls."""
+    [1, H, W, 3]) from `camera`, moved to the model's device first, the L1 loss against that
+    image, then its backward into the model's nine stored tensors, as the stage `backward`;
+    `torch.autograd.grad` accumulates nothing between calls."""
     import torch
 
     from openftgs._stages import point, stage
@@ -778,6 +779,12 @@ def _raster_call(
     packed, precull = variant
     params = [getattr(model, name) for name in model.PARAM_NAMES]
     order = itertools.cycle(frames)
+    # On the model's device once, as `Trainer` keeps its cameras: `render` copies a camera held on
+    # the host in every call, which synchronizes (§2.4 rule 3).
+    device = model.means.device
+    camera = replace(
+        camera, K=camera.K.to(device), world_to_camera=camera.world_to_camera.to(device)
+    )
 
     def call() -> None:
         timestamp, target = next(order)
