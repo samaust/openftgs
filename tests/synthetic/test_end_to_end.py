@@ -4,7 +4,7 @@
 coverage of surfaces with no initial points, both on the textured spheres of the analytic ray
 caster in `raycast.py` (Q-138 to Q-140), and S-5's effect of E8 on the same scene (#100, D-86).
 All train on the GPU: on the reference backend their 320 images at 128×96 would far exceed
-Q-119's 3-minute CPU target, as M11's S-5 did (Q-138).
+Q-119's 3-minute CPU target, as M11's retired S-5 did (Q-138).
 
 Each test records its measured values with `record_property`, for the Calibration data table of
 docs/clean-room/questions.md; the thresholds are §3.2's and never loosened there.

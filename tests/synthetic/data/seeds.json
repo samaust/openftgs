@@ -3,7 +3,6 @@
   "s2": {"ground_truth": 1201, "init_frames": 1202},
   "s3": {"ground_truth": 1301},
   "s4": {"ground_truth": 1401, "init": 1402},
-  "s5": {"clutter": 1501},
   "s6": {"dead": 1601, "ground_truth": 1234},
   "s7": {"init_frames": 1701},
   "s8": {"offsets": 1801, "init_images": 1802},
