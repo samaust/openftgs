@@ -1367,3 +1367,100 @@ def test_index_on_follows_the_switch_and_the_time_count() -> None:
     assert not _index_on(None, "gsplat", _INDEX_MIN_TIMES - 1)
     assert _index_on(None, "gsplat", _INDEX_MIN_TIMES)
     assert not _index_on(None, "reference", 10_000)
+
+
+# D-54's sharding of a render request across devices (Q-175, Q-T233.1).
+
+
+def _assert_renders_equal(got: Any, want: Any) -> None:
+    assert list(got.rgb) == list(want.rgb) == list(got.alpha) == list(want.alpha)
+    for key in want.rgb:
+        assert torch.equal(got.rgb[key], want.rgb[key]), key
+        assert torch.equal(got.alpha[key], want.alpha[key]), key
+
+
+def _sharding_request() -> RenderRequest:
+    """Items at seven times, one outside the training span (τ = 1.2), and two image sizes, so
+    that the request's groups differ in time and size."""
+    times = [0.05, 0.3, 0.3 + 1e-9, 0.55, 1.2, 0.8, 0.95]
+    small = pinhole(20, 14, fx=8.0, fy=8.0, cx=10.0, cy=7.0)
+    items = [RenderItem(f"a{k}", t, CAM_A) for k, t in enumerate(times)]
+    items += [RenderItem(f"s{k}", t, small) for k, t in enumerate(times[::2])]
+    items += [RenderItem(f"b{k}", t, CAM_B) for k, t in enumerate(times[::-1])]
+    return RenderRequest(items=tuple(items), time_unit="s", background=(0.1, 0.5, 0.9))
+
+
+@pytest.mark.parametrize("temporal_index", [False, True])
+def test_render_request_sharded_on_the_cpu_is_bitwise_unsharded(temporal_index: bool) -> None:
+    """D-54 ("without changing results"), Q-175: a request spread over three shards on the CPU
+    (`devices=["cpu"] * 3`) gives bitwise the reference renders of `devices=None`, in request
+    order, with the temporal index on and off, for items of several times and image sizes, a
+    time outside the training span among them."""
+    model = u32_scene()
+    request = _sharding_request()
+    kw: dict[str, Any] = {"backend": "reference", "temporal_index": temporal_index}
+    with pytest.warns(UserWarning):  # τ = 1.2 lies outside the training span (Q-9)
+        unsharded = render_request(model, request, **kw)
+    with pytest.warns(UserWarning):
+        sharded = render_request(model, request, devices=["cpu"] * 3, **kw)
+    assert list(sharded.rgb) == [item.id for item in request.items]
+    _assert_renders_equal(sharded, unsharded)
+
+
+def test_render_request_warms_each_shard_in_the_caller_thread_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-175, Q-T233.1: with `devices`, each shard's copy of the model runs the temporal slice
+    once in the caller's thread, one shard after another, before anything renders, so that no
+    two threads compile it at once; the renders then run in the shards' own threads, each on a
+    copy, never the caller's model, with the model's `slice_impl` (Q-66)."""
+    import threading
+
+    import openftgs.model
+    import openftgs.motion
+    import openftgs.render
+
+    model = u32_scene()
+    model.slice_impl = "eager"
+    request = u32_request([0.2, 0.4, 0.6, 0.8], [CAM_A, CAM_B])
+    slice_fn = openftgs.motion.temporal_slice
+    calls: list[tuple[str, str, int]] = []
+
+    def recorded(*args: Any, **kwargs: Any) -> Any:
+        calls.append((threading.current_thread().name, kwargs["impl"], args[0].data_ptr()))
+        return slice_fn(*args, **kwargs)
+
+    monkeypatch.setattr(openftgs.render, "temporal_slice", recorded)
+    monkeypatch.setattr(openftgs.model, "temporal_slice", recorded)
+    caller = threading.current_thread().name
+    render_request(model, request, backend="reference", devices=["cpu"] * 3)
+    warm, renders = calls[:3], calls[3:]
+    assert [name for name, _, _ in warm] == [caller] * 3
+    copies = {pointer for _, _, pointer in warm}
+    assert len(copies) == 3 and model.means.data_ptr() not in copies
+    assert len(renders) == 4  # one call per time, both cameras together (D-55)
+    shard_threads = {f"render_request shard {k}" for k in range(3)}
+    assert {name for name, _, _ in renders} <= shard_threads
+    assert {pointer for _, _, pointer in renders} <= copies
+    assert {impl for _, impl, _ in calls} == {"eager"}
+
+
+@pytest.mark.parametrize(
+    "devices", ["cpu", [], ["not a device"]], ids=["string", "empty", "unknown"]
+)
+def test_render_request_refuses_malformed_devices(devices: Any) -> None:
+    """Q-T233.1, as Q-122 for roma_init: `devices` is a non-empty sequence of device names;
+    anything else is a ValueError, before anything renders."""
+    request = u32_request([0.5], [CAM_A])
+    with pytest.raises(ValueError, match="device"):
+        render_request(random_model(3, seed=2), request, backend="reference", devices=devices)
+
+
+def test_render_request_raises_a_shards_error_in_the_caller() -> None:
+    """Q-T233.1: an error in a shard's thread, here `at_time`'s refusal of an SH degree above
+    the model's (Q-20), is raised in the caller's thread, as without `devices`."""
+    model = random_model(5, seed=3, sh_degree=1)
+    request = RenderRequest(items=_sharding_request().items, time_unit="s", sh_degree=2)
+    for devices in (None, ["cpu"] * 2):
+        with pytest.raises(ValueError, match="sh_degree"):
+            render_request(model, request, backend="reference", devices=devices)

@@ -19,6 +19,7 @@ from typing import Literal, get_args
 import torch
 from torch import Tensor
 
+from openftgs import _shards
 from openftgs._stages import point, stage
 from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
 from openftgs.motion import temporal_slice
@@ -70,6 +71,7 @@ _SLICE_INPUTS = (  # the stored tensors the temporal slice reads, in its argumen
 _Backend = Literal["gsplat", "reference"]
 _TimeUnits = Literal["raw", "normalized"]
 _Precull = Literal["internal", "compact"]  # Q-31: PerfConfig.precull's values (D-32, D-57)
+_SliceImpl = Literal["auto", "eager", "compiled", "cuda"]  # Q-66: the model's slice_impl (D-50)
 
 
 def render(
@@ -141,6 +143,7 @@ def render_request(
     temporal_index: bool | None = None,  # Q-174
     frame_dt: float | None = None,  # Q-174
     device: str | torch.device = "cpu",  # Q-174
+    devices: Sequence[str | torch.device] | None = None,  # Q-175
 ) -> Renders:
     """Answer a render request (§2.2, Q-57): one image and alpha per item, at the item's raw
     timestamp, with the request's background and SH degree, keyed by item id in request order.
@@ -156,6 +159,10 @@ def render_request(
     [0, 1]; True or False forces it. `frame_dt` is the buckets' width in normalized time, Δt_f
     (E14) for a model from a checkpoint; None takes the median gap between the request's
     distinct times in [0, 1].
+
+    `devices` spreads the request's calls over shards, one per entry, each with its own copy of
+    the model on its device and its own thread, without changing the images (D-54; Q-175,
+    Q-T233.1). None renders on the model's device, in the caller's thread.
     """
     _check_choice("backend", backend, get_args(_Backend))
     if temporal_index is not None and not isinstance(temporal_index, bool):  # Q-174
@@ -163,6 +170,7 @@ def render_request(
     if frame_dt is not None:  # Q-174
         _check_frame_dt(frame_dt)
     out_device = _output_device(device)
+    shard_devices = None if devices is None else _shards.devices(devices)  # Q-T233.1
     # Q-57, Q-17: the timestamps are raw τ in the request's unit, which must be the model's.
     if request.time_unit != model.time_unit:
         raise ValueError(
@@ -180,41 +188,29 @@ def render_request(
         _check_cameras([item.camera for item in group])
     times = {key: _time_in_span(model, key[0]) for key in groups}
     inside = sorted({t for t in times.values() if t is not None})
+    # Q-174: decided once for the whole request, so every shard renders alike (Q-T233.1).
+    indexed = bool(inside) and _index_on(temporal_index, backend, len(inside))
+    plan = _Plan(
+        request=request,
+        backend=backend,
+        index_times=inside if indexed else [],
+        width=_bucket_width(frame_dt, inside) if indexed else 1.0,
+        out_device=out_device,
+    )
+    jobs = [_Group(key, group, times[key]) for key, group in groups.items()]
+    if shard_devices is None:
+        renderer = _GroupRenderer(model, plan)
+        outputs = [renderer.render(job) for job in jobs]
+    else:
+        # D-54, Q-175: each shard is built and warmed up here, one after another, before any
+        # worker thread starts (Q-T233.1).
+        shards = [_shard_renderer(model, plan, jobs, d) for d in shard_devices]
+        outputs = _shards.run(shards, jobs, _GroupRenderer.render, name="render_request shard")
     rgb: dict[str, Tensor] = {}
     alpha: dict[str, Tensor] = {}
-    with torch.inference_mode():
-        like = model.means
-        background = _request_background(request.background, like)  # Q-174: once per request
-        cameras = _staged_cameras(request.items, like.device)
-        index: _TemporalIndex | None = None
-        sh: Tensor | None = None
-        if inside and _index_on(temporal_index, backend, len(inside)):
-            if backend == "gsplat":
-                _check_gsplat_model(model)
-            with stage("slice.sh_concat"):  # Q-174: once per request
-                sh = _sh_concat(model, request.sh_degree)
-            index = _TemporalIndex(model, _bucket_width(frame_dt, inside), inside)
-        for key, group in groups.items():
-            cams = [cameras[item.id] for item in group]
-            t = times[key]
-            if index is not None and sh is not None and t is not None:
-                image, alphas = _render_indexed(
-                    model, cams, t, index.rows(t), sh=sh, background=background, backend=backend
-                )
-            else:
-                # D-55: cameras that share a time (and, for render(), a size) render in one call.
-                out = render(
-                    model,
-                    cams,
-                    key[0],
-                    sh_degree=request.sh_degree,
-                    background=background,
-                    backend=backend,
-                )
-                image, alphas = out.image, out.alpha
-            for k, item in enumerate(group):
-                rgb[item.id] = image[k].to(out_device)
-                alpha[item.id] = alphas[k].to(out_device)
+    for job, output in zip(jobs, outputs, strict=True):
+        for item, (image, alphas) in zip(job.items, output, strict=True):
+            rgb[item.id], alpha[item.id] = image, alphas
     return Renders(rgb={i: rgb[i] for i in ids}, alpha={i: alpha[i] for i in ids})
 
 
@@ -592,6 +588,133 @@ def _empty_images(background: Tensor, width: int, height: int) -> tuple[Tensor, 
     alpha = background.new_zeros((count, height, width, 1))
     image = background.new_zeros((count, height, width, 3))
     return image + (1.0 - alpha) * background[:, None, None, :], alpha
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """What `render_request` decides once for the whole request (Q-174, Q-T233.1)."""
+
+    request: RenderRequest
+    backend: _Backend
+    index_times: list[float]  # the times in [0, 1] the index is built for; empty: no index
+    width: float  # the buckets' width
+    out_device: torch.device
+
+
+@dataclass(frozen=True)
+class _Group:
+    """One render call of a request: items that share a timestamp and an image size (D-55)."""
+
+    key: tuple[float, int, int]  # the raw timestamp, width and height
+    items: list[RenderItem]
+    t: float | None  # the normalized time inside the training span, else None (Q-174)
+
+
+class _GroupRenderer:
+    """One model's renders of one request's groups. What doesn't change with time is built once
+    (Q-174): the background and the cameras on the model's device and, with the index on, the
+    SH concat and the temporal index."""
+
+    def __init__(self, model: FreeTimeGaussians, plan: _Plan) -> None:
+        self._model = model
+        self._plan = plan
+        self._index: _TemporalIndex | None = None
+        self._sh: Tensor | None = None
+        with torch.inference_mode():
+            like = model.means
+            self._background = _request_background(plan.request.background, like)
+            self._cameras = _staged_cameras(plan.request.items, like.device)
+            if plan.index_times:
+                if plan.backend == "gsplat":
+                    _check_gsplat_model(model)
+                with stage("slice.sh_concat"):  # Q-174: once per request
+                    self._sh = _sh_concat(model, plan.request.sh_degree)
+                self._index = _TemporalIndex(model, plan.width, plan.index_times)
+
+    def render(self, group: _Group) -> list[tuple[Tensor, Tensor]]:
+        """The image [H, W, 3] and alpha [H, W, 1] of each of the group's items, in its order, on
+        the request's output device. Inference mode is entered here, in the thread that renders,
+        since it is per thread."""
+        plan, model = self._plan, self._model
+        with torch.inference_mode():
+            cams = [self._cameras[item.id] for item in group.items]
+            if self._index is not None and self._sh is not None and group.t is not None:
+                image, alphas = _render_indexed(
+                    model,
+                    cams,
+                    group.t,
+                    self._index.rows(group.t),
+                    sh=self._sh,
+                    background=self._background,
+                    backend=plan.backend,
+                )
+            else:
+                # D-55: cameras that share a time (and, for render(), a size) render in one call.
+                out = render(
+                    model,
+                    cams,
+                    group.key[0],
+                    sh_degree=plan.request.sh_degree,
+                    background=self._background,
+                    backend=plan.backend,
+                )
+                image, alphas = out.image, out.alpha
+            return [
+                (image[k].to(plan.out_device), alphas[k].to(plan.out_device))
+                for k in range(len(group.items))
+            ]
+
+    def warm_up(self, groups: Sequence[_Group]) -> None:
+        """Q-175, Q-T233.1: runs the temporal slice once, under inference mode as the renders
+        do, on each path that rendering `groups` takes: every row, as `render()` and the
+        reference backend's index slice them, and the gathered rows that gsplat slices with the
+        index on. So the compiled slice is compiled for this device here, in the caller's
+        thread, and not by several worker threads at once."""
+        model, plan = self._model, self._plan
+        indexed = self._index is not None
+        gathered = indexed and plan.backend == "gsplat" and not _GSPLAT_FULL_SLICE
+        every_row = not gathered or any(group.t is None for group in groups)
+        with torch.inference_mode():
+            arrays = [getattr(model, name) for name in _SLICE_INPUTS]
+            if every_row:
+                _slice_once(arrays, model.slice_impl)
+            if gathered and model.num_gaussians > 0:
+                rows = torch.arange(model.num_gaussians, device=model.means.device)
+                _slice_once([array[rows] for array in arrays], model.slice_impl)
+
+
+def _slice_once(arrays: Sequence[Tensor], impl: _SliceImpl) -> None:
+    """The temporal slice of `_SLICE_INPUTS`' arrays at t = 0, for its side effect: compiling."""
+    means, times, log_durations, velocities, log_scales, quats, opacity_logits = arrays
+    temporal_slice(
+        means, times, log_durations, velocities, log_scales, quats, opacity_logits, 0.0, impl=impl
+    )
+
+
+def _model_copy(model: FreeTimeGaussians, device: torch.device) -> FreeTimeGaussians:
+    """Q-175, Q-T233.1: the model on `device`, made with the public constructor from its stored
+    tensors, which it copies, keeping its `slice_impl` (Q-66)."""
+    copy = FreeTimeGaussians(
+        {name: getattr(model, name).detach().to(device) for name in model.PARAM_NAMES},
+        sh_degree=model.sh_degree,
+        time=model.time,
+        time_unit=model.time_unit,
+    )
+    copy.slice_impl = model.slice_impl
+    return copy
+
+
+def _shard_renderer(
+    model: FreeTimeGaussians, plan: _Plan, groups: Sequence[_Group], device: torch.device
+) -> _GroupRenderer:
+    """One shard of a request (D-54; Q-175, Q-T233.1): a copy of the model on `device`, what the
+    request builds once for it, and the warm-up of its temporal slice."""
+    copy = _model_copy(model, device)
+    if plan.backend == "gsplat":
+        _check_gsplat_model(copy)
+    renderer = _GroupRenderer(copy, plan)
+    renderer.warm_up(groups)
+    return renderer
 
 
 # The reference backend.
