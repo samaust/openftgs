@@ -24,7 +24,7 @@ import pytest
 import raycast
 import torch
 from builders import look_at, write_render_request
-from synthetic_scenes import fibonacci_sphere, load_seeds, synthetic_config
+from synthetic_scenes import load_seeds, smallest_spacing, synthetic_config
 
 from openftgs.cli import main
 from openftgs.config import TrainConfig, config_to_dict
@@ -35,7 +35,7 @@ from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.sh import rgb_to_sh0
 from openftgs.train import Trainer
-from openftgs.types import InitPoints
+from openftgs.types import ImageRecord, InitPoints
 
 ITERATIONS = 7_000  # Q-140: set during the M14 build and recorded
 PER_SPHERE = 300  # Q-140: lattice points per sphere and frame, 900 per frame (B = 1,000)
@@ -94,52 +94,89 @@ def test_cast_sees_each_sphere_where_the_camera_projects_its_center() -> None:
             assert raycast.cast([sphere], camera, 0.0).coverage[v, u] == 1.0
     # Q-140: seen from the -x side of a sphere every visible point has local x < 0, from +x
     # every one has x > 0.
-    center = scene[0].center_at(0.0)
-    for side, negative in ((-1.0, True), (1.0, False)):
-        eye = tuple(float(c) for c in center + np.array([side, 0.0, 0.0]))
-        camera = look_at(
-            eye, target=tuple(center), up=(0, 0, 1), width=128, height=96, focal=raycast.FOCAL
-        )
-        cast = raycast.cast(scene[:1], camera, 0.0)
-        hit = cast.coverage > 0
-        assert hit.sum() > 100
-        # `half` is the share of all of a pixel's rays, so a silhouette pixel shows below 1.
-        assert np.array_equal(cast.half > 0, hit) if negative else not cast.half.any()
-        if negative:
-            assert float(np.median(cast.half[hit])) == 1.0
+    for sphere in scene:
+        center = sphere.center_at(0.0)
+        for side, negative in ((-1.0, True), (1.0, False)):
+            eye = tuple(float(c) for c in center + np.array([side, 0.0, 0.0]))
+            camera = look_at(
+                eye,
+                target=tuple(center),
+                up=(0, 0, 1),
+                width=raycast.WIDTH,
+                height=raycast.HEIGHT,
+                focal=raycast.FOCAL,
+            )
+            cast = raycast.cast([sphere], camera, 0.0)
+            hit = cast.coverage > 0
+            assert hit.sum() > 100
+            # `half` is the share of all of a pixel's rays, so a silhouette pixel shows below 1.
+            assert np.array_equal(cast.half > 0, hit) if negative else not cast.half.any()
+            if negative:
+                assert float(np.median(cast.half[hit])) == 1.0
 
 
 def test_motion_stays_below_half_the_init_lattice_spacing(record_property: Record) -> None:
     """§3.2 S-4's precondition as Q-119 applies it to S-9 (D-23, Q-155, Q-156): every sphere's
-    displacement per frame is below half the smallest spacing of the lattice the init samples
-    (PER_SPHERE points on the sphere), so E15's nearest neighbour of a point in the next frame
-    is its own moved copy; the ratio reached is recorded."""
+    displacement per frame, and the top of the drawn range, is below half the smallest spacing
+    of the init's own lattice on that sphere (the surface samples of one frame), so E15's
+    nearest neighbour of a point in the next frame is its own moved copy; the ratio reached is
+    recorded."""
     rig = raycast.rig()
     scene = raycast.spheres(load_seeds()["s9"]["spheres"], rig.train + rig.test)
-    lattice = fibonacci_sphere(PER_SPHERE).double().numpy() * raycast.RADIUS
-    gaps = np.linalg.norm(lattice[:, None] - lattice[None], axis=-1)
-    np.fill_diagonal(gaps, np.inf)
-    half = 0.5 * float(np.min(gaps))
+    points = raycast.surface_samples(scene, load_seeds()["s9"]["lattice"], PER_SPHERE)
+    first = points.positions[: PER_SPHERE * len(scene)].double()  # frame 0, sphere by sphere
+    lattices = [first[k * PER_SPHERE : (k + 1) * PER_SPHERE] for k in range(len(scene))]
+    half = 0.5 * min(smallest_spacing(lattice) for lattice in lattices)
     step = max(float(np.linalg.norm(s.velocity)) / raycast.FPS for s in scene)
     record_property("s9_step_over_half_spacing", step / half)
     assert step < half
+    assert raycast.STEP[1] < half  # Q-155: the whole range, not only this seed's draws
+
+
+def test_surface_samples_of_the_positive_x_half_leave_the_cast_half_bare() -> None:
+    """Q-140: S-11's half init keeps exactly the lattice points with local x ≥ 0, the
+    complement of the local x < 0 half the caster counts as uninitialized."""
+    rig = raycast.rig()
+    scene = raycast.spheres(load_seeds()["s9"]["spheres"], rig.train + rig.test)
+    seed = load_seeds()["s9"]["lattice"]
+    full = raycast.surface_samples(scene, seed, PER_SPHERE)
+    half = raycast.surface_samples(scene, seed, PER_SPHERE, positive_x_only=True)
+    centers = [torch.from_numpy(s.center_at(raycast.tau(0))) for s in scene]
+
+    def local_x(points: InitPoints) -> torch.Tensor:
+        first = points.positions[points.frame_ids == 0].double()
+        near = torch.stack([torch.linalg.vector_norm(first - c, dim=1) for c in centers])
+        return (first - torch.stack(centers)[near.argmin(dim=0)])[:, 0]
+
+    assert bool((local_x(half) >= -1e-6).all())
+    negatives = int((local_x(full) < -1e-6).sum())
+    assert 0 < negatives and int((local_x(full) >= -1e-6).sum()) == local_x(half).numel()
 
 
 # S-9 (§3.2): end-to-end quality on non-Gaussian data, through the command line.
 
 
-def _sphere_psnr(pred: torch.Tensor, gt: torch.Tensor, coverage: np.ndarray) -> float:
-    """Q-138: the PSNR over the pixels where any of the caster's rays hits a sphere, after
-    E16's clamp; the full-image PSNR's black background is left out."""
-    hit = torch.from_numpy(coverage > 0)
-    mse = (pred.clamp(0.0, 1.0).double() - gt.double())[hit].square().mean()
+def _view(record: ImageRecord) -> tuple[str, int]:
+    """The caster's key for a held-out image: its camera and frame."""
+    assert record.frame_index is not None
+    return record.camera.name, record.frame_index
+
+
+def _psnr_over(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> float:
+    """The PSNR of one image over the pixels of `mask`, after E16's clamp."""
+    mse = (pred.clamp(0.0, 1.0).double() - gt.double())[mask].square().mean()
     return float(-10.0 * torch.log10(mse))
 
 
 def _s9(
-    scene: raycast.Scene, tmp_path: Path, record_property: Record, init: Path, prefix: str
+    scene: raycast.Scene,
+    tmp_path: Path,
+    record_property: Record,
+    init: Path,
+    prefix: str,
+    started: float,
 ) -> None:
-    started = time.perf_counter()
+    """`started`: when the run began, init included, for its wall time."""
     config = tmp_path / "cfg.json"
     config.write_text(json.dumps(config_to_dict(_cfg())))
     run = tmp_path / "run"
@@ -159,24 +196,28 @@ def _s9(
     assert main(["render", str(exchange), "--request", str(request), "--out", str(out)]) == 0
     renders = read_renders(out, request_sha256=hashlib.sha256(request.read_bytes()).hexdigest())
     pairs = [(renders.rgb[str(i)], video.load_image(i)) for i in tests]
-    keys = [(video.records[i].camera.name, video.records[i].frame_index or 0) for i in tests]
+    covered = [scene.coverage[_view(video.records[i])] for i in tests]
     psnrs = [float(psnr(pred, gt)) for pred, gt in pairs]
     ssims = [float(ssim_k(pred, gt, 1)) for pred, gt in pairs]  # Q-139
     ssims2 = [float(ssim_k(pred, gt, 2)) for pred, gt in pairs]  # Q-139: recorded only
-    spheres = [
-        _sphere_psnr(pred, gt, scene.coverage[key])
-        for (pred, gt), key in zip(pairs, keys, strict=True)
+    # Q-138: the PSNR over the pixels any ray of the caster hits a sphere in, the black
+    # background left out (a sphere-coverage PSNR; the glossary keeps "foreground" off it).
+    sphere_psnrs = [
+        _psnr_over(pred, gt, torch.from_numpy(c > 0))
+        for (pred, gt), c in zip(pairs, covered, strict=True)
     ]
     mean_psnr, mean_ssim = sum(psnrs) / len(psnrs), sum(ssims) / len(ssims)
+    mean_spheres = sum(sphere_psnrs) / len(sphere_psnrs)
     rows = (run / "train_log.jsonl").read_text().splitlines()
     record_property(f"{prefix}_psnr", mean_psnr)
     record_property(f"{prefix}_ssim1", mean_ssim)
     record_property(f"{prefix}_ssim2", sum(ssims2) / len(ssims2))
-    record_property(f"{prefix}_psnr_spheres", sum(spheres) / len(spheres))  # Q-138
+    record_property(f"{prefix}_psnr_spheres", mean_spheres)  # Q-138
+    record_property(f"{prefix}_coverage", float(np.mean([c.mean() for c in covered])))
     record_property(f"{prefix}_final_n", json.loads(rows[-1])["num_gaussians"])
     record_property(f"{prefix}_seconds", time.perf_counter() - started)
     print(
-        f"{prefix}: held-out PSNR {mean_psnr:.2f} dB (spheres {sum(spheres) / len(spheres):.2f}),"
+        f"{prefix}: held-out PSNR {mean_psnr:.2f} dB (spheres {mean_spheres:.2f}),"
         f" SSIM {mean_ssim:.4f}"
     )
     assert mean_psnr >= S9_PSNR
@@ -189,9 +230,10 @@ def test_s9_textured_spheres_end_to_end_from_surface_samples(
 ) -> None:
     """S-9: 16 cameras, 20 frames, 128×96, initialized from surface samples (Q-140), trained,
     exported and rendered through ftgs: held-out PSNR ≥ 28 dB and SSIM ≥ 0.9 (calibrated)."""
+    started = time.perf_counter()
     init = tmp_path / "init.safetensors"
     write_init_points(_full_init(scene), init, time_unit="s", producer="openftgs tests (S-9)")
-    _s9(scene, tmp_path, record_property, init, "s9")
+    _s9(scene, tmp_path, record_property, init, "s9", started)
 
 
 @pytest.mark.gpu
@@ -202,9 +244,10 @@ def test_s9_textured_spheres_end_to_end_from_roma(
 ) -> None:
     """S-9 with the RoMa initialization (§3.2: "or RoMa when [init] is installed"), made by
     ftgs init roma on the training images; the same criteria."""
+    started = time.perf_counter()  # the matching included, as bcb5e70's row timed it
     init = tmp_path / "init.safetensors"
     assert main(["init", "roma", str(scene.train_manifest), str(init)]) == 0
-    _s9(scene, tmp_path, record_property, init, "s9_roma")
+    _s9(scene, tmp_path, record_property, init, "s9_roma", started)
 
 
 # S-11 (§3.2): coverage of surfaces with no initial points.
@@ -218,15 +261,11 @@ def _masked_psnr(model: FreeTimeGaussians, scene: raycast.Scene) -> float:
     with torch.no_grad():
         for i in tests:
             record = video.records[i]
-            mask = torch.from_numpy(scene.halves[(record.camera.name, record.frame_index or 0)])
-            mask = (mask >= 0.5).to("cuda")
+            mask = (torch.from_numpy(scene.halves[_view(record)]) >= 0.5).to("cuda")
             if not bool(mask.any()):
                 continue
             out = render(model, record.camera, record.timestamp, backend="gsplat")
-            pred = out.image[0].clamp(0.0, 1.0).double()
-            gt = video.load_image(i).to("cuda").double()
-            mse = (pred - gt)[mask].square().mean()
-            values.append(float(-10.0 * torch.log10(mse)))
+            values.append(_psnr_over(out.image[0], video.load_image(i).to("cuda"), mask))
     return sum(values) / len(values)
 
 
@@ -287,6 +326,7 @@ def test_s11_growth_covers_surfaces_with_no_initial_points(
     cfg = _cfg()
     full = Trainer(cfg, video, _full_init(scene), device="cuda")
     full.train()
+    record_property("s11_seconds_full", time.perf_counter() - started)
     half_points = raycast.surface_samples(
         scene.spheres, load_seeds()["s9"]["lattice"], PER_SPHERE, positive_x_only=True
     )
