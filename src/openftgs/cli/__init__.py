@@ -7,7 +7,8 @@ Each command parses its options and calls the library; heavy imports happen insi
 commands, so `ftgs --help` stays fast and `ftgs train` can set environment variables before
 CUDA starts. The exit codes are §2.1's: 0 success, 2 invalid input or environment, 3 a
 numerical failure (Q-142); `ftgs train` stopped by a signal exits with 128 plus its number
-(Q-133). Any other exception is a bug and keeps its traceback (Q-26).
+(Q-133). Any other exception is a bug and keeps its traceback (Q-26). `ftgs bench` and its
+benchmarks are in the private module `_bench` (Q-166 to Q-168).
 """
 
 from __future__ import annotations
