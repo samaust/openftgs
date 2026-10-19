@@ -644,6 +644,9 @@ class _Loaded:
     # Q-136 (as answered): an exchange model's file, or a checkpoint's manifest.json, which
     # holds every other file's SHA-256 (§2.2, Q-25); only when asked for
     sha256: str | None
+    # Q-174: a checkpoint's Δt_f in normalized time (E14), the temporal index's bucket width;
+    # an exchange model carries none
+    frame_dt: float | None = None
 
 
 def _model_sha256(path: Path) -> str:
@@ -707,7 +710,7 @@ def _read_model(path: Path, device: str) -> _Loaded:
         time=state.time,
         time_unit=state.time_unit,
     )
-    return _Loaded(model, state.iteration, cfg.background, None)
+    return _Loaded(model, state.iteration, cfg.background, None, frame_dt=state.frame_dt)
 
 
 def _render_device(backend: str) -> str:
@@ -743,7 +746,8 @@ def _render(args: argparse.Namespace) -> int:
             f"the request's sh_degree {request.sh_degree} is above the model's "
             f"{loaded.model.sh_degree}"
         )
-    renders = render_request(loaded.model, request, backend=args.backend)
+    # Q-174: a checkpoint's Δt_f is the temporal index's bucket width.
+    renders = render_request(loaded.model, request, backend=args.backend, frame_dt=loaded.frame_dt)
     bad = [i for i, rgb in renders.rgb.items() if not bool(torch.isfinite(rgb).all())]
     bad += [i for i, a in renders.alpha.items() if not bool(torch.isfinite(a).all())]
     if bad:  # Q-129
@@ -842,6 +846,7 @@ def _eval(args: argparse.Namespace) -> int:
             backend=_backend(device),
             background=loaded.background,
             renders=supplied,
+            frame_dt=loaded.frame_dt,  # Q-174, Q-T230.1
         )
     except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; nothing is written
         _fail(str(error), _NUMERIC)
