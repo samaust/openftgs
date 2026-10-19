@@ -474,7 +474,9 @@ def test_b2_times_every_variant_at_each_size_and_active_fraction(
 def test_b2_counts_tile_intersections_per_time(raster_bench: dict[str, Any]) -> None:
     """B-2 (§3.4; Q-T227.1): per model and time, the rows active, the rows visible in the camera
     and gsplat's tile intersections, which every variant shares; more rows active at a time give
-    more of each, and the active share is near the fraction asked."""
+    more of each, and the active share is near the fraction asked. The memory resident before
+    the variants run is the model's and the targets' alone: about the same at every active
+    fraction of one N, and more at 3M than at 1M by at least the 2M rows' 64 float32 values."""
     counted = {
         (c["case"]["n"], c["case"]["active"]): c["figures"]
         for c in raster_bench["cases"]
@@ -494,6 +496,12 @@ def test_b2_counts_tile_intersections_per_time(raster_bench: dict[str, Any]) -> 
         for fewer, more in zip(ACTIVE, ACTIVE[1:], strict=False):
             for name in ("visible_rows", "tile_intersections"):
                 assert sum(counted[(n, fewer)][name]) < sum(counted[(n, more)][name]), (n, name)
+        # The same up to the caching allocator's rounding of blocks, well under a tenth of the
+        # model; a model still held from before would add at least a 1M-row model.
+        resident = [counted[(n, active)]["resident_memory_bytes"] for active in ACTIVE]
+        assert max(resident) - min(resident) <= n * 64 * 4 // 10, (n, resident)
+    small, large = (counted[(n, ACTIVE[0])]["resident_memory_bytes"] for n in SIZES)
+    assert large - small >= (SIZES[1] - SIZES[0]) * 64 * 4  # §1.1 at SH degree 3 (Q-168)
 
 
 @pytest.mark.gpu

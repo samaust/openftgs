@@ -859,7 +859,7 @@ def _raster(ctx: _Context) -> _Result:
                             }
                         )
                 cases.append({"case": case, "figures": figures})
-            del model
+            del model, call  # the last call holds the model; the next resident figure must not
     setup = {
         "model": "synthesized (Q-168, Q-181)",
         "seed": _SEED,
