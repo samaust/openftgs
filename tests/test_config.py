@@ -20,6 +20,7 @@ from openftgs.config import (
     TrainConfig,
     config_from_dict,
     config_to_dict,
+    resume_conflicts,
 )
 
 # Dotted path → default, from spec §2.1 (openftgs.config) and §2.4 (PerfConfig).
@@ -368,3 +369,61 @@ def test_sub_config_must_be_an_object() -> None:
     """Q-10: a sub-config is a nested JSON object."""
     with pytest.raises(ValueError, match="growth"):
         config_from_dict({"growth": 3})
+
+
+# What a resume may change (Q-134 as answered; Q-153).
+
+EXACT_PERF = {
+    "slice_impl": "eager",
+    "packed": False,
+    "precull": "compact",
+    "frame_cache": "mmap",
+    "prefetch": 3,
+    "log_every": 7,
+    "deterministic": True,
+}
+
+
+def _perf(**fields: Any) -> TrainConfig:
+    return TrainConfig(perf=PerfConfig(**fields))
+
+
+def test_resume_conflicts_of_one_configuration_are_none() -> None:
+    """Q-153: a configuration has no conflict with itself."""
+    assert resume_conflicts(TrainConfig(), TrainConfig()) == []
+
+
+@pytest.mark.parametrize(("name", "value"), sorted(EXACT_PERF.items()))
+def test_resume_conflicts_allow_each_exact_performance_setting(name: str, value: Any) -> None:
+    """Q-134 as answered, §2.4 rule 2: the PerfConfig fields that change no number may differ
+    on a resume (D-50, D-51, D-56, D-57; log_every only reads)."""
+    assert resume_conflicts(TrainConfig(), _perf(**{name: value})) == []
+    assert resume_conflicts(TrainConfig(), _perf(**EXACT_PERF)) == []
+
+
+@pytest.mark.parametrize(
+    ("given", "key"),
+    [
+        (_perf(perc_precision="ieee"), "perf.perc_precision"),  # D-52
+        (_perf(adam="foreach"), "perf.adam"),  # D-53
+        (_perf(images_per_step=2), "perf.images_per_step"),  # D-54
+        (TrainConfig(seed=1), "seed"),
+        (TrainConfig(optim=OptimConfig(iterations=20)), "optim.iterations"),
+        (TrainConfig(background=(1.0, 1.0, 1.0)), "background"),
+    ],
+)
+def test_resume_conflicts_name_the_fields_that_must_match(given: TrainConfig, key: str) -> None:
+    """Q-134 as answered: perc_precision, adam and images_per_step change results, so they must
+    match, as must every field outside PerfConfig; each conflict is named by its dotted path."""
+    assert resume_conflicts(TrainConfig(), given) == [key]
+    assert resume_conflicts(given, TrainConfig()) == [key]
+
+
+def test_resume_conflicts_are_sorted_and_skip_the_exact_fields() -> None:
+    """Q-153: several conflicts come back sorted, exact fields left out."""
+    given = TrainConfig(
+        seed=5,
+        loss=LossConfig(lambda_reg=0.0),
+        perf=PerfConfig(adam="selective", frame_cache="off"),
+    )
+    assert resume_conflicts(TrainConfig(), given) == ["loss.lambda_reg", "perf.adam", "seed"]

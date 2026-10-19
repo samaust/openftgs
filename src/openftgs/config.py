@@ -23,6 +23,7 @@ __all__ = [
     "TrainConfig",
     "config_from_dict",
     "config_to_dict",
+    "resume_conflicts",
 ]
 
 
@@ -232,6 +233,40 @@ def config_from_dict(data: Mapping[str, Any]) -> TrainConfig:
         else:
             kwargs[key] = value
     return TrainConfig(**kwargs)
+
+
+# Q-134 (as answered): the PerfConfig fields that change no number, which a resume may change.
+_EXACT_ON_RESUME = frozenset(
+    {
+        "perf.slice_impl",  # D-50, U-28
+        "perf.packed",  # D-57, U-8
+        "perf.precull",  # D-57, U-8
+        "perf.frame_cache",  # D-51, U-30
+        "perf.prefetch",  # D-51, U-30
+        "perf.log_every",  # reads only (Q-69)
+        "perf.deterministic",  # D-56
+    }
+)
+
+
+# Q-153: the one rule for Trainer.load_state_dict and ftgs train --resume.
+def resume_conflicts(stored: TrainConfig, given: TrainConfig) -> list[str]:
+    """The dotted keys whose values differ between a checkpoint's configuration and the one a
+    resume is given, sorted, leaving out the PerfConfig fields that change no number and so may
+    differ (Q-134): an empty list means the resume may go on with `given`."""
+    a, b = _dotted(config_to_dict(stored)), _dotted(config_to_dict(given))
+    differ = {k for k in a.keys() | b.keys() if a.get(k) != b.get(k)}
+    return sorted(differ - _EXACT_ON_RESUME)
+
+
+def _dotted(tree: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in tree.items():
+        if isinstance(value, Mapping):
+            out |= _dotted(value, f"{prefix}{key}.")
+        else:
+            out[f"{prefix}{key}"] = value
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
