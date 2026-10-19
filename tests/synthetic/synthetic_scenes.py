@@ -41,7 +41,7 @@ EDGE_MARGIN = 4.0  # pixels between a trajectory point and the image edge (Q-77)
 NEAREST_DEPTH = 0.2  # every trajectory point at least this far in front of every camera
 SCALE_RANGE = (0.02, 0.035)  # S-2 family and S-3 scales (Q-79)
 SEPARATION = 4.0 * SCALE_RANGE[1]  # Q-79: trajectories at least 4 × the largest scale apart
-DEAD_CLEARANCE = 5.0 * SCALE_RANGE[1]  # Q-78: dead rows of S-6 away from every trajectory
+DEAD_CLEARANCE = 5.0 * SCALE_RANGE[1]  # D-87: dead rows of S-6 away from every trajectory
 SPEED_RANGE = (0.125, 0.5)  # Q-77: §3.2's 0.5–2 per unit t, × ¼
 CENTER_RADIUS = 0.2  # Q-79: S-2 centers at t = ½ within 0.2 of the origin
 VOLUME = 0.35  # half-width of the cube that holds every trajectory: the view volume
@@ -416,13 +416,13 @@ def _gt_clutter(seed: int, gt: ExchangeModel) -> ExchangeModel:
     return exchange(arrays, tau0=gt.tau0, tau1=gt.tau1, degree=0)
 
 
-CLUSTER_SIZE = 3  # Q-83: each S-2 object and two companions
-CLUSTER_OFFSET = 1.5  # Q-83: companions this many of the object's largest scales away
-CLUSTER_SCALE = 0.8  # Q-83: a companion's scales, as a fraction of the object's
+CLUSTER_SIZE = 3  # D-87: each S-2 object and two companions
+CLUSTER_OFFSET = 1.5  # D-87: companions this many of the object's largest scales away
+CLUSTER_SCALE = 0.8  # D-87: a companion's scales, as a fraction of the object's
 
 
 def _gt_s6(seed: int, gt: ExchangeModel) -> ExchangeModel:
-    """S-6's under-fitted ground truth (Q-83): each of S-2's 8 objects followed by two companions
+    """S-6's under-fitted ground truth (D-87): each of S-2's 8 objects followed by two companions
     that share its motion, time, duration, rotation and opacity, offset in a uniform random
     direction by CLUSTER_OFFSET × its largest scale, with CLUSTER_SCALE × its scales and a
     random color. At focal length 56 px and radius 0.93 a scale of 0.035 is about 2 px, so a
@@ -461,7 +461,7 @@ GROUND_TRUTH_FILES = {
 def generate_ground_truth(seeds: dict[str, dict[str, int]]) -> dict[str, ExchangeModel]:
     """The ground truth of S-1 to S-6 from the committed seeds: S-4's is three spheres of
     Gaussians (Q-119); S-5's is S-2's 8 Gaussians (its first rows) followed by 2,000 small ones
-    (Q-78); S-6's is S-2's objects as clusters of three (Q-83); S-7 and S-8 reuse S-2's."""
+    (Q-78); S-6's is S-2's objects as clusters of three (D-87); S-7 and S-8 reuse S-2's."""
     s2 = _gt_s2(seeds["s2"]["ground_truth"])
     return {
         "s1": _gt_s1(seeds["s1"]["ground_truth"]),
@@ -741,7 +741,7 @@ def split_indices(video: MultiViewVideo, split: str) -> list[int]:
 
 
 def dead_rows(seed: int, gt: ExchangeModel, count: int, taus: Tensor) -> ExchangeModel:
-    """Q-78, S-6: `count` dead primitives (σ = 10⁻³) at seeded places in the view volume more than
+    """D-87, S-6: `count` dead primitives (σ = 10⁻³) at seeded places in the view volume more than
     DEAD_CLEARANCE from every ground-truth trajectory point, with scales like the ground truth's,
     random colors and rotations, S-2's duration, v = 0 and a random frame each."""
     g = torch.Generator().manual_seed(seed)
