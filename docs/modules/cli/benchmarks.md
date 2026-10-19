@@ -194,3 +194,11 @@ B-6 times the data wait, the `data` stage of a training iteration, for each plac
 
 - `beyond_estimate_bytes`: the run's peak reserved memory, less what was allocated after the probe's iteration, the cache and the growth: what the run took beyond the rule's estimate;
 - `margin_used`: that over ½·free, the share of the margin the rule leaves for it. At most 1 means a cache at the rule's limit would still have fit, judged from reserved memory, so conservatively; above 1, the ½ margin is too small, which goes to the owner as a decision change.
+
+## B-6's first run
+
+On kitchen and its 60-frame conversion (Calibration data, #232), the data wait takes 0.035 % of an iteration with the GPU cache, 0.035 % with the memory-mapped cache at prefetch 8 and 0.044 % at prefetch 0, all at 1M rows; every budget passes, about 23 times under 1 %. In each cache case the stage's median is 0.036 ms, the conversion of the frame to float32. Decoding PNGs (`off`, no budget) takes 1.95 %, 2.06 ms of an iteration's 105.9, which holds the copy of the decoded float32 image, four times a cached frame's bytes. Kitchen's `gpu` cases were skipped as expected: its 23.44 GB cache is above half the 23.40 GB free after a warm-up iteration.
+
+The host window shows why prefetch 0 still passes: its synchronous read, with the wait on a pinned buffer's event that the debug mode can't see (`docs/modules/train/trainer.md`), takes 0.44 ms of host time against 0.06 ms at prefetch 8, and runs while the GPU works through the previous iteration's losses and backward pass, so the training stream waits 0.01 ms more on average. PNG decoding takes 36 ms of host time, hidden the same way. The prefetcher stays as it is (PRD #220).
+
+Q-99's margin holds at N_max: at 3M rows with the cache on the GPU, the run took 8.57 GiB of reserved memory beyond the rule's estimate after the warm-up iteration (5.43 GiB allocated), 84 % of the 10.16 GiB the ½ margin leaves (54 % from allocated memory). That is close enough to the edge that the rule isn't tightened, and nothing goes to the owner. The device's memory outside PyTorch's allocator was 0.97 GiB, the desktop session's 0.49 GiB and the CUDA context.
