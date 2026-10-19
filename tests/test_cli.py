@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; Q-124 to Q-144, Q-146): a
+"""The ftgs command line (§2.1 CLI block and exit codes, §2.2; D-83; Q-124 to Q-152): a
 smoke test of every command on a small synthetic scene, the CLI round trips of U-26, U-22's
 rejections with exit code 2, U-27's exit code, and the train, resume, render, eval and export
 behaviour.
@@ -267,14 +267,8 @@ def test_a_signal_saves_a_checkpoint_from_which_resume_is_bitwise(
     checkpoint = tmp_path / "cut" / "checkpoint"
     assert load_checkpoint(checkpoint).iteration == 12
     assert _train(run, tmp_path / "cut", "--resume", checkpoint) == 0
-    straight = load_checkpoint(tmp_path / "straight" / "checkpoint")
-    resumed = load_checkpoint(checkpoint)
-    assert resumed.iteration == straight.iteration == ITERATIONS
-    for part in ("params", "optim", "stats", "rng"):
-        a, b = _tensors(getattr(straight, part)), _tensors(getattr(resumed, part))
-        assert a.keys() == b.keys() and a, part
-        assert all(torch.equal(a[k], b[k]) for k in a), part
-    assert straight.sampler == resumed.sampler
+    assert load_checkpoint(checkpoint).iteration == ITERATIONS
+    _assert_same_run(tmp_path / "straight" / "checkpoint", checkpoint)
     rows = (tmp_path / "cut" / "train_log.jsonl").read_text().splitlines()
     assert [json.loads(r)["iteration"] for r in rows] == [5, 10, 15, 20]
 
@@ -501,6 +495,152 @@ def test_train_evaluates_the_test_split_at_the_end(tmp_path: Path) -> None:
     report = json.loads((out / "METRICS.json").read_text())
     assert report["model"] == {"path": None, "iteration": ITERATIONS}
     assert report["split"] == "test" and set(report["entire"]["scene"]) == set(METRIC_NAMES)
+
+
+# Periodic checkpoints (D-83; Q-149 to Q-152).
+
+
+def _kept(run_dir: Path) -> dict[str, int]:
+    """The run directory's checkpoints by name, with the iteration each one holds."""
+    return {
+        p.name: load_checkpoint(p).iteration
+        for p in sorted(run_dir.iterdir())
+        if p.name == "checkpoint" or p.name.startswith("checkpoint-")
+    }
+
+
+def _assert_same_run(a: Path, b: Path) -> None:
+    """§2.2's resume contract, checkpoint against checkpoint: parameters, Adam moments and
+    steps, statistics, generator states and sampler, bitwise."""
+    x, y = load_checkpoint(a), load_checkpoint(b)
+    assert x.iteration == y.iteration
+    for part in ("params", "optim", "stats", "rng"):
+        p, q = _tensors(getattr(x, part)), _tensors(getattr(y, part))
+        assert p.keys() == q.keys() and p, part
+        assert all(torch.equal(p[k], q[k]) for k in p), part
+    assert x.sampler == y.sampler
+
+
+def test_periodic_saves_change_nothing_in_the_run(run: dict[str, Path], tmp_path: Path) -> None:
+    """D-83, §2.2: a run saving every 5 iterations is bitwise equal to one that doesn't, on the
+    reference backend on the CPU; by default only RUN_DIR/checkpoint is kept, and neither
+    option is part of the configuration."""
+    assert _train(run, tmp_path / "plain", "--config", run["config"]) == 0
+    periodic = tmp_path / "periodic"
+    assert _train(run, periodic, "--config", run["config"], "--checkpoint-every", 5) == 0
+    _assert_same_run(tmp_path / "plain" / "checkpoint", periodic / "checkpoint")
+    assert _kept(periodic) == {"checkpoint": ITERATIONS}
+    assert (periodic / "config.json").read_text() == (
+        tmp_path / "plain" / "config.json"
+    ).read_text()
+
+
+def test_keep_checkpoints_keeps_the_k_latest_saves(run: dict[str, Path], tmp_path: Path) -> None:
+    """D-83: with K = 2, exactly two checkpoints remain, the latest at RUN_DIR/checkpoint and the
+    one before as RUN_DIR/checkpoint-<its iteration>."""
+    out = tmp_path / "run"
+    args = ("--config", run["config"], "--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, *args) == 0
+    assert _kept(out) == {"checkpoint": ITERATIONS, "checkpoint-15": 15}
+
+
+def test_a_resume_from_a_periodic_checkpoint_is_bitwise(
+    run: dict[str, Path], tmp_path: Path
+) -> None:
+    """D-83, §2.2: resuming from a kept periodic checkpoint to T_it gives bitwise the run that
+    never stopped."""
+    assert _train(run, tmp_path / "straight", "--config", run["config"]) == 0
+    out = tmp_path / "run"
+    args = ("--config", run["config"], "--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, *args) == 0
+    resumed = tmp_path / "resumed"
+    assert _train(run, resumed, "--resume", out / "checkpoint-15") == 0
+    _assert_same_run(tmp_path / "straight" / "checkpoint", resumed / "checkpoint")
+
+
+@pytest.mark.parametrize("stop", [12, 15])
+def test_a_resume_from_an_older_checkpoint_removes_the_later_ones(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: int
+) -> None:
+    """D-83, Q-149: the resumed run's first save drops the kept checkpoints of its iteration or
+    later, the continuation the resume from an earlier one abandoned: at 12 a signal's save,
+    at 15 the periodic save the abandoned run also made, then the signal's in place."""
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 3)
+    assert _train(run, out, "--config", run["config"], *keep) == 0
+    assert _kept(out) == {"checkpoint": ITERATIONS, "checkpoint-10": 10, "checkpoint-15": 15}
+    _sigterm_at(monkeypatch, stop)
+    assert _train(run, out, "--resume", out / "checkpoint-10", *keep) == 128 + signal.SIGTERM
+    assert _kept(out) == {"checkpoint": stop, "checkpoint-10": 10}
+
+
+def test_a_resume_of_a_finished_run_keeps_its_checkpoints(
+    run: dict[str, Path], tmp_path: Path
+) -> None:
+    """Q-149: resuming a checkpoint at T_it saves T_it again, in place, so the run directory's
+    checkpoints stay as they were."""
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, "--config", run["config"], *keep) == 0
+    assert _train(run, out, "--resume", out / "checkpoint", *keep) == 0
+    assert _kept(out) == {"checkpoint": ITERATIONS, "checkpoint-15": 15}
+
+
+@pytest.mark.parametrize(
+    "option", [("--checkpoint-every", -1), ("--keep-checkpoints", 0)], ids=["every", "keep"]
+)
+def test_checkpoint_options_out_of_range_are_exit_code_2(
+    run: dict[str, Path], tmp_path: Path, option: tuple[str, int]
+) -> None:
+    """D-83: N ≥ 0 and K ≥ 1; anything else is exit code 2 and no run directory is made."""
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", run["config"], *option) == 2
+    assert not out.exists()
+
+
+def test_a_diverged_state_is_never_saved_periodically(
+    run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-83, Q-133: every save checks the model and its statistics first, so a model that turns
+    NaN before a periodic save is exit code 3, nothing is saved or renamed, and the earlier
+    checkpoint is untouched. The NaN comes after the shortened calendar's last event (17) and
+    the save at 18 is no log read (7, 14), so the trainer's own checks (Q-69) don't see it
+    first."""
+    step = Trainer.step
+
+    def late(self: Trainer) -> Any:
+        log = step(self)
+        if self.iteration == 17:
+            with torch.no_grad():
+                self.model.means[0, 0] = float("nan")
+        return log
+
+    monkeypatch.setattr(Trainer, "step", late)
+    cfg = _config_file(tmp_path / "seven.json", _cfg(perf=PerfConfig(log_every=7)))
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 9, "--keep-checkpoints", 2)
+    assert _train(run, out, "--config", cfg, *keep) == 3
+    assert _kept(out) == {"checkpoint": 9}
+
+
+@pytest.mark.parametrize(
+    ("stop", "want"),
+    [(12, {"checkpoint": 12, "checkpoint-10": 10}), (10, {"checkpoint": 10, "checkpoint-5": 5})],
+)
+def test_a_signal_save_follows_the_rotation(
+    run: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: int,
+    want: dict[str, int],
+) -> None:
+    """D-83: a signal's save is rotated like any other; Q-149: a signal during an iteration that
+    is a multiple of N saves that iteration once, replacing the periodic save in place."""
+    _sigterm_at(monkeypatch, stop)
+    out = tmp_path / "run"
+    keep = ("--checkpoint-every", 5, "--keep-checkpoints", 2)
+    assert _train(run, out, "--config", run["config"], *keep) == 128 + signal.SIGTERM
+    assert _kept(out) == want
 
 
 # Models for render, eval and export: a checkpoint trained through the Python API on the CPU.
