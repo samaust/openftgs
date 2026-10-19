@@ -661,9 +661,14 @@ def _earlier_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
     found: list[tuple[int, Path]] = []
     for path in run_dir.glob("checkpoint-*"):
         match = _EARLIER_NAME.fullmatch(path.name)
-        if match is not None and path.is_dir() and _is_checkpoint(path):
+        if match is not None and _counts_as_kept(path):
             found.append((int(match.group(1)), path))
     return sorted(found)
+
+
+def _counts_as_kept(path: Path) -> bool:
+    """Q-150: a checkpoint-<n> entry is a kept checkpoint when it is a checkpoint directory."""
+    return path.is_dir() and _is_checkpoint(path)
 
 
 def _check_keep(keep: int) -> None:
@@ -691,7 +696,7 @@ def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) ->
     if current is not None and current < state.iteration and keep > 1:
         renamed = run_dir / f"checkpoint-{current}"
         if renamed.exists() or renamed.is_symlink():
-            if not (renamed.is_dir() and _is_checkpoint(renamed)):  # Q-150
+            if not _counts_as_kept(renamed):  # Q-150
                 raise ValueError(f"{renamed} exists and is not a checkpoint; refusing to rotate")
             abandoned.append(renamed)  # Q-149: one save per iteration, the newer one kept
     for path in abandoned:
@@ -721,7 +726,7 @@ def check_run_checkpoints(run_dir: Path, *, keep: int = 1) -> None:
     blocking = []
     for path in Path(run_dir).glob("checkpoint-*"):
         match = _EARLIER_NAME.fullmatch(path.name)
-        if match is not None and not (path.is_dir() and _is_checkpoint(path)):
+        if match is not None and not _counts_as_kept(path):
             blocking.append((int(match.group(1)), path))
     if blocking:
         _, first = min(blocking)
