@@ -1089,8 +1089,8 @@ def _body(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def _assert_close(a: Any, b: Any, path: str = "body") -> None:
-    """Equal JSON trees, floats within 1e-6, relative or absolute (U-22's render tolerance, for
-    metrics of renders in [0, 1]; Q-162)."""
+    """Equal JSON trees, floats within 1e-6, relative or absolute: a round-off band, not U-22's
+    render tolerance carried over, since metrics amplify render differences (Q-162)."""
     if isinstance(a, dict):
         assert isinstance(b, dict) and a.keys() == b.keys(), path
         for key in a:
@@ -1328,8 +1328,11 @@ def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) ->
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
     exported = tmp_path / "exported.json"
     assert _ftgs("eval", exchange, scene, "--out", exported) == 0
-    # Q-162: the exchange model stores opacities and durations, not their logits, so its
-    # renders match the checkpoint's within U-22's 1e-6, and the bodies are compared there.
+    # Q-162: the exchange model stores opacities and durations, not their logits, so its body
+    # equals the checkpoint's only up to round-off. 1e-6 is a round-off band, not U-22's render
+    # tolerance carried over: metrics amplify render differences (PSNR by up to about
+    # 8.7 · δ / RMSE dB). It sits far above the rounding observed and far below the change a
+    # background mismatch makes, which is what D-84's test is for.
     _assert_close(_body(json.loads(exported.read_text())), _body(got))
 
 
