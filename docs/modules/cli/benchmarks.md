@@ -151,3 +151,7 @@ B-5 times the optimizer's part of a training iteration, `FTGSOptimizer.set_itera
 **Figures.** Per case (`{"adam", "n"}`): the median over 50 calls after the first call and 10 warm-up calls (`step_s`), the first call, the count, the peak allocated memory, and for selective Adam the mask's fraction. Per N (`{"n"}`): `fused_over_foreach`, fused's median over foreach's.
 
 **Budget** (§3.4, `kind: "budget"`): fused no slower than foreach, one entry per N, `fused_over_foreach` against 1.0 with no tolerance. If fused is slower at either N, the numbers go to the owner as a spec-change request, and the default stays `"fused"` meanwhile (#229, PRD #220).
+
+## B-5's first run
+
+On kitchen (Calibration data, #229), a call takes 2.05 / 4.51 / 0.67 ms at 1M rows and 6.03 / 13.56 / 2.00 ms at 3M for fused / foreach / selective Adam. Fused takes 45 % of foreach's time at both N (`fused_over_foreach` 0.454 and 0.445), so the budget passes and the default stays `"fused"`. Fused agrees with B-1's `adam` stage (2.11 and 6.22 ms at 1.02M and 3.06M rows, `zero_grad` included). Selective Adam, with its mask at 17 % of the rows, takes a third of fused's time, about 4 ms less per iteration at 3M; it stays opt-in, being approximate (§2.4 rule 2, D-53). Fused and selective Adam allocate nothing beyond the parameters, gradients and moments (1,024 B per row); foreach adds about 180 B per row in temporaries.
