@@ -259,6 +259,7 @@ def evaluate_images(
     backend: Literal["gsplat", "reference"] = "gsplat",
     background: tuple[float, float, float] = (0.0, 0.0, 0.0),
     renders: Mapping[int, Tensor] | None = None,
+    frame_dt: float | None = None,  # Q-T230.1
 ) -> list[ImageMetrics]:
     """The metrics of every image of one data split (E16, D-67): each record rendered at its
     raw timestamp with the model's full SH degree and `background`, through `render_request`
@@ -266,7 +267,8 @@ def evaluate_images(
     time's renders are held at once, then evaluated by `evaluator` with the image's mask.
     Results come in the manifest's order. Given `renders`, a prediction [H, W, 3] for every
     record of the split by record index, nothing is rendered and those are scored (Q-137); one
-    that isn't finite is a ValueError.
+    that isn't finite is a ValueError. `frame_dt` goes to every render request as the temporal
+    index's bucket width (Q-174); with one timestamp per request the index stays off by default.
 
     A render of the model that isn't finite, in its colors or its alpha, is not scored, nor is
     anything after it: once the whole data split is rendered, FloatingPointError names up to
@@ -297,7 +299,7 @@ def evaluate_images(
             request = RenderRequest(
                 items, time_unit=dataset.manifest.time_unit, background=background
             )
-            rendered = render_request(model, request, backend=backend)
+            rendered = render_request(model, request, backend=backend, frame_dt=frame_dt)
             predictions = {i: rendered.rgb[str(i)] for i in group}
             # Q-147: before E16's clamp, which would turn ±Inf into a plausible color.
             broken += [
