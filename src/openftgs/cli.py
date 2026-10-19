@@ -651,6 +651,11 @@ def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
     exit 2 (Q-154). So is a model whose second hash can't be taken, and a read that fails while
     the hash changes, as when a save tears the read; a read that fails with the hash unchanged
     keeps the reader's error (Q-154 as answered)."""
+    if not path.exists():  # a mistyped checkpoint directory isn't an unreadable FTGS-IF file
+        _fail(
+            f"model {path}: No such file or directory; MODEL is a checkpoint directory or an "
+            "FTGS-IF file"
+        )
     changed_message = f"model {path} changed while it was read; evaluate it again"
     with _as_input_error(f"model {path}", OSError):  # Q-142, Q-154
         before = _model_sha256(path) if hashed else None
@@ -724,6 +729,7 @@ def _render(args: argparse.Namespace) -> int:
             f"the request's time unit {request.time_unit!r} isn't the model's "
             f"{loaded.model.time_unit!r}"
         )
+    # Q-20: at_time refuses L′ > L, which is exit 2 (Q-26, Q-142); checked before rendering
     if request.sh_degree is not None and request.sh_degree > loaded.model.sh_degree:
         _fail(
             f"the request's sh_degree {request.sh_degree} is above the model's "

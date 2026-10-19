@@ -926,6 +926,31 @@ def test_render_refuses_invalid_requests_and_the_default_backend_without_cuda(
     assert not out.exists()
 
 
+@pytest.mark.parametrize("command", ["render", "eval"])
+def test_a_model_path_that_does_not_exist_is_exit_code_2_naming_it_once(
+    tmp_path: Path, command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.1 exit code 2 (an invalid input path): a MODEL that doesn't exist, as a mistyped
+    checkpoint directory, is reported as missing, with its path named once, not as an
+    unreadable FTGS-IF file; nothing is written."""
+    scene, _ = _trained(tmp_path)
+    missing = tmp_path / "run" / "checkpoit"
+    out = tmp_path / "out"
+    if command == "render":
+        request = write_render_request(tmp_path / "req.json", _test_items(scene))
+        args: tuple[object, ...] = ("--request", request, "--out", out, "--backend", "reference")
+    else:
+        args = (scene, "--out", out)
+    capsys.readouterr()
+    assert _ftgs(command, missing, *args) == 2
+    err = capsys.readouterr().err
+    assert err.count(str(missing)) == 1
+    assert "No such file or directory" in err
+    assert "checkpoint directory or an FTGS-IF file" in err
+    assert "safetensors" not in err
+    assert not out.exists()
+
+
 def test_renders_that_are_not_finite_are_exit_code_3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
