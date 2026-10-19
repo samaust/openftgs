@@ -25,6 +25,7 @@ intersection's, would show no warning at all. The debug mode is a prototype that
 synchronizations; the test pins the ones it sees.
 """
 
+import contextlib
 import dataclasses
 import os
 import sys
@@ -46,6 +47,7 @@ from torch import Tensor
 
 import openftgs.losses
 import openftgs.render
+from openftgs import _stages
 from openftgs.config import (
     GrowthConfig,
     LossConfig,
@@ -302,6 +304,7 @@ class _Case:
     perf: dict[str, Any] = field(default_factory=dict)
     lambda_perc: float = 0.0
     ssim_fallback: bool = False
+    stage_clock: bool = False  # §3.4: the stages' CUDA events and gradient hooks (B-1)
 
 
 _CASES = [
@@ -318,6 +321,7 @@ _CASES = [
     pytest.param(_Case(lambda_perc=0.01), id="perceptual", marks=pytest.mark.weights),
     pytest.param(_Case(ssim_fallback=True), id="ssim-fallback"),
     pytest.param(_Case({"deterministic": True}), id="deterministic"),
+    pytest.param(_Case(stage_clock=True), id="stage-clock"),
 ]
 
 
@@ -365,8 +369,9 @@ def test_u29_training_iterations_synchronize_only_inside_gsplat(
     first event, 20 iterations with no event and no log read synchronize only inside gsplat's
     render call, or at `render`'s kept-row selection under compaction. Each case changes one
     factor from the base (packed, internal pre-culling, fused Adam, compiled slice, GPU cache,
-    λ_perc = 0, not deterministic). At least one synchronization per iteration must be seen
-    (gsplat reads its tile intersections back every render), so the check can't pass empty."""
+    λ_perc = 0, not deterministic); with the stage clock active, its events and gradient hooks
+    add none (§3.4, #223). At least one synchronization per iteration must be seen (gsplat reads
+    its tile intersections back every render), so the check can't pass empty."""
     if case.ssim_fallback:
         # Q-42: the PyTorch path, as without fused-ssim installed.
         monkeypatch.setattr(openftgs.losses, "_fused_ssim", lambda: None)
@@ -377,8 +382,13 @@ def test_u29_training_iterations_synchronize_only_inside_gsplat(
     assert warm_up[_EVENT - 1].growth is not None  # the first event is behind
     threads = {threading.get_ident(), _autograd_device_thread()}
     torch.cuda.synchronize()
-    with _SyncRecorder() as recorder:
+    clock = _stages.Clock("cuda") if case.stage_clock else contextlib.nullcontext()
+    with _SyncRecorder() as recorder, clock:
         logs = [trainer.step() for _ in range(_WINDOW)]
+    if isinstance(clock, _stages.Clock):  # read after the window, where the test synchronizes
+        names = [timing.name for timing in clock.read()]
+        for name in ("iteration", "backward", "backward.losses_done", "backward.raster_done"):
+            assert names.count(name) == _WINDOW, name
     assert all(
         log.growth is None
         and log.relocation is None
