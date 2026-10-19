@@ -2126,16 +2126,16 @@ def test_init_roma_writes_init_points_with_provenance(tmp_path: Path) -> None:
 # ftgs bench (Q-166; Q-130, retired by #225; tests/test_bench.py has the benchmarks).
 
 
-def test_bench_checks_its_arguments_and_waits_for_unbuilt_benchmarks(
+def test_bench_checks_its_arguments(
     run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Q-166: an unknown benchmark, a missing manifest, and on this CPU-only view a benchmark
-    that needs CUDA, are exit 2. A benchmark whose ticket hasn't landed (B-8's `convert`, #234,
-    needs no CUDA) keeps Q-130's behaviour until then: it says so, writes nothing and returns
-    1."""
+    that needs CUDA, are exit 2. So is B-8's `convert`, which needs no CUDA, on a scene whose
+    manifest records no conversion to rerun (Q-169; #234 replaced Q-130's exit 1 here, and
+    `tests/test_bench.py` checks that exit 1 for the benchmarks still unbuilt, on a GPU)."""
     out = tmp_path / "bench.json"
-    assert _ftgs("bench", "convert", run["scene"], "--out", out) == 1
-    assert "comes with #234" in capsys.readouterr().err
+    assert _ftgs("bench", "convert", run["scene"], "--out", out) == 2
+    assert "records no converter run" in capsys.readouterr().err
     assert _ftgs("bench", "train-step", run["scene"], "--out", out) == 2
     assert _ftgs("bench", "warp", run["scene"], "--out", out) == 2
     assert _ftgs("bench", "raster", tmp_path / "none.json", "--out", out) == 2
