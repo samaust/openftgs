@@ -149,8 +149,9 @@ def render_request(
     unique; outputs are keyed by them, whatever the cameras' names. Runs in inference mode;
     outputs are inference tensors on `device`, the CPU by default.
 
-    The temporal index of D-55 (Q-174) renders each time in [0, 1] from the rows that can pass
-    the opacity cull then, with images unchanged (U-32). `temporal_index` None turns it on for
+    The temporal index of D-55 (Q-174) renders each timestamp inside the training span, a
+    normalized time in [0, 1], from the rows that can pass the opacity cull then, with images
+    unchanged (U-32); other timestamps render as without it. `temporal_index` None turns it on for
     the gsplat backend when the request has at least `_INDEX_MIN_TIMES` distinct times in
     [0, 1]; True or False forces it. `frame_dt` is the buckets' width in normalized time, Δt_f
     (E14) for a model from a checkpoint; None takes the median gap between the request's
@@ -177,11 +178,8 @@ def render_request(
         groups.setdefault(key, []).append(item)
     for group in groups.values():
         _check_cameras([item.camera for item in group])
-    with warnings.catch_warnings():
-        # Which path a group takes; the render warns outside the training span itself (Q-9).
-        warnings.simplefilter("ignore", UserWarning)
-        times = {key: _normalized_time(model, key[0], "raw") for key in groups}
-    inside = sorted({t for t in times.values() if 0.0 <= t <= 1.0})
+    times = {key: _time_in_span(model, key[0]) for key in groups}
+    inside = sorted({t for t in times.values() if t is not None})
     rgb: dict[str, Tensor] = {}
     alpha: dict[str, Tensor] = {}
     with torch.inference_mode():
@@ -198,8 +196,8 @@ def render_request(
             index = _TemporalIndex(model, _bucket_width(frame_dt, inside), inside)
         for key, group in groups.items():
             cams = [cameras[item.id] for item in group]
-            if index is not None and sh is not None and 0.0 <= times[key] <= 1.0:
-                t = _normalized_time(model, key[0], "raw")  # warns as render() would (Q-9)
+            t = times[key]
+            if index is not None and sh is not None and t is not None:
                 image, alphas = _render_indexed(
                     model, cams, t, index.rows(t), sh=sh, background=background, backend=backend
                 )
@@ -361,6 +359,18 @@ def _check_frame_dt(frame_dt: object) -> None:
         or not (math.isfinite(float(frame_dt)) and float(frame_dt) > 0.0)
     ):
         raise ValueError(f"frame_dt must be a finite positive number, got {frame_dt!r}")
+
+
+def _time_in_span(model: FreeTimeGaussians, timestamp: object) -> float | None:
+    """Q-174: the normalized time of a raw timestamp inside the training span [τ₀, τ₁], which
+    lies in [0, 1] and draws no warning; None for any other timestamp, which goes to `render()`
+    to be checked and warned about as before (Q-9, Q-32)."""
+    if isinstance(timestamp, bool) or not isinstance(timestamp, numbers.Real):
+        return None
+    value = float(timestamp)
+    if not model.time.tau0 <= value <= model.time.tau1:  # NaN included
+        return None
+    return model.time.to_t(value)
 
 
 def _output_device(device: str | torch.device) -> torch.device:
