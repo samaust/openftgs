@@ -274,19 +274,25 @@ def test_the_ablation_turns_relocation_off(tmp_path: Path) -> None:
         Trainer(cfg, _scene(tmp_path), _init_points(), device="cpu")
 
 
-@pytest.mark.parametrize(
-    "perf",
-    [
-        PerfConfig(perc_precision="bf16"),
-        PerfConfig(images_per_step=2),
-    ],
-)
-def test_options_of_later_milestones_are_refused(tmp_path: Path, perf: PerfConfig) -> None:
-    """Q-73: bf16 LPIPS and several images per step (M15) fail at construction rather than
-    being ignored; the frame cache's placements arrived with M12 (Q-99)."""
+def test_several_images_per_step_are_refused_naming_two_gpus_and_l3(tmp_path: Path) -> None:
+    """Q-177 (owner's answer, 2026-10-19): multi-GPU training is deferred, so images_per_step
+    > 1 (D-54) still fails at construction rather than being ignored, and says why: the mode
+    needs two GPUs and must pass M16's L3 first. The frame cache's placements arrived with M12
+    (Q-99) and bf16 LPIPS with M15 (D-52, #228)."""
     video = _scene(tmp_path)
-    with pytest.raises(NotImplementedError):
-        Trainer(_no_perceptual(perf=perf), video, _init_points(), device="cpu")
+    with pytest.raises(NotImplementedError, match=r"two GPUs.*M16's L3"):
+        Trainer(
+            _no_perceptual(perf=PerfConfig(images_per_step=2)), video, _init_points(), device="cpu"
+        )
+
+
+def test_bf16_perceptual_precision_is_accepted(tmp_path: Path) -> None:
+    """D-52, Q-73's note (4): bf16 LPIPS is built in M15 (#228), so the trainer no longer refuses
+    it; without the perceptual term it trains as any other run."""
+    video = _scene(tmp_path)
+    cfg = _no_perceptual(perf=PerfConfig(perc_precision="bf16"))
+    trainer = Trainer(cfg, video, _init_points(), device="cpu")
+    assert _all_finite([trainer.step()])
 
 
 # Checkpoints and exact resume (U-21), determinism (U-24), stability (S-10).
@@ -741,6 +747,34 @@ def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_pat
         torch.set_float32_matmul_precision(matmul)
 
 
+# Q-173: whether B-4 turned cuDNN autotuning on for training steps (Calibration data, #228).
+AUTOTUNING = False
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("caller", [False, True])
+def test_cudnn_autotuning_during_a_step_follows_b4_and_deterministic(
+    tmp_path: Path, deterministic: bool, caller: bool
+) -> None:
+    """D-52, Q-73, Q-173: during a training iteration's backward pass, cuDNN autotuning is off
+    under `deterministic`; otherwise it is on when B-4 turned it on, and else left as the caller
+    set it. Every flag is the caller's again after the step."""
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    try:
+        cudnn.benchmark = caller
+        perf = PerfConfig(deterministic=deterministic)
+        trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
+        seen: list[bool] = []
+        trainer.model.means.register_hook(lambda _: seen.append(cudnn.benchmark))  # type: ignore[no-untyped-call]
+        trainer.step()
+        expected = False if deterministic else (True if AUTOTUNING else caller)
+        assert seen == [expected]
+        assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (caller, *saved[1:])
+    finally:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+
+
 # Resuming another run's state (§2.2; Q-46, Q-69, Q-70, Q-72).
 
 
@@ -1027,6 +1061,41 @@ def test_training_with_the_perceptual_loss(tmp_path: Path) -> None:
     trainer = Trainer(TrainConfig(), _scene(tmp_path), _init_points(), device="cpu")
     logs = _run(trainer, 3)
     assert all(math.isfinite(float(log.losses["perceptual"])) for log in logs)
+
+
+def _step_with_gradients(trainer: Trainer) -> tuple[StepLog, dict[str, torch.Tensor]]:
+    """One training iteration, with the gradients its backward pass gives the model's stored
+    tensors, caught by hooks on them (the optimizer zeroes them before the step returns)."""
+    grads: dict[str, torch.Tensor] = {}
+    model = trainer.model
+    for name in model.PARAM_NAMES:
+        tensor = getattr(model, name)
+        tensor.register_hook(lambda g, name=name: grads.__setitem__(name, g.detach().clone()))
+    return trainer.step(), grads
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_a_bf16_step_gives_a_finite_perceptual_term_near_float32(
+    tmp_path: Path, device: str
+) -> None:
+    """D-52, Q-172 (#228): with perc_precision = "bf16" one training step runs LPIPS-VGG under
+    bfloat16 autocast; its perceptual term is finite and within 5e-2 relative of the float32
+    ("ieee") step from the same seed, which renders the same image, and the gradients that reach
+    the model are finite. bf16 is approximate (D-52), so the two terms differ."""
+    video = _scene(tmp_path)
+    terms, gradients = {}, {}
+    for precision in ("ieee", "bf16"):
+        cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
+        trainer = Trainer(cfg, video, _init_points(), device=device)
+        log, grads = _step_with_gradients(trainer)
+        terms[precision] = float(log.losses["perceptual"])
+        gradients[precision] = grads
+    assert math.isfinite(terms["bf16"]) and terms["ieee"] > 0.0
+    assert terms["bf16"] != terms["ieee"]
+    assert abs(terms["bf16"] - terms["ieee"]) <= 5e-2 * terms["ieee"]
+    assert "means" in gradients["bf16"]
+    assert all(bool(torch.isfinite(g).all()) for g in gradients["bf16"].values())
 
 
 def _evaluation_scene(root: Path) -> MultiViewVideo:
