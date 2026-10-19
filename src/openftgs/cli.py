@@ -648,13 +648,28 @@ def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
     """MODEL of §2.1: a checkpoint directory or an FTGS-IF file; with `hashed`, also the SHA-256
     that names it (Q-136), taken before and after reading, so that it names the bytes read: a
     model that changed meanwhile, as a periodic save (D-83) changes RUN_DIR/checkpoint, is
-    exit 2 (Q-154)."""
+    exit 2 (Q-154). A read that fails is that too when the hash has changed since, or can't be
+    taken, as when a save tears the read (Q-154 as answered); otherwise its error stands."""
+    changed = f"model {path} changed while it was read; evaluate it again"
     with _as_input_error(f"model {path}", OSError):  # Q-142, Q-154
         before = _model_sha256(path) if hashed else None
-        loaded = _read_model(path, device)
+        try:
+            loaded = _read_model(path, device)
+        except (ValueError, OSError):
+            if hashed and _model_sha256_or_none(path) != before:
+                _fail(changed)
+            raise
         if hashed and _model_sha256(path) != before:
-            _fail(f"model {path} changed while it was read; evaluate it again")
+            _fail(changed)
     return dataclasses.replace(loaded, sha256=before)
+
+
+def _model_sha256_or_none(path: Path) -> str | None:
+    """Q-154 (as answered): None when the model is gone or unreadable, as within a save."""
+    try:
+        return _model_sha256(path)
+    except OSError:
+        return None
 
 
 def _read_model(path: Path, device: str) -> _Loaded:
