@@ -315,7 +315,9 @@ def _write_manifests(out: Path, params: Params) -> list[Path]:
             "manifest_frames": frames,
             "fps": _FPS,
             "test_camera": camera_name(_TEST_CAMERA),
-            "purpose": "the GPU CI scene of §3.4 (Q-179); procedural images (Q-T235.2)",
+            # No Q-n here: renumbering a row must not change the manifest's bytes, by which
+            # B-6's frame cache is keyed.
+            "purpose": "the GPU CI scene of §3.4, with procedural images",
         }
         write_scene_manifest(out / name, records, time_unit="s", metadata=metadata)
         written.append(out / name)
