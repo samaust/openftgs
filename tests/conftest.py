@@ -53,6 +53,6 @@ def _cuda_profiler_warm_up(request: pytest.FixtureRequest) -> None:
         return
     import torch
 
-    cuda = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-    with torch.profiler.profile(activities=cuda):
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities):
         pass
