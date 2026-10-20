@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
+import numpy.typing as npt
 
 __all__ = [
     "LEVELS",
@@ -126,19 +127,17 @@ def level_summary(statuses: Sequence[str]) -> str:
     return "pass"
 
 
-def close_relative(a: np.ndarray, b: np.ndarray, tol: float) -> np.ndarray:
+def close_relative(a: npt.ArrayLike, b: npt.ArrayLike, tol: float) -> np.ndarray:
     """Q-208: |a − b| ≤ tol · max(|a|, |b|, 1e-3 · ‖b‖∞), elementwise. NaN never passes."""
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     floor = 1e-3 * float(np.max(np.abs(b))) if b.size and np.all(np.isfinite(b)) else 0.0
     scale = np.maximum(np.maximum(np.abs(a), np.abs(b)), floor)
     with np.errstate(invalid="ignore"):
         return np.asarray(np.abs(a - b) <= tol * scale)
 
 
-def close_absolute(a: np.ndarray, b: np.ndarray, tol: float) -> np.ndarray:
+def close_absolute(a: npt.ArrayLike, b: npt.ArrayLike, tol: float) -> np.ndarray:
     """Q-208: a bare tolerance is absolute. NaN never passes."""
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     with np.errstate(invalid="ignore"):
         return np.asarray(np.abs(a - b) <= tol)
