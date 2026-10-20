@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The dataset converters of openftgs.data (§1.4 "Dataset protocols", D-28, D-48, D-59 to D-61,
-D-63, D-64, D-80, D-81; Q-86 to Q-91, Q-93 to Q-101): U-27, U-37 and round trips on small
-generated datasets.
+D-63, D-64, D-80, D-81; Q-86 to Q-91, Q-93 to Q-101, Q-169): U-27, U-37 and round trips on
+small generated datasets.
 
 Videos are generated with the user's ffmpeg from its lavfi test sources, encoded losslessly
 (libx264rgb, -qp 0) where pixels are compared, so ffmpeg's own PNG decode is the oracle for the
@@ -129,6 +129,57 @@ def test_n3dv_manifest_holds_the_converted_cameras_times_and_metadata(tmp_path: 
     assert meta["ffmpeg"]["commands"]["cam00"][-1] == "-"
     assert meta["bounds"]["cam02"] == [0.5, 50.0]
     assert not (tmp_path / "out" / ".work").exists()
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("typed", ["data/kitchen", "data/../data/kitchen"])
+def test_n3dv_records_a_relative_srcs_videos_by_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, typed: str
+) -> None:
+    """D-48, Q-169: a relative SRC is made absolute, normalized lexically, before the ffmpeg
+    commands are built, so the full command the manifest records reads each video by its
+    absolute path, whatever directory the conversion ran in."""
+    n3dv_source(tmp_path / "data" / "kitchen", frames=3)
+    monkeypatch.chdir(tmp_path)
+    manifest = read_scene_manifest(
+        convert_n3dv(Path(typed), tmp_path / "out", frames=2, resize=0.5, jobs=1)
+    )
+    commands = manifest.metadata["ffmpeg"]["commands"]
+    for camera in ("cam00", "cam01"):
+        command = commands[camera]
+        video = Path.cwd() / "data" / "kitchen" / f"{camera}.mp4"
+        assert command[command.index("-i") + 1] == str(video)
+    assert manifest.metadata["source"] == "n3dv/kitchen"
+
+
+@needs_ffmpeg
+def test_n3dv_source_names_the_folder_when_src_is_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-62, Q-169: with SRC `.`, `metadata.source` is "n3dv/<the folder's name>", the form of
+    §2.2's example manifest, not "n3dv/"."""
+    monkeypatch.chdir(n3dv_source(tmp_path / "flame_steak", frames=2))
+    manifest = read_scene_manifest(
+        convert_n3dv(Path("."), tmp_path / "out", frames=1, resize=0.5, jobs=1)
+    )
+    assert manifest.metadata["source"] == "n3dv/flame_steak"
+
+
+@needs_ffmpeg
+def test_n3dv_source_keeps_the_name_of_a_symlinked_src(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-169: a relative SRC that names a symlink is made absolute without resolving the link,
+    so the name it was given stays in `metadata.source` and in the recorded `-i` paths."""
+    n3dv_source(tmp_path / "renders" / "take3", frames=2)
+    (tmp_path / "flame_steak").symlink_to(tmp_path / "renders" / "take3", target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    manifest = read_scene_manifest(
+        convert_n3dv(Path("flame_steak"), tmp_path / "out", frames=1, resize=0.5)
+    )
+    assert manifest.metadata["source"] == "n3dv/flame_steak"
+    command = manifest.metadata["ffmpeg"]["commands"]["cam01"]
+    assert command[command.index("-i") + 1] == str(Path.cwd() / "flame_steak" / "cam01.mp4")
 
 
 @needs_ffmpeg
@@ -290,6 +341,25 @@ def test_opencv_yaml_without_a_test_camera_has_only_training_images(tmp_path: Pa
     )
     assert {r.split for r in manifest.records} == {"train"}
     assert {(r.camera.width, r.camera.height) for r in manifest.records} == {(32, 24)}
+
+
+@needs_ffmpeg
+def test_opencv_yaml_records_a_relative_srcs_videos_by_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§1.4 ("the same ffmpeg call"), Q-169: as for Neural3DV, a relative SRC is made absolute
+    before the ffmpeg commands are built, so the recorded commands read the videos by absolute
+    path, and `metadata.source` names SRC's folder."""
+    _yaml_source(tmp_path / "data" / "actor1", ["0000", "0001"], frames=2)
+    monkeypatch.chdir(tmp_path / "data")
+    manifest = read_scene_manifest(
+        convert_opencv_yaml(Path("actor1"), tmp_path / "out", fps=60.0, frames=1, resize=0.5)
+    )
+    for camera in ("0000", "0001"):
+        command = manifest.metadata["ffmpeg"]["commands"][camera]
+        video = Path.cwd() / "actor1" / "videos" / f"{camera}.mp4"
+        assert command[command.index("-i") + 1] == str(video)
+    assert manifest.metadata["source"] == "opencv-yaml/actor1"
 
 
 @needs_ffmpeg
