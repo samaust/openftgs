@@ -44,3 +44,7 @@ Cameras go through the same parser as render requests, with the same checks (Q-5
 ## Writing a scene manifest
 
 `write_scene_manifest` writes the `ftgs-scene` file the converters produce, beside `read_scene_manifest` (Q-64, Q-84). It takes image records, their masks and the metadata; one camera entry per camera name comes from that name's first record, and a later record whose K or pose differs is written as a per-image override (§2.2). Camera values are written as the shortest decimals that read back to the same float32 values, so the reader rebuilds the converter's cameras exactly; timestamps keep their float64 value. Paths are written relative to the manifest. The file goes to a temporary name, is read back with `read_scene_manifest` and is renamed into place, and the writer returns what the reader returns, hash included.
+
+## Render conventions
+
+`render_conventions(*, background=(0, 0, 0))` returns a fresh copy of the 12 entries of `ftgs-if`'s `render_conventions` block (Q-35, D-73) with the given background (D-84). `write_exchange` writes it with the model's background, and `ftgs-adapter info` reports it with black (Q-204, Q-205).
