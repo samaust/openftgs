@@ -1,6 +1,6 @@
 # Metrics in `openftgs.eval`
 
-How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's. `eval` imports only `losses`. It never renders: renders come from `render.render_request` (Q-57), so the metrics stay pure tensor functions that run on the CPU.
+How `openftgs.eval` meets its §2.1 row for E16: the image metrics, the dynamic-region crop and mask of App. B.1, the averaging of D-67, and the metrics report that `ftgs eval` writes. The spec gives the module no signatures; its public API is Q-60's. `eval` imports `types`, `data`, `model`, `render` and `losses` from the bands below it, and the private `_shards` for D-54's sharding. The metrics never render: they are pure tensor functions that run on the CPU. `evaluate_images` renders a data split itself, through `render.render_request` (Q-57, Q-68), one request per timestamp, and then scores it ("Evaluating a model on a scene", below).
 
 ## The metrics
 
