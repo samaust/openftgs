@@ -89,7 +89,7 @@ Three keyword-only arguments come from Q-174, so no caller had to change: `tempo
 
 ### Once per request
 
-Before its first render, a request builds what doesn't change with time (§2.4, "activations computed once per model"; Q-174):
+Before its first render, a request builds what doesn't change with time (§2.4 and D-55 since revision 549l; Q-174):
 
 - the background, in float32 as requests have always passed it, on the model's device, filled there rather than copied from the host;
 - the cameras: on a CUDA model, every camera held on the host goes to the device in one copy for the whole request, staged in pinned memory and sent without blocking, with its values unchanged;
