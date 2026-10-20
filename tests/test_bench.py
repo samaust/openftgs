@@ -692,30 +692,29 @@ def test__raster_call_synchronizes_only_inside_gsplat(scene: Path, packed: bool)
 
 @pytest.mark.gpu
 def test_b2_spot_checks_each_image_against_packed_internal(raster_bench: dict[str, Any]) -> None:
-    """B-2 (§3.4 "images identical (U-8)"; D-57, Q-187): at every time, each variant's image
-    against the packed/internal one (D-57's default), its largest difference and the pixels over
-    1e-6, held to 1e-6 by a `limit` entry (#227); and each compacted image against the same
-    layout's internal one, U-8 itself, within 1e-6 and held to it by a `limit` entry too.
-    Neither entry changes the exit code (Q-166)."""
+    """B-2 (§3.4 "images identical (U-8)"; D-57, Q-187 as answered): at every time, each
+    variant's image against the packed/internal one (D-57's default), its largest difference and
+    the pixels over 1e-6, as figures without a `limit` entry, since D-57 lets the two layouts
+    differ at isolated pixels (revision 549k; #278); and each compacted image against the same
+    layout's internal one, U-8 itself, within 1e-6 and held to it by a `limit` entry. The entry
+    doesn't change the exit code (Q-166)."""
     timed = [c for c in raster_bench["cases"] if "packed" in c["case"]]
     others = [c for c in timed if (c["case"]["packed"], c["case"]["precull"]) != VARIANTS[0]]
     assert len(others) == 18
     expected = []
     for case in others:
         figures = case["figures"]
-        names = ["image_max_abs_diff"]
+        assert isinstance(figures["image_max_abs_diff"], float), case["case"]
         if case["case"]["precull"] == "compact":
-            names.append("precull_max_abs_diff")
-            assert figures["precull_max_abs_diff"] <= 1e-6, case["case"]  # U-8
-        for name in names:
-            value = figures[name]
+            value = figures["precull_max_abs_diff"]
+            assert value <= 1e-6, case["case"]  # U-8
             expected.append(
                 {
                     "case": case["case"],
-                    "figure": name,
+                    "figure": "precull_max_abs_diff",
                     "limit": 1e-6,
                     "value": value,
-                    "pass": value <= 1e-6,
+                    "pass": True,
                     "kind": "limit",
                 }
             )

@@ -1075,7 +1075,10 @@ _RASTER_VARIANTS: tuple[_RasterVariant, ...] = (
     (False, "internal"),
     (False, "compact"),
 )
-_SPOT_LIMIT = 1e-6  # U-8 on the GPU: images within 1e-6
+# U-8 on the GPU: compacted images within 1e-6 of internal culling's; also the threshold of the
+# layout comparison's pixel count, which has no limit: D-57 lets the layouts differ at isolated
+# pixels (Q-187 as answered, #278).
+_SPOT_LIMIT = 1e-6
 
 
 def _spot_check(
@@ -1157,10 +1160,11 @@ def _raster(ctx: _Context) -> _Result:
     """B-2: `render` forward plus an L1 backward for every `packed` × `precull` combination
     (D-57), on synthesized models at N = 1M and 3M with 5 %, 20 % and 100 % of rows active, from
     one training camera at 10 fixed times (Q-187). Per model, the rows active, the rows
-    visible and the tile intersections at each time, and the spot check (`_spot_check`), each
-    image held to 1e-6 of packed/internal's (#227) and each compacted one to 1e-6 of its layout's
-    internal one (U-8); per variant, the first call and the medians of 50 calls, and the peak
-    allocated memory."""
+    visible and the tile intersections at each time, and the spot check (`_spot_check`): each
+    image's difference from packed/internal's, recorded without a limit since D-57 lets the
+    layouts differ at isolated pixels (Q-187 as answered, #278), and each compacted one held to
+    1e-6 of its layout's internal one (U-8); per variant, the first call and the medians of 50
+    calls, and the peak allocated memory."""
     import torch
 
     from openftgs.config import PerfConfig
@@ -1207,9 +1211,10 @@ def _raster(ctx: _Context) -> _Result:
                 figures["peak_memory_bytes"] = torch.cuda.max_memory_allocated()
                 checked = spot.get(variant, {})
                 figures |= checked
-                for name in ("image_max_abs_diff", "precull_max_abs_diff"):
-                    if name in checked:
-                        budgets.append(_budget(case, figures, name, _SPOT_LIMIT, "limit"))
+                if "precull_max_abs_diff" in checked:  # U-8; the layouts' figures have none
+                    budgets.append(
+                        _budget(case, figures, "precull_max_abs_diff", _SPOT_LIMIT, "limit")
+                    )
                 cases.append({"case": case, "figures": figures})
             del model, call  # the last call holds the model; the next resident figure must not
     setup = {
