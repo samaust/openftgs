@@ -69,7 +69,7 @@ One JSON object, replaced atomically through a temporary sibling `.<name>.tmp-<p
 - `date` is the start of the run, in UTC.
 - `setup` holds the benchmark's fixed parameters, so a later run can be checked to have measured the same thing.
 - `cases` holds one entry per measured case: `case` names its parameters, and `figures` its numbers, times in seconds (names ending `_s`) and memory in bytes.
-- `budgets` holds one entry per budget or limit the run is held to, naming the case and the figure: `kind` is `budget` for a §3.4 budget, `bound` for an upper bound standing for one (Q-168's B-1), and `limit` for another spec limit checked on the run, as U-28's recompilations in B-3 and U-8's 1e-6 in B-2's spot check. `pass` never changes the exit code.
+- `budgets` holds one entry per budget or limit the run is held to, naming the case and the figure: `kind` is `budget` for a §3.4 budget, `bound` for an upper bound standing for one (Q-168's B-1), and `limit` for another spec limit checked on the run, as U-28's recompilations in B-3 and U-8's 1e-6 in B-2's spot check. `pass` is true when `value` is at most `limit`, except for B-6, whose "< 1%" passes only strictly under it, as the baseline comparison judges it. `pass` never changes the exit code.
 
 ## Measurement
 
@@ -246,7 +246,7 @@ B-6 times the data wait, the `data` stage of a training iteration, for each plac
 
 **Per case**, a fresh trainer runs iterations 1 to 120 untimed (B-1's warm-up, the event at 100 included), 121 to 320 under the stage clock's CUDA events, read once after 320, and 321 to 420 under the wall clock. The frame cache is built before the first case, so a case only opens it.
 
-**The figure**, `data_share`, is the `data` stage's mean over the `iteration` stage's mean over the 198 timed iterations without an event, a ratio of means as B-1's shares; the events at 200 and 300 are left out, which can only make the share larger. Its budget entry (`kind: "budget"`) holds it under 1 % for every case that reads the cache at 1M rows. Beside it: the data stage's mean and median, the mean iteration, and peak allocated and reserved memory from the first iteration on.
+**The figure**, `data_share`, is the `data` stage's mean over the `iteration` stage's mean over the 198 timed iterations without an event, a ratio of means as B-1's shares; the events at 200 and 300 are left out, which can only make the share larger. Its budget entry (`kind: "budget"`) holds it strictly under 1 % for every case that reads the cache at 1M rows: a share of exactly 1 % fails, as in `scripts/bench_compare.py`. Beside it: the data stage's mean and median, the mean iteration, and peak allocated and reserved memory from the first iteration on.
 
 **The host window.** The CUDA events see a wait only when the training stream stops for it. A wait on the host, as decoding a PNG, reading a memory-mapped frame or, at prefetch 0, waiting on a pinned buffer's previous copy (`docs/modules/train/trainer.md`), happens while the GPU still works through the previous iteration's losses and backward pass, about 100 ms of work on kitchen (B-1) queued after gsplat's read-back in the render, so the events can't see it unless it outlasts that backlog. The wall window gives the host time of the data stage and of an iteration over its 99 iterations without an event, to say how much of that backlog a wait uses. It is a diagnostic, not the B-6 figure.
 

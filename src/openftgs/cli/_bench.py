@@ -1475,9 +1475,10 @@ def _data_figures(
 
 def _data_budgets(cases: Sequence[dict[str, Any]], *, n: int) -> list[dict[str, Any]]:
     """§3.4 B-6, D-51 (#232): a budget entry for the data wait's share of every case that reads
-    the cache ("gpu", "mmap" at either depth) at B-6's `n` rows, against 1 %."""
+    the cache ("gpu", "mmap" at either depth) at B-6's `n` rows, strictly under 1 % (§3.4:
+    "< 1%"), as scripts/bench_compare.py judges it (Q-196)."""
     return [
-        _budget(c["case"], c["figures"], "data_share", _DATA_SHARE_LIMIT, "budget")
+        _budget(c["case"], c["figures"], "data_share", _DATA_SHARE_LIMIT, "budget", strict=True)
         for c in cases
         if c["case"]["placement"] in ("gpu", "mmap") and c["case"]["n"] == n
     ]
@@ -1636,16 +1637,23 @@ def _data(ctx: _Context) -> _Result:
 
 
 def _budget(
-    case: dict[str, Any], figures: dict[str, Any], figure: str, limit: float, kind: str
+    case: dict[str, Any],
+    figures: dict[str, Any],
+    figure: str,
+    limit: float,
+    kind: str,
+    *,
+    strict: bool = False,
 ) -> dict[str, Any]:
-    """A budget entry of BENCH.json (Q-166, Q-180) for one figure of one case."""
+    """A budget entry of BENCH.json (Q-166, Q-180) for one figure of one case: it passes at
+    most at `limit`, or, `strict`, only under it (B-6's "< 1%")."""
     value = figures[figure]
     return {
         "case": case,
         "figure": figure,
         "limit": limit,
         "value": value,
-        "pass": value <= limit,
+        "pass": value < limit if strict else value <= limit,
         "kind": kind,
     }
 

@@ -1198,7 +1198,9 @@ def test__data_figures_share_the_data_wait_over_iterations_without_an_event() ->
 def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
     """§3.4 B-6, D-51 (#232): the data wait's share is under 1 % for the cache's placements,
     "gpu" and "mmap" at either prefetch depth, at B-6's N; decoding PNGs ("off") and Q-99's
-    case at 3M rows have no budget. A failed budget is recorded, not an error (Q-166)."""
+    case at 3M rows have no budget. The budget is §3.4's strict "< 1%", as the baseline
+    comparison judges it (Q-196), so a share of exactly 1 % fails. A failed budget is recorded,
+    not an error (Q-166)."""
     from openftgs.cli._bench import _data_budgets
 
     def case(placement: str, n: int, share: float, **extra: int) -> dict[str, Any]:
@@ -1209,7 +1211,7 @@ def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
 
     cases = [
         case("gpu", 1_000, 0.001),
-        case("mmap", 1_000, 0.002, prefetch=8),
+        case("mmap", 1_000, 0.01, prefetch=8),  # exactly 1 %: not under it
         case("mmap", 1_000, 0.02, prefetch=0),
         case("off", 1_000, 0.3),
         case("gpu", 3_000, 0.001),
@@ -1223,7 +1225,7 @@ def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
             "pass": passed,
             "kind": "budget",
         }
-        for c, passed in zip(cases[:3], (True, True, False), strict=True)
+        for c, passed in zip(cases[:3], (True, False, False), strict=True)
     ]
 
 
@@ -1308,7 +1310,7 @@ def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) ->
     for budget, entry in zip(budgets, body["cases"], strict=False):
         assert (budget["figure"], budget["limit"], budget["kind"]) == ("data_share", 0.01, "budget")
         assert budget["value"] == entry["figures"]["data_share"]
-        assert budget["pass"] == (budget["value"] <= 0.01)
+        assert budget["pass"] == (budget["value"] < 0.01)  # §3.4: "< 1%"
 
 
 @pytest.mark.gpu
