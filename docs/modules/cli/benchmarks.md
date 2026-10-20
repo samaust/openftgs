@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-169, Q-178, Q-180 to Q-182, Q-185, Q-187 to Q-190, Q-192 and Q-193.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-169, Q-178, Q-180 to Q-182, Q-185, Q-187 to Q-190 and Q-192 to Q-195.
 
 ## Subcommands
 
@@ -29,7 +29,7 @@ The checks run in this order (Q-180):
 5. A benchmark not built yet stops here with exit 1.
 6. BENCH.json's folder is made before the run, so an output that can't be written is exit 2 at once, not after minutes of measuring (Q-142).
 
-Exit 0 means the benchmark ran, whatever its budgets and limits say: a measurement is not a command failure, and the comparison against the stored baselines decides (Q-166, Q-170). A scene the benchmark can't use is exit 2 as well: the synthesized models need more than one timestamp and two training poses (Q-181); `init` needs the `[init]` extra and RoMa's weights in torch.hub's cache (Q-192); `convert` needs a manifest that records a Neural3DV conversion whose source videos are still where its ffmpeg commands read them (Q-169, Q-193).
+Exit 0 means the benchmark ran, whatever its budgets and limits say: a measurement is not a command failure, and the comparison against the stored baselines decides (Q-166, Q-170). A scene the benchmark can't use is exit 2 as well: the synthesized models need more than one timestamp and two training poses (Q-181); `init` needs the `[init]` extra and RoMa's weights in torch.hub's cache (Q-192); `convert` needs a manifest that records a Neural3DV conversion whose source videos are still where its ffmpeg commands read them (Q-169, Q-193); `render` needs a model in the scene's time unit and the LPIPS networks' weights, which B-7's evaluation figures need and which it gets before measuring anything, as `ftgs eval` does (Q-142, Q-194).
 
 ## `--model`
 
@@ -75,6 +75,8 @@ One JSON object, replaced atomically through a temporary sibling `.<name>.tmp-<p
 Every benchmark but B-8 measures in the same way (Q-168): a first call, then 10 warm-up calls, then the timed calls, whose medians are the figures. The first call is timed on the wall clock from an idle device to a synchronize after it, so it includes compilation and the first launches of every kernel; it is never one of the timed calls. The timed calls run under the stage clock (`openftgs._stages.Clock("cuda")`), whose CUDA events are recorded on the stream without synchronizing; the clock is read once, after the last call, so nothing synchronizes inside the timed region (§2.4 rule 3, `docs/modules/train/trainer.md`, "Stages"). The calls are issued back to back, so where the GPU's work outlasts the host's launches the events time the GPU, and where it doesn't (a small N) they time the launches, as an iteration would see them.
 
 B-8 times work that runs once, initialization and conversion, so it runs it once, without a warm-up, under the wall clock (`Clock("wall")`), and its figures are sums and spreads of the stages it recorded (below).
+
+B-7's call is a whole render request, which synchronizes inside every render, so each call is timed on the wall clock from a synchronized device to a synchronize after it, after the same first call and warm-up (Q-194).
 
 B-1 times training iterations rather than calls: its warm-up is the first 120 iterations, and its figures are means as well as medians, since an iteration's time is the sum of its stages (below).
 
@@ -259,6 +261,38 @@ On kitchen and its 60-frame conversion (Calibration data, #232), the data wait t
 The host window shows why prefetch 0 still passes: its synchronous read, with the wait on a pinned buffer's event that the debug mode can't see (`docs/modules/train/trainer.md`), takes 0.44 ms of host time against 0.06 ms at prefetch 8, and runs while the GPU works through the previous iteration's losses and backward pass, so the training stream waits 0.01 ms more on average. PNG decoding takes 36 ms of host time, hidden the same way. The prefetcher stays as it is (PRD #220).
 
 Q-99's margin holds at N_max: at 3M rows with the cache on the GPU, the run took 8.57 GiB of reserved memory beyond the rule's estimate after the warm-up iteration (5.43 GiB allocated), 84 % of the 10.16 GiB the ½ margin leaves (54 % from allocated memory). That is close enough to the edge that the rule isn't tightened, and nothing goes to the owner. The device's memory outside PyTorch's allocator was 0.97 GiB, the desktop session's 0.49 GiB and the CUDA context.
+
+## B-7: `ftgs bench render`
+
+B-7 times `render.render_request`, the path `ftgs render`, `ftgs eval` and the trainer's evaluation share (Q-57), with the temporal index of D-55 on and off (`docs/modules/render/backends.md`, "The temporal index"), and from its measurements sets T, the number of distinct times from which `render_request`'s default builds the index (Q-174). Its setup is Q-194's, its rule for T Q-195's.
+
+- **Models.** Synthesized as above (seed 0) at N = 10⁶ and 3·10⁶, with 1 %, 5 % and 20 % of the rows active, each with its default `slice_impl` ("auto"); or the model given with `--model` alone. On kitchen's one-frame buckets (Δt_f = 1/299 of the span) a row of the 1 % model spans about 4 buckets, while the rows of the 5 % and 20 % models span 17 and 76 and so sit on the long list, which every render takes: B-7 sees the index both where it can help and where it can only cost.
+- **Camera.** Q-168's: the pose of the first camera in the manifest's camera order that has test images (kitchen's cam00), else of the first camera; fx and fy scaled by 1080/H, H its height, so pixels stay square and the vertical field of view is kept; the principal point at (960, 540); 1920×1080.
+- **Requests.** One item per distinct training timestamp (F of them, 300 on kitchen), the camera's tensors on the host as a request file gives them, a black background and the model's SH degree. The buckets' width (`frame_dt`) is a checkpoint's Δt_f, otherwise the scene's, one training frame interval as D-55 has it.
+- **Calls.** One call is one `render_request` with the gsplat backend, the index forced on or off, and the outputs on the GPU (`device="cuda"`) or on the CPU: a first call, 10 warm-up calls and 10 timed calls on the wall clock, whose medians give the request's time (`request_s`), FPS (renders over it) and the time per render (`render_s`), beside the first call and the peak allocated memory.
+- **Cases** (`{"n", "active", "times", "index", "outputs"}`). At the F times, the index on and off with the outputs on the GPU and on the CPU; with the outputs on the GPU, the index on and off at requests of k times spread evenly over the F, k = 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64 and 128 below F.
+- **The index** (`{"n", "active"}`). Its build time (`build_s`) is the one-time request with the index forced on (`temporal_index=True`) less the same request forced off, outputs on the GPU, so it can be negative where the index saves the render more than the build costs; and the model's break-even, below. B-7 reaches the index through `render_request` alone, as `cli` uses only public names of the modules below it (Q-153): the mean bucket size relative to N and the share of rows on the long list, which only the index's private rows give, are not reported (owner's answer, Q-194).
+- **Evaluation** (`{"n", "active", "evaluation"}`). `evaluate_images` on the test split (the training split when there is none) timed once on the wall clock, against the render requests it sends, one per timestamp with the outputs on the CPU as it takes them, also timed once; `render_share` is the second over the first.
+- **Budget.** §3.4's ≥ 450 FPS, kind `budget`, on the requests at the F times with the outputs on the GPU, index on and off. It is calibrated: M17 measures the trained kitchen, courtyard and studio models with `--model`.
+
+**The rule for T** (Q-195). A model's break-even is the smallest request size, among the swept sizes and F, at which the request with the index takes no longer than without it, there and at every larger size, outputs on the GPU; a model has none when the index is slower at F. T is the largest break-even over the models that have one, and at least 2, so a request at a single time never builds an index; B-7 writes it as the case `{"threshold": "T"}` (`distinct_times`). The recorded run's T becomes `render._INDEX_MIN_TIMES`, cited by its Calibration row. When no model has a break-even, T stays as it is and the numbers go to the owner, since an "auto" that never pays off is a change to Q-174's switch rather than a value of T.
+
+**The rule for evaluation** (PRD #220). `evaluate_images` keeps one render request per timestamp (Q-68) while `render_share` is at most 10 % at every model; above that, the numbers go to the owner as a request to change Q-68.
+
+## B-7's first run
+
+On kitchen (Calibration data, 2026-10-19; `/home/auss/datasets/openftgs-m15/bench/B-7-render.json`, 20 min at the default thread count), at the 300 training times from cam00 at 1920×1080, with the outputs on the GPU, index on / off:
+
+| Model | FPS, index on / off | Build | Break-even |
+| --- | --- | --- | --- |
+| 1M, 1 % active | 1,658 / 831 | 2.3 ms | 6 times |
+| 1M, 5 % | 624 / 824 | 1.5 ms | none |
+| 1M, 20 % | 535 / 687 | 1.5 ms | none |
+| 3M, 1 % | 1,572 / 344 | 7.5 ms | 6 times |
+| 3M, 5 % | 228 / 329 | 4.4 ms | none |
+| 3M, 20 % | 190 / 257 | 4.5 ms | none |
+
+So T = 6 (Q-195), now `render._INDEX_MIN_TIMES`. The 5 % and 20 % models' rows all sit on the long list, where the index only costs (`docs/modules/render/backends.md`, "The switch and the width"). The 450 FPS budget holds at 1M and only for the 1 % model at 3M; it is calibrated on the trained models in M17. With the outputs on the CPU every case stays between 108 and 212 FPS, the copy adding about 4.1 ms per render. Rendering is 2.4 to 3.9 % of `evaluate_images`, so evaluation keeps one request per timestamp.
 
 ## B-8: `ftgs bench init` and `ftgs bench convert`
 
