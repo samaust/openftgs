@@ -1,0 +1,212 @@
+{
+ "format": "ftgs-bench",
+ "version": 1,
+ "benchmark": "B-6",
+ "command": [
+  "ftgs",
+  "bench",
+  "data",
+  "/home/auss/datasets/openftgs-m15/ci-scene/scene.json",
+  "--out",
+  "/home/auss/datasets/openftgs-m15/bench/ci-1/B-6-data.json"
+ ],
+ "environment": {
+  "gpu": {
+   "name": "NVIDIA GeForce RTX 4090",
+   "count": 1
+  },
+  "driver": "595.99.02",
+  "cuda": "13.0",
+  "cudnn": 92400,
+  "torch": "2.14.1+cu130",
+  "gsplat": "1.5.3",
+  "fused_ssim": "1.0.0",
+  "python": "3.14.8",
+  "openftgs": "0.1.0.dev0",
+  "cpu": "12th Gen Intel(R) Core(TM) i9-12900",
+  "commit": "c3747016f77722d5a917c62c7eb6e2736b45ed4f",
+  "dirty": false
+ },
+ "scene": {
+  "path": "/home/auss/datasets/openftgs-m15/ci-scene/scene.json",
+  "sha256": "022f8209e3ab6a66fcb53ccfdb2f7a86b86c3a6d8ae4d2b770183b92678e9f6c",
+  "cameras": 20,
+  "frames": 300,
+  "width": 1352,
+  "height": 1014
+ },
+ "date": "2026-10-20T00:19:15+00:00",
+ "setup": {
+  "model": "synthesized (Q-168, Q-181)",
+  "seed": 0,
+  "active_fraction": 0.2,
+  "cases": [
+   [
+    1000000,
+    "gpu",
+    null
+   ],
+   [
+    1000000,
+    "mmap",
+    8
+   ],
+   [
+    1000000,
+    "mmap",
+    0
+   ],
+   [
+    1000000,
+    "off",
+    null
+   ],
+   [
+    3000000,
+    "gpu",
+    null
+   ]
+  ],
+  "configuration": "B-1's (#226): the default, LPIPS-VGG included, except growth.start = reloc.start = 100, growth.n_max = \u23081.02\u00b7N\u2309 and optim.sh_interval = 1; with the case's perf.frame_cache and perf.prefetch",
+  "frame_cache": "built before timing",
+  "gpu": "measured where \"auto\" would place the cache on the GPU (Q-99): a trainer decoding PNGs runs one iteration first, and the free memory and growth are read after it",
+  "warmup": 120,
+  "timed": [
+   121,
+   320
+  ],
+  "host": [
+   321,
+   420
+  ],
+  "events": [
+   200,
+   300,
+   400
+  ],
+  "clock": "CUDA events (openftgs._stages) over timed; the wall clock over host",
+  "figure": "data_share: the data stage's mean over the iteration's, over the timed iterations without an event",
+  "share_limit": 0.01,
+  "memory_n": 3000000,
+  "skipped": [
+   {
+    "case": {
+     "n": 1000000,
+     "placement": "gpu"
+    },
+    "reason": "\"auto\" would memory-map the cache (Q-99): its 23.44 GB exceed half the 23.51 GB free after a warm-up iteration less growth's 0.021 GB",
+    "estimate": {
+     "auto_free_bytes": 23514310144,
+     "auto_growth_bytes": 20640000,
+     "auto_allocated_bytes": 835983872,
+     "auto_reserved_bytes": 6882852864,
+     "auto_total_bytes": 25249579008,
+     "auto_outside_bytes": 899284992,
+     "cache_bytes": 23442868800,
+     "auto_limit_bytes": 11736515072.0
+    }
+   },
+   {
+    "case": {
+     "n": 3000000,
+     "placement": "gpu"
+    },
+    "reason": "\"auto\" would memory-map the cache (Q-99): its 23.44 GB exceed half the 21.93 GB free after a warm-up iteration less growth's 0.062 GB",
+    "estimate": {
+     "auto_free_bytes": 21925996032,
+     "auto_growth_bytes": 61920000,
+     "auto_allocated_bytes": 2396707328,
+     "auto_reserved_bytes": 8216641536,
+     "auto_total_bytes": 25249579008,
+     "auto_outside_bytes": 926875648,
+     "cache_bytes": 23442868800,
+     "auto_limit_bytes": 10901078016.0
+    }
+   }
+  ]
+ },
+ "cases": [
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 8
+   },
+   "figures": {
+    "data_share": 0.000345352009043947,
+    "data_mean_s": 3.613181254642056e-05,
+    "data_median_s": 3.564453125015632e-05,
+    "iteration_mean_s": 0.1046231427651046,
+    "iterations": 198,
+    "data_host_mean_s": 5.8396100425255495e-05,
+    "iteration_host_mean_s": 0.10276575186751392,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 6548397056,
+    "peak_reserved_bytes": 6933184512
+   }
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 0
+   },
+   "figures": {
+    "data_share": 0.00044115727187033686,
+    "data_mean_s": 4.6132669083331835e-05,
+    "data_median_s": 3.710937499867839e-05,
+    "iteration_mean_s": 0.10457193392222028,
+    "iterations": 198,
+    "data_host_mean_s": 0.00044068492916083394,
+    "iteration_host_mean_s": 0.10258914026207729,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 6515462144,
+    "peak_reserved_bytes": 6939475968
+   }
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "off"
+   },
+   "figures": {
+    "data_share": 0.01933744814173278,
+    "data_mean_s": 0.0020634307862503628,
+    "data_median_s": 0.0017302246093748863,
+    "iteration_mean_s": 0.10670646773692985,
+    "iterations": 198,
+    "data_host_mean_s": 0.03631489992925469,
+    "iteration_host_mean_s": 0.10489225812077597,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 6516492800,
+    "peak_reserved_bytes": 6918504448
+   }
+  }
+ ],
+ "budgets": [
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 8
+   },
+   "figure": "data_share",
+   "limit": 0.01,
+   "value": 0.000345352009043947,
+   "pass": true,
+   "kind": "budget"
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 0
+   },
+   "figure": "data_share",
+   "limit": 0.01,
+   "value": 0.00044115727187033686,
+   "pass": true,
+   "kind": "budget"
+  }
+ ]
+}

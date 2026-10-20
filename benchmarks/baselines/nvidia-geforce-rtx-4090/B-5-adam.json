@@ -1,0 +1,181 @@
+{
+ "format": "ftgs-bench",
+ "version": 1,
+ "benchmark": "B-5",
+ "command": [
+  "ftgs",
+  "bench",
+  "adam",
+  "/home/auss/datasets/openftgs-m15/ci-scene/scene.json",
+  "--out",
+  "/home/auss/datasets/openftgs-m15/bench/ci-1/B-5-adam.json"
+ ],
+ "environment": {
+  "gpu": {
+   "name": "NVIDIA GeForce RTX 4090",
+   "count": 1
+  },
+  "driver": "595.99.02",
+  "cuda": "13.0",
+  "cudnn": 92400,
+  "torch": "2.14.1+cu130",
+  "gsplat": "1.5.3",
+  "fused_ssim": "1.0.0",
+  "python": "3.14.8",
+  "openftgs": "0.1.0.dev0",
+  "cpu": "12th Gen Intel(R) Core(TM) i9-12900",
+  "commit": "c3747016f77722d5a917c62c7eb6e2736b45ed4f",
+  "dirty": false
+ },
+ "scene": {
+  "path": "/home/auss/datasets/openftgs-m15/ci-scene/scene.json",
+  "sha256": "022f8209e3ab6a66fcb53ccfdb2f7a86b86c3a6d8ae4d2b770183b92678e9f6c",
+  "cameras": 20,
+  "frames": 300,
+  "width": 1352,
+  "height": 1014
+ },
+ "date": "2026-10-20T00:19:11+00:00",
+ "setup": {
+  "model": "synthesized (Q-168, Q-181)",
+  "seed": 0,
+  "active_fraction": 0.2,
+  "cases": [
+   [
+    1000000,
+    0.173
+   ],
+   [
+    3000000,
+    0.17
+   ]
+  ],
+  "kinds": [
+   "fused",
+   "foreach",
+   "selective"
+  ],
+  "configuration": "OptimConfig() with the scene's S (D-27) and \u0394t_f",
+  "gradients": "N(0, 1), seeded, on all nine stored tensors, set once and kept",
+  "call": "set_iteration(it) then step(), it = 1, 2, \u2026, without zero_grad",
+  "visibility": "selective Adam's mask: round(f\u00b7N) rows chosen by a seeded permutation, f being B-1's visible fraction at N with 20 % active (Calibration data, Q-185)",
+  "warmup": 10,
+  "repetitions": 50,
+  "clock": "CUDA events: adam",
+  "budget": "fused_over_foreach \u2264 1.0 at each N"
+ },
+ "cases": [
+  {
+   "case": {
+    "adam": "fused",
+    "n": 1000000
+   },
+   "figures": {
+    "step_s": 0.002065918922424319,
+    "first_call_s": 0.0022220329992705956,
+    "repetitions": 50,
+    "peak_allocated_bytes": 1028635136
+   }
+  },
+  {
+   "case": {
+    "adam": "foreach",
+    "n": 1000000
+   },
+   "figures": {
+    "step_s": 0.004526077270507807,
+    "first_call_s": 0.03834378799365368,
+    "repetitions": 50,
+    "peak_allocated_bytes": 1209340416
+   }
+  },
+  {
+   "case": {
+    "adam": "selective",
+    "n": 1000000
+   },
+   "figures": {
+    "step_s": 0.0006809601783752447,
+    "first_call_s": 0.05119167099473998,
+    "repetitions": 50,
+    "peak_allocated_bytes": 1028630528,
+    "visible_fraction": 0.173
+   }
+  },
+  {
+   "case": {
+    "adam": "fused",
+    "n": 3000000
+   },
+   "figures": {
+    "step_s": 0.006066177368164061,
+    "first_call_s": 0.006146326006273739,
+    "repetitions": 50,
+    "peak_allocated_bytes": 3075045888
+   }
+  },
+  {
+   "case": {
+    "adam": "foreach",
+    "n": 3000000
+   },
+   "figures": {
+    "step_s": 0.013638626098632811,
+    "first_call_s": 0.01376254900242202,
+    "repetitions": 50,
+    "peak_allocated_bytes": 3615074304
+   }
+  },
+  {
+   "case": {
+    "adam": "selective",
+    "n": 3000000
+   },
+   "figures": {
+    "step_s": 0.0020183033943176262,
+    "first_call_s": 0.002067323002847843,
+    "repetitions": 50,
+    "peak_allocated_bytes": 3075041280,
+    "visible_fraction": 0.17
+   }
+  },
+  {
+   "case": {
+    "n": 1000000
+   },
+   "figures": {
+    "fused_over_foreach": 0.45644800098442234
+   }
+  },
+  {
+   "case": {
+    "n": 3000000
+   },
+   "figures": {
+    "fused_over_foreach": 0.44477921194512093
+   }
+  }
+ ],
+ "budgets": [
+  {
+   "case": {
+    "n": 1000000
+   },
+   "figure": "fused_over_foreach",
+   "limit": 1.0,
+   "value": 0.45644800098442234,
+   "pass": true,
+   "kind": "budget"
+  },
+  {
+   "case": {
+    "n": 3000000
+   },
+   "figure": "fused_over_foreach",
+   "limit": 1.0,
+   "value": 0.44477921194512093,
+   "pass": true,
+   "kind": "budget"
+  }
+ ]
+}
