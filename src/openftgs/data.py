@@ -8,6 +8,7 @@ Spec: §1.4, D-51, D-61, D-69. Band: Foundation (§2.1).
 
 import concurrent.futures
 import contextlib
+import functools
 import gzip
 import hashlib
 import importlib.metadata
@@ -21,9 +22,10 @@ import shutil
 import subprocess
 import tarfile
 import threading
+import time
 import zlib
 from collections import deque
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Literal
@@ -36,6 +38,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import Tensor
 
+from openftgs._stages import recorder, stage
 from openftgs.io import read_scene_manifest, write_scene_manifest
 from openftgs.types import Camera, ImageRecord, SceneManifest, TimeNormalizer, frame_interval
 
@@ -689,10 +692,11 @@ def _read_exactly(stream: IO[bytes], size: int) -> bytes:
 
 
 def _decode(
-    command: list[str], info: _VideoInfo, count: int, video: Path
+    command: list[str], info: _VideoInfo, count: int, video: Path, *, camera: str
 ) -> Generator[np.ndarray, None, None]:
-    """The frames ffmpeg writes, exactly W·H·3 bytes each (§1.4). Q-93: a short read, a
-    nonzero exit or any message at `-v error` is a ValueError."""
+    """The frames ffmpeg writes, exactly W·H·3 bytes each (§1.4), each read as the stage
+    "convert.decode" keyed by `camera` (§3.4 B-8). Q-93: a short read, a nonzero exit or any
+    message at `-v error` is a ValueError."""
     size = info.width * info.height * 3
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert process.stdout is not None and process.stderr is not None
@@ -702,7 +706,8 @@ def _decode(
     read = 0
     try:
         while read < count:
-            data = _read_exactly(process.stdout, size)
+            with stage("convert.decode", key=camera):
+                data = _read_exactly(process.stdout, size)
             if len(data) < size:
                 break
             read += 1
@@ -734,25 +739,29 @@ def _write_frame(
     size: tuple[int, int],
     K: np.ndarray | None = None,
     dist: np.ndarray | None = None,
-) -> None:
+) -> float:
     """One output frame (a pool task): undistorted with K and dist in OpenCV's convention when
     they distort, resized to `size` by area averaging with one 8-bit rounding (Q-90), and
-    written as 8-bit RGB PNG."""
-    frame = source if isinstance(source, np.ndarray) else _read_rgb(Path(source))
-    width, height = size
-    resized = (frame.shape[1], frame.shape[0]) != (width, height)
-    if dist is not None and _coefficients(dist).any():
-        values = undistort_image(frame.astype(np.float64), K, dist)
-        if resized:
-            values = resize_area(values, width, height)
-        out = np.clip(np.rint(values), 0, 255).astype(np.uint8)
-    elif resized:
-        out = resize_area(frame, width, height)
-    else:
-        out = frame
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(np.ascontiguousarray(out), "RGB").save(target, compress_level=_PNG_LEVEL)
+    written as 8-bit RGB PNG. Returns the task's wall time in seconds, which the converter
+    records as the stage "convert.encode" (§3.4 B-8): the pool's process has no clock."""
+    began = time.perf_counter()
+    with stage("convert.encode"):
+        frame = source if isinstance(source, np.ndarray) else _read_rgb(Path(source))
+        width, height = size
+        resized = (frame.shape[1], frame.shape[0]) != (width, height)
+        if dist is not None and _coefficients(dist).any():
+            values = undistort_image(frame.astype(np.float64), K, dist)
+            if resized:
+                values = resize_area(values, width, height)
+            out = np.clip(np.rint(values), 0, 255).astype(np.uint8)
+        elif resized:
+            out = resize_area(frame, width, height)
+        else:
+            out = frame
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.ascontiguousarray(out), "RGB").save(target, compress_level=_PNG_LEVEL)
+    return time.perf_counter() - began
 
 
 def _read_rgb(path: Path) -> np.ndarray:
@@ -792,6 +801,14 @@ def _worker_count(jobs: int) -> int:
     return jobs or max(1, (os.cpu_count() or 1) // 4)  # §2.4: one per four cores
 
 
+def _record_encoded(
+    encoded: Callable[[float], None], done: concurrent.futures.Future[float]
+) -> None:
+    """Record a pool task's wall time once it has finished without error (§3.4 B-8)."""
+    if not done.cancelled() and done.exception() is None:
+        encoded(done.result())
+
+
 def _run_jobs(
     camera_jobs: Sequence[_CameraJob], tools: _Tools | None, *, hwaccel: str, workers: int
 ) -> dict[str, list[str]]:
@@ -807,8 +824,11 @@ def _run_jobs(
     ) as pool:
 
         def submit(
-            source: np.ndarray | str, job: _CameraJob, k: int
-        ) -> concurrent.futures.Future[None]:
+            source: np.ndarray | str,
+            job: _CameraJob,
+            k: int,
+            encoded: Callable[[float], None] | None,
+        ) -> concurrent.futures.Future[float]:
             in_flight.acquire()
             try:
                 future = pool.submit(
@@ -818,9 +838,12 @@ def _run_jobs(
                 in_flight.release()
                 raise
             future.add_done_callback(lambda _: in_flight.release())
+            if encoded is not None:  # §3.4 B-8: the time the pool's process measured
+                future.add_done_callback(functools.partial(_record_encoded, encoded))
             return future
 
-        def camera(job: _CameraJob) -> list[concurrent.futures.Future[None]]:
+        def camera(job: _CameraJob) -> list[concurrent.futures.Future[float]]:
+            encoded = recorder("convert.encode", key=job.name)
             futures = []
             if job.video is not None:
                 assert tools is not None and job.info is not None
@@ -829,12 +852,13 @@ def _run_jobs(
                     tools, job.video, job.info, count=count, window=job.window, hwaccel=hwaccel
                 )
                 commands[job.name] = command
-                with contextlib.closing(_decode(command, job.info, count, job.video)) as frames:
+                decoded = _decode(command, job.info, count, job.video, camera=job.name)
+                with contextlib.closing(decoded) as frames:
                     for k, frame in enumerate(frames):
-                        futures.append(submit(frame, job, k))
+                        futures.append(submit(frame, job, k, encoded))
             else:
                 for k, image in enumerate(job.images):
-                    futures.append(submit(str(image), job, k))
+                    futures.append(submit(str(image), job, k, encoded))
             return futures
 
         with concurrent.futures.ThreadPoolExecutor(min(workers, len(camera_jobs)) or 1) as threads:
@@ -1957,7 +1981,7 @@ class Prefetcher:
             self._misses += 1  # read directly: not next in the schedule
             self._drop()
             self._plan.clear()
-            item = self._load(index)
+            item = self._load(index, ring=False)  # on the training thread: no wait (rule 3)
         image = self._finish(item)
         self._fill()
         return image
@@ -1972,7 +1996,7 @@ class Prefetcher:
             return
         while self._plan and len(self._pending) < self._depth:
             index = self._plan.popleft()
-            self._pending.append((index, self._executor.submit(self._load, index)))
+            self._pending.append((index, self._executor.submit(self._load, index, ring=True)))
 
     def _drop(self) -> None:
         while self._pending:
@@ -1980,6 +2004,8 @@ class Prefetcher:
             self._release(future.result())
 
     def _buffer(self, shape: tuple[int, ...]) -> Tensor:
+        """A buffer of the worker's ring, called on the worker thread only: waiting there for
+        the buffer's last copy keeps the wait off the training thread (§2.4 rule 3)."""
         with self._lock:
             free = self._free.get(shape)
             entry = free.pop() if free else None
@@ -1987,7 +2013,7 @@ class Prefetcher:
             return torch.empty(shape, dtype=torch.uint8, pin_memory=True)
         buffer, event = entry
         if event is not None:
-            event.synchronize()  # the buffer's last copy is done (on this worker, not the trainer)
+            event.synchronize()  # the buffer's last copy is done, on the worker thread
         return buffer
 
     def _release(self, item: tuple[Tensor, Any, Tensor | None]) -> None:
@@ -1996,18 +2022,28 @@ class Prefetcher:
             with self._lock:
                 self._free.setdefault(tuple(buffer.shape), []).append((buffer, event))
 
-    def _load(self, index: int) -> tuple[Tensor, Any, Tensor | None]:
+    def _load(self, index: int, *, ring: bool) -> tuple[Tensor, Any, Tensor | None]:
+        """Record `index`'s frame on the device, copied through a pinned buffer on the side
+        stream. `ring`: the worker's own ring of buffers, reused after waiting on their last
+        copy. Otherwise, on the training thread (`depth` 0, or a frame read out of order), a
+        fresh block of PyTorch's caching pinned allocator, dropped after the copy: the copy
+        records its event on the block, which the allocator reuses only once that event has
+        completed, checked without waiting, so the training thread never waits on the host
+        for an earlier copy (§2.4 rule 3). The bytes copied are the same either way."""
         frame = self._cache.frame(index)
         if frame.device == self._device or not self._cuda:
             return frame, None, None
         assert self._stream is not None
-        buffer = self._buffer(tuple(frame.shape))
+        shape = tuple(frame.shape)
+        buffer = (
+            self._buffer(shape) if ring else torch.empty(shape, dtype=torch.uint8, pin_memory=True)
+        )
         buffer.copy_(frame)
         with torch.cuda.stream(self._stream):
             on_device = buffer.to(self._device, non_blocking=True)
             event = torch.cuda.Event()  # type: ignore[no-untyped-call]
             event.record(self._stream)
-        return on_device, event, buffer
+        return on_device, event, buffer if ring else None
 
     def _finish(self, item: tuple[Tensor, Any, Tensor | None]) -> Tensor:
         frame, event, _ = item

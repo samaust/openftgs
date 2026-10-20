@@ -141,6 +141,23 @@ def test_io_imports_neither_model_nor_train() -> None:
         assert _openftgs_targets(path) & {"model", "train"} == set()
 
 
+def test_stage_module_imports_nothing_from_openftgs() -> None:
+    """PRD #220 (owner's decision): the stage instrumentation of §3.4 is a private top-level
+    module that every band may import, so it imports nothing from openftgs itself."""
+    path = PACKAGE_DIR / "_stages.py"
+    assert path.is_file()
+    assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
+
+
+def test_shard_module_imports_nothing_from_openftgs() -> None:
+    """PRD #220 (the plan's choice for D-54): the thread-per-device runner is a private
+    top-level module of the same kind as the stage instrumentation, shared by `init`, `render`
+    and `eval`, so it imports nothing from openftgs itself."""
+    path = PACKAGE_DIR / "_shards.py"
+    assert path.is_file()
+    assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
+
+
 def test_harness_never_imports_openftgs() -> None:
     offenders = [
         str(p.relative_to(ROOT))

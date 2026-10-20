@@ -14,8 +14,8 @@ import importlib
 import importlib.resources
 import json
 import math
-import queue
-import threading
+import pathlib
+import urllib.parse
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn, Protocol
@@ -26,6 +26,8 @@ from PIL import Image
 from scipy.spatial import cKDTree
 from torch import Tensor
 
+from openftgs import _shards
+from openftgs._stages import stage
 from openftgs.data import MultiViewVideo
 from openftgs.io import validate_init_points
 from openftgs.types import Camera, InitPoints
@@ -36,6 +38,7 @@ __all__ = [  # Q-106
     "knn_velocities",
     "roma_init",
     "roma_provenance",
+    "roma_weight_files",  # Q-198
     "triangulate_dlt",
 ]
 
@@ -129,6 +132,38 @@ def roma_provenance(cfg: RomaInitConfig) -> dict[str, str]:
     if cfg.model == "tiny_roma_v1_outdoor":
         record["xfeat_commit"] = _XFEAT_COMMIT
     return {"roma_init": json.dumps(record, separators=(",", ":"), sort_keys=True)}
+
+
+def _model_zoo() -> Any:
+    """The vendored RoMa's model zoo (D-65), imported only when RoMa is used; ImportError
+    without the [init] extra."""
+    return importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
+
+
+def _weight_urls(cfg: RomaInitConfig, zoo: Any) -> list[str]:
+    """The URLs of the checkpoints the default matcher loads for `cfg.model` (D-58), in load
+    order: RoMa's and DINOv2's for roma_outdoor, Tiny RoMa's for Tiny RoMa, whose XFeat is built
+    without weights (Q-123)."""
+    urls = zoo.weight_urls
+    if cfg.model == "roma_outdoor":
+        return [urls["romatch"]["outdoor"], urls["dinov2"]]
+    return [urls["tiny_roma_v1"]["outdoor"]]
+
+
+def roma_weight_files(cfg: RomaInitConfig) -> list[pathlib.Path]:  # Q-198
+    """The checkpoint files `roma_init` loads for `cfg` with its default matcher (D-58), where
+    torch.hub caches them: `torch.hub.get_dir()/checkpoints/`, each under its URL's file name,
+    in load order. `roma_init` downloads the ones missing; this only names them, downloading
+    and creating nothing. Tiny RoMa also fetches XFeat's code archive through torch.hub, which
+    holds no weights (Q-116, Q-123) and isn't listed. Raises ImportError without the [init]
+    extra, which the vendored RoMa needs (D-65)."""
+    _check_config(cfg)
+    folder = pathlib.Path(torch.hub.get_dir()) / "checkpoints"
+    names = [
+        pathlib.PurePosixPath(urllib.parse.urlparse(url).path).name
+        for url in _weight_urls(cfg, _model_zoo())
+    ]
+    return [folder / name for name in names]
 
 
 def _check_point_set(name: str, value: Tensor) -> None:
@@ -500,79 +535,24 @@ def _match_pair(
     dataset: MultiViewVideo,
     cfg: RomaInitConfig,
 ) -> _PairPoints:
-    """§1.3 steps 2–4 for one camera pair, on one shard."""
-    record_a, record_b = dataset.records[job.a], dataset.records[job.b]
-    image_a, image_b = dataset.load_image(job.a), dataset.load_image(job.b)
-    warp, certainty = _checked_matches(*matcher(image_a, image_b))
-    drawn = _draw(warp, certainty, cfg, job)
-    xa = _pixels(drawn[:, :2], record_a.camera)
-    xb = _pixels(drawn[:, 2:], record_b.camera)
-    X, keep = _triangulated(xa, xb, record_a.camera, record_b.camera, device)
-    # §1.3 step 3, D-22; Q-110: the color is the mean of the two source pixels.
-    colors = (_source_pixels(image_a, xa[keep]) + _source_pixels(image_b, xb[keep])) / 2
-    return _PairPoints(
-        positions=X[keep].to(torch.float32),  # Q-111: the values InitPoints stores
-        colors=colors,
-        timestamp=(float(record_a.timestamp) + float(record_b.timestamp)) / 2,  # step 4, D-47
-    )
-
-
-class _Shards:
-    """D-54, D-56; Q-106, Q-112: one thread and one dense matcher per `devices` entry, taking
-    jobs from a shared queue. Results come back keyed by `_Job.key`; a shard's exception is
-    raised in the caller's thread, after every shard has stopped."""
-
-    def __init__(
-        self,
-        jobs: Sequence[_Job],
-        matchers: Sequence[DenseMatcher],
-        devices: Sequence[torch.device],
-        work: Callable[[_Job, DenseMatcher, torch.device], _PairPoints],
-    ) -> None:
-        self._jobs: queue.SimpleQueue[_Job | None] = queue.SimpleQueue()
-        for job in jobs:
-            self._jobs.put(job)
-        for _ in matchers:
-            self._jobs.put(None)
-        self._results: queue.SimpleQueue[tuple[_Job, _PairPoints | BaseException]] = (
-            queue.SimpleQueue()
+    """§1.3 steps 2–4 for one camera pair, on one shard: the stage "init.match", keyed by the
+    shard's device, with the triangulation's stage inside it (§3.4 B-8)."""
+    with stage("init.match", key=str(device)):
+        record_a, record_b = dataset.records[job.a], dataset.records[job.b]
+        image_a, image_b = dataset.load_image(job.a), dataset.load_image(job.b)
+        warp, certainty = _checked_matches(*matcher(image_a, image_b))
+        drawn = _draw(warp, certainty, cfg, job)
+        xa = _pixels(drawn[:, :2], record_a.camera)
+        xb = _pixels(drawn[:, 2:], record_b.camera)
+        with stage("init.triangulate", key=str(device)):
+            X, keep = _triangulated(xa, xb, record_a.camera, record_b.camera, device)
+        # §1.3 step 3, D-22; Q-110: the color is the mean of the two source pixels.
+        colors = (_source_pixels(image_a, xa[keep]) + _source_pixels(image_b, xb[keep])) / 2
+        return _PairPoints(
+            positions=X[keep].to(torch.float32),  # Q-111: the values InitPoints stores
+            colors=colors,
+            timestamp=(float(record_a.timestamp) + float(record_b.timestamp)) / 2,  # D-47
         )
-        self._stop = threading.Event()
-        self._work = work
-        self._threads = [
-            threading.Thread(
-                target=self._serve, args=(matcher, device), name=f"roma_init shard {i}"
-            )
-            for i, (matcher, device) in enumerate(zip(matchers, devices, strict=True))
-        ]
-
-    def _serve(self, matcher: DenseMatcher, device: torch.device) -> None:
-        while not self._stop.is_set():
-            job = self._jobs.get()
-            if job is None:
-                return
-            try:
-                result: _PairPoints | BaseException = self._work(job, matcher, device)
-            except BaseException as error:  # noqa: BLE001 - raised again in the caller's thread
-                self._results.put((job, error))
-                return
-            self._results.put((job, result))
-
-    def __enter__(self) -> "_Shards":
-        for thread in self._threads:
-            thread.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._stop.set()
-        for thread in self._threads:
-            thread.join()
-
-    def next_result(self) -> tuple[_Job, _PairPoints]:
-        job, result = self._results.get()
-        if isinstance(result, BaseException):
-            raise result
-        return job, result
 
 
 @contextlib.contextmanager
@@ -605,17 +585,7 @@ def _devices(devices: Sequence[str] | None) -> list[torch.device]:
         if count == 0:
             _fail("devices is None and no CUDA device is visible; pass devices, e.g. ['cpu']")
         return [torch.device("cuda", i) for i in range(count)]
-    if isinstance(devices, str):  # Q-122: a string is a sequence of characters
-        _fail(f"devices must be a sequence of device names, got the string {devices!r}")
-    out = []
-    for entry in devices:
-        try:
-            out.append(torch.device(entry))
-        except (RuntimeError, TypeError) as error:
-            _fail(f"devices holds {entry!r}, which isn't a device: {error}")
-    if not out:
-        _fail("devices must name at least one device")
-    return out
+    return _shards.devices(devices)  # Q-122: a non-empty sequence of device names
 
 
 def _pil(image: Tensor) -> Image.Image:
@@ -661,12 +631,12 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
     """The default dense matcher per `cfg.model` (D-58), from the vendored RoMa (D-65), which
     is imported only here. The weights are fetched once, in the caller's thread, and every
     shard's model is built from them (Q-112)."""
-    zoo: Any = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
-    urls = zoo.weight_urls
+    zoo = _model_zoo()
+    urls = _weight_urls(cfg, zoo)  # the files roma_weight_files names (Q-198)
     fetch = torch.hub.load_state_dict_from_url
     if cfg.model == "roma_outdoor":
-        weights = fetch(urls["romatch"]["outdoor"], map_location="cpu")
-        dinov2_weights = fetch(urls["dinov2"], map_location="cpu")
+        weights = fetch(urls[0], map_location="cpu")
+        dinov2_weights = fetch(urls[1], map_location="cpu")
         use_custom_corr = _use_custom_corr()  # D-58, Q-112
 
         def build_roma(device: torch.device) -> DenseMatcher:
@@ -682,7 +652,7 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
             return _RomaMatcher(model, device)
 
         return build_roma
-    weights = fetch(urls["tiny_roma_v1"]["outdoor"], map_location="cpu")
+    weights = fetch(urls[0], map_location="cpu")
     # Q-116: XFeat at the commit whose license was read, not the repository's moving default.
     # torch.hub's validation accepts a commit only while it heads a branch or tag (it lists
     # them through GitHub's API; source log row 131), so Q-116's fallback applies: the
@@ -754,7 +724,8 @@ def roma_init(
     for keys in by_slot.values():
         keys.sort()  # Q-111: canonical pair order
 
-    def work(job: _Job, shard_matcher: DenseMatcher, device: torch.device) -> _PairPoints:
+    def work(shard: tuple[DenseMatcher, torch.device], job: _Job) -> _PairPoints:
+        shard_matcher, device = shard
         return _match_pair(job, shard_matcher, device, dataset, cfg)
 
     time = dataset.time
@@ -771,19 +742,23 @@ def roma_init(
             v = torch.zeros_like(frame.positions)
         else:  # E15, D-23; Q-111: against the other init frame's full set, dt from slot times
             dt = (other.k - frame.k) * frame_dt * unit
-            v = knn_velocities(frame.positions.to(e15_device), other.full.to(e15_device), dt)
+            with stage("init.knn"):  # §3.4 B-8, up to the copy back, which waits for it
+                v = knn_velocities(frame.positions.to(e15_device), other.full.to(e15_device), dt)
+                v = v.cpu()
         finished.append((dataclasses.replace(frame, full=frame.full.new_empty(0, 3)), v.cpu()))
 
     with _deterministic():
         build = matcher if matcher is not None else _roma_matchers(cfg)
-        matchers = [build(device) for device in shard_devices]
-        with _Shards(jobs, matchers, shard_devices, work) as shards:
+        # D-54, D-56; Q-106, Q-112: one thread and one dense matcher per `devices` entry, the
+        # matchers built here, one after another; results come back as pairs finish.
+        shards = [(build(device), device) for device in shard_devices]
+        with _shards.Shards(shards, jobs, work, name="roma_init shard") as running:
             results: dict[tuple[int, int, int], _PairPoints] = {}
             previous: _InitFrame | None = None  # the last init frame, not yet finished
             before: _InitFrame | None = None  # the init frame before it
             for k in slots:
                 while any(key not in results for key in by_slot[k]):
-                    job, result = shards.next_result()
+                    job, result = running.next_result()
                     results[job.key] = result
                 current = _init_frame(k, [results.pop(key) for key in by_slot[k]], cfg)
                 if current is None:  # no point survived at slot k: it has no init frame

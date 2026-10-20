@@ -16,6 +16,7 @@ from typing import Literal, NoReturn, get_args
 import torch
 from torch import Tensor
 
+from openftgs._stages import stage
 from openftgs.config import InitConfig, config_from_dict
 from openftgs.io import load_checkpoint, read_exchange, validate_exchange, validate_init_points
 from openftgs.motion import (
@@ -411,18 +412,22 @@ class FreeTimeGaussians(torch.nn.Module):
         (default: the model's degree; Q-20)."""
         degree = self.sh_degree if sh_degree is None else sh_degree
         degree = _check_sh_degree(degree, tuple(range(self.sh_degree + 1)))
-        s = temporal_slice(
-            self.means,
-            self.times,
-            self.log_durations,
-            self.velocities,
-            self.log_scales,
-            self.quats,
-            self.opacity_logits,
-            t,
-            impl=self._slice_impl,
-        )
-        sh = torch.cat([self.sh0, self.shN[:, : (degree + 1) ** 2 - 1]], dim=1)
+        # §3.4: the slice's stages wrap the call, never the compiled function's body (D-50).
+        with stage("slice"):
+            with stage("slice.kernel"):
+                s = temporal_slice(
+                    self.means,
+                    self.times,
+                    self.log_durations,
+                    self.velocities,
+                    self.log_scales,
+                    self.quats,
+                    self.opacity_logits,
+                    t,
+                    impl=self._slice_impl,
+                )
+            with stage("slice.sh_concat"):
+                sh = torch.cat([self.sh0, self.shN[:, : (degree + 1) ** 2 - 1]], dim=1)
         return GaussiansAtTime(
             means_t=s.means_t,
             opacities_t=s.opacities_t,

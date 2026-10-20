@@ -1,0 +1,244 @@
+{
+ "format": "ftgs-bench",
+ "version": 1,
+ "benchmark": "B-6",
+ "command": [
+  "ftgs",
+  "bench",
+  "data",
+  "/home/auss/datasets/openftgs-m15/ci-scene/scene-60.json",
+  "--out",
+  "/home/auss/datasets/openftgs-m15/bench/ci-1/B-6-data-60.json"
+ ],
+ "environment": {
+  "gpu": {
+   "name": "NVIDIA GeForce RTX 4090",
+   "count": 1
+  },
+  "driver": "595.99.02",
+  "cuda": "13.0",
+  "cudnn": 92400,
+  "torch": "2.14.1+cu130",
+  "gsplat": "1.5.3",
+  "fused_ssim": "1.0.0",
+  "python": "3.14.8",
+  "openftgs": "0.1.0.dev0",
+  "cpu": "12th Gen Intel(R) Core(TM) i9-12900",
+  "commit": "c3747016f77722d5a917c62c7eb6e2736b45ed4f",
+  "dirty": false
+ },
+ "scene": {
+  "path": "/home/auss/datasets/openftgs-m15/ci-scene/scene-60.json",
+  "sha256": "a8f26c1a386ba2154d6ef5884791d0f0872f566e72666b3bc21f6741c90eb3b2",
+  "cameras": 20,
+  "frames": 60,
+  "width": 1352,
+  "height": 1014
+ },
+ "date": "2026-10-20T00:21:36+00:00",
+ "setup": {
+  "model": "synthesized (Q-168, Q-181)",
+  "seed": 0,
+  "active_fraction": 0.2,
+  "cases": [
+   [
+    1000000,
+    "gpu",
+    null
+   ],
+   [
+    1000000,
+    "mmap",
+    8
+   ],
+   [
+    1000000,
+    "mmap",
+    0
+   ],
+   [
+    1000000,
+    "off",
+    null
+   ],
+   [
+    3000000,
+    "gpu",
+    null
+   ]
+  ],
+  "configuration": "B-1's (#226): the default, LPIPS-VGG included, except growth.start = reloc.start = 100, growth.n_max = \u23081.02\u00b7N\u2309 and optim.sh_interval = 1; with the case's perf.frame_cache and perf.prefetch",
+  "frame_cache": "built before timing",
+  "gpu": "measured where \"auto\" would place the cache on the GPU (Q-99): a trainer decoding PNGs runs one iteration first, and the free memory and growth are read after it",
+  "warmup": 120,
+  "timed": [
+   121,
+   320
+  ],
+  "host": [
+   321,
+   420
+  ],
+  "events": [
+   200,
+   300,
+   400
+  ],
+  "clock": "CUDA events (openftgs._stages) over timed; the wall clock over host",
+  "figure": "data_share: the data stage's mean over the iteration's, over the timed iterations without an event",
+  "share_limit": 0.01,
+  "memory_n": 3000000,
+  "skipped": []
+ },
+ "cases": [
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "gpu"
+   },
+   "figures": {
+    "data_share": 0.00035591023819539914,
+    "data_mean_s": 3.7230283107854855e-05,
+    "data_median_s": 3.710937500045475e-05,
+    "iteration_mean_s": 0.10460582223379303,
+    "iterations": 198,
+    "data_host_mean_s": 3.4120778295663044e-05,
+    "iteration_host_mean_s": 0.10265377283800685,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 11213012992,
+    "peak_reserved_bytes": 11607736320,
+    "auto_free_bytes": 23516079616,
+    "auto_growth_bytes": 20640000,
+    "auto_allocated_bytes": 835983872,
+    "auto_reserved_bytes": 6882852864,
+    "auto_total_bytes": 25249579008,
+    "auto_outside_bytes": 897515520,
+    "cache_bytes": 4688573760,
+    "auto_limit_bytes": 11737399808.0,
+    "beyond_estimate_bytes": 6062538688,
+    "margin_used": 0.515607940353726
+   }
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 8
+   },
+   "figures": {
+    "data_share": 0.00035320662922256794,
+    "data_mean_s": 3.6980445190981534e-05,
+    "data_median_s": 3.6865234374988676e-05,
+    "iteration_mean_s": 0.10469918209739731,
+    "iterations": 198,
+    "data_host_mean_s": 5.793852485819823e-05,
+    "iteration_host_mean_s": 0.10274615861705358,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 6547354112,
+    "peak_reserved_bytes": 6960447488
+   }
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 0
+   },
+   "figures": {
+    "data_share": 0.00043384361164794204,
+    "data_mean_s": 4.5391034904033026e-05,
+    "data_median_s": 3.6132812500255795e-05,
+    "iteration_mean_s": 0.10462533891329305,
+    "iterations": 198,
+    "data_host_mean_s": 0.00044791586873488444,
+    "iteration_host_mean_s": 0.10262844128333705,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 6513674240,
+    "peak_reserved_bytes": 6939475968
+   }
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "off"
+   },
+   "figures": {
+    "data_share": 0.019133468808873056,
+    "data_mean_s": 0.0020426988832045628,
+    "data_median_s": 0.0017568359375008669,
+    "iteration_mean_s": 0.10676050974391381,
+    "iterations": 198,
+    "data_host_mean_s": 0.0371550871509085,
+    "iteration_host_mean_s": 0.10517071605047959,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 6514557952,
+    "peak_reserved_bytes": 6918504448
+   }
+  },
+  {
+   "case": {
+    "n": 3000000,
+    "placement": "gpu"
+   },
+   "figures": {
+    "data_share": 0.00032759709691551235,
+    "data_mean_s": 3.784444168524327e-05,
+    "data_median_s": 3.784179687515987e-05,
+    "iteration_mean_s": 0.1155212974765872,
+    "iterations": 198,
+    "data_host_mean_s": 3.334063571534411e-05,
+    "iteration_host_mean_s": 0.11336325832352752,
+    "host_iterations": 99,
+    "peak_allocated_bytes": 12983686144,
+    "peak_reserved_bytes": 16353591296,
+    "auto_free_bytes": 21925996032,
+    "auto_growth_bytes": 61920000,
+    "auto_allocated_bytes": 2396707328,
+    "auto_reserved_bytes": 8216641536,
+    "auto_total_bytes": 25249579008,
+    "auto_outside_bytes": 926875648,
+    "cache_bytes": 4688573760,
+    "auto_limit_bytes": 10901078016.0,
+    "beyond_estimate_bytes": 9206390208,
+    "margin_used": 0.8397693947005819
+   }
+  }
+ ],
+ "budgets": [
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "gpu"
+   },
+   "figure": "data_share",
+   "limit": 0.01,
+   "value": 0.00035591023819539914,
+   "pass": true,
+   "kind": "budget"
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 8
+   },
+   "figure": "data_share",
+   "limit": 0.01,
+   "value": 0.00035320662922256794,
+   "pass": true,
+   "kind": "budget"
+  },
+  {
+   "case": {
+    "n": 1000000,
+    "placement": "mmap",
+    "prefetch": 0
+   },
+   "figure": "data_share",
+   "limit": 0.01,
+   "value": 0.00043384361164794204,
+   "pass": true,
+   "kind": "budget"
+  }
+ ]
+}

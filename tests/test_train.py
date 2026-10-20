@@ -43,6 +43,7 @@ from openftgs.config import (
 from openftgs.data import FrameCache, MultiViewVideo
 from openftgs.eval import METRIC_NAMES
 from openftgs.io import load_checkpoint, save_checkpoint
+from openftgs.losses import LPIPSLoss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer, _Sampler, calendar_entry
@@ -274,19 +275,25 @@ def test_the_ablation_turns_relocation_off(tmp_path: Path) -> None:
         Trainer(cfg, _scene(tmp_path), _init_points(), device="cpu")
 
 
-@pytest.mark.parametrize(
-    "perf",
-    [
-        PerfConfig(perc_precision="bf16"),
-        PerfConfig(images_per_step=2),
-    ],
-)
-def test_options_of_later_milestones_are_refused(tmp_path: Path, perf: PerfConfig) -> None:
-    """Q-73: bf16 LPIPS and several images per step (M15) fail at construction rather than
-    being ignored; the frame cache's placements arrived with M12 (Q-99)."""
+def test_several_images_per_step_are_refused_naming_two_gpus_and_l3(tmp_path: Path) -> None:
+    """Q-177 (owner's answer, 2026-10-19): multi-GPU training is deferred, so images_per_step
+    > 1 (D-54) still fails at construction rather than being ignored, and says why: the mode
+    needs two GPUs and must pass M16's L3 first. The frame cache's placements arrived with M12
+    (Q-99) and bf16 LPIPS with M15 (D-52, #228)."""
     video = _scene(tmp_path)
-    with pytest.raises(NotImplementedError):
-        Trainer(_no_perceptual(perf=perf), video, _init_points(), device="cpu")
+    with pytest.raises(NotImplementedError, match=r"two GPUs.*M16's L3"):
+        Trainer(
+            _no_perceptual(perf=PerfConfig(images_per_step=2)), video, _init_points(), device="cpu"
+        )
+
+
+def test_bf16_perceptual_precision_is_accepted(tmp_path: Path) -> None:
+    """D-52, Q-73's note (4): bf16 LPIPS is built in M15 (#228), so the trainer no longer refuses
+    it; without the perceptual term it trains as any other run."""
+    video = _scene(tmp_path)
+    cfg = _no_perceptual(perf=PerfConfig(perc_precision="bf16"))
+    trainer = Trainer(cfg, video, _init_points(), device="cpu")
+    assert _all_finite([trainer.step()])
 
 
 # Checkpoints and exact resume (U-21), determinism (U-24), stability (S-10).
@@ -741,6 +748,34 @@ def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_pat
         torch.set_float32_matmul_precision(matmul)
 
 
+# Q-173: B-4 left cuDNN autotuning off for training steps (Calibration data, #228).
+AUTOTUNING = False
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("caller", [False, True])
+def test_cudnn_autotuning_during_a_step_follows_b4_and_deterministic(
+    tmp_path: Path, deterministic: bool, caller: bool
+) -> None:
+    """D-52, Q-73, Q-173: during a training iteration's backward pass, cuDNN autotuning is off
+    under `deterministic`; otherwise it is on when B-4 turned it on, and else left as the caller
+    set it. Every flag is the caller's again after the step."""
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    try:
+        cudnn.benchmark = caller
+        perf = PerfConfig(deterministic=deterministic)
+        trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
+        seen: list[bool] = []
+        trainer.model.means.register_hook(lambda _: seen.append(cudnn.benchmark))  # type: ignore[no-untyped-call]
+        trainer.step()
+        expected = False if deterministic else (True if AUTOTUNING else caller)
+        assert seen == [expected]
+        assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (caller, *saved[1:])
+    finally:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+
+
 # Resuming another run's state (§2.2; Q-46, Q-69, Q-70, Q-72).
 
 
@@ -1029,6 +1064,84 @@ def test_training_with_the_perceptual_loss(tmp_path: Path) -> None:
     assert all(math.isfinite(float(log.losses["perceptual"])) for log in logs)
 
 
+def _step_with_gradients(trainer: Trainer) -> tuple[StepLog, dict[str, torch.Tensor]]:
+    """One training iteration, with the gradients its backward pass gives the model's stored
+    tensors, caught by hooks on them (the optimizer zeroes them before the step returns)."""
+    grads: dict[str, torch.Tensor] = {}
+    model = trainer.model
+    for name in model.PARAM_NAMES:
+        tensor = getattr(model, name)
+        tensor.register_hook(lambda g, name=name: grads.__setitem__(name, g.detach().clone()))
+    return trainer.step(), grads
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_a_bf16_step_gives_a_finite_perceptual_term_near_float32(
+    tmp_path: Path, device: str
+) -> None:
+    """D-52, Q-172 (#228): with perc_precision = "bf16" one training step runs LPIPS-VGG under
+    bfloat16 autocast; its perceptual term is finite and within 5e-2 relative of the float32
+    ("ieee") step from the same seed, which renders the same image, and the gradients that reach
+    the model are finite. bf16 is approximate (D-52), so the two terms differ."""
+    video = _scene(tmp_path)
+    terms, gradients = {}, {}
+    for precision in ("ieee", "bf16"):
+        cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
+        trainer = Trainer(cfg, video, _init_points(), device=device)
+        log, grads = _step_with_gradients(trainer)
+        terms[precision] = float(log.losses["perceptual"])
+        gradients[precision] = grads
+    assert math.isfinite(terms["bf16"]) and terms["ieee"] > 0.0
+    assert terms["bf16"] != terms["ieee"]
+    assert abs(terms["bf16"] - terms["ieee"]) <= 5e-2 * terms["ieee"]
+    assert "means" in gradients["bf16"]
+    assert all(bool(torch.isfinite(g).all()) for g in gradients["bf16"].values())
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_the_float32_perceptual_precisions_keep_a_plain_lpips_loss_bitwise(
+    tmp_path: Path, device: str, precision: Literal["ieee", "tf32"]
+) -> None:
+    """D-52, Q-172 (#228, PRD #220: "the float32 path is bitwise unchanged"): with
+    perc_precision "ieee" or "tf32" the network the trainer runs for the perceptual term is a
+    plain `LPIPSLoss`, not bf16's, and a training step's perceptual term equals, bitwise, a
+    direct call of a separately built `LPIPSLoss` on the same two images, made at the same
+    moment, so under the global flags the step sets (`cudnn.allow_tf32` per precision). The
+    images are caught by a global forward hook, PyTorch's public `register_module_forward_hook`."""
+    from torch.nn.modules.module import register_module_forward_hook
+
+    cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
+    trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device=device)
+    direct = LPIPSLoss(cfg.loss.perc_net).to(device)
+    seen: list[tuple[type, torch.Tensor, torch.Tensor]] = []
+    busy = False
+
+    def hook(module: torch.nn.Module, args: Any, output: Any) -> None:
+        nonlocal busy
+        if busy or not isinstance(module, LPIPSLoss):
+            return
+        busy = True  # the direct call below runs the same hook
+        try:
+            expected = direct(*(arg.detach().clone() for arg in args))
+        finally:
+            busy = False
+        seen.append((type(module), output.detach().clone(), expected.detach()))
+
+    handle = register_module_forward_hook(hook)
+    try:
+        log = trainer.step()
+    finally:
+        handle.remove()
+    assert len(seen) == 1
+    kind, term, expected = seen[0]
+    assert kind is LPIPSLoss
+    assert torch.equal(term, expected)
+    assert float(log.losses["perceptual"]) == float(expected)
+
+
 def _evaluation_scene(root: Path) -> MultiViewVideo:
     """64×48 cameras, so the masks' left halves (32 px) are usable dynamic regions (Q-61)."""
     cams = ring(3, radius=4.0, elevation=1.0, width_px=64, height_px=48, focal=60.0)
@@ -1226,3 +1339,47 @@ def test_u30_cuda_training_reads_from_each_placement(
     logs = _run(trainer)
     assert len(logs) == 30 and _all_finite(logs)
     assert FrameCache.default_directory(video.manifest).is_dir()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("placement", ["off", "auto"])
+def test_u30_cuda_png_path_gives_the_first_losses_of_the_gpu_cache_bitwise(
+    tmp_path: Path, placement: Literal["off", "auto"]
+) -> None:
+    """U-30 (GPU), D-51, §2.4 rule 3: on CUDA the PNG path ("off", and "auto" until its first
+    iteration has chosen a placement) stages each decoded image in pinned memory and copies it
+    without blocking. Its first iteration gives bitwise the loss terms of a first iteration
+    reading the cache in GPU memory, before any update could make the runs differ (gsplat's
+    backward pass accumulates with atomic additions)."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    first = [
+        Trainer(_with_cache(ONE_EVENT, cache), video, _u21_model(video), device="cuda").step()
+        for cache in (placement, "gpu")
+    ]
+    assert first[0].image_index == first[1].image_index
+    assert first[0].losses.keys() == first[1].losses.keys()
+    for name, value in first[0].losses.items():
+        assert torch.equal(value, first[1].losses[name]), name
+
+
+@pytest.mark.gpu
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+@pytest.mark.parametrize("placement", ["off", "auto"])
+def test__image_on_cuda_is_the_decoded_png_bitwise_and_never_synchronizes(
+    tmp_path: Path, placement: Literal["off", "auto"]
+) -> None:
+    """D-51, §2.4 rule 3: on the PNG path the trainer's CUDA image of every training record is
+    bitwise what `MultiViewVideo.load_image` decodes, and taking it makes no host–device
+    synchronization (torch's sync debug mode)."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    trainer = Trainer(_with_cache(ONE_EVENT, placement), video, _u21_model(video), device="cuda")
+    training = [i for i, record in enumerate(video.records) if record.split == "train"]
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        images = [trainer._image(index) for index in training]
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    for index, image in zip(training, images, strict=True):
+        assert image.device.type == "cuda"
+        assert torch.equal(image, video.load_image(index).cuda()), index

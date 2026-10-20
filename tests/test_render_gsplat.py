@@ -11,16 +11,23 @@ column u).
 """
 
 import math
+import sys
+import threading
 import warnings
 from typing import Any, Literal
 
 import pytest
 import torch
+import torch._dynamo
 from builders import (
     C0,
     CAM_A,
+    CAM_B,
     U8_CASES,
+    U32_BOUND_TIME,
+    U32_WIDTH,
     UNIT_TIME,
+    index_lookups,
     logit_of,
     model_from_rows,
     pinhole,
@@ -31,6 +38,9 @@ from builders import (
     sh0_for,
     sigmoid64,
     u8_scene,
+    u32_request,
+    u32_scene,
+    u32_times,
 )
 from render_margins import (
     boundary_margins,
@@ -38,11 +48,13 @@ from render_margins import (
     excluded_share,
     opacity_near_cull,
 )
+from sync_recorder import SyncRecorder, described, in_render_gsplat_stage
 from torch import Tensor
+from torch._dynamo.utils import counters
 
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render, render_request
-from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, TimeNormalizer
+from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders, TimeNormalizer
 
 pytestmark = pytest.mark.gpu
 
@@ -1013,31 +1025,33 @@ def _on_device(camera: Camera) -> Camera:
     )
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="the recorder needs sys.monitoring (Python 3.12)"
+)
 @LAYOUTS
 def test_render_synchronizes_only_inside_gsplat(packed: bool) -> None:
     """§2.4 rule 3, D-49, D-76: with cameras and background already on the device, a render
     (opacity cull inside the projection) synchronizes with the host only inside gsplat's own
-    calls: every synchronization torch's debug mode reports comes from gsplat's files, with the
-    default black background and with a given one. The debug mode is a prototype that misses some
-    synchronizations, so this pins only the ones it sees."""
+    calls: every synchronization torch's debug mode reports, as a Python warning or printed on
+    standard error (gsplat's tile intersection reads its count back only there;
+    `sync_recorder.py`), comes from one of `render`'s gsplat stage calls, on this thread, with
+    the default black background and with a given one. At least one is seen per render (the
+    tile intersection's), so the check can't pass on nothing. The debug mode is a prototype
+    that misses some synchronizations, so this pins only the ones it sees."""
     cameras = [_on_device(camera) for camera in _CAMERAS]
     model = _random_scene(7, min_rows=20)
     for background in (None, torch.tensor([0.25, 0.5, 0.75], device="cuda")):
         _gsplat(model, cameras, _T, background=background, packed=packed)
         torch.cuda.synchronize()
-        with warnings.catch_warnings(record=True) as records:
-            warnings.simplefilter("always")
-            torch.cuda.set_sync_debug_mode("warn")
-            try:
-                _gsplat(model, cameras, _T, background=background, packed=packed)
-            finally:
-                torch.cuda.set_sync_debug_mode(0)
-        sites = {
-            f"{record.filename}:{record.lineno}"
-            for record in records
-            if "synchronizing CUDA operation" in str(record.message)
-        }
-        assert all("/gsplat/" in site for site in sites), sites
+        with SyncRecorder() as recorder:
+            _gsplat(model, cameras, _T, background=background, packed=packed)
+        sites = recorder.syncs
+        assert sites, "the debug mode saw no synchronization in the render"
+        assert recorder.unattributed == 0
+        outside = [
+            s for s in sites if not in_render_gsplat_stage(s) or s.thread != threading.get_ident()
+        ]
+        assert not outside, described(outside, __file__)
 
 
 def test_render_request_on_gsplat_equals_render_per_item() -> None:
@@ -1066,3 +1080,186 @@ def test_render_request_on_gsplat_equals_render_per_item() -> None:
         assert out.rgb[item.id].device.type == "cpu"
         torch.testing.assert_close(out.rgb[item.id], single.image[0].cpu(), rtol=0.0, atol=1e-6)
         torch.testing.assert_close(out.alpha[item.id], single.alpha[0].cpu(), rtol=0.0, atol=1e-6)
+
+
+# U-32 · the temporal index on gsplat (D-55; Q-174, Q-13)
+
+
+def _assert_renders_close(a: Renders, b: Renders, atol: float) -> None:
+    assert list(a.rgb) == list(b.rgb)
+    for key in a.rgb:
+        torch.testing.assert_close(a.rgb[key], b.rgb[key], rtol=0.0, atol=atol, msg=key)
+        torch.testing.assert_close(a.alpha[key], b.alpha[key], rtol=0.0, atol=atol, msg=key)
+
+
+def test_u32_temporal_index_leaves_gsplat_renders_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """U-32 (GPU): a request rendered on gsplat with the temporal index forced on (buckets 1/29
+    wide, the gathered rows sliced with the model's implementation, "auto": compiled) and with it
+    off gives the same images and alpha within 1e-6, at 100 times that include 0, 1 and bucket
+    edges ±1 ulp, for a scene with long rows, rows with 255σ ≤ 1, and rows whose σ_eff is exactly
+    float32(1/255) at one of the times or one float32 ulp either side. Every row that passes the
+    opacity cull at a time, by the full slice, is among the rows the index passes then. If this
+    fails at the bound, Q-174's fallback is `_GSPLAT_FULL_SLICE`."""
+    model = _cuda(u32_scene())
+    times = u32_times()
+    request = u32_request(times, [CAM_A, CAM_B])
+    seen = index_lookups(monkeypatch)
+    on = render_request(model, request, backend="gsplat", temporal_index=True, frame_dt=U32_WIDTH)
+    off = render_request(model, request, backend="gsplat", temporal_index=False)
+    _assert_renders_close(on, off, 1e-6)
+    assert sorted(seen) == sorted(times)
+    with torch.no_grad():
+        for t, rows in seen.items():
+            passing = torch.nonzero(model.at_time(t).passes_cull).squeeze(1).cpu()
+            assert set(passing.tolist()) <= set(rows.tolist()), t
+        sigma = model.at_time(U32_BOUND_TIME).opacities_t.cpu()
+    assert min(len(rows) for rows in seen.values()) < model.num_gaussians
+    bound = torch.tensor(1.0 / 255.0, dtype=F32)
+    for value in (torch.nextafter(bound, -bound), bound, torch.nextafter(bound, 2 * bound)):
+        assert bool((sigma == value).any()), float(value)
+
+
+def test_render_request_through_small_buckets_stays_within_the_recompile_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-13, U-28, Q-174 (GPU): with the index on, renders whose selections hold 0, 1, 3 and 40
+    rows compile the temporal slice ("auto") at most 3 times, U-28's limit of 2 recompilations;
+    an empty selection runs no slice (dynamo would specialize zero rows); the "auto" slice never
+    falls back to eager, whose fallback would last for the process; the images match the
+    renders without the index within 1e-6."""
+    rows = [{"mean": (0.0, 0.0, 4.0), "time": 0.3, "log_duration": -6.0, "logit": 2.0}]
+    rows += [
+        {"mean": (0.05 * k - 1.0, 0.3, 5.0), "time": 0.7, "log_duration": -4.0, "logit": 1.0}
+        for k in range(40)
+    ]
+    rows += [
+        {"mean": (0.3 * k - 0.3, -0.5, 4.5), "time": 0.5, "log_duration": -5.0, "logit": 2.0}
+        for k in range(3)
+    ]
+    model = _cuda(model_from_rows(rows))
+    request = u32_request([0.1, 0.3, 0.7, 0.5, 0.66, 0.9], [CAM_A])
+    seen = index_lookups(monkeypatch)
+    torch._dynamo.reset()
+    counters.clear()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="torch.compile failed for the temporal slice")
+        on = render_request(model, request, backend="gsplat", temporal_index=True, frame_dt=0.05)
+    graphs = int(counters["stats"]["unique_graphs"])
+    assert {len(selection) for selection in seen.values()} == {0, 1, 3, 40}
+    assert graphs >= 1, "the compiled slice never ran"
+    assert graphs - 1 <= 2, f"{graphs - 1} recompilations"
+    off = render_request(model, request, backend="gsplat", temporal_index=False)
+    _assert_renders_close(on, off, 1e-6)
+
+
+def test_render_request_keeps_outputs_on_the_gpu_when_asked() -> None:
+    """Q-174 (GPU): device="cuda" leaves every output on the GPU, with the values the default
+    CPU outputs hold (within 1e-6, two gsplat runs), with and without the index."""
+    model = _cuda(u32_scene())
+    request = u32_request([0.2, 0.45, 0.8], [CAM_A, CAM_B])
+    for temporal_index in (False, True):
+        kw: dict[str, Any] = {"backend": "gsplat", "temporal_index": temporal_index}
+        on_gpu = render_request(model, request, device="cuda", **kw)
+        on_cpu = render_request(model, request, **kw)
+        for key in on_cpu.rgb:
+            assert on_gpu.rgb[key].device.type == "cuda" == on_gpu.alpha[key].device.type
+        moved = Renders(
+            rgb={k: v.cpu() for k, v in on_gpu.rgb.items()},
+            alpha={k: v.cpu() for k, v in on_gpu.alpha.items()},
+        )
+        _assert_renders_close(moved, on_cpu, 1e-6)
+
+
+def test__temporal_index_is_built_by_default_from_enough_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-174 (GPU), a private test of `render._TemporalIndex`: with temporal_index None, a
+    gsplat request with `_INDEX_MIN_TIMES` distinct times in [0, 1] builds the index once, and
+    a request at one time doesn't."""
+    import openftgs.render
+
+    built: list[int] = []
+    build = openftgs.render._TemporalIndex.__init__
+
+    def counted(self: Any, *args: Any, **kwargs: Any) -> None:
+        built.append(1)
+        build(self, *args, **kwargs)
+
+    monkeypatch.setattr(openftgs.render._TemporalIndex, "__init__", counted)
+    count = openftgs.render._INDEX_MIN_TIMES
+    times = [(k + 0.5) / count for k in range(count)]
+    model = _cuda(u32_scene())
+    render_request(model, u32_request(times[:1], [CAM_A, CAM_B]), backend="gsplat")
+    assert built == []
+    render_request(model, u32_request(times, [CAM_A]), backend="gsplat")
+    assert built == [1]
+
+
+def test__temporal_index_build_and_gsplat_are_a_gpu_requests_only_synchronizations() -> None:
+    """§2.4 rule 3, Q-174 (GPU), a private test that reads `render._TemporalIndex`'s source
+    lines: a request on gsplat with the index on and its outputs left on
+    the GPU, its cameras held on the host as a request file gives them, synchronizes with the
+    host only inside gsplat's calls and while the index is built: every synchronization torch's
+    debug mode reports comes from gsplat's files or from the index build. The debug mode is a
+    prototype that misses some synchronizations, so this pins only the ones it sees."""
+    import inspect
+
+    import openftgs.render
+
+    model = _cuda(u32_scene())
+    request = u32_request(u32_times()[:12], [CAM_A, CAM_B])
+    kw: dict[str, Any] = {
+        "backend": "gsplat",
+        "temporal_index": True,
+        "frame_dt": U32_WIDTH,
+        "device": "cuda",
+    }
+    render_request(model, request, **kw)  # compiles the slice for these sizes
+    torch.cuda.synchronize()
+    lines, first = inspect.getsourcelines(openftgs.render._TemporalIndex.__init__)
+    build = range(first, first + len(lines))
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            out = render_request(model, request, **kw)
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+    sites = {
+        (record.filename, record.lineno)
+        for record in records
+        if "synchronizing CUDA operation" in str(record.message)
+    }
+    in_build = {(f, n) for f, n in sites if f == openftgs.render.__file__ and n in build}
+    elsewhere = {f"{f}:{n}" for f, n in sites - in_build if "/gsplat/" not in f}
+    assert not elsewhere, elsewhere
+    assert in_build, "the debug mode saw no synchronization in the index build"
+    assert all(value.device.type == "cuda" for value in [*out.rgb.values(), *out.alpha.values()])
+
+
+# D-54's sharding of a render request (Q-175, Q-186)
+
+
+@pytest.mark.parametrize("temporal_index", [False, True])
+def test_render_request_sharded_on_one_gpu_matches_unsharded(temporal_index: bool) -> None:
+    """D-54 ("without changing results"), Q-175 (GPU): three shards on one GPU
+    (`devices=["cuda:0"] * 3`, shards simulated as U-33 simulates them) give the renders of
+    `devices=None` within 1e-6, two gsplat runs, in request order, with the temporal index on
+    and off. The "auto" slice, compiled per shard before the threads start, never falls back to
+    eager (Q-13)."""
+    model = _cuda(u32_scene())
+    request = u32_request(u32_times()[:24], [CAM_A, CAM_B])
+    kw: dict[str, Any] = {
+        "backend": "gsplat",
+        "temporal_index": temporal_index,
+        "frame_dt": U32_WIDTH,
+    }
+    unsharded = render_request(model, request, **kw)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="torch.compile failed for the temporal slice")
+        sharded = render_request(model, request, devices=["cuda:0"] * 3, **kw)
+    assert list(sharded.rgb) == [item.id for item in request.items]
+    assert all(value.device.type == "cpu" for value in sharded.rgb.values())
+    _assert_renders_close(sharded, unsharded, 1e-6)

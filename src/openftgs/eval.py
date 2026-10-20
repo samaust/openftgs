@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import threading
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from typing import Any, Literal
 import torch
 from torch import Tensor
 
+from openftgs import _shards
 from openftgs.data import MultiViewVideo
 from openftgs.losses import LPIPSLoss, ssim
 from openftgs.model import FreeTimeGaussians
@@ -60,16 +62,25 @@ _MASK_THRESHOLD = 0.5  # D-67: soft masks are binarized at 0.5; Q-61: 0.5 counts
 
 
 @contextlib.contextmanager
-def _metric_mode() -> Iterator[None]:
-    """D-52, §2.4 Precision: evaluation is a forward pass with plain float32 convolutions, so
-    cuDNN's TF32 flag is cleared, and restored on exit; inference mode, as for rendering."""
+def _tf32_off() -> Iterator[None]:
+    """D-52, §2.4 Precision: cuDNN's TF32 flag cleared, and restored on exit. The flag is one
+    for the whole process, so a sharded evaluation clears it once in the caller's thread around
+    the whole run: each metric's own save and restore in a worker thread then reads and writes
+    False only, and no thread can restore True while another computes (Q-175, Q-186)."""
     before = torch.backends.cudnn.allow_tf32
     torch.backends.cudnn.allow_tf32 = False
     try:
-        with torch.inference_mode():
-            yield
+        yield
     finally:
         torch.backends.cudnn.allow_tf32 = before
+
+
+@contextlib.contextmanager
+def _metric_mode() -> Iterator[None]:
+    """D-52, §2.4 Precision: evaluation is a forward pass with plain float32 convolutions, so
+    cuDNN's TF32 flag is cleared, and restored on exit; inference mode, as for rendering."""
+    with _tf32_off(), torch.inference_mode():
+        yield
 
 
 # Q-60: images are [..., H, W, 3] of one shape, floating dtype and device (Q-41); one value
@@ -259,6 +270,8 @@ def evaluate_images(
     backend: Literal["gsplat", "reference"] = "gsplat",
     background: tuple[float, float, float] = (0.0, 0.0, 0.0),
     renders: Mapping[int, Tensor] | None = None,
+    frame_dt: float | None = None,  # Q-183
+    devices: Sequence[str] | None = None,  # Q-175
 ) -> list[ImageMetrics]:
     """The metrics of every image of one data split (E16, D-67): each record rendered at its
     raw timestamp with the model's full SH degree and `background`, through `render_request`
@@ -266,11 +279,18 @@ def evaluate_images(
     time's renders are held at once, then evaluated by `evaluator` with the image's mask.
     Results come in the manifest's order. Given `renders`, a prediction [H, W, 3] for every
     record of the split by record index, nothing is rendered and those are scored (Q-137); one
-    that isn't finite is a ValueError.
+    that isn't finite is a ValueError. `frame_dt` goes to every render request as the temporal
+    index's bucket width (Q-174); with one timestamp per request the index stays off by default.
+
+    `devices` spreads the timestamps over shards, one per entry, each rendering and scoring on
+    its device with its own copy of the model and its own `Evaluator`, built by the public
+    constructor, in its own thread; `evaluator` is then not used. The results are unchanged
+    (D-54; Q-175, Q-186). None evaluates in the caller's thread.
 
     A render of the model that isn't finite, in its colors or its alpha, is not scored, nor is
     anything after it: once the whole data split is rendered, FloatingPointError names up to
     five such images (Q-129, Q-147)."""
+    shard_devices = None if devices is None else _shards.devices(devices)  # Q-186
     indices = [i for i, record in enumerate(dataset.records) if record.split == split]
     if not indices:
         raise ValueError(f"the data split {split!r} holds no images")
@@ -289,29 +309,32 @@ def evaluate_images(
     groups: dict[float, list[int]] = {}
     for i in indices:
         groups.setdefault(dataset.records[i].timestamp, []).append(i)
-    results: dict[int, ImageMetrics] = {}
-    broken = []
-    for timestamp, group in groups.items():
+    jobs = list(groups.items())
+    failed = threading.Event()  # Q-147: set by the first render that isn't finite
+
+    def evaluate(shard: _Shard, job: tuple[float, list[int]]) -> _Outcome:
+        timestamp, group = job
         if renders is None:
             items = tuple(RenderItem(str(i), timestamp, dataset.records[i].camera) for i in group)
             request = RenderRequest(
                 items, time_unit=dataset.manifest.time_unit, background=background
             )
-            rendered = render_request(model, request, backend=backend)
+            rendered = render_request(shard.model, request, backend=backend, frame_dt=frame_dt)
             predictions = {i: rendered.rgb[str(i)] for i in group}
             # Q-147: before E16's clamp, which would turn ±Inf into a plausible color.
-            broken += [
-                i for i in group if not _finite(rendered.rgb[str(i)], rendered.alpha[str(i)])
-            ]
+            broken = [i for i in group if not _finite(rendered.rgb[str(i)], rendered.alpha[str(i)])]
+            if broken:
+                failed.set()
         else:
-            predictions = {i: renders[i] for i in group}
+            predictions, broken = {i: renders[i] for i in group}, []
+        scored: dict[int, ImageMetrics] = {}
         for i in group:
-            if broken:  # Q-147: the data split fails, so nothing more is scored
+            if failed.is_set():  # Q-147: the data split fails, so nothing more is scored
                 continue
             record = dataset.records[i]
             mask = dataset.load_mask(i)
-            entire, dynamic = evaluator(predictions[i], dataset.load_image(i), mask=mask)
-            results[i] = ImageMetrics(
+            entire, dynamic = shard.evaluator(predictions[i], dataset.load_image(i), mask=mask)
+            scored[i] = ImageMetrics(
                 camera=record.camera.name,
                 timestamp=record.timestamp,
                 frame_index=record.frame_index,
@@ -320,12 +343,60 @@ def evaluate_images(
                 dynamic=dynamic,
                 masked=mask is not None,
             )
+        return _Outcome(scored, broken)
+
+    if shard_devices is None:
+        outcomes = [evaluate(_Shard(model, evaluator), job) for job in jobs]
+    else:
+        # D-54, Q-175: every shard is built, and its slice warmed up, here, one after another,
+        # before any worker thread starts; the TF32 flag is cleared once around the whole run.
+        shards = [_shard(model, d, renders is None) for d in shard_devices]
+        with _tf32_off():
+            outcomes = _shards.run(shards, jobs, evaluate, name="evaluate_images shard")
+    results = {i: m for outcome in outcomes for i, m in outcome.scored.items()}
+    broken = sorted(i for outcome in outcomes for i in outcome.broken)
     if broken:
-        names = _image_names(dataset, sorted(broken))
+        names = _image_names(dataset, broken)
         raise FloatingPointError(
             f"renders that aren't finite for {len(names)} image(s): {names[:5]}"
         )
     return [results[i] for i in indices]
+
+
+@dataclass(frozen=True)
+class _Shard:
+    """What one shard of an evaluation renders and scores with (D-54; Q-175)."""
+
+    model: FreeTimeGaussians
+    evaluator: Evaluator
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """One timestamp's results: the images scored, and those whose render isn't finite."""
+
+    scored: dict[int, ImageMetrics]
+    broken: list[int]
+
+
+def _shard(model: FreeTimeGaussians, device: torch.device, rendering: bool) -> _Shard:
+    """One shard of an evaluation (D-54; Q-175, Q-186): an `Evaluator` on `device` and, when
+    it renders, a copy of the model there, made with the public constructor and keeping its
+    `slice_impl` (Q-66), whose temporal slice has run once under inference mode, as its renders
+    run it: a request at one timestamp renders through `render()`, which slices every row. So
+    the compiled slice is compiled for the device here, in the caller's thread."""
+    copy = model
+    if rendering:
+        copy = FreeTimeGaussians(
+            {name: getattr(model, name).detach().to(device) for name in model.PARAM_NAMES},
+            sh_degree=model.sh_degree,
+            time=model.time,
+            time_unit=model.time_unit,
+        )
+        copy.slice_impl = model.slice_impl
+        with torch.inference_mode():
+            copy.at_time(0.0)
+    return _Shard(copy, Evaluator(device=device))
 
 
 def _image_names(dataset: MultiViewVideo, indices: Sequence[int]) -> list[str]:

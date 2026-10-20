@@ -7,7 +7,8 @@ Each command parses its options and calls the library; heavy imports happen insi
 commands, so `ftgs --help` stays fast and `ftgs train` can set environment variables before
 CUDA starts. The exit codes are §2.1's: 0 success, 2 invalid input or environment, 3 a
 numerical failure (Q-142); `ftgs train` stopped by a signal exits with 128 plus its number
-(Q-133). Any other exception is a bug and keeps its traceback (Q-26).
+(Q-133). Any other exception is a bug and keeps its traceback (Q-26). `ftgs bench` and its
+benchmarks are in the private module `_bench` (Q-166 to Q-168).
 """
 
 from __future__ import annotations
@@ -37,19 +38,6 @@ __all__ = ["main"]
 
 _INPUT = 2  # §2.1: invalid input or environment
 _NUMERIC = 3  # §2.1: a numerical failure (NaN or Inf)
-_STUB = 1  # Q-130: ftgs bench until M15
-
-_BENCHMARKS = (
-    "train-step",
-    "raster",
-    "slice",
-    "losses",
-    "adam",
-    "data",
-    "render",
-    "init",
-    "convert",
-)
 # Q-137: K and world_to_camera of a supplied render's item, relative (absolute near zero), so a
 # producer's own float32 rounding of pixel intrinsics still matches.
 _CAMERA_TOLERANCE = 1e-6
@@ -115,6 +103,20 @@ def _device() -> str:
 
 def _backend(device: str) -> Literal["gsplat", "reference"]:
     return "gsplat" if device == "cuda" else "reference"  # Q-69, Q-125
+
+
+def _shard_devices(device: str) -> list[str] | None:
+    """D-54, Q-175, Q-186: on CUDA with two or more visible CUDA devices, which
+    `CUDA_VISIBLE_DEVICES` restricts, every one of them, one shard each; None with one, or on
+    the CPU, which renders unsharded with no copy of the model."""
+    import torch
+
+    if device != "cuda":
+        return None
+    count = torch.cuda.device_count()
+    if count < 2:  # Q-186: one GPU shards nothing, so nothing is copied
+        return None
+    return [f"cuda:{k}" for k in range(count)]
 
 
 def _empty_or_absent(path: Path, what: str) -> None:
@@ -363,8 +365,8 @@ class _Signals:
 
 
 class _Profile:
-    """§3.4: a torch.profiler trace of iterations START … START + COUNT − 1 (NVTX ranges per
-    stage come with M15)."""
+    """§3.4: a torch.profiler trace of iterations START … START + COUNT − 1, in which every
+    stage of an iteration is a named range; the stages' NVTX ranges run with or without it."""
 
     def __init__(self, start: int, count: int, path: Path, device: str) -> None:
         import torch.profiler
@@ -379,8 +381,11 @@ class _Profile:
     def begin_if_due(self, iteration: int) -> None:
         """Start before iteration `iteration` + 1 when that is START."""
         if iteration + 1 == self._first and not self._running:
+            from openftgs._stages import set_profiling
+
             self._profiler.start()
             self._running = True
+            set_profiling(True)  # §3.4: the trace carries the stage names
 
     def step_done(self, iteration: int) -> None:
         """After iteration `iteration`: start before the window's first, finish after its
@@ -392,6 +397,9 @@ class _Profile:
     def finish(self) -> None:
         """Stop and write the trace, if the window has started (Q-144)."""
         if self._running:
+            from openftgs._stages import set_profiling
+
+            set_profiling(False)
             self._profiler.stop()
             self._running = False
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -638,6 +646,9 @@ class _Loaded:
     # Q-136 (as answered): an exchange model's file, or a checkpoint's manifest.json, which
     # holds every other file's SHA-256 (§2.2, Q-25); only when asked for
     sha256: str | None
+    # Q-174: a checkpoint's Δt_f in normalized time (E14), the temporal index's bucket width;
+    # an exchange model carries none
+    frame_dt: float | None = None
 
 
 def _model_sha256(path: Path) -> str:
@@ -701,7 +712,7 @@ def _read_model(path: Path, device: str) -> _Loaded:
         time=state.time,
         time_unit=state.time_unit,
     )
-    return _Loaded(model, state.iteration, cfg.background, None)
+    return _Loaded(model, state.iteration, cfg.background, None, frame_dt=state.frame_dt)
 
 
 def _render_device(backend: str) -> str:
@@ -737,7 +748,13 @@ def _render(args: argparse.Namespace) -> int:
             f"the request's sh_degree {request.sh_degree} is above the model's "
             f"{loaded.model.sh_degree}"
         )
-    renders = render_request(loaded.model, request, backend=args.backend)
+    renders = render_request(
+        loaded.model,
+        request,
+        backend=args.backend,
+        frame_dt=loaded.frame_dt,  # Q-174: a checkpoint's Δt_f is the index's bucket width
+        devices=_shard_devices(device),  # Q-175, Q-186
+    )
     bad = [i for i, rgb in renders.rgb.items() if not bool(torch.isfinite(rgb).all())]
     bad += [i for i, a in renders.alpha.items() if not bool(torch.isfinite(a).all())]
     if bad:  # Q-129
@@ -836,6 +853,8 @@ def _eval(args: argparse.Namespace) -> int:
             backend=_backend(device),
             background=loaded.background,
             renders=supplied,
+            frame_dt=loaded.frame_dt,  # Q-174, Q-183
+            devices=_shard_devices(device),  # Q-175, Q-186
         )
     except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; nothing is written
         _fail(str(error), _NUMERIC)
@@ -868,19 +887,6 @@ def _export(args: argparse.Namespace) -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)  # Q-142
         write_exchange(exchange, args.out)
     return 0
-
-
-# -- bench ---------------------------------------------------------------------------------------
-
-
-def _bench(args: argparse.Namespace) -> int:
-    _scene(args.scene)
-    print(
-        f"ftgs bench {args.benchmark}: the benchmarks of §3.4 arrive with milestone M15; "
-        "nothing was run or written",
-        file=sys.stderr,
-    )
-    return _STUB  # Q-130
 
 
 # -- parser --------------------------------------------------------------------------------------
@@ -970,12 +976,34 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, required=True, metavar="MODEL.safetensors")
     p.set_defaults(run=_export)
 
-    p = commands.add_parser("bench", help="performance benchmarks (M15)")
-    p.add_argument("benchmark", choices=_BENCHMARKS)
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--out", type=Path, required=True, metavar="BENCH.json")
-    p.set_defaults(run=_bench)
+    from openftgs.cli import _bench  # the package is loaded by now; the module imports from it
+
+    _bench.add_parser(commands)
     return parser
+
+
+def _physical_cores() -> int:
+    """The distinct (package, core) pairs of Linux's CPU topology; the logical CPUs where it
+    can't be read."""
+    cores: set[tuple[str, str]] = set()
+    try:
+        for topology in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology"):
+            package = (topology / "physical_package_id").read_text().strip()
+            cores.add((package, (topology / "core_id").read_text().strip()))
+    except OSError:
+        cores.clear()
+    return len(cores) or os.cpu_count() or 1
+
+
+# Q-176: §2.4 "Threads and processes", set at startup by the entry point (as Q-131 sets
+# CUBLAS_WORKSPACE_CONFIG); the library leaves the setting alone. After parsing, so --help stays
+# fast; PyTorch has already taken either variable, when set, at its own start.
+def _set_intra_op_threads() -> None:
+    if "OMP_NUM_THREADS" in os.environ or "MKL_NUM_THREADS" in os.environ:
+        return
+    import torch
+
+    torch.set_num_threads(_physical_cores())
 
 
 # Q-124: the module's one public name; the ftgs console script and `python -m openftgs.cli`.
@@ -986,6 +1014,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as stop:  # argparse: --help is 0, a usage error 2 (§2.1)
         return stop.code if isinstance(stop.code, int) else _INPUT
+    _set_intra_op_threads()
     try:
         code: int = args.run(args)
     except _Failure as failure:
@@ -994,7 +1023,3 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"warning: {note}", file=sys.stderr)
         return failure.code
     return code
-
-
-if __name__ == "__main__":
-    sys.exit(main())

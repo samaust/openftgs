@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from openftgs._stages import point, stage
 from openftgs.config import (
     PerfConfig,
     TrainConfig,
@@ -276,6 +277,11 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # Global PyTorch flags around a training iteration (Q-73).
 
+# Q-173: cuDNN autotuning during a training iteration that isn't deterministic, turned on only
+# when B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +4.3 % and
+# −1.0 % at its two sizes (Calibration data, #228).
+_AUTOTUNE = False
+
 
 @contextlib.contextmanager
 def _perf_flags(perf: PerfConfig) -> Iterator[None]:
@@ -289,7 +295,8 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
     )
     matmul = torch.get_float32_matmul_precision()
     try:
-        cudnn.allow_tf32 = perf.perc_precision == "tf32"  # D-52
+        # D-52; Q-172: under "bf16" the other convolutions (the SSIM fallback's) keep TF32.
+        cudnn.allow_tf32 = perf.perc_precision != "ieee"
         torch.set_float32_matmul_precision("highest")  # D-52: no TF32 in matrix products
         if perf.deterministic:
             # §2.4 Settings: autotuning off, deterministic kernels where PyTorch has them.
@@ -297,11 +304,33 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
             cudnn.benchmark = False
             cudnn.deterministic = True
             torch.use_deterministic_algorithms(True, warn_only=True)
+        elif _AUTOTUNE:
+            cudnn.benchmark = True  # Q-173; otherwise the flag stays the caller's (Q-73)
         yield
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
         torch.use_deterministic_algorithms(algorithms[0], warn_only=algorithms[1])
         torch.set_float32_matmul_precision(matmul)
+
+
+# Q-173: the training perceptual network's weights in channels-last memory, turned on only when
+# B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
+# at its two sizes (Calibration data, #228). Its inputs are channels-last already: `LPIPSLoss`
+# views a render's [..., H, W, 3] batch first.
+_CHANNELS_LAST_WEIGHTS = False
+
+
+# Q-172: autocast is local to the perceptual network, which only the trainer builds this way.
+class _Bf16LPIPSLoss(LPIPSLoss):
+    """D-52's approximate option, `perc_precision = "bf16"`: LPIPS with its network run under
+    bfloat16 autocast on the images' device, returning float32. The evaluator's networks stay
+    float32 (#228)."""
+
+    def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
+        # Q-191: on the CPU too; the network's own reductions as autocast leaves them.
+        with torch.autocast(pred.device.type, dtype=torch.bfloat16):
+            out = super().forward(pred, gt, map_inputs=map_inputs)
+        return out.float()
 
 
 def _check_ablation(cfg: TrainConfig) -> None:
@@ -316,11 +345,13 @@ def _check_ablation(cfg: TrainConfig) -> None:
 
 
 def _check_perf(perf: PerfConfig) -> None:
-    """Q-73: options later milestones build fail now rather than being ignored."""
-    if perf.perc_precision == "bf16":
-        raise NotImplementedError("perc_precision='bf16' (D-52) comes with M15")
+    """Q-73: an option that isn't built fails at construction rather than being ignored."""
     if perf.images_per_step != 1:
-        raise NotImplementedError("images_per_step > 1 (D-54) comes with M15")
+        # Q-177 (owner's answer): multi-GPU training is deferred.
+        raise NotImplementedError(
+            "images_per_step > 1 (D-54) is deferred: training on several GPUs needs at least "
+            "two GPUs, and must pass M16's L3 against single-GPU training before it is offered"
+        )
 
 
 def _bytes_per_row(model: FreeTimeGaussians) -> int:
@@ -481,10 +512,15 @@ class Trainer:
         )
         self._training = [i for i, r in enumerate(dataset.records) if r.split == "train"]
         self._background = torch.tensor(cfg.background, dtype=torch.float32, device=self._device)
-        # D-77: one perceptual network, built only when its weight is positive.
+        # D-77: one perceptual network, built only when its weight is positive; D-52: in bfloat16
+        # when asked (Q-172).
         self._perceptual: LPIPSLoss | None = None
         if cfg.loss.lambda_perc > 0.0:
-            self._perceptual = LPIPSLoss(cfg.loss.perc_net).to(self._device)
+            network = _Bf16LPIPSLoss if cfg.perf.perc_precision == "bf16" else LPIPSLoss
+            perceptual = network(cfg.loss.perc_net).to(self._device)
+            if _CHANNELS_LAST_WEIGHTS:  # Q-173
+                perceptual = perceptual.to(memory_format=torch.channels_last)
+            self._perceptual = perceptual
         self._evaluator: Evaluator | None = None
         self._frames: Prefetcher | None = None  # D-51: training images through the frame cache
         self._placement_pending = False
@@ -569,7 +605,13 @@ class Trainer:
         """Training image `index` on the device: from the frame cache when there is one, bitwise
         what `MultiViewVideo.load_image` decodes (D-51)."""
         if self._frames is None:
-            return self._dataset.load_image(index).to(self._device)
+            image = self._dataset.load_image(index)
+            if self._device.type != "cuda":
+                return image.to(self._device)
+            # §2.4 rule 3, D-51: a copy from pageable memory blocks the host, so the decoded image
+            # is staged in pinned memory and sent without blocking; PyTorch's pinned allocator
+            # keeps the staging block until the copy is done. The bytes are copied as they are.
+            return image.pin_memory().to(self._device, non_blocking=True)
         image = self._frames.take(index)
         self._schedule()
         return image
@@ -596,53 +638,66 @@ class Trainer:
         if it > cfg.optim.iterations:
             raise ValueError(f"the run is complete at iteration {run.iteration}")
         entry = calendar_entry(cfg, it)
-        with _perf_flags(cfg.perf), torch.enable_grad():
-            # Steps 1–2: the next image of the sampler, its normalized time and L_active.
-            index = run.sampler.next()
-            record = self._dataset.records[index]
-            gt = self._image(index)
-            t = float(run.time.to_t(record.timestamp))
-            # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
-            out = render(
-                run.model,
-                self._cameras[id(record.camera)],
-                t,
-                time_units="normalized",
-                sh_degree=entry.sh_degree,
-                background=self._background,
-                backend=self._backend,
-                return_aux=True,
-                precull=cfg.perf.precull,  # Q-31
-                packed=cfg.perf.packed,  # Q-36
-            )
-            # Step 4: E9.
-            loss, terms = total_loss(
-                out.image, gt[None], run.model, t, it, cfg.loss, perceptual=self._perceptual
-            )
-            # Step 5: backpropagate, then the gradient statistics (E10, D-12).
-            torch.autograd.backward(loss)
-            assert out.means2d is not None and out.visible is not None  # return_aux
-            grad = out.means2d.grad
-            if grad is not None:  # a check for None, not a synchronization
-                width, height = record.camera.width, record.camera.height
-                if out.gaussian_ids is not None:  # packed mode (Q-36)
-                    run.stats.update(
-                        grad, width=width, height=height, gaussian_ids=out.gaussian_ids
-                    )
-                else:
-                    run.stats.update(grad, width=width, height=height, visible=out.visible)
-            # Step 6: this iteration's rates and one Adam step.
-            rates = run.optimizer.set_iteration(it)
-            if cfg.perf.adam == "selective":
-                run.optimizer.step(visibility=out.visible.any(dim=0))
-            else:
-                run.optimizer.step()
-            run.optimizer.zero_grad()
-            # Step 7: the event.
-            growth, relocation, pruned = self._event(entry, it)
-        run.iteration = it
-        if self._placement_pending:
-            self._choose_placement()
+        # §3.4: the iteration's stages (B-1); the slice, rasterization and loss stages are
+        # render's, at_time's and total_loss's.
+        with stage("iteration"):
+            with _perf_flags(cfg.perf), torch.enable_grad():
+                # Steps 1–2: the next image of the sampler, its normalized time and L_active.
+                index = run.sampler.next()
+                record = self._dataset.records[index]
+                with stage("data"):
+                    gt = self._image(index)
+                t = float(run.time.to_t(record.timestamp))
+                # Step 3: the per-time arrays and the render, retaining the 2D means' gradient.
+                out = render(
+                    run.model,
+                    self._cameras[id(record.camera)],
+                    t,
+                    time_units="normalized",
+                    sh_degree=entry.sh_degree,
+                    background=self._background,
+                    backend=self._backend,
+                    return_aux=True,
+                    precull=cfg.perf.precull,  # Q-31
+                    packed=cfg.perf.packed,  # Q-36
+                )
+                # §3.4: with a stage clock active, the image's gradient marks where every loss's
+                # backward ends.
+                point(out.image, "backward.losses_done")
+                # Step 4: E9.
+                loss, terms = total_loss(
+                    out.image, gt[None], run.model, t, it, cfg.loss, perceptual=self._perceptual
+                )
+                # Step 5: backpropagate, then the gradient statistics (E10, D-12).
+                with stage("backward"):
+                    torch.autograd.backward(loss)
+                assert out.means2d is not None and out.visible is not None  # return_aux
+                with stage("statistics"):
+                    grad = out.means2d.grad
+                    if grad is not None:  # a check for None, not a synchronization
+                        width, height = record.camera.width, record.camera.height
+                        if out.gaussian_ids is not None:  # packed mode (Q-36)
+                            run.stats.update(
+                                grad, width=width, height=height, gaussian_ids=out.gaussian_ids
+                            )
+                        else:
+                            run.stats.update(grad, width=width, height=height, visible=out.visible)
+                # Step 6: this iteration's rates and one Adam step.
+                with stage("adam"):
+                    rates = run.optimizer.set_iteration(it)
+                    if cfg.perf.adam == "selective":
+                        run.optimizer.step(visibility=out.visible.any(dim=0))
+                    else:
+                        run.optimizer.step()
+                    run.optimizer.zero_grad()
+                # Step 7: the event.
+                with stage("events"):
+                    growth, relocation, pruned = self._event(entry, it)
+            run.iteration = it
+            if self._placement_pending:
+                self._choose_placement()
+            with stage("log"):
+                mean_losses = self._log(terms, it)
         return StepLog(
             iteration=it,
             image_index=index,
@@ -656,7 +711,7 @@ class Trainer:
             relocation=relocation,
             pruned=pruned,
             opacity_reset=entry.reset_opacity,
-            mean_losses=self._log(terms, it),
+            mean_losses=mean_losses,
         )
 
     def _check_valid(self, it: int) -> None:

@@ -170,6 +170,22 @@ def _compiled_slice() -> _SliceFn:
     return _compiled
 
 
+def _rows_dynamic(tensor: Tensor) -> Tensor:
+    """A view of `tensor` for the compiled slice: its rows dynamic, its other dims static.
+
+    Q-184: under `dynamic=True` dynamo makes every dim symbolic, the 3 of the means and the 4
+    of the quaternions too, and inductor then turns the quaternion norm over the last dim into
+    reduction kernels; with the row width static, the norm fuses into the pointwise kernels.
+    Only N changes at growth events, so this adds no recompilation, and the eager slice is
+    untouched: the compiled slice changes by rounding only (U-28)."""
+    import torch._dynamo  # loaded by torch.compile anyway
+
+    view = tensor.view_as(tensor)
+    for dim in range(1, view.dim()):
+        torch._dynamo.mark_static(view, dim)
+    return view
+
+
 def _compile_failures() -> tuple[type[Exception], ...]:
     """The exceptions Q-13 counts as a failed compilation: dynamo's and its backends' errors, and
     reaching the recompile limit, which is a plain Exception, not a dynamo one."""
@@ -201,18 +217,20 @@ def temporal_slice(
     same body through torch.compile with dynamic shapes and without graph breaks, raising if
     compilation fails; "auto" compiles on CUDA tensors and stays eager on CPU, falling back to
     eager with one warning if compilation fails, which includes reaching dynamo's recompile
-    limit; "cuda" is reserved for D-50's custom operator, which waits until B-1 justifies it
-    (M15).
+    limit; "cuda" is reserved for D-50's custom operator, which isn't built: B-1 put the slice
+    under 10% of an iteration (#226), so it raises NotImplementedError.
     """
     global _auto_fell_back
     if impl not in _IMPLS:
         raise ValueError(f"impl must be one of {_IMPLS}, got {impl!r}")
     if impl == "cuda":
-        # Q-13: D-50's custom CUDA operator is written only if B-1 shows the compiled slice above
-        # 10% of an iteration (M15).
+        # Q-13, D-50: the custom CUDA operator is written only if B-1 shows the slice above 10% of
+        # an iteration; on kitchen it took 1.2% at most (#226), so it isn't.
         raise NotImplementedError(
-            "the CUDA temporal slice is not built (D-50: it waits until B-1 justifies it, M15); "
-            "use impl='compiled' or 'eager'"
+            "the CUDA temporal slice is not built (D-50): B-1 measured the temporal slice at "
+            "1.2 % of a training iteration at most, under D-50's 10 % (§3.4 B-1 in the "
+            "Calibration data of docs/clean-room/questions.md, #226); use impl='compiled' or "
+            "'eager'"
         )
     args = (means, times, log_durations, velocities, log_scales, quats, opacity_logits)
     t_tensor = _as_time(t, times)
@@ -222,8 +240,9 @@ def temporal_slice(
         return TemporalSlice(*out)
     # D-50: dynamo gives nn.Parameter inputs static shapes, so a model's stored tensors would
     # recompile the slice at every growth event; views of them are plain tensors with dynamic
-    # shapes, and gradients still reach the parameters (#45, source log #37).
-    views = tuple(arg.view_as(arg) for arg in args)
+    # shapes, and gradients still reach the parameters (#45, source log #37). Q-184: only
+    # their rows are dynamic.
+    views = tuple(_rows_dynamic(arg) for arg in args)
     if impl == "compiled":
         out = _compiled_slice()(*views, t_tensor)
     else:

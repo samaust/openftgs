@@ -596,6 +596,32 @@ class _Unused:
         raise AssertionError("nothing should be evaluated")
 
 
+def test_evaluate_images_passes_frame_dt_to_every_render_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-183, Q-174: `frame_dt` reaches each of the split's render requests, one per
+    timestamp, as the temporal index's bucket width; None by default."""
+    video = _manifest(tmp_path)
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    seen: list[Any] = []
+
+    class _Stop(Exception):
+        pass
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("frame_dt", "absent"))
+        raise _Stop
+
+    monkeypatch.setattr("openftgs.eval.render_request", spy)
+    evaluator: Any = _Unused()
+    for frame_dt in (None, 0.04):
+        with pytest.raises(_Stop):
+            evaluate_images(model, video, evaluator, backend="reference", frame_dt=frame_dt)
+    with pytest.raises(_Stop):
+        evaluate_images(model, video, evaluator, backend="reference")
+    assert seen == [None, 0.04, None]
+
+
 def test_evaluate_images_needs_a_supplied_render_for_every_record(tmp_path: Path) -> None:
     """Q-137: supplied renders must cover every record of the split, which is checked before
     anything is rendered or evaluated."""
@@ -857,3 +883,126 @@ def test_evaluate_images_of_the_training_split(tmp_path: Path, evaluator: Evalua
     assert not any(m.masked for m in results)
     with pytest.raises(ValueError, match="split"):
         evaluate_images(model, video, evaluator, split="val", backend="reference")
+
+
+# D-54's sharding of an evaluation across devices (Q-175, Q-186).
+
+
+def _sharding_scene(root: Path) -> MultiViewVideo:
+    """Three 64×48 ring cameras over τ ∈ [0, 0.3]: ring00 trains; ring01 and ring02 are test
+    images at four timestamps listed out of time order, with masks whose left half is dynamic,
+    so the split has several timestamps to spread and its records' order isn't theirs."""
+    cams = ring(3, width_px=64, height_px=48, focal=60.0)
+    gt = random_model(12, seed=0, sh_degree=1, time=TimeNormalizer(0.0, 0.3), spread=0.5)
+    taus = (0.0, 0.1, 0.2, 0.3)
+    images = [(cams[0], tau, "train") for tau in taus]
+    images += [(cams[1 + k % 2], tau, "test") for k, tau in enumerate((0.2, 0.0, 0.3, 0.1))]
+    images += [(cams[2 - k % 2], tau, "test") for k, tau in enumerate((0.1, 0.3, 0.0, 0.2))]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, images, mask_tests=True))
+
+
+@pytest.mark.weights
+def test_evaluate_images_sharded_on_the_cpu_equals_unsharded(
+    tmp_path: Path, evaluator: Evaluator
+) -> None:
+    """D-54 ("without changing results"), Q-175: an evaluation spread over three shards on the
+    CPU (`devices=["cpu"] * 3`, each with its own model copy and Evaluator) gives exactly the
+    metrics of `devices=None`, entire and dynamic, in record order."""
+    video = _sharding_scene(tmp_path)
+    model = random_model(12, seed=1, sh_degree=1, time=video.time, spread=0.5)
+    unsharded = evaluate_images(model, video, evaluator, backend="reference")
+    sharded = evaluate_images(model, video, evaluator, backend="reference", devices=["cpu"] * 3)
+    assert len(unsharded) == 8 and all(m.dynamic is not None for m in unsharded)
+    assert sharded == unsharded
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_evaluate_images_sharded_on_one_gpu_equals_unsharded(tmp_path: Path) -> None:
+    """D-54 ("without changing results"), Q-175 (GPU): three shards on one GPU
+    (`devices=["cuda:0"] * 3`, shards simulated as U-33 simulates them), each rendering on
+    gsplat with its own model copy and scoring with its own Evaluator, give metrics equal to
+    those of `devices=None`, in record order; the caller's TF32 flag is unchanged afterwards."""
+    video = _sharding_scene(tmp_path)
+    model = random_model(12, seed=1, sh_degree=1, time=video.time, spread=0.5).to("cuda")
+    evaluator = Evaluator(device="cuda")
+    before = torch.backends.cudnn.allow_tf32
+    unsharded = evaluate_images(model, video, evaluator, backend="gsplat")
+    sharded = evaluate_images(model, video, evaluator, backend="gsplat", devices=["cuda:0"] * 3)
+    assert torch.backends.cudnn.allow_tf32 is before
+    assert len(unsharded) == 8 and all(m.dynamic is not None for m in unsharded)
+    assert sharded == unsharded
+
+
+def test_sharded_evaluation_clears_tf32_once_and_restores_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-52, Q-175, Q-186: a sharded evaluation clears cuDNN's process-wide TF32 flag once,
+    in the caller's thread, around the whole run: the flag is already False whenever a shard's
+    Evaluator is called in its thread, before any metric's own save and restore, and the
+    caller's True is back afterwards, also when a render that isn't finite fails the data split
+    (Q-147). (The Evaluator is stood in for, so no LPIPS weights are needed.)"""
+    import threading
+
+    video = _sharding_scene(tmp_path)
+    model = random_model(12, seed=1, sh_degree=1, time=video.time, spread=0.5)
+    seen: list[tuple[str, bool]] = []
+
+    def build(self: Evaluator, *, device: str | torch.device = "cuda") -> None:
+        pass
+
+    def call(self: Evaluator, pred: Tensor, gt: Tensor, *, mask: Tensor | None = None) -> Any:
+        seen.append((threading.current_thread().name, torch.backends.cudnn.allow_tf32))
+        return dict.fromkeys(METRIC_NAMES, 0.0), None
+
+    monkeypatch.setattr(Evaluator, "__init__", build)
+    monkeypatch.setattr(Evaluator, "__call__", call)
+    kw: dict[str, Any] = {"backend": "reference", "devices": ["cpu"] * 3}
+    before = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+        results = evaluate_images(model, video, Evaluator(), **kw)
+        assert torch.backends.cudnn.allow_tf32 is True
+        _broken_renders(monkeypatch, "alpha", math.nan)
+        with pytest.raises(FloatingPointError):
+            evaluate_images(model, video, Evaluator(), **kw)
+        assert torch.backends.cudnn.allow_tf32 is True
+    finally:
+        torch.backends.cudnn.allow_tf32 = before
+    assert len(results) == len(seen) == 8
+    assert {flag for _, flag in seen} == {False}
+    assert {name for name, _ in seen} <= {f"evaluate_images shard {k}" for k in range(3)}
+
+
+def test_sharded_evaluation_names_the_renders_that_are_not_finite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-147, Q-186: spread over shards, a data split whose renders aren't finite raises the
+    FloatingPointError of an unsharded evaluation, naming the same first five images in the
+    manifest's order, whichever shard rendered them. (Nothing is scored, so the shards'
+    Evaluators are stood in for.)"""
+    video = _sharding_scene(tmp_path)
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    monkeypatch.setattr(Evaluator, "__init__", lambda self, **kwargs: None)
+    _broken_renders(monkeypatch, "rgb", math.nan)
+    evaluator: Any = _Unused()
+    messages = []
+    for devices in (None, ["cpu"] * 3):
+        with pytest.raises(FloatingPointError) as raised:
+            evaluate_images(model, video, evaluator, backend="reference", devices=devices)
+        messages.append(str(raised.value))
+    assert "8 image(s)" in messages[0]
+    assert messages[1] == messages[0]
+
+
+@pytest.mark.parametrize(
+    "devices", ["cpu", [], ["not a device"]], ids=["string", "empty", "unknown"]
+)
+def test_evaluate_images_refuses_malformed_devices(tmp_path: Path, devices: Any) -> None:
+    """Q-186, as Q-122 for roma_init: `devices` is a non-empty sequence of device names;
+    anything else is a ValueError, before anything is rendered or scored."""
+    video = _manifest(tmp_path)
+    model = random_model(4, seed=1, sh_degree=0, time=video.time, spread=0.5)
+    evaluator: Any = _Unused()
+    with pytest.raises(ValueError, match="device"):
+        evaluate_images(model, video, evaluator, backend="reference", devices=devices)

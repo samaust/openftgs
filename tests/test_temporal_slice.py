@@ -3,9 +3,9 @@
 with few recompilations (§2.4 "Kernels", D-50; Q-12, Q-13, Q-15), on plain tensors and through
 FreeTimeGaussians.at_time on a model resized with resize_ (Q-23, #45).
 
-The CUDA implementation isn't built (D-50 waits for B-1, M15), so only eager and compiled are
-compared. "Relative" is the relative L2 error per tensor (Q-15). Recompilations are counted by
-dynamo's count of unique graphs, after a reset (Q-13).
+The CUDA implementation isn't built (D-50: B-1 put the slice under 10% of an iteration, #226),
+so only eager and compiled are compared. "Relative" is the relative L2 error per tensor (Q-15).
+Recompilations are counted by dynamo's count of unique graphs, after a reset (Q-13).
 """
 
 import warnings

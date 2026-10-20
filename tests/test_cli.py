@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,6 +43,7 @@ from builders import (
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from openftgs import _stages
 from openftgs.cli import main
 from openftgs.config import (
     GrowthConfig,
@@ -192,6 +194,53 @@ def test_python_m_runs_the_cli_and_reports_errors_without_a_traceback(tmp_path: 
     )
     assert bad.returncode == 2
     assert "ftgs bench: error:" in bad.stderr and "Traceback" not in bad.stderr
+
+
+def _physical_cores() -> int:
+    """§2.4's physical cores: the distinct sets of hardware threads that share a core."""
+    cores = {
+        p.read_text().strip()
+        for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology/core_cpus_list")
+    }
+    if not cores:
+        pytest.skip("needs Linux's CPU topology in /sys")
+    return len(cores)
+
+
+@pytest.fixture
+def _restore_threads() -> Iterator[None]:
+    """The intra-op thread count is process-wide, and parallel CPU reductions may round
+    differently with another count, so the bitwise tests after this one need it back."""
+    before = torch.get_num_threads()
+    yield
+    torch.set_num_threads(before)
+
+
+@pytest.mark.usefixtures("_restore_threads")
+@pytest.mark.parametrize("variable", [None, "OMP_NUM_THREADS", "MKL_NUM_THREADS"])
+def test_ftgs_sets_the_intra_op_threads_to_the_physical_cores_at_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variable: str | None,
+) -> None:
+    """§2.4 "Threads and processes", Q-176: a command sets PyTorch's intra-op threads to the
+    number of physical cores at startup, before it runs (here one that fails at once), unless
+    OMP_NUM_THREADS or MKL_NUM_THREADS is set: then the count PyTorch took from the variable
+    stands. --help runs no command and leaves the count alone."""
+    cores = _physical_cores()
+    other = cores + 1
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    if variable is not None:
+        monkeypatch.setenv(variable, str(other))
+    torch.set_num_threads(other)  # what PyTorch took from the variable, or another default
+    assert _ftgs("--help") == 0
+    assert torch.get_num_threads() == other
+    missing = tmp_path / "absent"
+    assert _ftgs("export", missing, "--format", "ftgs-if", "--out", tmp_path / "m") == 2
+    assert torch.get_num_threads() == (cores if variable is None else other)
+    capsys.readouterr()
 
 
 # ftgs train (§2.1; Q-131 to Q-135).
@@ -459,6 +508,55 @@ def test_profile_writes_a_trace_of_its_window(run: dict[str, Path], tmp_path: Pa
         )
 
 
+_TRAINING_STAGES = {
+    "iteration",
+    "data",
+    "slice",
+    "slice.kernel",
+    "slice.sh_concat",
+    "raster.forward",
+    "loss.l1",
+    "loss.ssim",
+    "loss.reg",
+    "backward",
+    "statistics",
+    "adam",
+    "events",
+    "log",
+}
+_GSPLAT_STAGES = {
+    "raster.forward.projection",
+    "raster.forward.sh",
+    "raster.forward.isect",
+    "raster.forward.rasterize",
+}
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        pytest.param(_TRAINING_STAGES, id="cpu"),
+        pytest.param(_TRAINING_STAGES | _GSPLAT_STAGES, id="gpu", marks=pytest.mark.gpu),
+    ],
+)
+def test_profile_trace_carries_the_stage_names(
+    run: dict[str, Path], tmp_path: Path, stages: set[str]
+) -> None:
+    """§3.4 (PRD #220): the profile window turns the stages' profiler ranges on, so the trace
+    names every stage of its iterations (λ_perc = 0 here, so no perceptual stage), once per
+    iteration of the window; they are off again after it."""
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", run["config"], "--profile", "3:2") == 0
+    events = json.loads((out / "profile" / "trace.json").read_text())["traceEvents"]
+    names = [event.get("name") for event in events]
+    assert stages <= set(names)
+    assert names.count("iteration") == 2
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        with _stages.stage("adam"):
+            pass
+    assert "adam" not in {event.name for event in prof.events()}
+
+
 def test_profile_window_starts_after_a_resumed_iteration(
     run: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -497,7 +595,8 @@ def test_train_refuses_invalid_inputs(
 ) -> None:
     """§2.1 exit code 2 (Q-142): a broken init file, an init file in another time unit, a missing
     scene, a non-empty run directory (Q-132), F·B > N_max (D-24, Q-128), and a configuration this
-    build can't run (bf16, until M15)."""
+    build can't run (`images_per_step > 1`, deferred with multi-GPU training, Q-177; bf16 was
+    one until M15 built it, Q-172)."""
     broken = tmp_path / "broken.safetensors"
     broken.write_bytes(b"not a safetensors file")
     assert _ftgs("train", run["scene"], "--init", broken, "--out", tmp_path / "a") == 2
@@ -517,8 +616,9 @@ def test_train_refuses_invalid_inputs(
     capsys.readouterr()
     assert _train(run, tmp_path / "d", "--config", budget) == 2
     assert "F·B" in capsys.readouterr().err  # D-24's own error
-    bf16 = _config_file(tmp_path / "bf16.json", _cfg(perf=PerfConfig(perc_precision="bf16")))
-    assert _train(run, tmp_path / "e", "--config", bf16) == 2
+    # Q-142: a configuration this build can't run; multi-GPU training is deferred (Q-177).
+    two = _config_file(tmp_path / "two.json", _cfg(perf=PerfConfig(images_per_step=2)))
+    assert _train(run, tmp_path / "e", "--config", two) == 2
 
 
 def test_divergence_is_exit_code_3_and_saves_nothing(
@@ -899,6 +999,139 @@ def test_render_answers_a_request(tmp_path: Path) -> None:
     assert renders.rgb["t9"].shape == (32, 48, 3)
     with safe_open(str(out), framework="pt") as f:
         assert f.metadata()["request_sha256"] == sha
+
+
+def _model_of_kind(tmp_path: Path, checkpoint: Path, kind: str) -> tuple[Path, float | None]:
+    """MODEL as the checkpoint itself or as its export, with the Δt_f it carries (normalized
+    time, E14), None for an exchange model, which carries none."""
+    if kind == "checkpoint":
+        frame_dt = load_checkpoint(checkpoint).frame_dt
+        assert 0.0 < frame_dt < 1.0
+        return checkpoint, frame_dt
+    exchange = tmp_path / "m.safetensors"
+    assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
+    return exchange, None
+
+
+@pytest.mark.parametrize("kind", ["checkpoint", "exchange"])
+def test_render_passes_a_checkpoints_frame_interval_as_the_bucket_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Q-174: ftgs render passes a checkpoint's Δt_f to render_request as the temporal index's
+    bucket width, and None for an exchange model."""
+    import openftgs.render
+
+    scene, checkpoint = _trained(tmp_path)
+    model, frame_dt = _model_of_kind(tmp_path, checkpoint, kind)
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
+    original = openftgs.render.render_request
+    seen: list[Any] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("frame_dt", "absent"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(openftgs.render, "render_request", spy)
+    out = tmp_path / "r.safetensors"
+    ref = ("--backend", "reference")
+    assert _ftgs("render", model, "--request", request, "--out", out, *ref) == 0
+    assert seen == [frame_dt]
+
+
+@pytest.mark.parametrize("kind", ["checkpoint", "exchange"])
+def test_eval_passes_a_checkpoints_frame_interval_as_the_bucket_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Q-174, Q-183: ftgs eval passes a checkpoint's Δt_f, through evaluate_images, to the
+    render request of each timestamp, and None for an exchange model. (The render here stops
+    the command, as a render that isn't finite does, before any metric needs LPIPS weights.)"""
+    import openftgs.eval
+
+    scene, checkpoint = _trained(tmp_path)
+    model, frame_dt = _model_of_kind(tmp_path, checkpoint, kind)
+    seen: list[Any] = []
+
+    def stopping(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("frame_dt", "absent"))
+        raise FloatingPointError("stopped by the test")
+
+    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", lambda self, **kwargs: None)
+    monkeypatch.setattr("openftgs.eval.render_request", stopping)
+    assert _ftgs("eval", model, scene, "--out", tmp_path / "m.json") == 3
+    assert seen == [frame_dt]
+
+
+def _visible_gpus(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
+    """Stands in for `count` visible CUDA devices, as `CUDA_VISIBLE_DEVICES` would leave them;
+    the model is still read onto the CPU, so nothing runs on a GPU."""
+    import openftgs.cli
+
+    read = openftgs.cli._read_model
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
+    monkeypatch.setattr(openftgs.cli, "_read_model", lambda path, device: read(path, "cpu"))
+
+
+@pytest.mark.parametrize(
+    ("count", "devices"),
+    [(1, None), (2, ["cuda:0", "cuda:1"]), (3, ["cuda:0", "cuda:1", "cuda:2"])],
+)
+def test_render_shards_only_over_two_or_more_visible_cuda_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int, devices: list[str] | None
+) -> None:
+    """D-54, Q-175, Q-186 (as answered): `ftgs render` with gsplat spreads the request over
+    the visible CUDA devices, `cuda:0` to `cuda:n−1`, with no option of its own, only when
+    n ≥ 2; with one it passes None, so the model isn't copied. `--backend reference` renders
+    on the CPU (Q-125), unsharded."""
+    import openftgs.render
+
+    scene, checkpoint = _trained(tmp_path)
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
+    original = openftgs.render.render_request
+    seen: list[Any] = []
+
+    def spy(model: FreeTimeGaussians, request: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("devices", "absent"))
+        return original(model, request, backend="reference")
+
+    monkeypatch.setattr(openftgs.render, "render_request", spy)
+    _visible_gpus(monkeypatch, count)
+    for backend in ("gsplat", "reference"):
+        out = tmp_path / f"{backend}.safetensors"
+        assert (
+            _ftgs("render", checkpoint, "--request", request, "--out", out, "--backend", backend)
+            == 0
+        )
+    assert seen == [devices, None]
+
+
+@pytest.mark.parametrize(
+    ("count", "devices"),
+    [(0, None), (1, None), (2, ["cuda:0", "cuda:1"]), (3, ["cuda:0", "cuda:1", "cuda:2"])],
+)
+def test_eval_shards_only_over_two_or_more_visible_cuda_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int, devices: list[str] | None
+) -> None:
+    """D-54, Q-175, Q-186 (as answered): `ftgs eval` on CUDA spreads the evaluation over the
+    visible CUDA devices, `cuda:0` to `cuda:n−1`, with no option of its own, only when n ≥ 2;
+    with one, or on the CPU (count 0: no CUDA), it passes None, so neither the model nor the
+    LPIPS networks are copied. (The evaluation here stops the command, as a render that isn't
+    finite does, before any metric needs LPIPS weights.)"""
+    import openftgs.eval
+
+    scene, checkpoint = _trained(tmp_path)
+    seen: list[Any] = []
+
+    def stopping(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("devices", "absent"))
+        raise FloatingPointError("stopped by the test")
+
+    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", lambda self, **kwargs: None)
+    monkeypatch.setattr(openftgs.eval, "evaluate_images", stopping)
+    if count:
+        _visible_gpus(monkeypatch, count)
+    assert _ftgs("eval", checkpoint, scene, "--out", tmp_path / "m.json") == 3
+    assert seen == [devices]
 
 
 def test_render_refuses_invalid_requests_and_the_default_backend_without_cuda(
@@ -1892,16 +2125,23 @@ def test_init_roma_writes_init_points_with_provenance(tmp_path: Path) -> None:
     assert provenance["points_per_frame"] == 200 and provenance["seed"] == 3
 
 
-# ftgs bench (Q-130).
+# ftgs bench (Q-166; Q-130, retired by #225; tests/test_bench.py has the benchmarks).
 
 
-def test_bench_is_a_stub_until_m15(run: dict[str, Path], tmp_path: Path) -> None:
-    """Q-130: it checks its arguments and the manifest, writes nothing and returns 1."""
+def test_bench_checks_its_arguments(
+    run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-166: an unknown benchmark, a missing manifest, and on this CPU-only view a benchmark
+    that needs CUDA, are exit 2. So is B-8's `convert`, which needs no CUDA, on a scene whose
+    manifest records no conversion to rerun (Q-169; #234 replaced Q-130's exit 1 here, and
+    #225 to #235 retired Q-130's stub for every subcommand)."""
     out = tmp_path / "bench.json"
-    assert _ftgs("bench", "train-step", run["scene"], "--out", out) == 1
-    assert not out.exists()
+    assert _ftgs("bench", "convert", run["scene"], "--out", out) == 2
+    assert "records no converter run" in capsys.readouterr().err
+    assert _ftgs("bench", "train-step", run["scene"], "--out", out) == 2
     assert _ftgs("bench", "warp", run["scene"], "--out", out) == 2
     assert _ftgs("bench", "raster", tmp_path / "none.json", "--out", out) == 2
+    assert not out.exists()
 
 
 # Single-file outputs are replaced atomically (Q-126 as answered; Q-25's temporary naming; #179).

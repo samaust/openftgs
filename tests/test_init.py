@@ -6,6 +6,7 @@ contracts of Q-106 to Q-112, Q-120 and Q-121, Q-122."""
 
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -27,6 +28,7 @@ from safetensors import safe_open
 from torch import Tensor
 
 import openftgs
+from openftgs import _stages
 from openftgs.config import InitConfig
 from openftgs.data import MultiViewVideo, convert_selfcap
 from openftgs.init import (
@@ -39,6 +41,7 @@ from openftgs.init import (
     knn_velocities,
     roma_init,
     roma_provenance,
+    roma_weight_files,
     triangulate_dlt,
 )
 from openftgs.io import read_init_points, validate_init_points, write_init_points
@@ -497,6 +500,50 @@ def test_roma_provenance_records_whether_local_corr_imports(
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout.splitlines()[-1])["use_custom_corr"] is expected
+
+
+# roma_weight_files (Q-198)
+
+_HAS_INIT_EXTRA = all(
+    importlib.util.find_spec(m) is not None for m in ("einops", "loguru", "torchvision")
+)
+
+
+@pytest.mark.skipif(not _HAS_INIT_EXTRA, reason="needs the [init] extra")
+@pytest.mark.parametrize(
+    ("model", "names"),
+    [
+        ("roma_outdoor", ["roma_outdoor.pth", "dinov2_vitl14_pretrain.pth"]),
+        ("tiny_roma_v1_outdoor", ["tiny_roma_v1_outdoor.pth"]),
+    ],
+)
+def test_roma_weight_files_names_the_checkpoints_in_torch_hubs_cache(
+    tmp_path: Path, model: str, names: list[str]
+) -> None:
+    """Q-198, D-58, Q-192: the checkpoint files `roma_init` loads for a configuration with
+    its default matcher, where torch.hub caches them: `get_dir()/checkpoints/` under their URLs'
+    file names (source log 178), RoMa's and DINOv2's for roma_outdoor, Tiny RoMa's alone for
+    Tiny RoMa, whose XFeat is built without weights (Q-123). Nothing is downloaded or made."""
+    hub = tmp_path / "hub"
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(hub))
+    try:
+        files = roma_weight_files(RomaInitConfig(model=model))  # type: ignore[arg-type]
+    finally:
+        torch.hub.set_dir(previous)
+    assert files == [hub / "checkpoints" / name for name in names]
+    assert not hub.exists()
+
+
+def test_roma_weight_files_without_the_init_extra_raises_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-198: the weight files come from the vendored RoMa, which needs the [init] extra;
+    without it (the vendored module made unimportable) the call is an ImportError, as
+    `roma_init`'s default matcher is (Q-142)."""
+    monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.model_zoo", None)
+    with pytest.raises(ImportError):
+        roma_weight_files(RomaInitConfig())
 
 
 def test_init_imports_without_the_vendored_roma() -> None:
@@ -1364,6 +1411,31 @@ def test_u33_shards_and_pair_order_give_bitwise_identical_init_points(tmp_path: 
     assert len(outputs[0].positions) == 4 * 50  # every slot holds more than B points
     assert _same(outputs[0], outputs[1])
     assert _same(outputs[0], outputs[2])
+
+
+def test_roma_init_runs_its_stages_on_the_wall_clock(tmp_path: Path) -> None:
+    """§3.4 B-8 (PRD #220): under a wall clock, each camera pair is the stage "init.match" in
+    its shard's thread, keyed by the shard's device, with its triangulation nested in it, and
+    each init frame's E15 search is the stage "init.knn" in the caller's thread."""
+    dataset = _rig_scene(tmp_path, [0.0, _FRAME, 2 * _FRAME])
+    with _stages.Clock("wall") as clock:
+        _run(dataset, _StandIn(dataset, points=_static()), ["cpu", "cpu"])
+    timings = clock.read()
+    matches = [t for t in timings if t.name == "init.match"]
+    assert len(matches) == 3  # one pair (A, B) per init frame
+    for match in matches:
+        assert match.key == "cpu" and match.thread.startswith("roma_init shard")
+        (triangulate,) = [
+            t
+            for t in timings
+            if t.name == "init.triangulate"
+            and t.thread == match.thread
+            and match.start <= t.start <= t.end <= match.end
+        ]
+        assert triangulate.key == "cpu"
+    assert len([t for t in timings if t.name == "init.triangulate"]) == 3
+    knn = [t for t in timings if t.name == "init.knn"]
+    assert len(knn) == 3 and {t.thread for t in knn} == {threading.current_thread().name}
 
 
 def test_roma_init_sets_the_deterministic_flags_for_the_call_and_restores_them(
