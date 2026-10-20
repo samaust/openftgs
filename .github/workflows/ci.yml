@@ -40,7 +40,7 @@ jobs:
           mypy
       - name: CPU tests
         if: matrix.job == 'test'
-        run: pytest -m "not gpu and not dataset and not weights"
+        run: pytest -n auto --dist loadgroup -m "not gpu and not dataset and not weights"
       - name: License scan (GPL, AGPL, non-commercial fail; others need a sign-off)
         if: matrix.job == 'licenses'
         run: python scripts/license_scan.py

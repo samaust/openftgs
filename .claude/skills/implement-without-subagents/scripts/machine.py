@@ -15,6 +15,7 @@ lives as long as the process that holds it: an entry whose process has died is i
         TORCHINDUCTOR_COMPILE_THREADS), every GPU with --gpu, or the whole machine at the
         default thread count with --exclusive, and exits with COMMAND's exit code. When that
         budget isn't free it exits 75 and prints the ledger, or with --wait takes its turn.
+        `pytest -n auto` divides --threads N among N/2 workers, two threads each (Q-214).
 
 Waiters start in arrival order: a run that fits starts at once unless a waiter ahead of it is
 short of a resource it would take. Each finished run goes into `history.jsonl` beside the
