@@ -132,7 +132,7 @@ Each shard gets its own copy of the model on its device, made with the public co
 
 The caller's thread builds the shards one after another before any worker starts, and runs each copy's temporal slice once, under inference mode, on each path the request's renders take: every row, as `render()` and the reference backend's index slice them, and, when gsplat slices the index's rows, a gathered copy of every row. So the compiled slice (Q-13) is compiled for each device by one thread at a time, and under "auto" a failed compilation warns from the caller's thread. Dynamo compiles a graph per device, and every graph counts toward the recompile limit of Q-13.
 
-On the reference backend, three shards on the CPU give bitwise the images of an unsharded request, which a test checks; on gsplat, three shards on one GPU agree with it within 1e-6, as two gsplat runs do. The runner is `openftgs._shards`, a private top-level module that imports nothing from openftgs, so `roma_init` and `evaluate_images` share it. `ftgs render` with gsplat passes every visible CUDA device (`docs/modules/cli/command-line.md`).
+On the reference backend, three shards on the CPU give bitwise the images of an unsharded request, which a test checks; on gsplat, three shards on one GPU agree with it within 1e-6, as two gsplat runs do. The runner is `openftgs._shards`, a private top-level module that imports nothing from openftgs, so `roma_init` and `evaluate_images` share it. `ftgs render` with gsplat passes every visible CUDA device when two or more are visible, and `devices=None` with one (Q-186; `docs/modules/cli/command-line.md`).
 
 ## Where the backends differ
 
