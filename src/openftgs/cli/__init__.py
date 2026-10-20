@@ -106,13 +106,17 @@ def _backend(device: str) -> Literal["gsplat", "reference"]:
 
 
 def _shard_devices(device: str) -> list[str] | None:
-    """D-54, Q-175, Q-186: on CUDA, every visible CUDA device, which `CUDA_VISIBLE_DEVICES`
-    restricts, one shard each; None on the CPU, which renders unsharded."""
+    """D-54, Q-175, Q-186: on CUDA with two or more visible CUDA devices, which
+    `CUDA_VISIBLE_DEVICES` restricts, every one of them, one shard each; None with one, or on
+    the CPU, which renders unsharded with no copy of the model."""
     import torch
 
     if device != "cuda":
         return None
-    return [f"cuda:{k}" for k in range(torch.cuda.device_count())]
+    count = torch.cuda.device_count()
+    if count < 2:  # Q-186: one GPU shards nothing, so nothing is copied
+        return None
+    return [f"cuda:{k}" for k in range(count)]
 
 
 def _empty_or_absent(path: Path, what: str) -> None:
@@ -749,7 +753,7 @@ def _render(args: argparse.Namespace) -> int:
         request,
         backend=args.backend,
         frame_dt=loaded.frame_dt,  # Q-174: a checkpoint's Δt_f is the index's bucket width
-        devices=_shard_devices(device),  # Q-175
+        devices=_shard_devices(device),  # Q-175, Q-186
     )
     bad = [i for i, rgb in renders.rgb.items() if not bool(torch.isfinite(rgb).all())]
     bad += [i for i, a in renders.alpha.items() if not bool(torch.isfinite(a).all())]
@@ -850,7 +854,7 @@ def _eval(args: argparse.Namespace) -> int:
             background=loaded.background,
             renders=supplied,
             frame_dt=loaded.frame_dt,  # Q-174, Q-183
-            devices=_shard_devices(device),  # Q-175
+            devices=_shard_devices(device),  # Q-175, Q-186
         )
     except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; nothing is written
         _fail(str(error), _NUMERIC)

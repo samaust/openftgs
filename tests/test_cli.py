@@ -1070,13 +1070,17 @@ def _visible_gpus(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
     monkeypatch.setattr(openftgs.cli, "_read_model", lambda path, device: read(path, "cpu"))
 
 
-@pytest.mark.parametrize("count", [1, 3])
-def test_render_passes_every_visible_cuda_device(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int
+@pytest.mark.parametrize(
+    ("count", "devices"),
+    [(1, None), (2, ["cuda:0", "cuda:1"]), (3, ["cuda:0", "cuda:1", "cuda:2"])],
+)
+def test_render_shards_only_over_two_or_more_visible_cuda_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int, devices: list[str] | None
 ) -> None:
-    """D-54, Q-175, Q-186: `ftgs render` with gsplat spreads the request over every visible
-    CUDA device, `cuda:0` to `cuda:n−1`, with no option of its own; `--backend reference`
-    renders on the CPU (Q-125), unsharded."""
+    """D-54, Q-175, Q-186 (as answered): `ftgs render` with gsplat spreads the request over
+    the visible CUDA devices, `cuda:0` to `cuda:n−1`, with no option of its own, only when
+    n ≥ 2; with one it passes None, so the model isn't copied. `--backend reference` renders
+    on the CPU (Q-125), unsharded."""
     import openftgs.render
 
     scene, checkpoint = _trained(tmp_path)
@@ -1096,17 +1100,21 @@ def test_render_passes_every_visible_cuda_device(
             _ftgs("render", checkpoint, "--request", request, "--out", out, "--backend", backend)
             == 0
         )
-    assert seen == [[f"cuda:{k}" for k in range(count)], None]
+    assert seen == [devices, None]
 
 
-@pytest.mark.parametrize("cuda", [False, True])
-def test_eval_passes_every_visible_cuda_device(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cuda: bool
+@pytest.mark.parametrize(
+    ("count", "devices"),
+    [(0, None), (1, None), (2, ["cuda:0", "cuda:1"]), (3, ["cuda:0", "cuda:1", "cuda:2"])],
+)
+def test_eval_shards_only_over_two_or_more_visible_cuda_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int, devices: list[str] | None
 ) -> None:
-    """D-54, Q-175, Q-186: `ftgs eval` on CUDA spreads the evaluation over every visible CUDA
-    device, `cuda:0` to `cuda:n−1`, with no option of its own; on the CPU it passes None. (The
-    evaluation here stops the command, as a render that isn't finite does, before any metric
-    needs LPIPS weights.)"""
+    """D-54, Q-175, Q-186 (as answered): `ftgs eval` on CUDA spreads the evaluation over the
+    visible CUDA devices, `cuda:0` to `cuda:n−1`, with no option of its own, only when n ≥ 2;
+    with one, or on the CPU (count 0: no CUDA), it passes None, so neither the model nor the
+    LPIPS networks are copied. (The evaluation here stops the command, as a render that isn't
+    finite does, before any metric needs LPIPS weights.)"""
     import openftgs.eval
 
     scene, checkpoint = _trained(tmp_path)
@@ -1118,10 +1126,10 @@ def test_eval_passes_every_visible_cuda_device(
 
     monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", lambda self, **kwargs: None)
     monkeypatch.setattr(openftgs.eval, "evaluate_images", stopping)
-    if cuda:
-        _visible_gpus(monkeypatch, 2)
+    if count:
+        _visible_gpus(monkeypatch, count)
     assert _ftgs("eval", checkpoint, scene, "--out", tmp_path / "m.json") == 3
-    assert seen == [["cuda:0", "cuda:1"] if cuda else None]
+    assert seen == [devices]
 
 
 def test_render_refuses_invalid_requests_and_the_default_backend_without_cuda(
@@ -2118,16 +2126,16 @@ def test_init_roma_writes_init_points_with_provenance(tmp_path: Path) -> None:
 # ftgs bench (Q-166; Q-130, retired by #225; tests/test_bench.py has the benchmarks).
 
 
-def test_bench_checks_its_arguments_and_waits_for_unbuilt_benchmarks(
+def test_bench_checks_its_arguments(
     run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Q-166: an unknown benchmark, a missing manifest, and on this CPU-only view a benchmark
-    that needs CUDA, are exit 2. A benchmark whose ticket hasn't landed (B-8's `convert`, #234,
-    needs no CUDA) keeps Q-130's behaviour until then: it says so, writes nothing and returns
-    1."""
+    that needs CUDA, are exit 2. So is B-8's `convert`, which needs no CUDA, on a scene whose
+    manifest records no conversion to rerun (Q-169; #234 replaced Q-130's exit 1 here, and
+    `tests/test_bench.py` checks that exit 1 for the benchmarks still unbuilt, on a GPU)."""
     out = tmp_path / "bench.json"
-    assert _ftgs("bench", "convert", run["scene"], "--out", out) == 1
-    assert "comes with #234" in capsys.readouterr().err
+    assert _ftgs("bench", "convert", run["scene"], "--out", out) == 2
+    assert "records no converter run" in capsys.readouterr().err
     assert _ftgs("bench", "train-step", run["scene"], "--out", out) == 2
     assert _ftgs("bench", "warp", run["scene"], "--out", out) == 2
     assert _ftgs("bench", "raster", tmp_path / "none.json", "--out", out) == 2

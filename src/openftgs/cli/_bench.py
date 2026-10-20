@@ -2,9 +2,9 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51. Q-166 (BENCH.json and
-the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-178 and Q-189 (B-6).
-docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-56, D-81. Q-166
+(BENCH.json and the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-178 and Q-189 (B-6),
+Q-169, Q-192 and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
@@ -27,7 +27,9 @@ import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -2096,6 +2098,285 @@ def _losses(ctx: _Context) -> _Result:
     return _Result(setup, cases)
 
 
+# -- B-8: initialization on the wall clock (§3.4, D-56, D-58; Q-106, Q-192) ---------------------
+
+
+def _roma_weights() -> list[Path]:
+    """Q-192: where torch.hub keeps the checkpoints `roma_init` loads with the default
+    RomaInitConfig, D-58's roma_outdoor: RoMa's and DINOv2's, each under its URL's file name in
+    `get_dir()/checkpoints` (source log 178). ImportError without the [init] extra, which the
+    vendored RoMa needs (D-65)."""
+    import torch
+
+    zoo: Any = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
+    urls = (zoo.weight_urls["romatch"]["outdoor"], zoo.weight_urls["dinov2"])
+    folder = Path(torch.hub.get_dir()) / "checkpoints"
+    return [folder / Path(urllib.parse.urlparse(url).path).name for url in urls]
+
+
+def _spread(values: Sequence[float]) -> dict[str, float]:
+    return {
+        "total_s": float(sum(values)),
+        "median_s": _median(values),
+        "min_s": float(min(values)),
+        "max_s": float(max(values)),
+    }
+
+
+def _init(ctx: _Context) -> _Result:
+    """B-8's initialization (§3.4, D-56): `roma_init` with the default RomaInitConfig on every
+    visible GPU (Q-106), once, under the wall clock: matching per pair and in total per GPU
+    (`init.match`, which holds the pair's two image reads and its triangulation), triangulation
+    per GPU (`init.triangulate`), the k-NN searches of E15 (`init.knn`), and the whole call. It
+    needs the [init] extra and RoMa's weights in torch.hub's cache, and never downloads them, so
+    no download is timed (Q-192)."""
+    import torch
+
+    from openftgs._stages import Clock
+    from openftgs.init import RomaInitConfig, roma_init, roma_provenance
+
+    try:
+        weights = _roma_weights()
+    except ImportError as error:  # Q-142, Q-166
+        _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
+    missing = [str(path) for path in weights if not path.is_file()]
+    if missing:  # Q-166, Q-192
+        _fail(
+            "bench init needs RoMa's weights in torch.hub's cache and doesn't download them; "
+            f"missing {', '.join(missing)} (one `ftgs init roma` run fetches them)"
+        )
+    cfg = RomaInitConfig()  # D-58's defaults (Q-192)
+    devices = [str(torch.device("cuda", i)) for i in range(torch.cuda.device_count())]  # Q-106
+    try:
+        with _as_input_error("bench init: RoMa initialization"), Clock("wall") as clock:
+            start = time.perf_counter()
+            points = roma_init(ctx.video, cfg)  # devices None: every visible GPU (Q-106)
+            wall = time.perf_counter() - start
+    except ImportError as error:  # Q-142: the [init] extra, found missing only now
+        _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
+    timings = clock.read()
+
+    def of(name: str) -> dict[str | None, list[Timing]]:
+        by_key: dict[str | None, list[Timing]] = {}
+        for t in timings:
+            if t.name == name:
+                by_key.setdefault(t.key, []).append(t)
+        return by_key
+
+    cases: list[dict[str, Any]] = []
+    matches, triangulations = of("init.match"), of("init.triangulate")
+    for device in sorted(k for k in matches if k is not None):
+        seconds = [t.seconds for t in matches[device]]
+        figures = {"pairs": len(seconds), **_spread(seconds)}
+        cases.append({"case": {"part": "init.match", "device": device}, "figures": figures})
+    for device in sorted(k for k in triangulations if k is not None):
+        seconds = [t.seconds for t in triangulations[device]]
+        figures = {"pairs": len(seconds), **_spread(seconds)}
+        cases.append({"case": {"part": "init.triangulate", "device": device}, "figures": figures})
+    searches = [t.seconds for found in of("init.knn").values() for t in found]
+    if searches:
+        figures = {"frames": len(searches), **_spread(searches)}
+        cases.append({"case": {"part": "init.knn"}, "figures": figures})
+    pairs = [t for found in matches.values() for t in found]
+    frames = 0 if points.frame_ids is None else int(torch.unique(points.frame_ids).numel())
+    whole = {
+        "wall_s": wall,
+        # Loading the weights and building a model per GPU, before the first pair starts.
+        "startup_s": min((t.start for t in pairs), default=wall),
+        "pairs": len(pairs),
+        "init_frames": frames,
+        "points": int(points.positions.shape[0]),
+    }
+    cases.append({"case": {"part": "roma_init"}, "figures": whole})
+    setup = {
+        "roma_init": json.loads(roma_provenance(cfg)["roma_init"]),  # Q-107's record
+        "devices": devices,
+        "weights": [str(path) for path in weights],
+        "repetitions": 1,
+        "clock": "wall: init.match per camera pair, keyed by its shard's device, with "
+        "init.triangulate inside it; init.knn per init frame",
+    }
+    return _Result(setup, cases)
+
+
+# -- B-8: conversion on the wall clock (§3.4, D-48, D-81; Q-169, Q-193) -------------------------
+
+# Q-193: B-8's scene is a Neural3DV one; selfcap's recorded `-i` paths are inside the
+# conversion's own work folder, which it removes, so they can never be found again.
+_RERUNS = ("n3dv",)
+
+
+@dataclass(frozen=True)
+class _RecordedConversion:
+    """What a manifest records of the conversion that made it (Q-169): the converter, the source
+    folder its ffmpeg commands read, and the options to run it with again."""
+
+    converter: str
+    source: Path
+    frames: Any
+    resize: Any
+    ffmpeg: str
+    ffprobe: str
+
+
+def _recorded_conversion(ctx: _Context) -> _RecordedConversion:
+    """Q-169: the converter and its options from the manifest's metadata, and the source from
+    the `-i` paths of its ffmpeg commands; exit 2, naming the path, when one isn't there."""
+    where = f"scene manifest {ctx.args.scene}"
+    metadata = ctx.video.manifest.metadata
+    converter = metadata.get("converter")
+    ffmpeg = metadata.get("ffmpeg")
+    commands = ffmpeg.get("commands") if isinstance(ffmpeg, dict) else None
+    if not isinstance(converter, str) or not isinstance(commands, dict) or not commands:
+        _fail(f"{where}: its metadata records no converter run with ffmpeg commands (Q-169)")
+    if converter not in _RERUNS:
+        _fail(
+            f"{where}: recorded by the {converter} converter; bench convert reruns "
+            f"{', '.join(_RERUNS)} conversions (B-8, Q-193)"
+        )
+    assert isinstance(ffmpeg, dict)
+    sources: list[Path] = []
+    for camera, command in commands.items():
+        if not isinstance(command, list) or "-i" not in command[:-1]:
+            _fail(f"{where}: the recorded ffmpeg command of {camera} has no -i path (Q-169)")
+        path = Path(str(command[command.index("-i") + 1]))
+        if not path.is_file():
+            _fail(f"source video {path} not found (the ffmpeg command recorded for {camera})")
+        sources.append(path)
+    folders = sorted({str(path.parent) for path in sources})
+    if len(folders) != 1:
+        _fail(f"{where}: the recorded ffmpeg commands read from {len(folders)} folders: {folders}")
+    for key in ("path", "ffprobe"):
+        if not isinstance(ffmpeg.get(key), str):
+            _fail(f"{where}: its metadata records no ffmpeg {key} (Q-169)")
+    return _RecordedConversion(
+        converter=converter,
+        source=Path(folders[0]).resolve(),
+        frames=metadata.get("frames"),
+        resize=metadata.get("resize"),
+        ffmpeg=ffmpeg["path"],
+        ffprobe=ffmpeg["ffprobe"],
+    )
+
+
+def _cuda_decoding(ffmpeg: str) -> str | None:
+    """Q-193: None when the recorded ffmpeg can be asked to decode with CUDA here, otherwise
+    why not: a CUDA device must be visible, and the build must list `cuda` among its hardware
+    acceleration methods (source log 179)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return "not run: no CUDA device is visible"
+    listed = _run(ffmpeg, "-hide_banner", "-hwaccels")
+    if listed is None:
+        return f"not run: {ffmpeg} -hwaccels failed"
+    if "cuda" not in [line.strip() for line in listed.splitlines()[1:]]:
+        return f"not run: {ffmpeg} lists no cuda hardware acceleration"
+    return None
+
+
+@dataclass(frozen=True)
+class _Conversion:
+    """One run of a converter: its call's wall time and the stages it recorded."""
+
+    wall: float
+    timings: list[Timing]
+
+
+def _conversion(recorded: _RecordedConversion, hwaccel: Literal["none", "cuda"]) -> _Conversion:
+    """The recorded converter, run once with `hwaccel` into a temporary directory that is
+    removed afterwards, under the wall clock (§3.4 B-8). A ValueError of the converter (a
+    missing ffmpeg, an unreadable source, a pixel format CUDA can't decode) propagates."""
+    from openftgs._stages import Clock
+    from openftgs.data import convert_n3dv
+
+    with tempfile.TemporaryDirectory(prefix="ftgs-bench-convert-") as folder:
+        with _output(f"the temporary conversion in {folder}"), Clock("wall") as clock:
+            start = time.perf_counter()
+            convert_n3dv(
+                recorded.source,
+                Path(folder) / "scene",
+                frames=recorded.frames,
+                resize=recorded.resize,
+                ffmpeg=recorded.ffmpeg,
+                ffprobe=recorded.ffprobe,
+                hwaccel=hwaccel,
+            )  # jobs: the converter's default; the manifest doesn't record it (Q-193)
+            wall = time.perf_counter() - start
+        return _Conversion(wall, clock.read())
+
+
+def _conversion_cases(hwaccel: str, run: _Conversion) -> list[dict[str, Any]]:
+    """Per camera: its frames, the sum of its frames' reads from ffmpeg (`convert.decode`) and
+    of their processing and writing in the pool (`convert.encode`, measured in the pool's
+    processes, so they overlap), and its wall time, from its first read to its last frame
+    written. In total: the converter's call on the wall clock, and the sums."""
+    decode: dict[str, list[Timing]] = {}
+    encode: dict[str, list[Timing]] = {}
+    for t in run.timings:
+        parts = {"convert.decode": decode, "convert.encode": encode}.get(t.name)
+        if parts is not None and t.key is not None:
+            parts.setdefault(t.key, []).append(t)
+    cases: list[dict[str, Any]] = []
+    for camera in sorted(set(decode) | set(encode)):
+        mine = decode.get(camera, []) + encode.get(camera, [])
+        figures = {
+            "frames": len(encode.get(camera, [])),
+            "wall_s": max(t.end for t in mine) - min(t.start for t in mine),
+            "decode_s": sum(t.seconds for t in decode.get(camera, [])),
+            "encode_s": sum(t.seconds for t in encode.get(camera, [])),
+        }
+        cases.append({"case": {"hwaccel": hwaccel, "camera": camera}, "figures": figures})
+    total = {
+        "cameras": len(cases),
+        "frames": sum(c["figures"]["frames"] for c in cases),
+        "wall_s": run.wall,
+        "decode_s": sum(c["figures"]["decode_s"] for c in cases),
+        "encode_s": sum(c["figures"]["encode_s"] for c in cases),
+    }
+    return cases + [{"case": {"hwaccel": hwaccel}, "figures": total}]
+
+
+def _convert(ctx: _Context) -> _Result:
+    """B-8's conversion (§3.4, D-48, D-81): the scene's recorded converter rerun from its
+    recorded source, once with `--hwaccel none` and once with `cuda` when the recorded ffmpeg
+    supports it here, each into a temporary directory; the wall time per camera and in total.
+    It runs once: there is nothing to warm up in a conversion (Q-193)."""
+    recorded = _recorded_conversion(ctx)
+    where = f"bench convert: the {recorded.converter} converter on {recorded.source}"
+    with _as_input_error(where):  # Q-142: the converters' input and environment errors
+        runs = {"none": _conversion(recorded, "none")}
+    skipped: dict[str, str] = {}
+    reason = _cuda_decoding(recorded.ffmpeg)
+    if reason is None:
+        try:
+            runs["cuda"] = _conversion(recorded, "cuda")
+        except ValueError as error:  # Q-193: the CPU's numbers stand; the refusal is noted
+            reason = f"failed: {error}"
+    if reason is not None:
+        skipped["cuda"] = reason
+    cases = [case for hwaccel, run in runs.items() for case in _conversion_cases(hwaccel, run)]
+    version = _run(recorded.ffmpeg, "-version")
+    setup = {
+        "converter": recorded.converter,
+        "source": str(recorded.source),
+        "frames": recorded.frames,
+        "resize": recorded.resize,
+        "ffmpeg": recorded.ffmpeg,
+        "ffprobe": recorded.ffprobe,
+        "ffmpeg_version": version.splitlines()[0] if version else None,
+        "jobs": 0,  # the converter's default, one decoding process per four cores (§2.4)
+        "cpus": os.cpu_count(),
+        "temporary": tempfile.gettempdir(),
+        "hwaccel": list(runs),
+        "skipped": skipped,
+        "repetitions": 1,
+        "clock": "wall: convert.decode per frame read from ffmpeg, convert.encode per frame "
+        "processed and written in the pool, keyed by camera",
+    }
+    return _Result(setup, cases)
+
+
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
@@ -2106,6 +2387,6 @@ _BENCHMARKS: dict[str, _Benchmark] = {
     "adam": _Benchmark("B-5", 229, _adam),
     "data": _Benchmark("B-6", 232, _data),
     "render": _Benchmark("B-7", 231, model=True),
-    "init": _Benchmark("B-8", 234),
-    "convert": _Benchmark("B-8", 234, cuda=False),
+    "init": _Benchmark("B-8", 234, _init),
+    "convert": _Benchmark("B-8", 234, _convert, cuda=False),
 }
