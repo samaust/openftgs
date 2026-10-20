@@ -38,7 +38,7 @@ The live set is tested on the stored logit against ô_dead (D-14). Every logit b
 
 U-13 compares `mcmc_split` with gsplat 1.5.3's `compute_relocation`, a float32 kernel, over live targets and every n E11 allows, as U-13's row asks. Away from the clamp the two agree far inside U-13's bound; where σ_new falls below the dead threshold, so that only a_new is kept, the difference grows to just under the bound, from float32 cancellation in the kernel's evaluation of σ_new, not from the float64 path (source log #60, #62, #63). That is where a later move of the gsplat pin would show first.
 
-Note for M16: `mcmc_split` applies only the upper bound of E11's clamp, so the harness adapter's answer to the L2 `relocation_math` query must apply D-14's lower bound to σ_new itself (Q-50).
+The harness adapter's answer to the L2 `relocation_math` query applies D-14's lower bound to σ_new itself, since `mcmc_split` applies only the upper bound of E11's clamp (Q-50; `docs/modules/cli/adapter.md`).
 
 The clamp has two halves. `mcmc_split` applies the upper bound. The lower bound is D-14's and is applied by the callers to the stored float32 logit, as a floor at ô_dead from the configuration: only a bound on the stored logit guarantees that every relocated row is live, since sigmoid(ô_dead) rounds below the threshold in float32 (Q-50).
 
@@ -71,3 +71,7 @@ Writing in place keeps the parameters' identity, so the optimizer keeps its refe
 | `relocate`, `grow`, `prune` | events | yes, by design: the number of dead rows, candidates and targets sizes the draws and the gathers, `validate()` reads values, and the reports hold Python ints. Events synchronize anyway (§2.4 rule 3) |
 
 Draws on a CPU generator are copied to the model's device at the event, after the scores are copied to the CPU. B-1 measured that copy on kitchen's GPU (#226, Q-72 note 5): 0.27 ms at 0.51M rows, 0.52 ms at 1.02M and 1.5 ms at 3.06M, the median of 50, against 22 ms that an event iteration adds at 3M rows. Over the default calendar's 246 events that is under 0.4 s of a run bounded at 3,462 s, so the relocation generator stays on the CPU: Q-72 note 5 moves it to the GPU only if the copy matters, and then as a decision change, since it changes the draws. `bincount` is not used, because on CUDA it reads its maximum back; counts go through `index_add_`, which torch runs deterministically under its deterministic mode (source log #58).
+
+## The draw of targets
+
+`draw_targets(scores, count, *, generator)` is D-15's multinomial draw with replacement, public so that the harness's `relocation_sampling` query tests the draw `relocate` makes (Q-204). `relocate` calls it with the relocation generator; the same generator state gives the same targets.

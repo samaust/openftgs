@@ -23,7 +23,7 @@ from openftgs import _shards
 from openftgs._stages import point, stage
 from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
 from openftgs.motion import temporal_slice
-from openftgs.sh import sh_basis
+from openftgs.sh import sh_to_color
 from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders
 
 __all__ = ["render", "render_request"]
@@ -835,17 +835,9 @@ def _project(g: GaussiansAtTime, cam: _CameraTensors) -> _Projection:
         means2d=torch.where(visible[:, None], mean2d, torch.zeros_like(mean2d)),
         conics=conics,
         depths=z.detach(),
-        colors=_colors(g.sh, g.means_t, cam.center),
+        colors=sh_to_color(g.sh, g.means_t - cam.center),
         visible=visible,
     )
-
-
-def _colors(sh: Tensor, means_t: Tensor, center: Tensor) -> Tensor:
-    """E2: max(0, Σ c_lm Y_lm(d) + 0.5) per channel, with d from the camera center to the moved
-    position (D-4); `sh_basis` normalizes d."""
-    degree = math.isqrt(sh.shape[1]) - 1
-    basis = sh_basis(means_t - center, degree)
-    return torch.clamp((sh * basis[..., None]).sum(dim=-2) + _SH_OFFSET, min=0.0)
 
 
 def _rasterize(

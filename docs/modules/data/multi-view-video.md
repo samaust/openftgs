@@ -19,3 +19,7 @@ All three are read from the training images only (data split "train"), so the te
 `load_image` decodes the file at every call; training reads its images through the frame cache instead (D-51, `frame-cache.md`), which gives bitwise the same values. It accepts 8-bit RGB and RGBA files, drops the alpha channel as §1.4 says, checks the size against the record's camera, and returns float32 values divided by 255. Other modes are refused rather than converted, since a conversion (palette, grayscale, 16-bit) would be a choice the spec doesn't make (Q-65). Pillow opens a 16-bit RGB PNG in its 8-bit RGB mode, keeping the high byte, so a PNG's bit depth is read from its header and anything but 8 bits per channel is refused.
 
 `load_mask` returns None for an image without a mask. A mask is a bilevel or 8-bit grayscale image of the image's size; 8-bit values are divided by 255, as Q-61 asks of mask readers, so `eval.dynamic_region` sees values in [0, 1]. Only test images carry masks (§2.2).
+
+## Spatial scale
+
+`spatial_scale(records, factor)` is D-27 over a sequence of `ImageRecord`s: the training records' distinct camera centres, de-duplicated in first-occurrence order, and factor × their largest distance from their centroid. `MultiViewVideo.spatial_scale(factor)` calls it on the dataset's records; the harness's `spatial_scale` query calls it on records it builds from cameras alone, with no image files (Q-204).

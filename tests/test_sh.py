@@ -16,7 +16,7 @@ import torch
 from real_sh import real_sh
 
 import openftgs.sh
-from openftgs.sh import C0, rgb_to_sh0, sh0_to_rgb, sh_basis
+from openftgs.sh import C0, rgb_to_sh0, sh0_to_rgb, sh_basis, sh_to_color
 
 
 def _directions(n: int, seed: int) -> np.ndarray:
@@ -34,7 +34,13 @@ def _directions(n: int, seed: int) -> np.ndarray:
 
 def test_all_lists_the_public_api() -> None:
     """Q-14: `__all__` is exactly the public API."""
-    assert sorted(openftgs.sh.__all__) == ["C0", "rgb_to_sh0", "sh0_to_rgb", "sh_basis"]
+    assert sorted(openftgs.sh.__all__) == [
+        "C0",
+        "rgb_to_sh0",
+        "sh0_to_rgb",
+        "sh_basis",
+        "sh_to_color",
+    ]
 
 
 def test_c0_is_the_l0_constant() -> None:
@@ -141,3 +147,36 @@ def test_sh_basis_matches_gsplat_spherical_harmonics(degree: int) -> None:
     expected = spherical_harmonics(degree, dirs, coeffs)
     got = (sh_basis(dirs, degree)[..., None] * coeffs).sum(dim=-2)
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+
+
+# sh_to_color: E2's colour from the basis (Q-204).
+
+
+@pytest.mark.parametrize("degree", [0, 1, 2, 3])
+def test_sh_to_color_is_e2_against_independent_real_sh(degree: int) -> None:
+    """Q-204: sh_to_color(sh, d) = max(0, Σ c_lm Y_lm(d/|d|) + 0.5) per channel (E2), with the
+    degree read from the number of coefficients; checked against the independent real-SH
+    evaluation in float64."""
+    dirs = _directions(40, seed=7 + degree)
+    rng = np.random.default_rng(degree)
+    coeffs = rng.normal(scale=0.6, size=(len(dirs), (degree + 1) ** 2, 3))
+    unit = dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
+    expected = np.maximum((coeffs * real_sh(unit, degree)[..., None]).sum(axis=-2) + 0.5, 0.0)
+    got = sh_to_color(torch.from_numpy(coeffs), torch.from_numpy(dirs))
+    torch.testing.assert_close(got, torch.from_numpy(expected), rtol=1e-12, atol=1e-12)
+
+
+def test_sh_to_color_clamps_each_channel_at_zero() -> None:
+    """E2: the max is per channel. A DC coefficient of −1/C0 on one channel gives
+    C0·(−1/C0) + 0.5 = −0.5, clamped to 0, while the other channels keep 0.5 + C0·c."""
+    sh = torch.tensor([[[-1.0 / C0, 0.0, 0.4]]], dtype=torch.float64)
+    got = sh_to_color(sh, torch.tensor([[0.0, 0.0, 2.0]], dtype=torch.float64))
+    torch.testing.assert_close(
+        got, torch.tensor([[0.0, 0.5, 0.5 + C0 * 0.4]], dtype=torch.float64), rtol=0, atol=1e-15
+    )
+
+
+def test_sh_to_color_rejects_a_coefficient_count_that_is_not_a_square() -> None:
+    """Q-204: the coefficient axis holds (L + 1)² entries for L in 0 to 3."""
+    with pytest.raises(ValueError, match="coefficients"):
+        sh_to_color(torch.zeros(2, 5, 3), torch.ones(2, 3))

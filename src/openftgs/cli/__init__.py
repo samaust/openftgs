@@ -727,16 +727,24 @@ def _render_device(backend: str) -> str:
 
 
 def _render(args: argparse.Namespace) -> int:
+    device = _render_device(args.backend)
+    return _render_loaded(
+        _load_model(args.model, device), args.request, args.out, args.backend, device
+    )
+
+
+def _render_loaded(
+    loaded: _Loaded, request_path: Path, out: Path, backend: str, device: str
+) -> int:
+    """`ftgs render`'s body once MODEL is read: also `ftgs-adapter render`'s (Q-202)."""
     import torch
 
     from openftgs.io import read_render_request, write_renders
     from openftgs.render import render_request
 
-    device = _render_device(args.backend)
-    loaded = _load_model(args.model, device)
-    with _as_input_error(f"render request {args.request}", OSError):
-        sha = _sha256(args.request)
-        request = read_render_request(args.request)
+    with _as_input_error(f"render request {request_path}", OSError):
+        sha = _sha256(request_path)
+        request = read_render_request(request_path)
     if request.time_unit != loaded.model.time_unit:
         _fail(
             f"the request's time unit {request.time_unit!r} isn't the model's "
@@ -751,7 +759,7 @@ def _render(args: argparse.Namespace) -> int:
     renders = render_request(
         loaded.model,
         request,
-        backend=args.backend,
+        backend=backend,  # type: ignore[arg-type]
         frame_dt=loaded.frame_dt,  # Q-174: a checkpoint's Δt_f is the index's bucket width
         devices=_shard_devices(device),  # Q-175, Q-186
     )
@@ -759,9 +767,9 @@ def _render(args: argparse.Namespace) -> int:
     bad += [i for i, a in renders.alpha.items() if not bool(torch.isfinite(a).all())]
     if bad:  # Q-129
         _fail(f"renders that aren't finite: {sorted(set(bad))[:5]}", _NUMERIC)
-    with _output(f"renders {args.out}"):  # Q-142
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        write_renders(renders, args.out, producer=_producer(), request_sha256=sha)
+    with _output(f"renders {out}"):  # Q-142
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_renders(renders, out, producer=_producer(), request_sha256=sha)
     return 0
 
 
@@ -876,16 +884,20 @@ def _eval(args: argparse.Namespace) -> int:
 
 
 def _export(args: argparse.Namespace) -> int:
-    from openftgs.io import write_exchange
-
     if not args.checkpoint.is_dir():
         _fail(f"{args.checkpoint} is not a checkpoint directory")
-    loaded = _load_model(args.checkpoint, "cpu")
+    return _export_loaded(_load_model(args.checkpoint, "cpu"), args.out)
+
+
+def _export_loaded(loaded: _Loaded, out: Path) -> int:
+    """`ftgs export`'s body once the model is read: also `ftgs-adapter export`'s (Q-202)."""
+    from openftgs.io import write_exchange
+
     # D-84: the file records the background the run was trained against.
     exchange = dataclasses.replace(loaded.model.to_exchange(), background=loaded.background)
-    with _output(f"exchange model {args.out}"), _as_input_error(f"exchange model {args.out}"):
-        args.out.parent.mkdir(parents=True, exist_ok=True)  # Q-142
-        write_exchange(exchange, args.out)
+    with _output(f"exchange model {out}"), _as_input_error(f"exchange model {out}"):
+        out.parent.mkdir(parents=True, exist_ok=True)  # Q-142
+        write_exchange(exchange, out)
     return 0
 
 

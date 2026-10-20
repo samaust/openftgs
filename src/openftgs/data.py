@@ -56,6 +56,7 @@ __all__ = [
     "resize_area",
     "resize_camera",
     "resized_size",
+    "spatial_scale",
     "undistort_image",
     "undistortion_map",
 ]
@@ -100,14 +101,6 @@ class MultiViewVideo:
         for record in train:
             by_camera.setdefault(record.camera.name, []).append(record.timestamp)
         self.frame_dt = frame_interval(by_camera, self.time)
-        # D-27, Q-65: the distinct training poses' centers −R_wᵀt_w (E2), in float64.
-        centers: dict[tuple[float, ...], None] = {}
-        seen: set[int] = set()
-        for record in train:
-            if id(record.camera) not in seen:
-                seen.add(id(record.camera))
-                centers[_center(record)] = None
-        self._centers = torch.tensor(list(centers), dtype=torch.float64)
 
     @classmethod
     def from_manifest(cls, path: Path) -> "MultiViewVideo":
@@ -115,21 +108,9 @@ class MultiViewVideo:
         return cls(read_scene_manifest(Path(path)))
 
     def spatial_scale(self, factor: float) -> float:
-        """S of D-27: `factor` × the largest distance from a distinct training camera center
-        to the centroid of those centers (Q-65)."""
-        if (
-            isinstance(factor, bool)
-            or not isinstance(factor, numbers.Real)
-            or not (math.isfinite(factor) and factor > 0.0)
-        ):
-            raise ValueError(f"factor must be a finite number > 0, got {factor!r}")
-        if self._centers.shape[0] < 2:
-            raise ValueError(
-                "the spatial scale needs two distinct training camera centers, got "
-                f"{self._centers.shape[0]}"
-            )
-        offsets = self._centers - self._centers.mean(dim=0)
-        return float(factor) * float(torch.linalg.vector_norm(offsets, dim=1).max())
+        """S of D-27 over the video's records: `spatial_scale(self.records, factor)` (Q-65,
+        Q-204)."""
+        return spatial_scale(self.records, factor)
 
     def _checked_index(self, index: int) -> int:
         if not 0 <= index < len(self.records):
@@ -153,6 +134,33 @@ class MultiViewVideo:
         if pixels.dtype == np.bool_:
             return torch.from_numpy(pixels.astype(np.float32))
         return torch.from_numpy(pixels.astype(np.float32)) / 255.0
+
+
+def spatial_scale(records: Sequence[ImageRecord], factor: float) -> float:
+    """S of D-27: `factor` × the largest distance from a distinct training camera center to the
+    centroid of those centers (Q-65, Q-204). Test records are left out; only poses are read, so
+    the images need not exist."""
+    if (
+        isinstance(factor, bool)
+        or not isinstance(factor, numbers.Real)
+        or not (math.isfinite(factor) and factor > 0.0)
+    ):
+        raise ValueError(f"factor must be a finite number > 0, got {factor!r}")
+    # D-27, Q-65: the distinct training poses' centers −R_wᵀt_w (E2), in float64, in the order
+    # they first occur (which sets the centroid's summation order).
+    centers: dict[tuple[float, ...], None] = {}
+    seen: set[int] = set()
+    for record in records:
+        if record.split == "train" and id(record.camera) not in seen:
+            seen.add(id(record.camera))
+            centers[_center(record)] = None
+    if len(centers) < 2:
+        raise ValueError(
+            f"the spatial scale needs two distinct training camera centers, got {len(centers)}"
+        )
+    points = torch.tensor(list(centers), dtype=torch.float64)
+    offsets = points - points.mean(dim=0)
+    return float(factor) * float(torch.linalg.vector_norm(offsets, dim=1).max())
 
 
 def _center(record: ImageRecord) -> tuple[float, ...]:

@@ -549,15 +549,19 @@ One of the harness's four stages: L0 boundary converters, L1 identical-model ren
 _Avoid_: stage, phase, tier (the tolerance class within L1)
 
 **Tier**:
-The L1 tolerance class chosen from both info replies: same rasterizer and constants, or different rasterizers. §3.3 L1
+The L1 tolerance class chosen from both info replies: same rasterizer and constants when the rasterizer identity and every render convention but the model's background match, otherwise different rasterizers. §3.3 L1, D-73, D-84
 _Avoid_: level, tolerance mode, strictness
+
+**Run settings**:
+The harness's own settings for one run (case seed, seed count K, GPUs, trained models, L3 scenes, case sizes), kept apart from harness_config.json, which holds TrainConfig values only. §3.3
+_Avoid_: harness config (reserved for harness_config.json), options file, run config
 
 **Probe**:
 One of the ten L1 scenes, P1 to P10, that isolates a single behavior by sweeping one variable so a mismatch points at one quantity. §3.3 L1
 _Avoid_: test scene, fixture, case (any check's inputs), synthetic scene (reserved for S-n)
 
 **Forward query**:
-An L2 case: a ftgs-forward-queries file naming a query kind (motion, temporal_opacity, losses, lr_schedule, relocation_math and the others) with seeded inputs, answered by a ftgs-forward-answers file. §3.3 L2
+An L2 case: one ftgs-forward-queries file per query kind (motion, temporal_opacity, losses, lr_schedule, relocation_math and the others) with seeded inputs, answered by a ftgs-forward-answers file. §3.3 L2
 _Avoid_: unit query, probe, request (reserved for render requests)
 
 **Symptom**:

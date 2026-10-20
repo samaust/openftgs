@@ -47,6 +47,7 @@ __all__ = [
     "read_render_request",
     "read_renders",
     "read_scene_manifest",
+    "render_conventions",
     "save_checkpoint",
     "save_run_checkpoint",
     "validate_exchange",
@@ -279,6 +280,24 @@ _RENDER_CONVENTIONS = {
 }
 
 
+def render_conventions(*, background: Sequence[float] = (0.0, 0.0, 0.0)) -> dict[str, Any]:
+    """A fresh copy of ftgs-if's `render_conventions` block (§2.2, D-73; Q-24, Q-35, Q-204) with
+    `background`, three numbers in [0, 1] (D-84), black by default (D-34)."""
+    if (
+        isinstance(background, str)
+        or not isinstance(background, Sequence)
+        or len(background) != 3
+        or not all(
+            isinstance(c, int | float) and not isinstance(c, bool) and 0.0 <= c <= 1.0
+            for c in background
+        )
+    ):  # NaN fails the comparison
+        _fail(
+            "render_conventions", f"background must be three numbers in [0, 1], got {background!r}"
+        )
+    return {**_RENDER_CONVENTIONS, "background": [float(c) for c in background]}
+
+
 # Q-22, Q-24: the ftgs-if validator, shared by the reader, the writer and the model.
 def validate_exchange(model: ExchangeModel) -> None:
     """§2.2 ftgs-if validation (Q-22, Q-24): the table's keys, dtypes and shapes, N ≥ 1, all
@@ -368,7 +387,7 @@ def write_exchange(model: ExchangeModel, path: Path) -> None:
         "producer": model.producer,
         # D-84: the model's background in place of the renderer's default (D-34).
         "render_conventions": json.dumps(
-            {**_RENDER_CONVENTIONS, "background": [float(c) for c in model.background]},
+            render_conventions(background=model.background),
             separators=(",", ":"),
         ),
     }

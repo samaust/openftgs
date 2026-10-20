@@ -29,6 +29,8 @@ dependencies = [
 # §2.1, D-62: the command line; Q-124: main returns the exit code.
 [project.scripts]
 ftgs = "openftgs.cli:main"
+# Q-202: the adapter of the differential harness (§3.3).
+ftgs-adapter = "openftgs.cli._adapter:main"
 
 [project.optional-dependencies]
 # §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. D-85: fused-local-corr, RoMa's optional

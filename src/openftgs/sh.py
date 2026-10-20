@@ -4,12 +4,15 @@
 Spec: E2. Band: Core model (§2.1).
 """
 
+import math
+
 import torch
 from torch import Tensor
 
-__all__ = ["C0", "rgb_to_sh0", "sh0_to_rgb", "sh_basis"]  # Q-14
+__all__ = ["C0", "rgb_to_sh0", "sh0_to_rgb", "sh_basis", "sh_to_color"]  # Q-14, Q-204
 
 C0: float = 0.28209479177387814  # §1.1: the l = 0 real SH constant, 1/(2√π)
+_COLOR_OFFSET = 0.5  # E2: the SH sum + 0.5, clamped at 0 per channel; D-4
 
 # Normalization constants of the real SH, from the standard Cartesian table (source log #9),
 # named _C<l>_<|m|>. The m = −2 terms use 2·_C<l>_2: _C2_1 = 2·_C2_2, and 2·_C3_2 for l = 3.
@@ -58,6 +61,19 @@ def sh_basis(dirs: Tensor, degree: int) -> Tensor:
             -_C3_3 * x * (xx - 3.0 * yy),
         ]
     return torch.stack(out, dim=-1)
+
+
+def sh_to_color(sh: Tensor, dirs: Tensor) -> Tensor:
+    """E2's colour: max(0, Σ c_lm Y_lm(d) + 0.5) per channel (Q-204).
+
+    ``sh`` is ``[..., (L + 1)², 3]`` and ``dirs`` ``[..., 3]``; the degree L comes from the number
+    of coefficients, and ``sh_basis`` normalizes the directions.
+    """
+    degree = math.isqrt(sh.shape[-2]) - 1
+    if (degree + 1) ** 2 != sh.shape[-2]:
+        raise ValueError(f"expected (L + 1)² SH coefficients, got {sh.shape[-2]}")
+    basis = sh_basis(dirs, degree)
+    return torch.clamp((sh * basis[..., None]).sum(dim=-2) + _COLOR_OFFSET, min=0.0)
 
 
 def rgb_to_sh0(rgb: Tensor) -> Tensor:

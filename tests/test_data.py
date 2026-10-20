@@ -22,9 +22,9 @@ import pytest
 import torch
 from PIL import Image
 
-from openftgs.data import MultiViewVideo, fastest_frames
+from openftgs.data import MultiViewVideo, fastest_frames, spatial_scale
 from openftgs.io import read_scene_manifest
-from openftgs.types import TimeNormalizer
+from openftgs.types import Camera, ImageRecord, TimeNormalizer
 
 F32 = torch.float32
 
@@ -260,6 +260,38 @@ def test_spatial_scale_needs_two_distinct_centers(tmp_path: Path) -> None:
     video = MultiViewVideo.from_manifest(_write_scene(tmp_path, _RING, images))
     with pytest.raises(ValueError, match="two distinct"):
         video.spatial_scale(1.1)
+
+
+def _record(center: tuple[float, float, float], split: str = "train") -> ImageRecord:
+    """A record of a camera with the identity rotation at `center` and an image path that need
+    not exist: the spatial scale reads poses only."""
+    w2c = torch.eye(4)
+    w2c[:3, 3] = -torch.tensor(center)
+    camera = Camera(K=torch.eye(3), world_to_camera=w2c, width=4, height=3)
+    return ImageRecord(camera, 0.0, Path("absent.png"), split)  # type: ignore[arg-type]
+
+
+def test_spatial_scale_of_records_without_image_files() -> None:
+    """Q-204, D-27: from records alone, four training centers at distance 2 from the origin give
+    1.1 × 2 = 2.2; the test camera at distance 100 is left out."""
+    records = [_record(c) for c in ((2, 0, 0), (-2, 0, 0), (0, 2, 0), (0, -2, 0))]
+    records.append(_record((100.0, 0.0, 0.0), "test"))
+    assert spatial_scale(records, 1.1) == pytest.approx(2.2, rel=1e-12)
+
+
+def test_spatial_scale_of_records_equals_the_videos(tmp_path: Path) -> None:
+    """Q-204: MultiViewVideo.spatial_scale is spatial_scale over the video's records, bit for
+    bit, a pose override included."""
+    images = _ring_images(2)
+    images.append(_image("a", 0.5, world_to_camera=_camera((0.0, 0.0, 4.0))["world_to_camera"]))
+    video = MultiViewVideo.from_manifest(_write_scene(tmp_path, _RING, images))
+    assert spatial_scale(video.records, 1.1) == video.spatial_scale(1.1)
+
+
+def test_spatial_scale_of_records_needs_two_distinct_centers() -> None:
+    """Q-65: one training center (the same pose twice) is refused."""
+    with pytest.raises(ValueError, match="two distinct"):
+        spatial_scale([_record((1.0, 2.0, 3.0)), _record((1.0, 2.0, 3.0))], 1.1)
 
 
 @pytest.mark.parametrize("factor", [0.0, -1.0, float("inf"), float("nan"), True])

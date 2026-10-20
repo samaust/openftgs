@@ -40,3 +40,7 @@ The trainer (M10, `docs/modules/train/trainer.md`) calls these functions on its 
 - With relocation off, the trainer resets the gradient statistics itself after each event (Q-51).
 - A failure of `FreeTimeGaussians.validate()` before an event means the run diverged, which the trainer reports as `FloatingPointError` (Q-69).
 - U-25's "stops growing after 15,000" and "growth runs before relocation in an event" are calendar properties, pinned by the trainer's tests.
+
+## The growth masks
+
+`growth_masks(g, scales, cfg, *, spatial_scale)` returns the clone and split masks after D-44's cap: candidates are rows with g above `cfg.grad_threshold`; a candidate whose largest scale is at most `cfg.split_scale`·S is cloned, the others split; when candidates exceed the room below `cfg.n_max`, the largest-g ones grow, ties to the lower row index. `grow` calls it, and the harness's `growth_decisions` query reads it (Q-204).

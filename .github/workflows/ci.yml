@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
           # The test job imports the vendored RoMa (U-38, Q-117); the license job scans [init] (Q-4).
-          python -m pip install -e ".[dev${{ (matrix.job == 'test' || matrix.job == 'licenses') && ',init' || '' }}]" -e harness
+          python -m pip install -e ".[dev${{ (matrix.job == 'test' || matrix.job == 'licenses') && ',init' || '' }}]" -e "harness[lpips]"
       - name: Lint and type-check
         if: matrix.job == 'lint'
         run: |
