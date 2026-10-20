@@ -10,7 +10,8 @@ from typing import Any
 
 import pytest
 import torch
-from builders import exchange_arrays, random_model, ring, write_scene
+from adapter_cases import exchange_file, request_file
+from builders import random_model, ring, write_scene
 
 from openftgs.config import LossConfig, PerfConfig, TrainConfig, config_to_dict
 from openftgs.io import (
@@ -18,10 +19,9 @@ from openftgs.io import (
     read_exchange,
     read_renders,
     render_conventions,
-    write_exchange,
     write_init_points,
 )
-from openftgs.types import ExchangeModel, InitPoints, TimeNormalizer
+from openftgs.types import InitPoints, TimeNormalizer
 
 ADAPTER = str(Path(sys.executable).parent / "ftgs-adapter")
 FTGS = str(Path(sys.executable).parent / "ftgs")
@@ -34,39 +34,6 @@ def _adapter(*args: object, backend: str = "reference") -> subprocess.CompletedP
         text=True,
         check=False,
     )
-
-
-def _exchange(path: Path, *, n: int = 12, sh_degree: int = 2, seed: int = 0) -> Path:
-    arrays = exchange_arrays(n, sh_degree, seed)
-    arrays["position"] = arrays["position"] * 0.3  # inside the request's view
-    arrays["scale"] = arrays["scale"] * 0.2
-    write_exchange(
-        ExchangeModel(arrays, sh_degree, 2.0, 12.0, "s", "test", background=(0.0, 0.2, 1.0)), path
-    )
-    return path
-
-
-def _request(path: Path) -> Path:
-    items = []
-    for k, cam in enumerate(ring(3, radius=4.0, elevation=1.0, width_px=24, height_px=16)):
-        items.append(
-            {
-                "id": f"r{k}",
-                "timestamp": 2.0 + 3.0 * k,
-                "camera": {
-                    "width": cam.width,
-                    "height": cam.height,
-                    "K": cam.K.tolist(),
-                    "world_to_camera": cam.world_to_camera.tolist(),
-                },
-            }
-        )
-    path.write_text(
-        json.dumps(
-            {"format": "ftgs-render-request", "version": 1, "time_unit": "s", "items": items}
-        )
-    )
-    return path
 
 
 @pytest.mark.parametrize(
@@ -89,7 +56,7 @@ def test_info_reports_the_render_conventions_and_the_rasterizer(
 def test_import_then_export_round_trips_an_exchange_file(tmp_path: Path) -> None:
     """§3.3 L0: through the native directory and back, every field within 1e-6 relative
     (opacity after the clamp, quaternions up to sign), the background exact (D-84)."""
-    source = _exchange(tmp_path / "in.safetensors")
+    source = exchange_file(tmp_path / "in.safetensors")
     assert _adapter("import", source, tmp_path / "native").returncode == 0
     assert (tmp_path / "native" / "params.safetensors").is_file()
     done = _adapter("export", tmp_path / "native", tmp_path / "out.safetensors")
@@ -106,8 +73,8 @@ def test_import_then_export_round_trips_an_exchange_file(tmp_path: Path) -> None
 def test_render_equals_ftgs_render_for_each_kind_of_model(tmp_path: Path) -> None:
     """Q-202: the adapter's render of an FTGS-IF file is `ftgs render`'s, bit for bit; its
     render of the imported native directory is the same images up to the round trip."""
-    source = _exchange(tmp_path / "m.safetensors")
-    request = _request(tmp_path / "req.json")
+    source = exchange_file(tmp_path / "m.safetensors")
+    request = request_file(tmp_path / "req.json")
     out = tmp_path / "ftgs.safetensors"
     subprocess.run(
         [FTGS, "render", source, "--request", request, "--out", out, "--backend", "reference"],

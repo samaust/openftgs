@@ -15,8 +15,8 @@ from ftgs_harness.models import random_exchange, unit_quaternions
 
 __all__ = ["GENERATORS", "generate"]
 
-TAU0, TAU1 = 0.0, 2.0
-Generator = Callable[
+_TAU0, _TAU1 = 0.0, 2.0
+_QueryGenerator = Callable[
     [np.random.Generator, bool, Mapping[str, Any]], tuple[dict[str, Any], dict[str, np.ndarray]]
 ]
 
@@ -28,8 +28,8 @@ def _with_model(ex: Exchange, **params: Any) -> tuple[dict[str, Any], dict[str, 
 
 def _edge_model(rng: np.random.Generator, n: int, sh_degree: int = 0) -> Exchange:
     """Durations from 10⁻⁶ to 10² × T_τ, opacities near 0 and 1."""
-    ex = random_exchange(rng, n, sh_degree=sh_degree, tau0=TAU0, tau1=TAU1)
-    span = TAU1 - TAU0
+    ex = random_exchange(rng, n, sh_degree=sh_degree, tau0=_TAU0, tau1=_TAU1)
+    span = _TAU1 - _TAU0
     ex.arrays["duration"] = np.exp(rng.uniform(math.log(1e-6), math.log(1e2), size=n)) * span
     sigma = ex.arrays["opacity"].copy()
     sigma[: n // 4] = np.float32(1e-6)
@@ -39,7 +39,7 @@ def _edge_model(rng: np.random.Generator, n: int, sh_degree: int = 0) -> Exchang
 
 
 def _times(rng: np.random.Generator, ex: Exchange, edge: bool) -> np.ndarray:
-    times = [TAU0, TAU1, TAU0 - 0.3, TAU1 + 0.3, *rng.uniform(TAU0, TAU1, size=4)]
+    times = [_TAU0, _TAU1, _TAU0 - 0.3, _TAU1 + 0.3, *rng.uniform(_TAU0, _TAU1, size=4)]
     if edge:  # |t − μt|/s of about 10⁴ for the row with the smallest duration
         row = int(np.argmin(ex.arrays["duration"]))
         center, s = float(ex.arrays["time_center"][row]), float(ex.arrays["duration"][row])
@@ -53,7 +53,7 @@ def _per_time(
     ex = (
         _edge_model(rng, 40)
         if edge
-        else random_exchange(rng, 40, sh_degree=0, tau0=TAU0, tau1=TAU1)
+        else random_exchange(rng, 40, sh_degree=0, tau0=_TAU0, tau1=_TAU1)
     )
     params, tensors = _with_model(ex)
     tensors["times"] = _times(rng, ex, edge)
@@ -64,16 +64,16 @@ def _sh_color(
     rng: np.random.Generator, edge: bool, cfg: Mapping[str, Any]
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if edge:  # every row at the origin, static: the six centres look along the axes
-        ex = random_exchange(rng, 12, sh_degree=3, tau0=TAU0, tau1=TAU1, speed=0.0, spread=0.0)
+        ex = random_exchange(rng, 12, sh_degree=3, tau0=_TAU0, tau1=_TAU1, speed=0.0, spread=0.0)
         axes = np.concatenate([np.eye(3), -np.eye(3)]) * 4.0
         params, tensors = _with_model(ex, sh_degree=None)
         tensors["centers"] = axes
-        tensors["times"] = rng.uniform(TAU0, TAU1, size=6)
+        tensors["times"] = rng.uniform(_TAU0, _TAU1, size=6)
         return params, tensors
     degree = int(rng.integers(0, 4))
-    ex = random_exchange(rng, 30, sh_degree=3, tau0=TAU0, tau1=TAU1)
+    ex = random_exchange(rng, 30, sh_degree=3, tau0=_TAU0, tau1=_TAU1)
     params, tensors = _with_model(ex, sh_degree=degree)
-    tensors["times"] = rng.uniform(TAU0 - 0.2, TAU1 + 0.2, size=5)
+    tensors["times"] = rng.uniform(_TAU0 - 0.2, _TAU1 + 0.2, size=5)
     tensors["centers"] = rng.normal(size=(5, 3)) * 4.0
     return params, tensors
 
@@ -84,7 +84,7 @@ def _losses(
     ex = (
         _edge_model(rng, 20)
         if edge
-        else random_exchange(rng, 20, sh_degree=0, tau0=TAU0, tau1=TAU1)
+        else random_exchange(rng, 20, sh_degree=0, tau0=_TAU0, tau1=_TAU1)
     )
     loss = {k: v for k, v in dict(cfg.get("loss", {})).items() if k != "perc_net"}
     params, tensors = _with_model(
@@ -96,7 +96,7 @@ def _losses(
     tensors["pred"] = np.clip(gt + rng.normal(scale=noise, size=gt.shape), -0.1, 1.2).astype(
         np.float32
     )
-    tensors["t"] = np.array(rng.uniform(TAU0, TAU1))
+    tensors["t"] = np.array(rng.uniform(_TAU0, _TAU1))
     return params, tensors
 
 
@@ -157,7 +157,7 @@ def _grad_stats(
     rng: np.random.Generator, edge: bool, cfg: Mapping[str, Any]
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     degree = 1
-    ex = random_exchange(rng, 40, sh_degree=degree, tau0=TAU0, tau1=TAU1, log_duration=(0.0, 1.0))
+    ex = random_exchange(rng, 40, sh_degree=degree, tau0=_TAU0, tau1=_TAU1, log_duration=(0.0, 1.0))
     angle = float(rng.uniform(0, 2 * math.pi))
     eye = np.array([4.0 * math.cos(angle), 4.0 * math.sin(angle), 1.5])
     width, height = 48, 32
@@ -176,7 +176,7 @@ def _grad_stats(
     )
     tensors["K"] = intrinsics(width, height, 40.0)
     tensors["world_to_camera"] = look_at(eye)
-    tensors["t"] = np.array(rng.uniform(TAU0, TAU1))
+    tensors["t"] = np.array(rng.uniform(_TAU0, _TAU1))
     tensors["gt"] = rng.random((height, width, 3)).astype(np.float32)
     return params, tensors
 
@@ -251,7 +251,7 @@ def _growth_decisions(
     return params, {"g": g, "scales": scales}
 
 
-GENERATORS: dict[str, Generator] = {
+GENERATORS: dict[str, _QueryGenerator] = {
     "motion": _per_time,
     "temporal_opacity": _per_time,
     "effective_opacity": _per_time,

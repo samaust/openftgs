@@ -132,13 +132,15 @@ def test_info_problems_names_each_missing_render_convention() -> None:
         ({"render_conventions": {**CONVENTIONS, "eps2d": 0.1}}, "different"),
         ({"render_conventions": {**CONVENTIONS, "extra": 1}}, "different"),
         ({"name": "other implementation"}, "same"),
+        ({"render_conventions": {**CONVENTIONS, "background": [1.0, 1.0, 1.0]}}, "same"),
     ],
 )
 def test_tier_is_same_only_for_the_same_rasterizer_and_conventions(
     change: dict[str, Any], tier: str
 ) -> None:
     """Q-206: the same-constants tier needs the same rasterizer identity and every
-    render_conventions entry equal; the implementations' own names don't matter."""
+    render_conventions entry equal, the background aside, since it is each model's (D-84); the
+    implementations' own names don't matter."""
     assert choose_tier(INFO, {**INFO, **change}) == tier
     assert choose_tier(INFO, None) == "different"
 
@@ -175,12 +177,16 @@ def _run(tmp_path: Path, *extra: str, a: str = f"{STUB} A", b: str = f"{STUB} B"
     )
 
 
+# Private tests of the runner (`test_runner_…`): its level registry is pointed at a stand-in
+# level, so they pin the run mechanics apart from any real level.
 @pytest.fixture
 def fake_l0(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(runner._LEVEL_MODULES, "L0", "fake_level")
 
 
-def test_run_with_passing_checks_exits_0_and_writes_the_run(tmp_path: Path, fake_l0: None) -> None:
+def test_runner_with_passing_checks_exits_0_and_writes_the_run(
+    tmp_path: Path, fake_l0: None
+) -> None:
     """§3.3: exit 0 when all checks passed; run.json, report.json and report.md are written,
     the info checks under the lowest level, with the tier in the run record."""
     assert _run(tmp_path, "--levels", "L0") == 0
@@ -194,7 +200,7 @@ def test_run_with_passing_checks_exits_0_and_writes_the_run(tmp_path: Path, fake
     assert (tmp_path / "run" / "run.json").is_file()
 
 
-def test_run_with_a_failed_check_exits_1(
+def test_runner_with_a_failed_check_exits_1(
     tmp_path: Path, fake_l0: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """§3.3: exit 1 when at least one check failed; a crashing call is the "crash" pattern."""
@@ -206,7 +212,7 @@ def test_run_with_a_failed_check_exits_1(
     assert all(c["pattern"] == "crash" and "exited with code 3" in c["symptom"] for c in failed)
 
 
-def test_an_incomplete_info_reply_fails_its_check(
+def test_runner_fails_the_check_of_an_incomplete_info_reply(
     tmp_path: Path, fake_l0: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """D-73: an info reply without one of render_conventions' entries is a failed info check,
@@ -221,7 +227,7 @@ def test_an_incomplete_info_reply_fails_its_check(
     assert report["run"]["tier"] == "different"
 
 
-def test_rerun_reproduces_one_check(
+def test_runner_rerun_reproduces_one_check(
     tmp_path: Path,
     fake_l0: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -277,3 +283,24 @@ def test_a_non_empty_run_directory_or_bad_settings_exit_2(tmp_path: Path) -> Non
     assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 2
     settings.write_text(json.dumps({"unknown": 1}))
     assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 2
+
+
+def test_l3_without_the_lpips_extra_is_exit_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-201: L3 computes LPIPS itself, so without torch and lpips it is a configuration
+    error, before any adapter runs."""
+    import importlib.util
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *a: None if name == "lpips" else real(name, *a)
+    )
+    scene = tmp_path / "scene.json"
+    scene.write_text("{}")
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"l3": {"scenes": [{"name": "s", "manifest": str(scene), "init": str(scene)}]}})
+    )
+    assert _run(tmp_path, "--levels", "L3", "--settings", str(settings)) == 2
+    assert not (tmp_path / "run" / "run.json").exists()

@@ -23,7 +23,7 @@ __all__ = [
     "write_run",
 ]
 
-RUN_FORMAT = "ftgs-harness-run"
+_RUN_FORMAT = "ftgs-harness-run"
 
 
 class HarnessError(Exception):
@@ -55,7 +55,7 @@ class Settings:
     trained_models: tuple[Path, ...] = ()
     scenes: tuple[Scene, ...] = ()
     sizes: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SIZES))
-    l2_lpips: bool = True  # Q-203: LPIPS-VGG in L2's losses (off where weights can't download)
+    l2_lpips: bool = True  # Q-212: LPIPS-VGG in L2's losses (off where weights can't download)
 
     @property
     def reduced(self) -> bool:
@@ -216,7 +216,7 @@ class RunRecord:
 
 def write_run(path: Path, record: RunRecord) -> None:
     body = {
-        "format": RUN_FORMAT,
+        "format": _RUN_FORMAT,
         "version": 1,
         **{k: v for k, v in asdict(record).items()},
     }
@@ -231,8 +231,8 @@ def read_run(path: Path) -> RunRecord:
         body = json.loads(Path(path).read_text())
     except (OSError, ValueError) as error:
         raise HarnessError(f"run record {path}: {error}") from error
-    if not isinstance(body, dict) or body.get("format") != RUN_FORMAT or body.get("version") != 1:
-        raise HarnessError(f"run record {path}: not a {RUN_FORMAT} v1 file")
+    if not isinstance(body, dict) or body.get("format") != _RUN_FORMAT or body.get("version") != 1:
+        raise HarnessError(f"run record {path}: not a {_RUN_FORMAT} v1 file")
     settings = body["settings_path"]
     return RunRecord(
         a=body["a"],

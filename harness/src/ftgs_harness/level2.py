@@ -4,14 +4,13 @@ implementations answer the same seeded queries, kind by kind, compared at §3.3'
 `relocation_sampling` by χ² tests instead. A kind missing from an `info` reply is not
 comparable."""
 
-import hashlib
 from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
 
 from ftgs_harness.checks import Check, Status, close_absolute, close_relative
-from ftgs_harness.formats import Answer, FormatError, read_answers, write_queries
+from ftgs_harness.formats import Answer, FormatError, file_sha256, read_answers, write_queries
 from ftgs_harness.info import QUERY_KINDS
 from ftgs_harness.queries import generate
 from ftgs_harness.rendering import relative
@@ -43,7 +42,7 @@ TOLERANCES: dict[str, dict[str, tuple[str, float]]] = {
 }
 _SAMPLING_P = 0.001  # §3.3: χ² test, p > 0.001
 
-SPEC_REFS = {
+_SPEC_REFS = {
     "motion": ["E1"],
     "temporal_opacity": ["E4"],
     "effective_opacity": ["E3", "E4"],
@@ -110,7 +109,7 @@ def _describe(
     )
     return (
         f"For {kind} query {query_id} ({shape}), B's {name} differs from A's by up to {value:.3g} "
-        f"({expected.split()[-1] if expected.split() else 'exact'}); §3.3 allows {expected}."
+        f"({expected.split()[-1] if expected.split() else 'exact'}); the tolerance is {expected}."
     )
 
 
@@ -148,16 +147,18 @@ def _sampling_checks(
         symptom = ""
         if status == "fail":
             symptom = (
-                f"For relocation_sampling query {query.id} (25 targets, 50 seeds × 200 draws), the "
+                f"For relocation_sampling query {query.id} ({len(scores)} rows, "
+                f"{(scores > 0).sum()} with a positive score; {len(query.params['seeds'])} seeds × "
+                f"{query.params['count']} draws), the "
                 f"pooled counts give χ² p = {p_a:.3g} for A and {p_b:.3g} for B against the "
-                f"scores, and p = {p_ab:.3g} between A and B; §3.3 needs p > 0.001."
+                f"scores, and p = {p_ab:.3g} between A and B; each must exceed 0.001."
             )
         checks.append(
             Check(
                 id=check_id,
                 level="L2",
                 status=status,
-                spec_refs=SPEC_REFS["relocation_sampling"],
+                spec_refs=_SPEC_REFS["relocation_sampling"],
                 inputs={**inputs, "queries": [query.id]},
                 metric="chi2_p_min",
                 expected="> 0.001",
@@ -182,25 +183,27 @@ def _status_check(
     found = {label: answers[label].get(query_id) for label in labels}
     statuses = {label: "missing" if a is None else a.status for label, a in found.items()}
     not_comparable = all(s == "not_comparable" for s in statuses.values())
-    message = "; ".join(
-        f"{label}: {'no answer' if a is None else a.message}" for label, a in found.items()
-    )
+    # §3.3 symptom rule 2: an adapter's own message may name its code, so it stays out of the
+    # symptom, in the localization.
+    messages = {label: "" if a is None else a.message for label, a in found.items()}
     symptom = (
         ""
         if not_comparable
-        else f"The {kind} query {query_id} got no usable answer from {', '.join(labels)} "
-        f"({message})."
+        else f"The {kind} query {query_id} got no usable answer from {', '.join(labels)}: "
+        + ", ".join(f"{k} {v}" for k, v in statuses.items())
+        + "."
     )
     return Check(
         id=check_id,
         level="L2",
         status="not_comparable" if not_comparable else "fail",
-        spec_refs=SPEC_REFS[kind],
+        spec_refs=_SPEC_REFS[kind],
         inputs={**inputs, "queries": [query_id]},
         metric="answer_status",
         expected="ok",
         observed=", ".join(f"{k} {v}" for k, v in statuses.items()),
         symptom=symptom,
+        localization={"adapter_messages": messages},
         pattern=None if not_comparable else "crash",
         repro=ctx.repro(check_id),
     )
@@ -215,7 +218,7 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
                 id=prefix,
                 level="L2",
                 status="not_comparable",
-                spec_refs=SPEC_REFS[kind],
+                spec_refs=_SPEC_REFS[kind],
                 inputs={"kind": kind, "adapters": missing},
                 metric="query_kinds",
                 expected=f"{kind} in both info replies",
@@ -230,7 +233,7 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
     queries = generate(kind, ctx.settings.sizes["l2.queries"], ctx.settings.seed, config)
     if not path.exists():
         write_queries(path, kind, queries)
-    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    sha = file_sha256(path)
     inputs: dict[str, object] = {"queries_file": relative(ctx, path)}
     answers: dict[str, dict[str, Answer]] = {}
     failures = []
@@ -244,7 +247,7 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
                     id=f"{prefix}.{label}",
                     level="L2",
                     status="fail",
-                    spec_refs=SPEC_REFS[kind],
+                    spec_refs=_SPEC_REFS[kind],
                     inputs={**inputs, "log": outcome.log},
                     metric="forward_call",
                     expected="exit 0",
@@ -263,7 +266,7 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
                     id=f"{prefix}.{label}",
                     level="L2",
                     status="fail",
-                    spec_refs=SPEC_REFS[kind],
+                    spec_refs=_SPEC_REFS[kind],
                     inputs=inputs,
                     metric="answers_file",
                     expected="a valid ftgs-forward-answers file",
@@ -294,7 +297,7 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
                 id=check_id,
                 level="L2",
                 status="pass" if ok else "fail",
-                spec_refs=SPEC_REFS[kind],
+                spec_refs=_SPEC_REFS[kind],
                 inputs={**inputs, "queries": [query.id]},
                 metric=f"{name or 'answer'}_difference",
                 expected=expected or "match",

@@ -88,12 +88,15 @@ def info_problems(info: Any) -> list[str]:
 
 def choose_tier(info_a: Any, info_b: Any) -> Tier:
     """Q-206: "same" only when both replies name the same rasterizer and every
-    `render_conventions` entry of either matches the other's; "different" otherwise, also when
-    a reply is unusable."""
+    `render_conventions` entry of either, the background aside (D-84), matches the other's;
+    "different" otherwise, also when a reply is unusable."""
     if info_problems(info_a) or info_problems(info_b):
         return "different"
     if dict(info_a["rasterizer"]) != dict(info_b["rasterizer"]):
         return "different"
-    if dict(info_a["render_conventions"]) != dict(info_b["render_conventions"]):
+    # D-84: the background is each model's, so it isn't a convention of the renderer.
+    ca = {k: v for k, v in dict(info_a["render_conventions"]).items() if k != "background"}
+    cb = {k: v for k, v in dict(info_b["render_conventions"]).items() if k != "background"}
+    if ca != cb:
         return "different"
     return "same"

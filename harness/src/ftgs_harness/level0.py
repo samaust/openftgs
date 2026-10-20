@@ -20,9 +20,11 @@ from ftgs_harness.settings import HarnessError
 
 __all__ = ["field_errors", "run"]
 
-SPEC_REFS = ["§2.2"]
+_SPEC_REFS = ["§2.2"]
 _TOLERANCE = 1e-6  # §3.3 L0: relative
-_TIME_FIELDS = ("time_center", "duration")  # float64, judged against the field's scale (Q-208)
+# Q-208: time centres are judged against the field's largest magnitude, since an implementation
+# may store μt as float32 normalized time, an error of about T_τ·2⁻²⁴ wherever τ lies.
+_TIME_FIELDS = ("time_center",)
 
 # The pattern a field's difference shows as (§3.3 symptom rule 4).
 _PATTERN = {
@@ -108,7 +110,7 @@ def _models(ctx: Context) -> list[tuple[str, Path, bool]]:
     return out
 
 
-def _round_trip(ctx: Context, name: str, path: Path, label: str) -> list[Check]:
+def _round_trip(ctx: Context, name: str, path: Path, trained: bool, label: str) -> list[Check]:
     check_id = f"L0.roundtrip.{name}.{label}"
     render_id = f"L0.render.{name}.{label}"
     if not (ctx.wants(check_id) or ctx.wants(render_id)):
@@ -117,7 +119,7 @@ def _round_trip(ctx: Context, name: str, path: Path, label: str) -> list[Check]:
     folder = ctx.out / label / "L0"
     folder.mkdir(parents=True, exist_ok=True)
     native, exported = folder / f"{name}.native", folder / f"{name}.roundtrip.safetensors"
-    inputs = {"model": relative(ctx, path), "adapter": label}
+    inputs = {"model": relative(ctx, path), "trained": trained, "adapter": label}
     try:
         original = read_exchange(path)
     except FormatError as error:
@@ -131,7 +133,7 @@ def _round_trip(ctx: Context, name: str, path: Path, label: str) -> list[Check]:
                     id=check_id,
                     level="L0",
                     status="fail",
-                    spec_refs=SPEC_REFS,
+                    spec_refs=_SPEC_REFS,
                     inputs={**inputs, "log": outcome.log},
                     metric=f"{command}_call",
                     expected="exit 0",
@@ -151,12 +153,12 @@ def _round_trip(ctx: Context, name: str, path: Path, label: str) -> list[Check]:
                 id=check_id,
                 level="L0",
                 status="fail",
-                spec_refs=SPEC_REFS,
+                spec_refs=_SPEC_REFS,
                 inputs=inputs,
                 metric="exported_file",
                 expected="a valid ftgs-if file",
                 observed="schema violation",
-                symptom=f"Adapter {label}'s export of {inputs['model']} fails §2.2: {error}.",
+                symptom=f"Adapter {label}'s export of {inputs['model']} fails its format: {error}.",
                 pattern="schema violation",
                 repro=ctx.repro(check_id),
             )
@@ -172,14 +174,14 @@ def _round_trip(ctx: Context, name: str, path: Path, label: str) -> list[Check]:
             symptom = (
                 f"After adapter {label}'s import and export of {inputs['model']}, "
                 + ", ".join(f"{k} differs by up to {v:.3g} relative" for k, v in errors.items())
-                + f" (§3.3 allows 1e-6) over {original.num} rows."
+                + f" (the tolerance is 1e-6) over {original.num} rows of model {name}."
             )
         checks.append(
             Check(
                 id=check_id,
                 level="L0",
                 status="fail" if errors else "pass",
-                spec_refs=SPEC_REFS,
+                spec_refs=_SPEC_REFS,
                 inputs={**inputs, "exported": relative(ctx, exported)},
                 metric="max_relative_field_error",
                 expected="<= 1e-06",
@@ -205,14 +207,14 @@ def _render_check(
     """The implementation's renders of the model and of its round trip, at the strict tier."""
     items = small_items(model, fit_rig(model, width=64, height=48))
     request = ctx.cases / "L0" / f"{name}.request.json"
-    sha = request_for(ctx, request, items, (0.0, 0.0, 0.0))
+    sha = request_for(request, items, (0.0, 0.0, 0.0))
     folder = ctx.out / label / "L0"
     before = render(ctx, label, path, request, sha, items, folder / f"{name}.before.safetensors")
     after = render(ctx, label, exported, request, sha, items, folder / f"{name}.after.safetensors")
     inputs = {"model": relative(ctx, path), "roundtrip": relative(ctx, exported), "adapter": label}
     for result in (before, after):
         if result.renders is None:
-            return [failure_check(ctx, check_id, "L0", result, label, inputs, SPEC_REFS)]
+            return [failure_check(ctx, check_id, "L0", result, label, inputs, _SPEC_REFS)]
     assert before.renders is not None and after.renders is not None
     per_item = item_checks(
         ctx,
@@ -224,7 +226,7 @@ def _render_check(
         second=after.renders,
         tier="same",  # one implementation, so always the strict tolerance (Q-206)
         inputs=inputs,
-        spec_refs=SPEC_REFS,
+        spec_refs=_SPEC_REFS,
     )
     failed = [c for c in per_item if c.status == "fail"]
     worst = failed[0] if failed else min(per_item, key=lambda c: c.observed or float("inf"))
@@ -234,6 +236,8 @@ def _render_check(
 
 
 def run(ctx: Context) -> list[Check]:
-    jobs = [(name, path, label) for name, path, _ in _models(ctx) for label in ("A", "B")]
+    jobs = [
+        (name, path, trained) + (label,) for name, path, trained in _models(ctx) for label in "AB"
+    ]
     results = ctx.map(lambda job: _round_trip(ctx, *job), jobs)
     return [c for checks in results for c in checks]

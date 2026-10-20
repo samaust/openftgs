@@ -11,8 +11,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from adapter_cases import exchange_file, request_file
 from safetensors import safe_open
-from test_adapter import _exchange, _request
 
 HERE = Path(__file__).parent
 ADAPTER = str(Path(sys.executable).parent / "ftgs-adapter")
@@ -41,8 +41,8 @@ def _metadata(path: Path) -> dict[str, str]:
 
 
 def test_without_a_fault_the_outputs_are_the_wrapped_adapters(tmp_path: Path) -> None:
-    model = _exchange(tmp_path / "m.safetensors")
-    request = _request(tmp_path / "req.json")
+    model = exchange_file(tmp_path / "m.safetensors")
+    request = request_file(tmp_path / "req.json")
     assert _wrapped("render", model, request, tmp_path / "w.safetensors") == 0
     assert _plain("render", model, request, tmp_path / "p.safetensors") == 0
     # safetensors keeps its metadata in a hash map, so equal files can differ in their bytes.
@@ -56,7 +56,7 @@ def test_without_a_fault_the_outputs_are_the_wrapped_adapters(tmp_path: Path) ->
     [("velocity=1.1", "velocity"), ("duration=1.2", "duration"), ("dc=0.05", "sh")],
 )
 def test_a_model_fault_changes_only_its_field(tmp_path: Path, fault: str, changed: str) -> None:
-    model = _exchange(tmp_path / "m.safetensors")
+    model = exchange_file(tmp_path / "m.safetensors")
     assert _wrapped("import", model, tmp_path / "w", faults=(fault,)) == 0
     assert _plain("import", model, tmp_path / "p") == 0
     assert _plain("export", tmp_path / "w", tmp_path / "w.safetensors") == 0
@@ -67,10 +67,10 @@ def test_a_model_fault_changes_only_its_field(tmp_path: Path, fault: str, change
 
 
 def test_output_faults_change_what_they_name(tmp_path: Path) -> None:
-    model = _exchange(tmp_path / "m.safetensors")
+    model = exchange_file(tmp_path / "m.safetensors")
     assert _wrapped("export", model, tmp_path / "x.safetensors", faults=("drop_key=velocity",)) == 0
     assert "velocity" not in _arrays(tmp_path / "x.safetensors")
-    request = _request(tmp_path / "req.json")
+    request = request_file(tmp_path / "req.json")
     assert _wrapped("render", model, request, tmp_path / "n.safetensors", faults=("nan",)) == 0
     rgb = _arrays(tmp_path / "n.safetensors")["rgb/r0"]
     assert np.isnan(rgb).sum() == 3 and np.isnan(rgb[rgb.shape[0] // 2, rgb.shape[1] // 2]).all()

@@ -2,7 +2,6 @@
 """Render comparisons shared by L0 and L1 (§3.3): one request, both adapters (or one adapter and
 two models), one check per item with its measures, tier verdict, symptom and artifacts."""
 
-import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,8 +11,8 @@ import numpy as np
 from ftgs_harness.adapter import Outcome
 from ftgs_harness.artifacts import save_pair
 from ftgs_harness.checks import Check
-from ftgs_harness.compare import measure, verdict
-from ftgs_harness.formats import FormatError, RequestItem, read_renders, write_request
+from ftgs_harness.compare import STEP, measure, verdict
+from ftgs_harness.formats import FormatError, RequestItem, file_sha256, read_renders, write_request
 from ftgs_harness.info import Tier
 from ftgs_harness.runner import Context
 from ftgs_harness.symptoms import classify, describe, measure_pair
@@ -28,8 +27,6 @@ __all__ = [
     "request_for",
     "where_text",
 ]
-
-_MAX_ARTIFACTS = 12  # failed items per case that get images
 
 
 @dataclass(frozen=True)
@@ -48,13 +45,11 @@ class RenderResult:
     error: str | None  # a schema violation of the renders file
 
 
-def request_for(
-    ctx: Context, path: Path, items: Sequence[CaseItem], background: Sequence[float]
-) -> str:
+def request_for(path: Path, items: Sequence[CaseItem], background: Sequence[float]) -> str:
     """Write the case's request once (a rerun reuses the run's), returning its SHA-256."""
     if not path.exists():
         write_request(path, [i.item for i in items], background=background)
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return file_sha256(path)
 
 
 def render(
@@ -77,13 +72,6 @@ def render(
     return RenderResult(outcome, renders, None)
 
 
-def _rel(ctx: Context, path: Path) -> str:
-    try:
-        return str(path.relative_to(ctx.run_dir))
-    except ValueError:
-        return str(path)
-
-
 def failure_check(
     ctx: Context,
     check_id: str,
@@ -95,7 +83,10 @@ def failure_check(
 ) -> Check:
     """One failed check for a render call that crashed or wrote a malformed file."""
     if result.error is not None:
-        pattern, symptom = "schema violation", f"{who}'s renders file fails §2.2: {result.error}."
+        pattern, symptom = (
+            "schema violation",
+            f"{who}'s renders file fails its format: {result.error}.",
+        )
     else:
         pattern, symptom = "crash", f"{who}'s render call: {result.outcome.describe()}."
     return Check(
@@ -139,7 +130,6 @@ def item_checks(
 ) -> list[Check]:
     """One check per item: `second`'s render (B's, or the round trip's) against `first`'s."""
     checks = []
-    images = 0
     for entry in items:
         item = entry.item
         check_id = f"{prefix}.{item.id}"
@@ -149,13 +139,17 @@ def item_checks(
         m = measure(rgb_a, rgb_b, alpha_a, alpha_b)
         passed, metric, expected, observed = verdict(m, tier)
         symptom, pattern, artifacts = "", None, []
-        localization: dict[str, object] = {"times": [item.timestamp], "cameras": [entry.camera]}
+        localization: dict[str, object] = {
+            "times": [item.timestamp],
+            "cameras": [entry.camera],
+            "measures": m.to_json(),  # §3.3 L1: every per-item measure
+        }
         if not passed:
             pm = measure_pair(rgb_a, rgb_b, alpha_a, alpha_b)
             pattern = classify(pm, view_dependent=view_dependent)
             symptom = describe(pattern, pm, where_text(entry, m.psnr_db, swept_name))
             diff = np.abs(np.nan_to_num(rgb_a) - np.nan_to_num(rgb_b)).max(axis=-1)
-            ys, xs = np.nonzero(diff > 1.0 / 255.0)
+            ys, xs = np.nonzero(diff > STEP)
             if xs.size:
                 localization["pixel_bbox"] = [
                     int(xs.min()),
@@ -163,10 +157,8 @@ def item_checks(
                     int(xs.max()) + 1,
                     int(ys.max()) + 1,
                 ]
-            if images < _MAX_ARTIFACTS:
-                artifacts = save_pair(ctx.out, f"{case}_{item.id}", rgb_a, rgb_b)
-                artifacts = [_rel(ctx, ctx.out / a) for a in artifacts]
-                images += 1
+            artifacts = save_pair(ctx.out, f"{case}_{item.id}", rgb_a, rgb_b)
+            artifacts = [relative(ctx, ctx.out / a) for a in artifacts]
         checks.append(
             Check(
                 id=check_id,
@@ -188,4 +180,8 @@ def item_checks(
 
 
 def relative(ctx: Context, path: Path) -> str:
-    return _rel(ctx, path)
+    """`path` relative to the run directory, as the report names files."""
+    try:
+        return str(path.relative_to(ctx.run_dir))
+    except ValueError:
+        return str(path)

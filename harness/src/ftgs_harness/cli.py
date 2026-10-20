@@ -4,6 +4,7 @@ when one did, 2 for a harness or configuration error."""
 
 import argparse
 import sys
+import traceback
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -53,4 +54,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return rerun(args.check_id, args.out)
     except HarnessError as error:
         print(f"ftgs-harness: error: {error}", file=sys.stderr)
+        return _ERROR
+    except Exception:  # §3.3: any other failure of the harness itself is exit 2 too
+        traceback.print_exc()
+        print("ftgs-harness: error: the harness failed (traceback above)", file=sys.stderr)
         return _ERROR

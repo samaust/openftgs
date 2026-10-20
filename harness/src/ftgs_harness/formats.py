@@ -52,7 +52,7 @@ _REQUEST = "ftgs-render-request"
 _RENDERS = "ftgs-renders"
 _SCENE = "ftgs-scene"
 _OPACITY_RANGE = (1e-7, 1.0 - 1e-7)  # §2.2: the exchange file's opacity clamp
-_UNIT_TOLERANCE = 1e-5  # |‖q‖ − 1| allowed for a stored float32 unit quaternion
+_UNIT_TOLERANCE = 1e-6  # |‖q‖ − 1| allowed, as openftgs's writer allows (Q-24)
 
 
 class FormatError(ValueError):
@@ -78,10 +78,21 @@ def _read(path: Path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     return tensors, meta
 
 
-def _header(meta: Mapping[str, str], fmt: str, where: str) -> None:
+def _major(version: Any) -> int | None:
+    """A version's major number: 1 for 1, "1", "1.0" or "1.3"; None when it has none."""
+    if isinstance(version, int) and not isinstance(version, bool):
+        return version
+    if isinstance(version, str):
+        head = version.split(".")[0]
+        return int(head) if head.isdigit() else None
+    return None
+
+
+def _header(meta: Mapping[str, Any], fmt: str, where: str) -> None:
+    """§2.2: readers reject an unknown major version and ignore unknown optional keys."""
     if meta.get("format") != fmt:
         raise FormatError(f"{where}: format is {meta.get('format')!r}, not {fmt!r}")
-    if meta.get("version") != "1":
+    if _major(meta.get("version")) != 1:
         raise FormatError(f"{where}: version {meta.get('version')!r} is not 1")
 
 
@@ -150,7 +161,7 @@ def validate_exchange(ex: Exchange, where: str = _IF) -> None:
     if np.any(np.abs(np.linalg.norm(q, axis=1) - 1.0) > _UNIT_TOLERANCE):
         raise FormatError(f"{where}: rotation is not a unit quaternion on every row")
     if np.any(q[:, 0] < 0.0):
-        raise FormatError(f"{where}: rotation has w < 0 on some row (§2.2: w ≥ 0)")
+        raise FormatError(f"{where}: rotation has w < 0 on some row, where w ≥ 0")  # §2.2
     low, high = _OPACITY_RANGE
     opacity = ex.arrays["opacity"]
     if np.any(opacity < np.float32(low)) or np.any(opacity > np.float32(high)):
@@ -160,7 +171,9 @@ def validate_exchange(ex: Exchange, where: str = _IF) -> None:
     if ex.tau0 == ex.tau1 and (
         np.any(ex.arrays["time_center"] != ex.tau0) or np.any(ex.arrays["velocity"] != 0.0)
     ):
-        raise FormatError(f"{where}: with τ₀ = τ₁ every time_center is τ₀ and velocity 0 (D-71)")
+        raise FormatError(
+            f"{where}: with τ₀ = τ₁ every time_center is τ₀ and every velocity 0"
+        )  # D-71
     conventions = ex.render_conventions
     if conventions is not None and "background" in conventions:
         bg = conventions["background"]
@@ -170,7 +183,7 @@ def validate_exchange(ex: Exchange, where: str = _IF) -> None:
             and all(isinstance(c, int | float) and not isinstance(c, bool) for c in bg)
             and all(0.0 <= c <= 1.0 for c in bg)
         ):
-            raise FormatError(f"{where}: background {bg!r} is not three numbers in [0, 1] (D-84)")
+            raise FormatError(f"{where}: background {bg!r} is not three numbers in [0, 1]")  # D-84
 
 
 def read_exchange(path: Path) -> Exchange:
@@ -323,6 +336,28 @@ def _matrix(value: Any, shape: tuple[int, int], where: str) -> np.ndarray:
     return a
 
 
+def _scene_image(
+    i: int, image: Any, cameras: Mapping[str, Any], base: Path, where: str
+) -> SceneImage:
+    name = image.get("camera") if isinstance(image, dict) else None
+    if not isinstance(name, str) or name not in cameras:
+        raise FormatError(f"{where}: image {i} names an unknown camera")
+    cam = cameras[name]
+    return SceneImage(
+        camera=name,
+        timestamp=float(image["timestamp"]),
+        path=base / image["path"],
+        split=image.get("split", "train"),
+        K=_matrix(image.get("K", cam["K"]), (3, 3), where),
+        world_to_camera=_matrix(
+            image.get("world_to_camera", cam["world_to_camera"]), (4, 4), where
+        ),
+        width=int(cam["width"]),
+        height=int(cam["height"]),
+        frame_index=image.get("frame_index"),
+    )
+
+
 def read_scene(path: Path) -> SceneInfo:
     """Read a ftgs-scene manifest (§2.2): cameras, images with per-image overrides of K and
     world_to_camera, paths relative to the manifest."""
@@ -331,34 +366,22 @@ def read_scene(path: Path) -> SceneInfo:
         raw = json.loads(Path(path).read_text())
     except (OSError, ValueError) as error:
         raise FormatError(f"{where}: {error}") from error
-    if not isinstance(raw, dict) or raw.get("format") != _SCENE or raw.get("version") != 1:
+    if not isinstance(raw, dict):
         raise FormatError(f"{where}: not a {_SCENE} v1 file")
+    _header(raw, _SCENE, where)
     cameras = raw.get("cameras")
     images = raw.get("images")
     if not isinstance(cameras, dict) or not isinstance(images, list):
         raise FormatError(f"{where}: needs cameras and images")
     base = Path(path).resolve().parent
-    out = []
-    for i, image in enumerate(images):
-        name = image.get("camera") if isinstance(image, dict) else None
-        if not isinstance(name, str) or name not in cameras:
-            raise FormatError(f"{where}: image {i} names an unknown camera")
-        cam = cameras[name]
-        out.append(
-            SceneImage(
-                camera=name,
-                timestamp=float(image["timestamp"]),
-                path=base / image["path"],
-                split=image.get("split", "train"),
-                K=_matrix(image.get("K", cam["K"]), (3, 3), where),
-                world_to_camera=_matrix(
-                    image.get("world_to_camera", cam["world_to_camera"]), (4, 4), where
-                ),
-                width=int(cam["width"]),
-                height=int(cam["height"]),
-                frame_index=image.get("frame_index"),
-            )
-        )
+    try:
+        out = [_scene_image(i, image, cameras, base, where) for i, image in enumerate(images)]
+    except (KeyError, TypeError, ValueError) as error:
+        if isinstance(error, FormatError):
+            raise
+        raise FormatError(
+            f"{where}: a camera or image lacks a key or a value: {error!r}"
+        ) from error
     return SceneInfo(
         path=Path(path).resolve(),
         time_unit=str(raw.get("time_unit", "s")),

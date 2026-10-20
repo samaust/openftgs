@@ -19,14 +19,14 @@ from ftgs_harness.settings import HarnessError
 
 __all__ = ["Adapter", "Outcome"]
 
-OutcomeStatus = Literal["ok", "crash", "timeout"]
+_OutcomeStatus = Literal["ok", "crash", "timeout"]
 
 
 @dataclass(frozen=True)
 class Outcome:
     """How an adapter call ended: `ok` (exit 0), `crash` (any other exit) or `timeout`."""
 
-    status: OutcomeStatus
+    status: _OutcomeStatus
     returncode: int | None
     seconds: float
     stdout: str
@@ -83,7 +83,7 @@ class Adapter:
             env=full_env,
             start_new_session=True,
         )
-        status: OutcomeStatus
+        status: _OutcomeStatus
         code: int | None
         try:
             stdout, stderr = process.communicate(timeout=self.timeout)

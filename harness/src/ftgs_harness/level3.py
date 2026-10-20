@@ -42,7 +42,7 @@ from ftgs_harness.stats import (
     welch_p,
 )
 
-__all__ = ["MARGINS", "run", "trace_targets"]
+__all__ = ["MARGINS", "QUANTITIES", "run", "trace_targets"]
 
 # §3.3 L3 step 4: the TOST margins; DSSIM is reported only, a function of SSIM (Q-210).
 MARGINS = {"psnr": 0.25, "ssim1": 0.005, "ssim2": 0.005, "lpips_alex": 0.01, "lpips_vgg": 0.01}
@@ -63,7 +63,7 @@ _SPEC = ["§3.3 L3"]
 
 
 @dataclass
-class RunResult:
+class _RunResult:
     impl: str
     seed: int
     folder: Path
@@ -98,8 +98,13 @@ def _held_out(ctx: Context, scene: Scene) -> tuple[list[CaseItem], list[Path]]:
     return items, [image.path for image in tests]
 
 
-def _image(path: Path) -> np.ndarray:
-    pixels = matplotlib.image.imread(str(path))
+def _image(scene: Scene, path: Path) -> np.ndarray:
+    """A held-out ground-truth image as float32 RGB in [0, 1]; a scene whose image can't be read
+    is a configuration error."""
+    try:
+        pixels = matplotlib.image.imread(str(path))
+    except (OSError, ValueError) as error:
+        raise HarnessError(f"L3 scene {scene.name}: can't read {path}: {error}") from error
     if pixels.dtype == np.uint8:
         pixels = pixels.astype(np.float32) / 255.0
     return np.asarray(pixels[..., :3], dtype=np.float32)
@@ -124,10 +129,42 @@ def _samples(path: Path, rng: np.random.Generator) -> dict[str, np.ndarray]:
 
 
 def _trace(folder: Path) -> list[dict[str, Any]]:
+    """train_log.jsonl's rows (§3.3 adapter contract: iteration, loss terms, N; Q-132)."""
     path = folder / "train_log.jsonl"
     if not path.is_file():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    try:
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except ValueError as error:
+        raise FormatError(f"{path}: a row is not JSON ({error})") from error
+    if not all(isinstance(r, dict) and isinstance(r.get("losses", {}), dict) for r in rows):
+        raise FormatError(f"{path}: rows must be objects with an iteration, losses and N")
+    return rows
+
+
+def _not_comparable_keys(folder: Path) -> list[str]:
+    """The settings the adapter couldn't honor (Q-202): a JSON list of dotted keys."""
+    path = folder / "not_comparable.json"
+    if not path.is_file():
+        return []
+    try:
+        keys = json.loads(path.read_text())
+    except ValueError as error:
+        raise FormatError(f"{path}: not JSON ({error})") from error
+    if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+        raise FormatError(f"{path}: not a list of dotted keys")
+    return keys
+
+
+@dataclass(frozen=True)
+class _HeldOut:
+    """A scene's held-out request, its ground truth and the metrics the harness computes."""
+
+    request: Path
+    sha: str
+    items: list[CaseItem]
+    truths: list[np.ndarray]
+    measure: Callable[[np.ndarray, np.ndarray], dict[str, float]]
 
 
 def _failure(
@@ -148,39 +185,28 @@ def _failure(
     )
 
 
-class _Gpus:
-    """Round-robin GPU slots: each run holds one GPU of the settings' list (D-54)."""
-
-    def __init__(self, gpus: Sequence[str]) -> None:
-        self.free: queue.Queue[str] = queue.Queue()
-        for gpu in gpus:
-            self.free.put(gpu)
-
-
 def _one_run(
     ctx: Context,
     scene: Scene,
     impl: str,
     seed: int,
-    request: Path,
-    sha: str,
-    items: list[CaseItem],
-    truths: list[np.ndarray],
-    measure: Callable[[np.ndarray, np.ndarray], dict[str, float]],
-    gpus: _Gpus | None,
-) -> RunResult:
+    held: _HeldOut,
+    gpus: "queue.Queue[str] | None",
+) -> _RunResult:
+    """One run: train, export and render the held-out request, on one GPU slot of `gpus` (each
+    run holds one GPU of the settings' list, D-54), then the harness's metrics."""
     adapter = ctx.b if impl == "B" else ctx.a
     folder = ctx.out / "L3" / scene.name / impl / f"seed{seed}"
-    result = RunResult(impl, seed, folder)
+    result = _RunResult(impl, seed, folder)
     check_id = f"L3.run.{scene.name}.{impl}.seed{seed}"
-    gpu = gpus.free.get() if gpus is not None else None
+    gpu = gpus.get() if gpus is not None else None
     env = {"CUDA_VISIBLE_DEVICES": gpu} if gpu is not None else None
     try:
         folder.parent.mkdir(parents=True, exist_ok=True)
         steps: list[tuple[str, list[Any]]] = [
             ("train", [scene.train_manifest, scene.init, ctx.config_path, seed, folder]),
             ("export", [folder, folder.with_suffix(".ftgs-if.safetensors")]),
-            ("render", [folder, request, folder.with_suffix(".renders.safetensors")]),
+            ("render", [folder, held.request, folder.with_suffix(".renders.safetensors")]),
         ]
         for command, args in steps:
             outcome = adapter.call(command, args, env=env)
@@ -197,17 +223,19 @@ def _one_run(
                 return result
     finally:
         if gpus is not None and gpu is not None:
-            gpus.free.put(gpu)
+            gpus.put(gpu)
     try:
         renders = read_renders(
             folder.with_suffix(".renders.safetensors"),
-            request_sha256=sha,
-            items=[i.item for i in items],
+            request_sha256=held.sha,
+            items=[i.item for i in held.items],
         )
         result.samples = _samples(
             folder.with_suffix(".ftgs-if.safetensors"),
             np.random.default_rng([ctx.settings.seed, 3, seed]),
         )
+        result.trace = _trace(folder)
+        result.not_comparable = _not_comparable_keys(folder)
     except FormatError as error:
         result.failure = _failure(
             ctx,
@@ -218,41 +246,32 @@ def _one_run(
         )
         return result
     per_image = [
-        measure(renders[i.item.id][0], truth) for i, truth in zip(items, truths, strict=True)
+        held.measure(renders[i.item.id][0], truth)
+        for i, truth in zip(held.items, held.truths, strict=True)
     ]
     result.metrics = {k: float(np.mean([m[k] for m in per_image])) for k in per_image[0]}
     result.per_image_psnr = [m["psnr"] for m in per_image]
     result.samples["psnr_per_time"] = np.array(result.per_image_psnr)
-    result.trace = _trace(folder)
-    nc = folder / "not_comparable.json"
-    if nc.is_file():
-        result.not_comparable = [str(k) for k in json.loads(nc.read_text())]
     return result
 
 
-def _runs(
-    ctx: Context,
-    scene: Scene,
-    request: Path,
-    sha: str,
-    items: list[CaseItem],
-    truths: list[np.ndarray],
-    measure: Callable[[np.ndarray, np.ndarray], dict[str, float]],
-) -> list[RunResult]:
+def _runs(ctx: Context, scene: Scene, held: _HeldOut) -> list[_RunResult]:
     k = ctx.settings.k
     plan = (
         [("A", s) for s in range(k)]
         + [("B", s) for s in range(k)]
         + [("A2", s) for s in range(k, 2 * k)]
     )
-    gpus = _Gpus(ctx.settings.gpus) if ctx.settings.gpus else None
+    gpus: queue.Queue[str] | None = None
+    if ctx.settings.gpus:
+        gpus = queue.Queue()
+        for gpu in ctx.settings.gpus:
+            gpus.put(gpu)
     workers = len(ctx.settings.gpus) if ctx.settings.gpus else 1
     with concurrent.futures.ThreadPoolExecutor(workers) as pool:
         return list(
             pool.map(
-                lambda job: _one_run(
-                    ctx, scene, job[0], job[1], request, sha, items, truths, measure, gpus
-                ),
+                lambda job: _one_run(ctx, scene, job[0], job[1], held, gpus),
                 plan,
             )
         )
@@ -269,7 +288,7 @@ class _MetricRow:
     runs_b: list[dict[str, float]]
 
 
-def _metric_checks(ctx: Context, scenes: dict[str, list[RunResult]]) -> list[Check]:
+def _metric_checks(ctx: Context, scenes: dict[str, list[_RunResult]]) -> list[Check]:
     rows: list[_MetricRow] = []
     for name, results in scenes.items():
         good = [r for r in results if r.failure is None]
@@ -349,8 +368,19 @@ def _metric_checks(ctx: Context, scenes: dict[str, list[RunResult]]) -> list[Che
     return checks
 
 
-def _dist_checks(ctx: Context, scenes: dict[str, list[RunResult]]) -> list[Check]:
-    rows = []
+@dataclass(frozen=True)
+class _DistRow:
+    scene: str
+    quantity: str
+    distance: str  # "ks" or "w1"
+    statistic: float  # d(A, B) − d(A, A′)
+    p: float
+    k: int
+    pooled: dict[str, np.ndarray]
+
+
+def _dist_checks(ctx: Context, scenes: dict[str, list[_RunResult]]) -> list[Check]:
+    rows: list[_DistRow] = []
     for name, results in scenes.items():
         good = [r for r in results if r.failure is None]
         groups = {impl: [r.samples for r in good if r.impl == impl] for impl in ("A", "B", "A2")}
@@ -367,14 +397,23 @@ def _dist_checks(ctx: Context, scenes: dict[str, list[RunResult]]) -> list[Check
                 pooled = {
                     impl: np.concatenate([s[quantity] for s in g]) for impl, g in groups.items()
                 }
-                rows.append((name, quantity, label, stat, p, len(groups["B"]), pooled))
+                rows.append(_DistRow(name, quantity, label, stat, p, len(groups["B"]), pooled))
     if not rows:
         return []
-    adjusted = holm([r[4] for r in rows])
+    adjusted = holm([r.p for r in rows])
     m = len(rows)
     checks = []
     plotted: dict[tuple[str, str], str] = {}
-    for (name, quantity, label, stat, p, k, pooled), p_holm in zip(rows, adjusted, strict=True):
+    for row, p_holm in zip(rows, adjusted, strict=True):
+        name, quantity, label, stat, p, k = (
+            row.scene,
+            row.quantity,
+            row.distance,
+            row.statistic,
+            row.p,
+            row.k,
+        )
+        pooled = row.pooled
         check_id = f"L3.dist.{name}.{quantity}.{label}"
         if not ctx.wants(check_id):
             continue
@@ -425,7 +464,7 @@ def _dist_checks(ctx: Context, scenes: dict[str, list[RunResult]]) -> list[Check
     return checks
 
 
-def _trace_checks(ctx: Context, name: str, results: list[RunResult]) -> list[Check]:
+def _trace_checks(ctx: Context, name: str, results: list[_RunResult]) -> list[Check]:
     iterations = int(dict(ctx.config.get("optim", {})).get("iterations", 30_000))
     targets = trace_targets(iterations)
     checks = []
@@ -464,6 +503,14 @@ def _trace_checks(ctx: Context, name: str, results: list[RunResult]) -> list[Che
         status: Status = "pass" if finite and not missing else "fail"
         if not ctx.wants(check_id):
             continue
+        # §3.3 L3 step 6: compared by median and spread, B's median against the spread of A's
+        # seeds and A′'s together; reported, not judged (Q-210).
+        comparison = {}
+        for term, b_stats in summary.get("B", {}).items():
+            lows = [summary[i][term]["min"] for i in ("A", "A2") if term in summary.get(i, {})]
+            highs = [summary[i][term]["max"] for i in ("A", "A2") if term in summary.get(i, {})]
+            if lows:
+                comparison[term] = bool(min(lows) <= b_stats["median"] <= max(highs))
         checks.append(
             Check(
                 id=check_id,
@@ -474,6 +521,7 @@ def _trace_checks(ctx: Context, name: str, results: list[RunResult]) -> list[Che
                 metric="loss_terms_and_N",
                 expected="logged and finite",
                 observed=summary,
+                localization={"B_median_within_A_and_A2_spread": comparison},
                 symptom=""
                 if status == "pass"
                 else (
@@ -506,7 +554,7 @@ def _trace_checks(ctx: Context, name: str, results: list[RunResult]) -> list[Che
     return checks
 
 
-def _not_comparable(ctx: Context, name: str, results: list[RunResult]) -> list[Check]:
+def _not_comparable(ctx: Context, name: str, results: list[_RunResult]) -> list[Check]:
     keys = sorted({(r.impl, k) for r in results for k in r.not_comparable if r.impl in ("A", "B")})
     checks = []
     for impl, key in keys:
@@ -548,7 +596,7 @@ def _measurer() -> Callable[[np.ndarray, np.ndarray], dict[str, float]]:
 def run(ctx: Context) -> list[Check]:
     measure = _measurer()
     background = list(ctx.config.get("background", [0.0, 0.0, 0.0]))
-    by_scene: dict[str, list[RunResult]] = {}
+    by_scene: dict[str, list[_RunResult]] = {}
     checks: list[Check] = []
     for scene in ctx.settings.scenes:
         if not ctx.wants("L3") and not any(
@@ -557,11 +605,11 @@ def run(ctx: Context) -> list[Check]:
         ):
             continue
         items, paths = _held_out(ctx, scene)
-        truths = [_image(p) for p in paths]
+        truths = [_image(scene, p) for p in paths]
         request = ctx.cases / "L3" / f"{scene.name}.request.json"
         request.parent.mkdir(parents=True, exist_ok=True)
-        sha = request_for(ctx, request, items, background)
-        results = _runs(ctx, scene, request, sha, items, truths, measure)
+        sha = request_for(request, items, background)
+        results = _runs(ctx, scene, _HeldOut(request, sha, items, truths, measure))
         by_scene[scene.name] = results
         checks += [r.failure for r in results if r.failure is not None and ctx.wants(r.failure.id)]
         checks += _not_comparable(ctx, scene.name, results)

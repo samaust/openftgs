@@ -17,7 +17,6 @@ import numpy as np
 __all__ = ["PairMeasures", "classify", "describe", "measure_pair"]
 
 _BORDER_PX = 3  # the width of the border band
-_COLOR_STEP = 1.0 / 255.0
 
 
 @dataclass(frozen=True)

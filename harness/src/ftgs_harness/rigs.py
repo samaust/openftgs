@@ -7,9 +7,9 @@ from ftgs_harness.cameras import Cam, intrinsics, look_at
 from ftgs_harness.formats import Exchange, RequestItem
 from ftgs_harness.rendering import CaseItem
 
-__all__ = ["Rig", "fit_rig", "frames", "main_items"]
+__all__ = ["Rig", "fit_rig", "frames", "main_items", "small_items"]
 
-FRAMES = 20  # §3.3 L1's rig: 20 frames (Q-209)
+_FRAMES = 20  # §3.3 L1's rig: 20 frames (Q-209)
 
 
 class Rig:
@@ -51,10 +51,10 @@ def fit_rig(model: Exchange, *, count: int = 8, width: int = 128, height: int = 
 
 
 def frames(model: Exchange) -> np.ndarray:
-    """The rig's frame times: FRAMES evenly over [τ₀, τ₁] (one when τ₀ = τ₁)."""
+    """The rig's frame times: _FRAMES evenly over [τ₀, τ₁] (one when τ₀ = τ₁)."""
     if model.tau1 == model.tau0:
         return np.array([model.tau0])
-    return np.linspace(model.tau0, model.tau1, FRAMES)
+    return np.linspace(model.tau0, model.tau1, _FRAMES)
 
 
 def _item(item_id: str, cam: Cam, tau: float) -> CaseItem:

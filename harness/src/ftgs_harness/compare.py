@@ -11,9 +11,9 @@ import numpy as np
 
 from ftgs_harness.info import TIERS, Tier
 
-__all__ = ["ItemMeasures", "measure", "verdict"]
+__all__ = ["STEP", "ItemMeasures", "measure", "verdict"]
 
-_STEP = 1.0 / 255.0  # §3.3 L1: the share of pixels with |Δ| > 1/255
+STEP = 1.0 / 255.0  # §3.3 L1: the share of pixels with |Δ| > 1/255
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ def measure(
         psnr_db=math.inf if mse == 0.0 else -10.0 * math.log10(mse),
         max_abs=float(diff.max()),
         mean_abs=float(diff.mean()),
-        share_above=float(np.mean(np.any(diff > _STEP, axis=-1))),
+        share_above=float(np.mean(np.any(diff > STEP, axis=-1))),
         alpha_max_abs=float(alpha.max()),
         alpha_mean_abs=float(alpha.mean()),
         finite=True,

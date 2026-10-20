@@ -30,8 +30,8 @@ from ftgs_harness.settings import (
 
 __all__ = ["Context", "harness_version", "rerun", "run"]
 
-T = TypeVar("T")
-R = TypeVar("R")
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 # The module that runs each level; each has `run(ctx) -> list[Check]`.
 _LEVEL_MODULES = {
@@ -87,7 +87,7 @@ class Context:
         kinds = info.get("query_kinds") if isinstance(info, dict) else None
         return set(kinds) if isinstance(kinds, list) else set()
 
-    def map(self, fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
+    def map(self, fn: Callable[[_T], _R], items: Iterable[_T]) -> list[_R]:
         """`fn` over `items`, `jobs` at a time, in order."""
         items = list(items)
         if self.jobs <= 1 or len(items) <= 1:
@@ -199,7 +199,7 @@ def run(
         levels=chosen,
         jobs=jobs,
         timeout=timeout,
-        started=datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        started=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         harness_version=harness_version(),
     )
     ctx = Context(

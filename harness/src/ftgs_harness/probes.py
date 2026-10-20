@@ -28,8 +28,8 @@ from ftgs_harness.trends import fit_trend
 
 __all__ = ["PROBES", "Probe", "run"]
 
-WIDTH, HEIGHT, FOCAL = 64, 48, 60.0
-TAU0, TAU1, TC = 0.0, 1.9, 0.95
+_WIDTH, _HEIGHT, _FOCAL = 64, 48, 60.0
+_TAU0, _TAU1, _TC = 0.0, 1.9, 0.95
 _EYE = np.array([0.0, -4.0, 0.0])  # looking along +y: image x is world x, image y is −z
 
 
@@ -47,14 +47,14 @@ class Probe:
     view: bool = False
 
 
-def _camera(name: str, *, eye: np.ndarray = _EYE, cx: float = WIDTH / 2.0) -> Cam:
-    K = intrinsics(WIDTH, HEIGHT, FOCAL)
+def _camera(name: str, *, eye: np.ndarray = _EYE, cx: float = _WIDTH / 2.0) -> Cam:
+    K = intrinsics(_WIDTH, _HEIGHT, _FOCAL)
     K[0, 2] = cx
-    return Cam(name, K, look_at(eye), WIDTH, HEIGHT)
+    return Cam(name, K, look_at(eye), _WIDTH, _HEIGHT)
 
 
 def _item(i: int, cam: Cam, tau: float, swept: float) -> CaseItem:
-    item = RequestItem(f"r{i:04d}", float(tau), cam.K, cam.world_to_camera, WIDTH, HEIGHT)
+    item = RequestItem(f"r{i:04d}", float(tau), cam.K, cam.world_to_camera, _WIDTH, _HEIGHT)
     return CaseItem(item, cam.name, swept)
 
 
@@ -64,8 +64,8 @@ def _time_items(times: np.ndarray) -> list[CaseItem]:
 
 
 def _tau_for(effective: float, sigma: float, duration: float) -> float:
-    """The τ after TC at which σ·σt(τ) is `effective` (E3, E4)."""
-    return TC + duration * math.sqrt(-2.0 * math.log(min(effective / sigma, 1.0)))
+    """The τ after _TC at which σ·σt(τ) is `effective` (E3, E4)."""
+    return _TC + duration * math.sqrt(-2.0 * math.log(min(effective / sigma, 1.0)))
 
 
 def _away(values: np.ndarray, cut: float, margin: float) -> np.ndarray:
@@ -80,7 +80,7 @@ def _p1(n: int) -> tuple[Exchange, list[CaseItem]]:
     model = single_primitive(scale=(0.08, 0.08, 0.08))
     shifts = np.linspace(0.0, 1.0, n)
     return model, [
-        _item(i, _camera(f"sub{s:.2f}", cx=WIDTH / 2 + s), TC, s) for i, s in enumerate(shifts)
+        _item(i, _camera(f"sub{s:.2f}", cx=_WIDTH / 2 + s), _TC, s) for i, s in enumerate(shifts)
     ]
 
 
@@ -89,7 +89,7 @@ def _moving() -> Exchange:
 
 
 def _p2(n: int) -> tuple[Exchange, list[CaseItem]]:
-    return _moving(), _time_items(np.linspace(TAU0, TAU1, n))
+    return _moving(), _time_items(np.linspace(_TAU0, _TAU1, n))
 
 
 def _p3(n: int) -> tuple[Exchange, list[CaseItem]]:
@@ -118,23 +118,23 @@ def _p5(n: int) -> tuple[Exchange, list[CaseItem]]:
     for i, deg in enumerate(angles):
         rad = math.radians(deg)
         eye = 4.0 * np.array([math.sin(rad), -math.cos(rad), 0.3])
-        items.append(_item(i, _camera(f"view{deg:.0f}", eye=eye), TC, float(deg)))
+        items.append(_item(i, _camera(f"view{deg:.0f}", eye=eye), _TC, float(deg)))
     return model, items
 
 
 def _p6(n: int) -> tuple[Exchange, list[CaseItem]]:
-    # The primitive's camera depth is 0.1 + 0.4·(τ − TC), crossing the near plane 0.01 (E6).
+    # The primitive's camera depth is 0.1 + 0.4·(τ − _TC), crossing the near plane 0.01 (E6).
     model = single_primitive(
         position=(0.02, -3.9, 0.0), velocity=(0.0, 0.4, 0.0), scale=(0.02, 0.02, 0.02)
     )
     depth = _away(np.linspace(-0.2, 0.47, n), 0.01, 0.5)
-    times = TC + (depth - 0.1) / 0.4
+    times = _TC + (depth - 0.1) / 0.4
     cam = _camera("front")
     return model, [_item(i, cam, t, d) for i, (t, d) in enumerate(zip(times, depth, strict=True))]
 
 
 def _p7(n: int) -> tuple[Exchange, list[CaseItem]]:
-    # A static primitive at depth 4 and a moving one crossing it in depth at TC.
+    # A static primitive at depth 4 and a moving one crossing it in depth at _TC.
     rows = [
         single_primitive(scale=(0.15, 0.15, 0.15), opacity=0.7, color_sh=(1.0, -0.5, -0.5)),
         single_primitive(
@@ -147,8 +147,8 @@ def _p7(n: int) -> tuple[Exchange, list[CaseItem]]:
     model = replace(
         rows[0], arrays={k: np.concatenate([r.arrays[k] for r in rows]) for k in rows[0].arrays}
     )
-    times = np.linspace(TAU0, TAU1, n)
-    times = np.where(np.abs(times - TC) < 0.02, TC + np.sign(times - TC + 1e-12) * 0.02, times)
+    times = np.linspace(_TAU0, _TAU1, n)
+    times = np.where(np.abs(times - _TC) < 0.02, _TC + np.sign(times - _TC + 1e-12) * 0.02, times)
     return model, _time_items(times)
 
 
@@ -161,21 +161,24 @@ def _p8(n: int) -> tuple[Exchange, list[CaseItem]]:
 
 def _p9(n: int) -> tuple[Exchange, list[CaseItem]]:
     model = single_primitive(scale=(0.8, 0.8, 0.8), opacity=0.6)
-    positions = np.linspace(-30.0, WIDTH + 30.0, n)
-    items = [_item(i, _camera(f"cx{p:.1f}", cx=p), TC, p) for i, p in enumerate(positions)]
+    positions = np.linspace(-30.0, _WIDTH + 30.0, n)
+    items = [_item(i, _camera(f"cx{p:.1f}", cx=p), _TC, p) for i, p in enumerate(positions)]
     return model, items
 
 
 def _p10(n: int) -> tuple[Exchange, list[CaseItem]]:
     half = (n + 1) // 2
     times = np.concatenate(
-        [np.linspace(TAU0 - 1.0, TAU0 - 0.05, half), np.linspace(TAU1 + 0.05, TAU1 + 1.0, n - half)]
+        [
+            np.linspace(_TAU0 - 1.0, _TAU0 - 0.05, half),
+            np.linspace(_TAU1 + 0.05, _TAU1 + 1.0, n - half),
+        ]
     )
     return _moving(), _time_items(times)
 
 
 def _since_center(entry: CaseItem) -> float:
-    return abs(entry.item.timestamp - TC)
+    return abs(entry.item.timestamp - _TC)
 
 
 PROBES = [
@@ -382,11 +385,8 @@ def _analyse(
     sentence = f" The {name} is {trend.describe(variable, unit or 'units')}."
     for check in failing:
         check.symptom = check.symptom.rstrip() + sentence
-        check.localization["trend"] = {
-            "variable": variable,
-            "model": trend.model,
-            "coefficients": list(trend.coefficients),
-        }
+        check.localization["trend"] = f"{trend.model} in {variable}"  # as §3.3's example
+        check.localization["trend_coefficients"] = list(trend.coefficients)
         check.artifacts.append(relative(ctx, ctx.out / plot))
 
 

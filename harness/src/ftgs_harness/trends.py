@@ -20,7 +20,7 @@ class Trend:
     coefficients: tuple[float, ...]  # c0, c1, c2: y ≈ c0 + c1·x + c2·x²
 
     def describe(self, variable: str, unit: str) -> str:
-        """For example "linear in |τ − time_center| (7.3 px per s, 0.0 px at 0)"."""
+        """For example "linear in |τ − time_center| (7.3 px per unit, 0.0 px at 0)"."""
         c = self.coefficients
         if self.model == "constant":
             return f"constant over {variable} ({c[0]:.3g} {unit})"

@@ -25,7 +25,7 @@ from ftgs_harness.settings import HarnessError
 
 __all__ = ["CaseRenders", "compare_case", "render_case", "run"]
 
-SPEC_REFS = ["E1", "E2", "E3", "E4", "E5", "E6"]
+_SPEC_REFS = ["E1", "E2", "E3", "E4", "E5", "E6"]
 
 
 @dataclass
@@ -50,7 +50,7 @@ def render_case(
         assert model is not None
         write_exchange(model_path, model)
     request = folder / f"{case}.request.json"
-    sha = request_for(ctx, request, items, (0.0, 0.0, 0.0))
+    sha = request_for(request, items, (0.0, 0.0, 0.0))
     inputs: dict[str, object] = {
         "model": relative(ctx, model_path),
         "request": relative(ctx, request),
@@ -129,7 +129,7 @@ def run(ctx: Context) -> list[Check]:
             model = _main_model(ctx, np.random.default_rng([ctx.settings.seed, 1, 0]))
         rng = np.random.default_rng([ctx.settings.seed, 1, 1])
         items = main_items(model, fit_rig(model), ctx.settings.sizes["l1.items"], rng)
-        checks += compare_case(ctx, "main", model, items, spec_refs=SPEC_REFS)
+        checks += compare_case(ctx, "main", model, items, spec_refs=_SPEC_REFS)
     from ftgs_harness import probes  # probes builds on this module's cases
 
     return checks + probes.run(ctx)

@@ -73,9 +73,12 @@ def _raw_motion(ex: Exchange) -> tuple[np.ndarray, np.ndarray]:
 
 def test_info_lists_all_thirteen_query_kinds(capsys: pytest.CaptureFixture[str]) -> None:
     """§3.3 L2: openftgs answers every kind (Q-205)."""
+    import json
+
     from ftgs_harness.info import QUERY_KINDS
 
-    assert sorted(_adapter._info("gsplat")["query_kinds"]) == sorted(QUERY_KINDS)
+    assert _adapter.main(["--backend", "gsplat", "info"]) == 0
+    assert sorted(json.loads(capsys.readouterr().out)["query_kinds"]) == sorted(QUERY_KINDS)
 
 
 def test_motion_and_temporal_and_effective_opacity(tmp_path: Path) -> None:

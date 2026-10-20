@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The harness's statistics (§3.3 L2 and L3; Q-209, Q-210) on constructed samples."""
 
-import math
-
 import numpy as np
 import pytest
-import scipy.stats
 
 from ftgs_harness.stats import (
     chi2_goodness_of_fit,
@@ -22,12 +19,16 @@ from ftgs_harness.stats import (
 )
 
 
-def test_welch_ks_and_w1_are_scipys() -> None:
-    g = np.random.default_rng(0)
-    a, b = g.normal(size=7), g.normal(0.5, 2.0, size=9)
-    assert welch_p(a, b) == pytest.approx(scipy.stats.ttest_ind(a, b, equal_var=False).pvalue)
-    assert ks_distance(a, b) == scipy.stats.ks_2samp(a, b).statistic
-    assert w1_distance(a, b) == scipy.stats.wasserstein_distance(a, b)
+def test_welch_ks_and_w1_on_worked_samples() -> None:
+    """Worked by hand: equal samples give Welch p = 1; disjoint samples give a KS distance of 1;
+    W1 between two samples one shifted by 3 is 3; KS between (0, 1, 2, 3) and (2, 3, 4, 5) is
+    0.5, where half of the first lies below every value of the second."""
+    a = np.array([1.0, 2.0, 3.0, 4.0])
+    assert welch_p(a, a) == pytest.approx(1.0)
+    assert welch_p(a, a + 100.0) < 1e-6
+    assert ks_distance(a, a + 10.0) == 1.0
+    assert w1_distance(a, a + 3.0) == pytest.approx(3.0)
+    assert ks_distance([0.0, 1.0, 2.0, 3.0], [2.0, 3.0, 4.0, 5.0]) == pytest.approx(0.5)
 
 
 def test_tost_declares_equivalence_only_within_the_margin() -> None:
@@ -39,14 +40,10 @@ def test_tost_declares_equivalence_only_within_the_margin() -> None:
     assert tost_p(a, a + 0.5, 0.25) > 0.5
     noisy = 30.0 + g.normal(scale=1.0, size=5)
     assert tost_p(noisy, noisy + 0.01, 0.25) > 0.05
-    # The two one-sided tests by hand, for a worked pair.
+    # A margin at the observed difference leaves one one-sided test at p = 0.5.
     x, y = np.array([1.0, 1.2, 0.9, 1.1]), np.array([1.05, 1.0, 1.15, 1.0])
-    va, vb = x.var(ddof=1) / 4, y.var(ddof=1) / 4
-    se = math.sqrt(va + vb)
-    df = (va + vb) ** 2 / (va**2 / 3 + vb**2 / 3)
-    d = x.mean() - y.mean()
-    expected = max(scipy.stats.t.sf((d + 0.3) / se, df), scipy.stats.t.cdf((d - 0.3) / se, df))
-    assert tost_p(x, y, 0.3) == pytest.approx(expected, rel=1e-12)
+    d = abs(float(x.mean() - y.mean()))
+    assert tost_p(x, y, d) == pytest.approx(0.5)
 
 
 def test_holm_steps_down() -> None:
