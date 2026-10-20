@@ -145,7 +145,7 @@ def render_request(
     temporal_index: bool | None = None,  # Q-174
     frame_dt: float | None = None,  # Q-174
     device: str | torch.device = "cpu",  # Q-174
-    devices: Sequence[str | torch.device] | None = None,  # Q-175
+    devices: Sequence[str] | None = None,  # Q-175
 ) -> Renders:
     """Answer a render request (§2.2, Q-57): one image and alpha per item, at the item's raw
     timestamp, with the request's background and SH degree, keyed by item id in request order.

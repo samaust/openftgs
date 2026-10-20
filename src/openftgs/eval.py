@@ -271,7 +271,7 @@ def evaluate_images(
     background: tuple[float, float, float] = (0.0, 0.0, 0.0),
     renders: Mapping[int, Tensor] | None = None,
     frame_dt: float | None = None,  # Q-183
-    devices: Sequence[str | torch.device] | None = None,  # Q-175
+    devices: Sequence[str] | None = None,  # Q-175
 ) -> list[ImageMetrics]:
     """The metrics of every image of one data split (E16, D-67): each record rendered at its
     raw timestamp with the model's full SH degree and `background`, through `render_request`
