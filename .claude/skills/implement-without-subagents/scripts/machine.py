@@ -197,7 +197,9 @@ def report(ledger: Path, command: str | None = None) -> str:
     held = sum(e["threads"] for e in live if e["state"] == "running")
     gpu_held = any(e["gpu"] for e in live if e["state"] == "running")
     gpu_state = "none" if not devices else ("held" if gpu_held else "free")
-    out.append(f"free: {max(cores - held, 0)} cores, GPU {gpu_state}")
+    waiting = any(e["state"] == "waiting" for e in live)
+    claims = ", before what the waiting runs ahead will take" if waiting else ""
+    out.append(f"free: {max(cores - held, 0)} cores, GPU {gpu_state}{claims}")
     if load[0] > held + 2:
         out.append(
             f"note: the 1-min load is {load[0]:.1f} against {held} threads in the ledger: "
