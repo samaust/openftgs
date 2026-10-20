@@ -17,9 +17,11 @@ so a level's test can check that the harness sees that change, with the expected
   from `export`'s file), `answers=E` (every float answer × (1 + E)), `biased_sampler`
   (`relocation_sampling` counts moved from the last target with draws to the first),
   `no_kind=K` (kind K left out of `info`), `drop_convention=K` (entry K left out of `info`'s
-  render_conventions);
+  render_conventions), `rasterizer=NAME` (`info` names another rasterizer);
 - process faults: `exit=C` (exit with C without running), `hang` (sleep past any timeout),
   `garbage` (OUT written as bytes that are no format).
+
+`--on CMD` (repeatable) limits the faults to those commands; the others run unchanged.
 """
 
 import argparse
@@ -76,12 +78,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--inner", required=True)
     parser.add_argument("--fault", action="append", default=[])
+    parser.add_argument("--on", action="append", default=[])
     parser.add_argument("command")
     parser.add_argument("args", nargs="*")
     opts = parser.parse_args()
     inner = shlex.split(opts.inner)
     faults = dict(f.partition("=")[::2] for f in opts.fault)
     command, args = opts.command, list(opts.args)
+    if opts.on and command not in opts.on:
+        faults = {}
     if "exit" in faults:
         return int(faults["exit"])
     if "hang" in faults:
@@ -98,6 +103,8 @@ def main() -> int:
                 info["query_kinds"] = [k for k in info["query_kinds"] if k != faults["no_kind"]]
             if "drop_convention" in faults:
                 info["render_conventions"].pop(faults["drop_convention"], None)
+            if "rasterizer" in faults:
+                info["rasterizer"] = {"name": faults["rasterizer"], "version": "0"}
             print(json.dumps(info))
             return done.returncode
         if command in ("import", "render") and MODEL_FAULTS & faults.keys():
