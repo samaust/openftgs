@@ -6,6 +6,7 @@ cache and the prefetcher must give bitwise the same values (D-51 is exact). Scen
 8-bit images written by hand, so every value is known.
 """
 
+import threading
 from pathlib import Path
 from typing import Literal
 
@@ -131,23 +132,59 @@ def test_u30_prefetch_loads_in_the_scheduled_order(tmp_path: Path) -> None:
 @pytest.mark.gpu
 def test_u30_gpu_placement_and_cuda_prefetch_equal_png_decoding(tmp_path: Path) -> None:
     """U-30 (GPU), D-51: the cache in GPU memory, and the memory-mapped cache through pinned
-    buffers on a side stream, give bitwise PNG decoding's values on the device."""
+    buffers on a side stream, give bitwise PNG decoding's values on the device: read ahead
+    (depth 3), read when taken on the calling thread (depth 0), and taken out of the scheduled
+    order, which reads directly too."""
     video = _scene(tmp_path)
     order = _training(video)
     gpu = FrameCache.open(video, placement="gpu", device="cuda")
     on_gpu = Prefetcher(gpu, device="cuda", depth=2)
     mapped = Prefetcher(FrameCache.open(video, placement="mmap"), device="cuda", depth=3)
-    mapped.schedule(order)
-    on_gpu.schedule(order)
+    synchronous = Prefetcher(FrameCache.open(video, placement="mmap"), device="cuda", depth=0)
+    out_of_order = Prefetcher(FrameCache.open(video, placement="mmap"), device="cuda", depth=2)
+    for prefetcher in (on_gpu, mapped, synchronous):
+        prefetcher.schedule(order)
+    out_of_order.schedule(order[::-1])
     for index in order:
         want = video.load_image(index).cuda()
         assert gpu.frame(index).device.type == "cuda"
-        for prefetcher in (on_gpu, mapped):
+        for prefetcher in (on_gpu, mapped, synchronous, out_of_order):
             got = prefetcher.take(index)
             assert got.device.type == "cuda" and torch.equal(got, want)
     torch.cuda.synchronize()
-    mapped.close()
-    on_gpu.close()
+    for prefetcher in (on_gpu, mapped, synchronous, out_of_order):
+        prefetcher.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("depth", [0, 2])
+def test_u30_a_frame_read_on_the_calling_thread_waits_on_no_earlier_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, depth: int
+) -> None:
+    """§2.4 rule 3, D-51 (PRD #220 review): a frame the prefetcher reads on the calling thread,
+    the training thread in a run (every frame at depth 0; at depth 2, every frame taken out of
+    the scheduled order), never waits on the host for an earlier frame's copy: no CUDA event is
+    synchronized on that thread, over two passes, so pinned memory is reused. The frames stay
+    bitwise PNG decoding's."""
+    waits: list[int] = []
+    synchronize = torch.cuda.Event.synchronize
+
+    def recorded(self: torch.cuda.Event) -> None:
+        waits.append(threading.get_ident())
+        synchronize(self)
+
+    monkeypatch.setattr(torch.cuda.Event, "synchronize", recorded)
+    video = _scene(tmp_path)
+    order = _training(video)
+    prefetcher = Prefetcher(FrameCache.open(video, placement="mmap"), device="cuda", depth=depth)
+    for _ in range(2):
+        prefetcher.schedule(order[::-1])  # every take below is out of the scheduled order
+        for index in order:
+            got = prefetcher.take(index)
+            assert torch.equal(got, video.load_image(index).cuda())
+    torch.cuda.synchronize()
+    prefetcher.close()
+    assert threading.get_ident() not in waits
 
 
 @pytest.mark.gpu
