@@ -118,13 +118,15 @@ class Check:
 
 
 def level_summary(statuses: Sequence[str]) -> str:
-    """Q-211: `fail` if any check failed, otherwise `inconclusive` if any was, otherwise `pass`;
-    `not_comparable` checks fail nothing."""
+    """Q-211: `fail` if any check failed, otherwise `inconclusive` if any was, otherwise `pass` if
+    any passed, otherwise `not_comparable`; `not_comparable` checks fail nothing."""
     if "fail" in statuses:
         return "fail"
     if "inconclusive" in statuses:
         return "inconclusive"
-    return "pass"
+    if "pass" in statuses:
+        return "pass"
+    return "not_comparable"
 
 
 def close_relative(a: npt.ArrayLike, b: npt.ArrayLike, tol: float) -> np.ndarray:
