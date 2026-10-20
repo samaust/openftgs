@@ -246,6 +246,8 @@ def _s2_run(device: str) -> dict[str, float]:
         }
 
 
+# Q-214: on one xdist worker, which runs the cached run once.
+@pytest.mark.xdist_group("s2-run")
 @pytest.mark.parametrize("device", DEVICES)
 def test_s2_linear_motion_recovers_trajectories_and_velocities(
     device: str, record_property: Record
@@ -286,6 +288,8 @@ def test_s7_interpolates_at_unseen_odd_frames(
     assert abs(psnr_odd - psnr_even) <= 1.0
 
 
+# Q-214: on one xdist worker, which runs the cached run once.
+@pytest.mark.xdist_group("s2-run")
 @pytest.mark.parametrize("device", DEVICES)
 def test_s8_per_image_timestamps_recover_unsynchronized_cameras(
     device: str, tmp_path: Path, record_property: Record
@@ -495,6 +499,8 @@ def _s6_runs(device: str) -> _S6Runs:
         )
 
 
+# Q-214: on one xdist worker, which runs the cached run once.
+@pytest.mark.xdist_group("s6-runs")
 @pytest.mark.parametrize("device", DEVICES)
 def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(
     device: str, record_property: Record
@@ -519,6 +525,8 @@ def test_s6_relocation_keeps_n_and_revives_every_dead_primitive(
     assert runs.dead_after_event == ()
 
 
+# Q-214: on one xdist worker, which runs the cached run once.
+@pytest.mark.xdist_group("s6-runs")
 @pytest.mark.parametrize("device", DEVICES)
 def test_s6_relocation_gains_one_db(device: str, record_property: Record) -> None:
     """S-6: PSNR with relocation ≥ PSNR without + 1 dB (calibrated; the measured gain goes to

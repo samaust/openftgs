@@ -44,6 +44,7 @@ init = [
 fast = []
 dev = [
     "pytest",
+    "pytest-xdist",  # Q-214: parallel CPU tests
     "hypothesis",
     "ruff",
     "mypy",
