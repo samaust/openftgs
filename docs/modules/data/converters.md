@@ -14,6 +14,8 @@ OUT must be absent or empty (Q-88). Frames go to `OUT/images/<camera>/<frame_ind
 
 The manifest's metadata records how the scene was made (Q-94): the source and converter, the resize ratio, frames or window, ffmpeg's path, version line, the command per camera and the decoder that ran, and for SelfCap the archives' SHA-256s, the calibration source, whether sync offsets were applied, the undistortion mode, COLMAP's commands, warnings, the masks' source and, for dance1, the Fastest-10 range (D-69, Q-59). `metadata.source` for Neural3DV is "n3dv/<scene>", which `eval.lpips_backbone` reads (Q-62).
 
+`convert_n3dv` and `convert_opencv_yaml` make SRC absolute before anything else (Q-169). The path is normalized lexically, `..` included, and a symlinked folder keeps the name it was given (`os.path.abspath`); `Path.resolve()` would put the link's target in its place. Each recorded command therefore reads its video by absolute path and means the same from any directory, which is what lets `ftgs bench convert` rerun it (`docs/modules/cli/benchmarks.md`), and `metadata.source` names SRC's folder even when SRC is `.`. SelfCap's recorded commands read from `OUT/.work/`, which the converter removes, so they can't be rerun and stay as they are (Q-193).
+
 ## Decoding with ffmpeg
 
 Frames come from the user's ffmpeg, run as a separate program (D-48); the package never links FFmpeg. Width, height, pixel format and frame count come from ffprobe, and the converter reads exactly W·H·3 bytes per frame from the pipe. Up to `jobs` cameras decode at once (0 means one per four cores), and resizing, undistortion and PNG encoding run in a process pool whose workers use one PyTorch thread (§2.4). Outputs don't depend on `jobs`.
