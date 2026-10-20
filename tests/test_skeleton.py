@@ -103,6 +103,36 @@ def test_all_lists_exactly_the_public_names(name: str) -> None:
     assert set(exported) == _defined_public_names(Path(module.__file__))
 
 
+def _declared_all(module_file: Path) -> list[str]:
+    """A module's `__all__` as its source assigns it, or [] when it assigns none."""
+    tree = ast.parse(module_file.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
+        ):
+            return list(ast.literal_eval(node.value))
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "__all__"
+            and node.value is not None
+        ):
+            return list(ast.literal_eval(node.value))
+    return []
+
+
+@pytest.mark.parametrize(
+    "module_file", sorted(HARNESS_DIR.glob("*.py")), ids=lambda p: f"ftgs_harness.{p.stem}"
+)
+def test_harness_all_lists_exactly_the_public_names(module_file: Path) -> None:
+    """Q-213 (#309): each harness module's `__all__` lists exactly its public top-level names,
+    as in openftgs's modules. `__all__` is read from the source, since importing `__main__`
+    runs the command."""
+    exported = _declared_all(module_file)
+    assert len(exported) == len(set(exported))
+    assert set(exported) == _defined_public_names(module_file)
+
+
 def test_package_imports() -> None:
     import ftgs_harness
     import openftgs
