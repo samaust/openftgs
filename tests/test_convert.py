@@ -156,8 +156,8 @@ def test_n3dv_records_a_relative_srcs_videos_by_absolute_path(
 def test_n3dv_source_names_the_folder_when_src_is_the_working_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Q-62, Q-169: with SRC `.`, `metadata.source` is "n3dv/<the folder's name>", so
-    `eval.lpips_backbone` sees the scene."""
+    """Q-62, Q-169: with SRC `.`, `metadata.source` is "n3dv/<the folder's name>", the form of
+    §2.2's example manifest, not "n3dv/"."""
     monkeypatch.chdir(n3dv_source(tmp_path / "flame_steak", frames=2))
     manifest = read_scene_manifest(
         convert_n3dv(Path("."), tmp_path / "out", frames=1, resize=0.5, jobs=1)
@@ -166,16 +166,20 @@ def test_n3dv_source_names_the_folder_when_src_is_the_working_directory(
 
 
 @needs_ffmpeg
-def test_n3dv_source_keeps_the_name_of_a_symlinked_src(tmp_path: Path) -> None:
-    """Q-169: SRC given through a symlink keeps the name it was given, in `metadata.source` and
-    in the recorded `-i` paths; the link isn't resolved to its target."""
+def test_n3dv_source_keeps_the_name_of_a_symlinked_src(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-169: a relative SRC that names a symlink is made absolute without resolving the link,
+    so the name it was given stays in `metadata.source` and in the recorded `-i` paths."""
     n3dv_source(tmp_path / "renders" / "take3", frames=2)
-    link = tmp_path / "flame_steak"
-    link.symlink_to(tmp_path / "renders" / "take3", target_is_directory=True)
-    manifest = read_scene_manifest(convert_n3dv(link, tmp_path / "out", frames=1, resize=0.5))
+    (tmp_path / "flame_steak").symlink_to(tmp_path / "renders" / "take3", target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    manifest = read_scene_manifest(
+        convert_n3dv(Path("flame_steak"), tmp_path / "out", frames=1, resize=0.5)
+    )
     assert manifest.metadata["source"] == "n3dv/flame_steak"
     command = manifest.metadata["ffmpeg"]["commands"]["cam01"]
-    assert command[command.index("-i") + 1] == str(link / "cam01.mp4")
+    assert command[command.index("-i") + 1] == str(Path.cwd() / "flame_steak" / "cam01.mp4")
 
 
 @needs_ffmpeg
