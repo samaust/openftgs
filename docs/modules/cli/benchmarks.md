@@ -1,6 +1,6 @@
 # The benchmarks in `openftgs.cli`
 
-`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-178, Q-180 to Q-182, Q-185, Q-187, Q-188, Q-189 and Q-190.
+`ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-168, Q-170, Q-178 to Q-182, Q-185, Q-187, Q-188, Q-189, Q-190, Q-T235.1 and Q-T235.2.
 
 ## Subcommands
 
@@ -257,3 +257,40 @@ On kitchen and its 60-frame conversion (Calibration data, #232), the data wait t
 The host window shows why prefetch 0 still passes: its synchronous read, with the wait on a pinned buffer's event that the debug mode can't see (`docs/modules/train/trainer.md`), takes 0.44 ms of host time against 0.06 ms at prefetch 8, and runs while the GPU works through the previous iteration's losses and backward pass, so the training stream waits 0.01 ms more on average. PNG decoding takes 36 ms of host time, hidden the same way. The prefetcher stays as it is (PRD #220).
 
 Q-99's margin holds at N_max: at 3M rows with the cache on the GPU, the run took 8.57 GiB of reserved memory beyond the rule's estimate after the warm-up iteration (5.43 GiB allocated), 84 % of the 10.16 GiB the ½ margin leaves (54 % from allocated memory). That is close enough to the edge that the rule isn't tightened, and nothing goes to the owner. The device's memory outside PyTorch's allocator was 0.97 GiB, the desktop session's 0.49 GiB and the CUDA context.
+
+## The GPU CI job
+
+§3.4 runs B-2 to B-6 in CI on one fixed GPU runner, on a synthetic scene the size of the Neural3DV setup, and fails when a budgeted figure gets more than 10 % worse than its stored baseline. Datasets never enter CI (§2.3), so B-1, B-7 and B-8 run on openftgs-synth's scenes before each release instead (D-79), and their results are stored with it.
+
+**The workflow**, `.github/workflows/gpu-bench.yml`, starts only by hand (`workflow_dispatch`), never on pushes or pull requests, on a self-hosted runner with the labels `self-hosted`, `linux` and `gpu`: a public repository shouldn't run pull requests on the owner's machine (Q-179, the owner's answer). It stays dormant until such a runner is registered. Its steps, within 120 minutes:
+
+1. check that the runner's Python imports torch with a CUDA device, gsplat, lpips, fused-ssim and the checked-out openftgs;
+2. generate the scene (below) into the folder `FTGS_CI_SCENE` names, or into the runner's temporary folder;
+3. run B-2 to B-6 on `scene.json`, then B-6 again on `scene-60.json`, writing `bench/B-2-raster.json`, `B-3-slice.json`, `B-4-losses.json`, `B-5-adam.json`, `B-6-data.json` and `B-6-data-60.json`;
+4. keep those files as the run's artifact `bench`, whether or not a benchmark failed;
+5. compare them with the baselines (below); this step's exit code is the job's verdict.
+
+**Setting up a runner.** A Linux machine with a CUDA GPU, registered as a self-hosted runner of this repository with the extra label `gpu`, and two repository variables:
+
+- `FTGS_CI_PYTHON`, the path of a Python whose environment holds a CUDA build of torch, gsplat 1.5.3, lpips 0.1.4 and fused-ssim, installed as the README says (fused-ssim isn't on PyPI and builds against the installed torch). The job puts the checked-out `src` first on `PYTHONPATH`, so the commit being tested is the code measured whatever openftgs the environment holds; LPIPS's VGG weights download on the first run.
+- `FTGS_CI_SCENE`, optional: a folder outside the workspace that keeps the scene between runs. The generator completes a folder that holds the same generation instead of refusing it, and B-6's frame caches beside the manifests stay valid, so a later run skips both. The folder needs about 12 GB for the PNGs (2.0 MB each) and 28 GB for the two frame caches (23.4 GB for the 19 training cameras' 300 frames, 4.7 GB for their first 60), about 40 GB in all.
+
+**The scene**, `scripts/ci_scene.py OUT` (Q-T235.2), seeded, outside the wheel: 20 cameras, cam00 to cam19, evenly spaced on a horizontal arc of 90° and radius 4 at height 1 around a common point, each looking at it, with a 60° horizontal field of view and the principal point at the image centre; cam00 is held out, as Neural3DV's is. 300 frames per camera, frame k at k/30 s, as 1352×1014 8-bit RGB PNGs at `images/camXX/NNNNNN.png`, PNG level 1 as the converters write them. `scene.json` lists them all; `scene-60.json` the first 60 frames of the same PNGs, for B-6's `gpu` placement, since the full scene's 23.4 GB cache can't sit on a 24 GiB GPU (Q-178). Both manifests are written with `openftgs.io.write_scene_manifest`, and their metadata holds only the generator's parameters, so their bytes repeat on any machine.
+
+The images are procedural, not renders: the benchmarks' costs don't depend on the pixels, except B-6's `off` placement, which decodes a PNG every iteration. So the pixels are made to compress as a converted openftgs-synth frame does: smooth colour interpolated from a coarse random grid, three oriented sinusoids, 12 discs that move over the 10 s, and Gaussian noise of 1 level: a frame takes 2.0 MB at level 1 and about 30 ms to decode, where a converted `kitchen` frame takes 1.9 to 2.0 MB and 29 to 36 ms. Each frame is drawn from its own seed (the scene's seed, the camera, the frame), so the PNGs don't depend on how many processes encode them (`--jobs`, one per CPU by default). The "1M primitives" of §3.4 are the benchmarks' own synthesized models (Q-181): B-2, B-5 and B-6 build theirs at 1M rows among other sizes, around the cameras' common point.
+
+**The comparison**, `scripts/bench_compare.py RUN_DIR [--baselines DIR]` (Q-170, Q-T235.1). Each BENCH.json in RUN_DIR is compared with the file of the same name in `DIR/<gpu>/`, by default `benchmarks/baselines/<gpu>/`, where `<gpu>` is the GPU model the run recorded, in lower case with hyphens (`nvidia-geforce-rtx-4090`):
+
+| Benchmark | Compared, per case | Fails when |
+| --- | --- | --- |
+| B-2 | `forward_backward_s` of each `packed` × `precull` combination, at each N and active fraction | above 1.10 × the baseline's |
+| B-3 | `forward_backward_s` of each implementation at each size | above 1.10 × the baseline's |
+| B-4 | `forward_backward_s` of each LPIPS-VGG variant and SSIM path at each size | above 1.10 × the baseline's |
+| B-5 | `step_s` of each Adam kind at each N | above 1.10 × the baseline's |
+| B-6 (both files) | `data_share` of each case with a budget entry | not under 1 %, whatever the baseline's |
+
+A share near 0 is noise in relative terms, so B-6 keeps §3.4's absolute budget; B-2 to B-4 have no budget of their own, so their times are held to their baselines (Q-170). Cases match by their parameters exactly. The comparison also fails on a run without a baseline (B-6's included), a baseline of the run's GPU model without a run, a baseline recorded on another GPU model or of another benchmark, a scene of another size, and a case measured on one side only, so a benchmark that skipped a case is caught. It judges nothing else: not the first calls, memory, the other figures, B-5's own budget, nor the `limit` entries, which check equivalence rather than speed (B-2's spot check fails on every recorded run, a finding the owner has). A different scene SHA-256, driver, CUDA, cuDNN, PyTorch, gsplat, fused-ssim or Python is printed as a note beside the checks. Exit 0 when every check passes, 1 when one fails, 2 for invalid input.
+
+**The baselines** are the BENCH.json files of a reference run, kept in `benchmarks/baselines/<gpu>/` under the names the workflow writes, one folder per GPU model; a run on a model without a folder fails rather than borrowing another model's. The RTX 4090's come from the owner's machine, run with the workflow's commands at the default thread count (#235).
+
+**Refreshing them**, after a deliberate slowdown, a new driver or PyTorch, a change to a benchmark's cases or a new version of the generator: run the workflow, or its commands by hand on a quiet machine, put the six BENCH.json files in one folder (the workflow's artifact `bench` is one), run `python scripts/bench_compare.py FOLDER --update`, which copies each into its GPU model's folder, and commit them with the reason. A new GPU model starts the same way: its first run fails for want of baselines, and `--update` makes its folder.
