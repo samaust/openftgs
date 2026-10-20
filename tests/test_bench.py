@@ -866,14 +866,18 @@ def _cases_by(body: dict[str, Any]) -> dict[tuple[tuple[str, Any], ...], dict[st
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b1_times_every_stage_and_bounds_a_training_run(train_step_bench: dict[str, Any]) -> None:
-    """§3.4 B-1 (#226, Q-185): per case, every stage of a training iteration and the three
-    parts of its backward, timed over iterations 121 to 420 by the stage clock, with the mean
-    and median over the 297 iterations without an event and its share of an iteration; the
-    events at 200, 300 and 400; whole iterations 421 to 720 without the clock; peak memory, the
-    active and visible fractions, N at the start and at the end; the cost of copying the
-    relocation scores to the CPU (Q-72 note 5); and the bound on a training run (Q-168) and
-    D-50's 10 % as budget entries, which don't change the exit code (Q-166)."""
+def test__train_step_times_every_stage_and_bounds_a_training_run(
+    train_step_bench: dict[str, Any],
+) -> None:
+    """A private test of `_train_step` at reduced sizes (`_TRAIN_STEP_CASES` patched): §3.4 B-1
+    itself is the recorded BENCH.json runs, not this test. #226, Q-185: per case, every stage of
+    a training iteration and the three parts of its backward, timed over iterations 121 to 420
+    by the stage clock, with the mean and median over the 297 iterations without an event and
+    its share of an iteration; the events at 200, 300 and 400; whole iterations 421 to 720
+    without the clock; peak memory, the active and visible fractions, N at the start and at the
+    end; the cost of copying the relocation scores to the CPU (Q-72 note 5); and the bound on a
+    training run (Q-168) and D-50's 10 % as budget entries, which don't change the exit code
+    (Q-166)."""
     body = train_step_bench
     assert body["benchmark"] == "B-1"
     assert body["command"][:3] == ["ftgs", "bench", "train-step"]
@@ -1057,14 +1061,15 @@ def adam_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[st
 
 
 @pytest.mark.gpu
-def test_b5_times_each_adam_kind_at_each_n_and_holds_fused_against_foreach(
+def test__adam_times_each_kind_at_each_n_and_holds_fused_against_foreach(
     adam_bench: dict[str, Any],
 ) -> None:
-    """§3.4 B-5 (D-53; #229, Q-188): `set_iteration` plus `step` of fused, foreach and
-    selective Adam at each N, with seeded gradients on all nine stored tensors, the median of 50
-    calls after a warm-up; selective Adam's mask at the visible fraction given for that N; per N
-    the budget "fused no slower than foreach" as fused's median over foreach's against 1.0,
-    which doesn't change the exit code (Q-166)."""
+    """A private test of `_adam` at reduced sizes (`_ADAM_CASES` patched): §3.4 B-5 itself is
+    the recorded BENCH.json runs, not this test. D-53; #229, Q-188: `set_iteration` plus `step`
+    of fused, foreach and selective Adam at each N, with seeded gradients on all nine stored
+    tensors, the median of 50 calls after a warm-up; selective Adam's mask at the visible
+    fraction given for that N; per N the budget "fused no slower than foreach" as fused's median
+    over foreach's against 1.0, which doesn't change the exit code (Q-166)."""
     body = adam_bench
     assert body["benchmark"] == "B-5"
     assert body["command"][:3] == ["ftgs", "bench", "adam"]
@@ -1242,8 +1247,10 @@ def data_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[st
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b6_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> None:
-    """§3.4 B-6, D-51 (#232, Q-189): with B-1's configuration, the data stage's share of an
+def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> None:
+    """A private test of `_data` at reduced sizes (`_DATA_N` and `_MEMORY_N` patched): §3.4 B-6
+    itself is the recorded BENCH.json runs, not this test. D-51 (#232, Q-189): with B-1's
+    configuration, the data stage's share of an
     iteration, from the stage clock's CUDA events over iterations 121 to 320 (the 198 without an
     event), and its host time over 321 to 420 under the wall clock (the 99 without an event),
     for the GPU cache, the memory-mapped cache at prefetch depths 8 and 0 and PNG decoding; then
@@ -1306,10 +1313,12 @@ def test_b6_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> No
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b6_skips_the_gpu_placement_where_auto_would_not_choose_it(
+def test__data_skips_the_gpu_placement_where_auto_would_not_choose_it(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Q-178, Q-99 (Q-189): the GPU placement is measured only where "auto" would place the
+    """A private test of `_data` at reduced sizes (`_DATA_N`, `_MEMORY_N` and
+    `_DATA_PLACEMENTS` patched): §3.4 B-6 itself is the recorded BENCH.json runs, not this
+    test. Q-178, Q-99 (Q-189): the GPU placement is measured only where "auto" would place the
     cache there after a warm-up iteration; a cache too large for that, as kitchen's on a 24 GiB
     GPU, is skipped at either N, with what "auto" estimated, and gets no case or budget."""
     from openftgs.data import FrameCache
@@ -1445,8 +1454,12 @@ def _timed_figures_are_consistent(figures: dict[str, Any]) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str, Any]) -> None:
-    """§3.4 B-4 (D-52; Q-190): LPIPS-VGG's forward and the prediction's backward for each of
+def test__losses_times_every_lpips_variant_and_both_ssim_paths(
+    losses_bench: dict[str, Any],
+) -> None:
+    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
+    patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. D-52; Q-190:
+    LPIPS-VGG's forward and the prediction's backward for each of
     {IEEE, TF32, bf16} × {NCHW, channels-last inputs, channels-last inputs and weights} ×
     autotuning off and on; SSIM through fused-ssim, when it imports, and through the PyTorch
     path, timed where fused-ssim can't be imported (PRD #220), with autotuning off and on; at
@@ -1486,10 +1499,12 @@ def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b4_records_bf16s_deviation_and_the_gains_of_its_comparisons(
+def test__losses_records_bf16s_deviation_and_the_gains_of_its_comparisons(
     losses_bench: dict[str, Any],
 ) -> None:
-    """§3.4 B-4, D-52, Q-173 (Q-190): bf16's and TF32's deviation from IEEE float32 in value
+    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
+    patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. D-52, Q-173
+    (Q-190): bf16's and TF32's deviation from IEEE float32 in value
     and gradient at each size, bf16's within the 5e-2 the bf16 step test allows; each
     comparison's gain, 1 − variant / baseline of the medians, at each size, and whether its
     smallest gain reaches Q-173's 3 %; fused-ssim's gain over the PyTorch path."""
