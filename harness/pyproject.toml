@@ -14,8 +14,16 @@ authors = [{ name = "Samuel Austin" }]
 # Q-1: Python floor.
 requires-python = ">=3.11"
 # Owner decision 2026-10-11 (docs/clean-room/milestones.md, M16): report plots use
-# matplotlib's Agg backend.
-dependencies = ["matplotlib"]
+# matplotlib's Agg backend. Q-201: NumPy, SciPy and safetensors read the files and run the
+# statistics; the [lpips] extra holds what L3's LPIPS-Alex and LPIPS-VGG need (E16).
+dependencies = ["numpy", "scipy", "safetensors", "matplotlib"]
+
+[project.optional-dependencies]
+lpips = ["torch", "lpips==0.1.4"]
+
+# §3.3: the command line; Q-203: the run options.
+[project.scripts]
+ftgs-harness = "ftgs_harness.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
