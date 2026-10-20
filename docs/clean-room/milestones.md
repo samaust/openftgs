@@ -9,7 +9,7 @@ How to run one. Each milestone runs as one PRD through the skills in `.claude/sk
 3. **Split, if needed.** When the milestone's complexity and amount of work call for tickets, run `/prd-to-tickets <PRD#>`: one ticket per module or test group. Otherwise skip this step; the PRD is then implemented as a single ticket.
 4. **Build.** Run `/implement-without-subagents <PRD#>`, or `/implement-with-subagents <PRD#>` when the tickets cover independent modules. Don't approve the merge in this prompt: the skill builds on an integration branch, runs `two-axis-review`, and then stops to ask before merging into `main`.
 5. **Review.** While the build session waits, it runs the review prompt below in a subagent with a fresh context, on Fable 5.1 at effort xhigh, naming the integration branch. The subagent sees none of the build's conversation, only the prompt and the repository, and changes nothing.
-6. **Fix and merge.** The build session relays the review's findings to the owner unchanged and logs its Sources consulted on the integration branch. The build session fixes them in further commits, reruns the full suites and asks again; then approve the merge. The milestone is done when its PRD is merged and closed; only then does the next milestone start.
+6. **Fix and merge.** The build session relays the review's findings to the owner unchanged and logs its Sources consulted on the integration branch. The build session fixes them in further commits, reruns the affected tests and asks again; then approve the merge. The milestone is done when its PRD is merged and closed; only then does the next milestone start.
 
 Review prompt, run in a subagent with a fresh context, on Fable 5.1 at effort xhigh, after each milestone's build:
 
