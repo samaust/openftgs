@@ -25,9 +25,9 @@ import torch
 
 __all__ = ["Shards", "devices", "run"]
 
-S = TypeVar("S")  # a shard: what one worker thread needs
-J = TypeVar("J")  # a job
-R = TypeVar("R")  # a job's result
+_S = TypeVar("_S")  # a shard: what one worker thread needs
+_J = TypeVar("_J")  # a job
+_R = TypeVar("_R")  # a job's result
 
 
 def devices(entries: Sequence[str | torch.device]) -> list[torch.device]:
@@ -47,7 +47,7 @@ def devices(entries: Sequence[str | torch.device]) -> list[torch.device]:
     return out
 
 
-class Shards(Generic[S, J, R]):
+class Shards(Generic[_S, _J, _R]):
     """One worker thread per shard, taking jobs from a shared queue, as a context manager: the
     threads start on entry and are joined on exit. Results come back in the order they finish,
     with their job; a shard's exception is raised by `next_result`, and the shard that raised
@@ -55,18 +55,18 @@ class Shards(Generic[S, J, R]):
 
     def __init__(
         self,
-        shards: Sequence[S],
-        jobs: Iterable[J],
-        work: Callable[[S, J], R],
+        shards: Sequence[_S],
+        jobs: Iterable[_J],
+        work: Callable[[_S, _J], _R],
         *,
         name: str,
     ) -> None:
-        self._jobs: queue.SimpleQueue[J | None] = queue.SimpleQueue()
+        self._jobs: queue.SimpleQueue[_J | None] = queue.SimpleQueue()
         for job in jobs:
             self._jobs.put(job)
         for _ in shards:
             self._jobs.put(None)  # one stop per worker, after every job
-        self._results: queue.SimpleQueue[tuple[J, R | BaseException]] = queue.SimpleQueue()
+        self._results: queue.SimpleQueue[tuple[_J, _R | BaseException]] = queue.SimpleQueue()
         self._stop = threading.Event()
         self._work = work
         self._threads = [
@@ -74,19 +74,19 @@ class Shards(Generic[S, J, R]):
             for i, shard in enumerate(shards)
         ]
 
-    def _serve(self, shard: S) -> None:
+    def _serve(self, shard: _S) -> None:
         while not self._stop.is_set():
             job = self._jobs.get()
             if job is None:
                 return
             try:
-                result: R | BaseException = self._work(shard, job)
+                result: _R | BaseException = self._work(shard, job)
             except BaseException as error:  # noqa: BLE001 - raised again in the caller's thread
                 self._results.put((job, error))
                 return
             self._results.put((job, result))
 
-    def __enter__(self) -> "Shards[S, J, R]":
+    def __enter__(self) -> "Shards[_S, _J, _R]":
         for thread in self._threads:
             thread.start()
         return self
@@ -101,7 +101,7 @@ class Shards(Generic[S, J, R]):
         for thread in self._threads:
             thread.join()
 
-    def next_result(self) -> tuple[J, R]:
+    def next_result(self) -> tuple[_J, _R]:
         """The next job to finish and its result; a shard's exception is raised here."""
         job, result = self._results.get()
         if isinstance(result, BaseException):
@@ -109,13 +109,15 @@ class Shards(Generic[S, J, R]):
         return job, result
 
 
-def run(shards: Sequence[S], jobs: Sequence[J], work: Callable[[S, J], R], *, name: str) -> list[R]:
+def run(
+    shards: Sequence[_S], jobs: Sequence[_J], work: Callable[[_S, _J], _R], *, name: str
+) -> list[_R]:
     """Every job's result, in the jobs' order, done by `work` on the shards' worker threads
     (named `name` and the shard's number). The first exception a shard raises is raised here,
     once every shard has stopped."""
-    done: dict[int, R] = {}
+    done: dict[int, _R] = {}
 
-    def numbered(shard: S, job: tuple[int, J]) -> R:
+    def numbered(shard: _S, job: tuple[int, _J]) -> _R:
         return work(shard, job[1])
 
     with Shards(shards, list(enumerate(jobs)), numbered, name=name) as running:
