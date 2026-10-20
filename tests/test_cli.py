@@ -646,9 +646,9 @@ def test_train_refuses_invalid_inputs(
     run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """§2.1 exit code 2 (Q-142): a broken init file, an init file in another time unit, a missing
-    scene, a non-empty run directory (Q-132), F·B > N_max (D-24, Q-128), and a configuration this
-    build can't run (`images_per_step > 1`, deferred with multi-GPU training, Q-177; bf16 was
-    one until M15 built it, Q-172)."""
+    scene, a non-empty run directory (Q-132), F·B > N_max (D-24, Q-128), and configurations this
+    build can't run (`images_per_step > 1`, deferred with multi-GPU training, Q-177; the CUDA
+    temporal slice, not built, D-50; bf16 was one until M15 built it, Q-172)."""
     broken = tmp_path / "broken.safetensors"
     broken.write_bytes(b"not a safetensors file")
     assert _ftgs("train", run["scene"], "--init", broken, "--out", tmp_path / "a") == 2
@@ -671,6 +671,11 @@ def test_train_refuses_invalid_inputs(
     # Q-142: a configuration this build can't run; multi-GPU training is deferred (Q-177).
     two = _config_file(tmp_path / "two.json", _cfg(perf=PerfConfig(images_per_step=2)))
     assert _train(run, tmp_path / "e", "--config", two) == 2
+    # D-50: B-1 decided against the CUDA slice (#226); refused before the first iteration.
+    cuda = _config_file(tmp_path / "cuda.json", _cfg(perf=PerfConfig(slice_impl="cuda")))
+    capsys.readouterr()
+    assert _train(run, tmp_path / "f", "--config", cuda) == 2
+    assert "D-50" in capsys.readouterr().err
 
 
 def test_divergence_is_exit_code_3_and_saves_nothing(

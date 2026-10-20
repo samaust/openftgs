@@ -104,7 +104,7 @@ What each field does in M10 (Q-73):
 
 | Field | In M10 |
 | --- | --- |
-| `slice_impl` | set on the model (Q-66) |
+| `slice_impl` | set on the model (Q-66); "cuda" raises `NotImplementedError` at construction, citing D-50: B-1 decided against the operator (#226), and the refusal comes before the first iteration rather than from its slice (Q-73) |
 | `packed`, `precull` | passed to `render` (Q-36, Q-31) |
 | `adam` | passed to `build_optimizer` (Q-44) |
 | `log_every` | the period of the log reads and their validity check |
