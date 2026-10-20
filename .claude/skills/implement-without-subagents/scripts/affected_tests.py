@@ -16,8 +16,8 @@ these edges from every Python file in the checkout:
   `openftgs` or `ftgs_harness` is a file under `src/` or `harness/src/`, with its parent
   packages' `__init__.py`; a subpackage (`openftgs.cli`, `openftgs._vendor.romatch`) is every
   file in it, but `openftgs` itself only its `__init__.py`. Any other name is a test helper
-  under `tests/` (`builders`, `synthetic_scenes`) or a file beside the importer when one has
-  that name, and third-party otherwise.
+  under `tests/` (`builders`, `synthetic_scenes`) or, for an importer outside the packages, a
+  file beside it when one has that name, and the stdlib or third-party otherwise.
 - Its string literals, docstrings aside: a dotted name under those packages, as
   `importlib.import_module`, `python -m` or `monkeypatch.setattr` take it, and a path, which is
   every file whose path ends with it (`"license_scan.py"`, `"romatch/VENDOR.json"`). A bare
@@ -114,6 +114,8 @@ class Checkout:
         """A top-level name outside PACKAGES: a test helper, or a file beside `importer`."""
         stem = f"{name.split('.')[0]}.py"
         found = {f for f in self.by_name.get(stem, set()) if f.startswith("tests/")}
+        if self.package_of(importer):  # in a package, `from types import …` is the stdlib's
+            return found
         beside = str(PurePosixPath(importer).parent / stem)
         return found | ({beside} if beside in self.files else set())
 
