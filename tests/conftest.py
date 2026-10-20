@@ -3,6 +3,8 @@
 
 Tests not marked ``gpu`` get the ``cpu`` marker and run on the reference backend.
 ``gpu``, ``dataset`` and ``weights`` tests are skipped when their resource is absent.
+A session that runs ``gpu`` tests opens one CPU+CUDA profiler session before any test
+(Q-200).
 """
 
 import os
@@ -35,3 +37,22 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason="OPENFTGS_DATASETS is not a directory"))
         if item.get_closest_marker("weights") is not None and not allow_downloads:
             item.add_marker(pytest.mark.skip(reason="OPENFTGS_ALLOW_DOWNLOADS is not 1"))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cuda_profiler_warm_up(request: pytest.FixtureRequest) -> None:
+    """Q-200: with PyTorch 2.14.1, a CPU+CUDA profiler session that follows a CPU-only one in
+    the same process records no GPU side (no kernels, no GPU-side copies of the ranges), while
+    one CPU+CUDA session first keeps every later one whole. So a session that runs a ``gpu``
+    test opens an empty one before its first test; sessions without one are left alone. The
+    selected items are read here, after ``-m`` has deselected its tests."""
+    if not any(
+        item.get_closest_marker("gpu") is not None and item.get_closest_marker("skip") is None
+        for item in request.session.items
+    ):
+        return
+    import torch
+
+    cuda = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=cuda):
+        pass
