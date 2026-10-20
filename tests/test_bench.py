@@ -1712,9 +1712,12 @@ has_init_extra = all(importlib.util.find_spec(m) for m in ("einops", "loguru", "
 def test_b8_init_without_the_init_extra_or_the_weights_exits_2(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """B-8, Q-166, Q-192: `bench init` needs the [init] extra and RoMa's weights already in
-    torch.hub's cache, and is exit 2 without either, with nothing written and nothing
-    downloaded. PyTorch is made to see a CUDA device, which these checks come before."""
+    """B-8, Q-166, Q-192, Q-T220.1: `bench init` needs the [init] extra and RoMa's weights
+    already in torch.hub's cache, the files the public `init.roma_weight_files` names, and is
+    exit 2 without either, with nothing written and nothing downloaded: without the extra (the
+    vendored RoMa made unimportable) `roma_weight_files` raises ImportError, and without the
+    weights (an empty hub folder) the message names each missing file. PyTorch is made to see
+    a CUDA device, which these checks come before."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
     out = tmp_path / "bench.json"
     with monkeypatch.context() as without:  # the vendored RoMa can't be imported

@@ -33,4 +33,8 @@ A dense matcher takes two images as `load_image` returns them and gives a warp i
 
 ## Provenance
 
-`roma_provenance(cfg)` gives the metadata `write_init_points` records under one key, `roma_init`: compact JSON with sorted keys of every `RomaInitConfig` field, `use_custom_corr` as the import check gives it, `roma_commit` from the vendored copy's VENDOR.json and, for Tiny RoMa, `xfeat_commit`, the commit of XFeat's code (D-58; Q-107, Q-122, Q-123). It reads VENDOR.json without importing the vendored copy. `ftgs init roma` passes it to `write_init_points`. `ftgs init` knows neither the trainer's B nor its N_max, so D-24's check of F·B against N_max happens when `ftgs train` builds the model, as exit code 2 (Q-128).
+`roma_provenance(cfg)` gives the metadata `write_init_points` records under one key, `roma_init`: compact JSON with sorted keys of every `RomaInitConfig` field, `use_custom_corr` as the import check gives it, `roma_commit` from the vendored copy's VENDOR.json and, for Tiny RoMa, `xfeat_commit`, the commit of XFeat's code (D-58; Q-107, Q-122, Q-123). It reads VENDOR.json without importing the vendored copy. `ftgs init roma` passes it to `write_init_points`.
+
+`roma_weight_files(cfg)` names the checkpoint files `roma_init` loads for `cfg` with its default matcher, where torch.hub caches them: `torch.hub.get_dir()/checkpoints/`, each under its URL's file name, RoMa's and DINOv2's for roma_outdoor and Tiny RoMa's alone for Tiny RoMa, whose XFeat code archive holds no weights (Q-123). It downloads and creates nothing, and raises ImportError without the `[init]` extra, since the URLs live in the vendored copy; the default matcher fetches the same URLs. `ftgs bench init` uses it to refuse a run whose weights would have to be downloaded (Q-192, Q-T220.1).
+
+`ftgs init` knows neither the trainer's B nor its N_max, so D-24's check of F·B against N_max happens when `ftgs train` builds the model, as exit code 2 (Q-128).

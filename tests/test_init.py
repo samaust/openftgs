@@ -6,6 +6,7 @@ contracts of Q-106 to Q-112, Q-120 and Q-121, Q-122."""
 
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from openftgs.init import (
     knn_velocities,
     roma_init,
     roma_provenance,
+    roma_weight_files,
     triangulate_dlt,
 )
 from openftgs.io import read_init_points, validate_init_points, write_init_points
@@ -498,6 +500,50 @@ def test_roma_provenance_records_whether_local_corr_imports(
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout.splitlines()[-1])["use_custom_corr"] is expected
+
+
+# roma_weight_files (Q-T220.1)
+
+_HAS_INIT_EXTRA = all(
+    importlib.util.find_spec(m) is not None for m in ("einops", "loguru", "torchvision")
+)
+
+
+@pytest.mark.skipif(not _HAS_INIT_EXTRA, reason="needs the [init] extra")
+@pytest.mark.parametrize(
+    ("model", "names"),
+    [
+        ("roma_outdoor", ["roma_outdoor.pth", "dinov2_vitl14_pretrain.pth"]),
+        ("tiny_roma_v1_outdoor", ["tiny_roma_v1_outdoor.pth"]),
+    ],
+)
+def test_roma_weight_files_names_the_checkpoints_in_torch_hubs_cache(
+    tmp_path: Path, model: str, names: list[str]
+) -> None:
+    """Q-T220.1, D-58, Q-192: the checkpoint files `roma_init` loads for a configuration with
+    its default matcher, where torch.hub caches them: `get_dir()/checkpoints/` under their URLs'
+    file names (source log 178), RoMa's and DINOv2's for roma_outdoor, Tiny RoMa's alone for
+    Tiny RoMa, whose XFeat is built without weights (Q-123). Nothing is downloaded or made."""
+    hub = tmp_path / "hub"
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(hub))
+    try:
+        files = roma_weight_files(RomaInitConfig(model=model))  # type: ignore[arg-type]
+    finally:
+        torch.hub.set_dir(previous)
+    assert files == [hub / "checkpoints" / name for name in names]
+    assert not hub.exists()
+
+
+def test_roma_weight_files_without_the_init_extra_raises_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-T220.1: the weight files come from the vendored RoMa, which needs the [init] extra;
+    without it (the vendored module made unimportable) the call is an ImportError, as
+    `roma_init`'s default matcher is (Q-142)."""
+    monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.model_zoo", None)
+    with pytest.raises(ImportError):
+        roma_weight_files(RomaInitConfig())
 
 
 def test_init_imports_without_the_vendored_roma() -> None:

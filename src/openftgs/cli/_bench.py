@@ -30,7 +30,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -2435,19 +2434,6 @@ def _render(ctx: _Context) -> _Result:
 # -- B-8: initialization on the wall clock (§3.4, D-56, D-58; Q-106, Q-192) ---------------------
 
 
-def _roma_weights() -> list[Path]:
-    """Q-192: where torch.hub keeps the checkpoints `roma_init` loads with the default
-    RomaInitConfig, D-58's roma_outdoor: RoMa's and DINOv2's, each under its URL's file name in
-    `get_dir()/checkpoints` (source log 178). ImportError without the [init] extra, which the
-    vendored RoMa needs (D-65)."""
-    import torch
-
-    zoo: Any = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
-    urls = (zoo.weight_urls["romatch"]["outdoor"], zoo.weight_urls["dinov2"])
-    folder = Path(torch.hub.get_dir()) / "checkpoints"
-    return [folder / Path(urllib.parse.urlparse(url).path).name for url in urls]
-
-
 def _spread(values: Sequence[float]) -> dict[str, float]:
     return {
         "total_s": float(sum(values)),
@@ -2467,10 +2453,11 @@ def _init(ctx: _Context) -> _Result:
     import torch
 
     from openftgs._stages import Clock
-    from openftgs.init import RomaInitConfig, roma_init, roma_provenance
+    from openftgs.init import RomaInitConfig, roma_init, roma_provenance, roma_weight_files
 
+    cfg = RomaInitConfig()  # D-58's defaults (Q-192)
     try:
-        weights = _roma_weights()
+        weights = roma_weight_files(cfg)  # Q-T220.1: where torch.hub keeps them
     except ImportError as error:  # Q-142, Q-166
         _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
     missing = [str(path) for path in weights if not path.is_file()]
@@ -2479,7 +2466,6 @@ def _init(ctx: _Context) -> _Result:
             "bench init needs RoMa's weights in torch.hub's cache and doesn't download them; "
             f"missing {', '.join(missing)} (one `ftgs init roma` run fetches them)"
         )
-    cfg = RomaInitConfig()  # D-58's defaults (Q-192)
     devices = [str(torch.device("cuda", i)) for i in range(torch.cuda.device_count())]  # Q-106
     try:
         with _as_input_error("bench init: RoMa initialization"), Clock("wall") as clock:
