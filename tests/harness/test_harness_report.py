@@ -248,7 +248,8 @@ def test_runner_marks_smaller_case_sizes_or_lpips_off_as_a_reduced_run(
     assert _run(tmp_path, "--levels", "L0", "--settings", str(path)) == 0
     report = json.loads((tmp_path / "run" / "report.json").read_text())
     assert report["run"]["settings"]["reduced"] is reduced
-    header = (tmp_path / "run" / "report.md").read_text().split("\n\n")[1]
+    md = (tmp_path / "run" / "report.md").read_text().splitlines()
+    header = next(line for line in md if line.startswith("Started "))
     assert ("reduced" in header) is reduced
     for what in ("case sizes", "LPIPS"):
         assert (what in header) is (what in named), header

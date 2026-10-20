@@ -7,6 +7,7 @@ Every problem here is a harness or configuration error, exit code 2 (§3.3 "Repo
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ __all__ = [
     "load_config",
     "load_settings",
     "read_run",
+    "sizes_reduced",
     "write_run",
 ]
 
@@ -32,6 +34,11 @@ class HarnessError(Exception):
 
 # Q-203: §3.3's case sizes, the defaults.
 DEFAULT_SIZES = {"l0.models": 20, "l1.items": 200, "l1.probe_items": 21, "l2.queries": 4}
+
+
+def sizes_reduced(sizes: Mapping[str, int]) -> bool:
+    """Whether any case size is below §3.3's (Q-203); a size not given is §3.3's."""
+    return any(sizes.get(k, v) < v for k, v in DEFAULT_SIZES.items())
 
 
 @dataclass(frozen=True)
@@ -60,7 +67,7 @@ class Settings:
     @property
     def reduced(self) -> bool:
         """Whether any case size is below §3.3's (Q-203) or L2 leaves LPIPS out (Q-212)."""
-        return any(self.sizes[k] < v for k, v in DEFAULT_SIZES.items()) or not self.l2_lpips
+        return sizes_reduced(self.sizes) or not self.l2_lpips
 
     def to_json(self) -> dict[str, Any]:
         out = asdict(self)

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ftgs_harness.checks import Check, json_value, level_summary
-from ftgs_harness.settings import DEFAULT_SIZES
+from ftgs_harness.settings import sizes_reduced
 
 __all__ = ["REPORT_FORMAT", "build_report", "render_markdown", "write_report"]
 
@@ -64,14 +64,13 @@ def _check_block(check: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def _reduced(settings: Mapping[str, Any]) -> str:
+def _reduced_note(settings: Mapping[str, Any]) -> str:
     """What makes the run reduced, for the header: case sizes below §3.3's (Q-203), LPIPS left
     out of L2 (Q-212), or both."""
     if not settings.get("reduced"):
         return ""
-    sizes = settings.get("sizes", {})
     parts = []
-    if any(sizes.get(k, v) < v for k, v in DEFAULT_SIZES.items()):
+    if sizes_reduced(settings.get("sizes", {})):
         parts.append("case sizes below §3.3's")
     if settings.get("l2_lpips") is False:
         parts.append("LPIPS left out of L2")
@@ -87,7 +86,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "",
         f"Started {run.get('started', '?')}, harness {run.get('harness_version', '?')}, "
         f"config SHA-256 `{str(run.get('config_sha256', '?'))[:12]}…`"
-        + _reduced(run.get("settings", {})),
+        + _reduced_note(run.get("settings", {})),
         "",
         "| Implementation | Name | Version |",
         "| --- | --- | --- |",
