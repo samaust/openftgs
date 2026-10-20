@@ -363,7 +363,7 @@ def test__b7_camera_is_the_test_camera_at_1920_by_1080(scene: Path, tested_scene
         )
 
 
-def test__b7_times_spread_a_request_of_k_times_over_the_scene() -> None:
+def test__spread_times_spread_a_request_of_k_times_over_the_scene() -> None:
     """Q-194: a request of k times takes the timestamps round(j(F − 1)/(k − 1)), rounded half
     up, j = 0 … k − 1, and the middle one for k = 1; the swept sizes are 1, 2, 3, 4, 6, 8, 12,
     16, 24, 32, 48, 64 and 128 below F, then F."""

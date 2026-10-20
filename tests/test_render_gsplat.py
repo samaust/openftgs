@@ -1167,11 +1167,12 @@ def test_render_request_keeps_outputs_on_the_gpu_when_asked() -> None:
         _assert_renders_close(moved, on_cpu, 1e-6)
 
 
-def test_render_request_builds_the_index_by_default_from_enough_times(
+def test__temporal_index_is_built_by_default_from_enough_times(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Q-174 (GPU): with temporal_index None, a gsplat request with `_INDEX_MIN_TIMES` distinct
-    times in [0, 1] builds the index once, and a request at one time doesn't."""
+    """Q-174 (GPU), a private test of `render._TemporalIndex`: with temporal_index None, a
+    gsplat request with `_INDEX_MIN_TIMES` distinct times in [0, 1] builds the index once, and
+    a request at one time doesn't."""
     import openftgs.render
 
     built: list[int] = []
@@ -1191,8 +1192,9 @@ def test_render_request_builds_the_index_by_default_from_enough_times(
     assert built == [1]
 
 
-def test_render_request_on_the_gpu_synchronizes_only_in_gsplat_and_the_index_build() -> None:
-    """§2.4 rule 3, Q-174 (GPU): a request on gsplat with the index on and its outputs left on
+def test__temporal_index_build_and_gsplat_are_a_gpu_requests_only_synchronizations() -> None:
+    """§2.4 rule 3, Q-174 (GPU), a private test that reads `render._TemporalIndex`'s source
+    lines: a request on gsplat with the index on and its outputs left on
     the GPU, its cameras held on the host as a request file gives them, synchronizes with the
     host only inside gsplat's calls and while the index is built: every synchronization torch's
     debug mode reports comes from gsplat's files or from the index build. The debug mode is a
