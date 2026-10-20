@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
-codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
+codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (D-88), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
 D-50, Q-13), B-4 (`bench losses`; D-52, Q-173, Q-190), B-5 (`bench adam`; D-53, Q-188),
 B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), B-7 (`bench render`; D-55, Q-174, Q-194,
@@ -136,7 +136,7 @@ def test_bench_with_an_invalid_scene_exits_2(
 def test_bench_model_is_only_for_train_step_and_render(
     scene: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-167: `--model MODEL` belongs to `train-step` and `render` only; given to another
+    """D-88: `--model MODEL` belongs to `train-step` and `render` only; given to another
     subcommand it is a usage error, exit 2, with nothing written."""
     out = tmp_path / "bench.json"
     model = tmp_path / "model.safetensors"
@@ -152,7 +152,7 @@ def test_bench_model_is_only_for_train_step_and_render(
 def test_bench_train_step_and_render_take_a_model(
     scene: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-167: `train-step` and `render` take `--model MODEL`, an FTGS-IF file or a checkpoint
+    """D-88: `train-step` and `render` take `--model MODEL`, an FTGS-IF file or a checkpoint
     directory, read as `ftgs render` reads one: an unreadable MODEL is exit 2. B-1 with a model
     is `test_b1_takes_a_model`, B-7 with one `test_b7_times_the_model_given`; one of another
     scene's time normalizer can't be trained on this scene, exit 2 (#226)."""
@@ -940,7 +940,7 @@ def test__train_step_times_every_stage_and_bounds_a_training_run(
 @pytest.mark.gpu
 @pytest.mark.weights
 def test_b1_takes_a_model(train_step_model_bench: dict[str, Any]) -> None:
-    """Q-167, #226: with `--model`, B-1 times that model, at its SH degree, as its one case,
+    """D-88, #226: with `--model`, B-1 times that model, at its SH degree, as its one case,
     which carries the bound."""
     body = train_step_model_bench
     assert body["command"][-2] == "--model"
@@ -1903,7 +1903,7 @@ def test_b7_times_the_share_of_evaluation_spent_rendering(render_bench: dict[str
 @pytest.mark.gpu
 @pytest.mark.weights
 def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
-    """Q-167, Q-194: with `--model`, B-7 times that model alone, its N in the cases and no
+    """D-88, Q-194: with `--model`, B-7 times that model alone, its N in the cases and no
     active fraction; an exchange model carries no Δt_f, so the buckets take the scene's."""
     model = tmp_path / "model.safetensors"
     write_exchange(random_model(32, seed=1, sh_degree=1, time=TIME).to_exchange(), model)

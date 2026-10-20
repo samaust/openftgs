@@ -2,8 +2,8 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55, D-56, D-81.
-Q-166 (BENCH.json and the exit codes), Q-167 (`--model`), Q-168 (the setups), Q-178 and Q-189
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55, D-56, D-81,
+D-88 (`--model`). Q-166 (BENCH.json and the exit codes), Q-168 (the setups), Q-178 and Q-189
 (B-6), Q-174 (the index threshold T that B-7 sets), Q-194 and Q-195 (B-7), Q-169, Q-192
 and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
@@ -69,7 +69,7 @@ _FORMAT, _VERSION = "ftgs-bench", 1  # Q-166
 @dataclass(frozen=True)
 class _Context:
     """What a benchmark gets: the parsed arguments, the scene, and `--model` read on CUDA
-    (Q-167), None when not given."""
+    (D-88), None when not given."""
 
     args: argparse.Namespace
     video: MultiViewVideo
@@ -90,7 +90,7 @@ class _Result:
 @dataclass(frozen=True)
 class _Benchmark:
     """One subcommand: its §3.4 ID, the function that runs it, whether it needs CUDA (all but
-    `convert`, Q-166) and whether it takes `--model` (Q-167)."""
+    `convert`, Q-166) and whether it takes `--model` (D-88)."""
 
     id: str
     run: Callable[[_Context], _Result]
@@ -104,7 +104,7 @@ def add_parser(commands: Any) -> None:
     p.add_argument("benchmark", choices=tuple(_BENCHMARKS))
     p.add_argument("scene", type=Path, metavar="SCENE.json")
     p.add_argument("--out", type=Path, required=True, metavar="BENCH.json")
-    # Q-167: train-step and render only; the spec's CLI line takes no model (a change request).
+    # D-88: train-step and render only.
     p.add_argument("--model", type=Path, metavar="MODEL")
     p.set_defaults(run=run)
 
@@ -115,13 +115,13 @@ def run(args: argparse.Namespace) -> int:
     import torch
 
     bench = _BENCHMARKS[args.benchmark]
-    if args.model is not None and not bench.model:  # Q-167
+    if args.model is not None and not bench.model:  # D-88
         takers = " and ".join(name for name, b in _BENCHMARKS.items() if b.model)
         _fail(f"--model applies only to {takers}", _INPUT)
     video = _scene(args.scene)
     if bench.cuda and not torch.cuda.is_available():  # Q-166: an invalid environment
         _fail(f"{bench.id} needs a CUDA device", _INPUT)
-    model = None if args.model is None else _load_model(args.model, "cuda")  # Q-167
+    model = None if args.model is None else _load_model(args.model, "cuda")  # D-88
     with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after it
         args.out.parent.mkdir(parents=True, exist_ok=True)
     date = datetime.now(UTC).isoformat(timespec="seconds")
@@ -888,7 +888,7 @@ def _train_step_case(
 def _train_step(ctx: _Context) -> _Result:
     """B-1: a training iteration by stage, from the stage clock's CUDA events, on synthesized
     models of 0.5M, 1M and 3M rows with 20 % active and 3M with 5 % (Q-168, Q-181), or on the
-    model given with `--model` (Q-167); with peak memory, the events, and a bound on a default
+    model given with `--model` (D-88); with peak memory, the events, and a bound on a default
     training run (Q-168); and D-50's share of the temporal slice (#226, Q-185)."""
     import functools
 
@@ -2316,7 +2316,7 @@ def _render(ctx: _Context) -> _Result:
     """B-7: the speed of `render.render_request` from one 1920×1080 camera at every distinct
     training time, with the temporal index on and off and the outputs on the GPU and on the CPU,
     and with the index on and off at fewer times, on synthesized models at N = 1M and 3M with
-    1 %, 5 % and 20 % of rows active, or on the model given with `--model` (Q-167); per model the
+    1 %, 5 % and 20 % of rows active, or on the model given with `--model` (D-88); per model the
     index's build time, its break-even and the share of evaluation spent rendering; then T, the
     number of distinct times from which "auto" builds the index (Q-174, Q-194, Q-195).
     Everything goes through `render_request` and `evaluate_images`, public names only (Q-153;
