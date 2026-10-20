@@ -50,7 +50,9 @@ _TILE_SIZE = 16  # D-57
 _RADIUS_CLIP = 0.0  # D-57: no primitive is skipped for its size
 
 # D-55's temporal index (Q-174).
-_INDEX_MIN_TIMES = 8  # Q-174: temporal_index None needs this many distinct times; B-7 (#231) sets T
+# Q-174, Q-T231.2: T, the distinct times from which temporal_index None builds the index; B-7's
+# recorded run on kitchen (Calibration data, "Q-174's T": the 1 % models break even at 6).
+_INDEX_MIN_TIMES = 6
 _INDEX_OPACITY_MARGIN = 1e-4  # D-55's margin: rows are listed where 255σ(1 + 10⁻⁴)·σt can reach 1
 _INDEX_TIME_MARGIN = 1e-6  # D-55's margin: added to each row's reach, in normalized time
 _INDEX_LONG = 8  # Q-174: rows whose reach covers more buckets go to the long list
@@ -416,7 +418,7 @@ def _staged_cameras(items: Sequence[RenderItem], device: torch.device) -> dict[s
 def _index_on(temporal_index: bool | None, backend: str, distinct_times: int) -> bool:
     """Q-174: whether a request with this many distinct times in [0, 1] renders through the
     temporal index. None turns it on for gsplat from `_INDEX_MIN_TIMES` times, so never for one
-    time; the threshold is provisional until B-7 (#231) measures it."""
+    time; that threshold is B-7's (Q-T231.2)."""
     if temporal_index is not None:
         return temporal_index
     return backend == "gsplat" and distinct_times >= _INDEX_MIN_TIMES
