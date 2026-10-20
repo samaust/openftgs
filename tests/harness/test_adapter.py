@@ -180,3 +180,14 @@ def test_train_delegates_to_ftgs_train_and_reports_settings_it_cannot_honor(
     assert load_checkpoint(out / "checkpoint").config["seed"] == 7
     exported = _adapter("export", out, tmp_path / "trained.safetensors")
     assert exported.returncode == 0, exported.stderr
+
+
+def test_the_console_scripts() -> None:
+    """Q-202, Q-203: `ftgs-adapter` is openftgs's second console script, beside `ftgs`, and
+    `ftgs-harness` the harness's."""
+    import importlib.metadata
+
+    scripts = {e.name: e.value for e in importlib.metadata.entry_points(group="console_scripts")}
+    assert scripts["ftgs-adapter"] == "openftgs.cli._adapter:main"
+    assert scripts["ftgs-harness"] == "ftgs_harness.cli:main"
+    assert scripts["ftgs"] == "openftgs.cli:main"

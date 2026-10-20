@@ -264,6 +264,7 @@ class _MetricRow:
     metric: str
     a: np.ndarray  # per-seed means of A
     b: np.ndarray
+    a2: np.ndarray  # A′'s, reported for the seed spread
     runs_a: list[dict[str, float]]
     runs_b: list[dict[str, float]]
 
@@ -274,12 +275,14 @@ def _metric_checks(ctx: Context, scenes: dict[str, list[RunResult]]) -> list[Che
         good = [r for r in results if r.failure is None]
         runs_a = [r.metrics for r in good if r.impl == "A"]
         runs_b = [r.metrics for r in good if r.impl == "B"]
+        runs_a2 = [r.metrics for r in good if r.impl == "A2"]
         if len(runs_a) < 2 or len(runs_b) < 2:
             continue
         for metric in MARGINS:
             a = np.array([m[metric] for m in runs_a])
             b = np.array([m[metric] for m in runs_b])
-            rows.append(_MetricRow(name, metric, a, b, runs_a, runs_b))
+            a2 = np.array([m[metric] for m in runs_a2])
+            rows.append(_MetricRow(name, metric, a, b, a2, runs_a, runs_b))
     if not rows:
         return []
     tost = holm([tost_p(r.a, r.b, MARGINS[r.metric]) for r in rows])
@@ -310,6 +313,9 @@ def _metric_checks(ctx: Context, scenes: dict[str, list[RunResult]]) -> list[Che
             "p_welch_holm": p_diff,
             "seeds": len(a),
             "k_for_80_percent_power": needed,
+            "per_seed_A": a.tolist(),
+            "per_seed_B": b.tolist(),
+            "per_seed_A2": row.a2.tolist(),
         }
         if metric.startswith("ssim"):
             k = metric[-1]
