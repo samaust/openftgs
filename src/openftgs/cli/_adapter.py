@@ -15,7 +15,6 @@ Exit codes follow `ftgs`'s (§2.1): 2 for invalid input, 3 for a render that isn
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import importlib.metadata
 import json
 import os
@@ -118,48 +117,14 @@ def _import(exchange_path: Path, out: Path) -> int:
 
 
 def _export(model_path: Path, out: Path) -> int:
-    from openftgs.io import write_exchange
-
-    loaded = _load(model_path, "cpu")
-    exchange = dataclasses.replace(loaded.model.to_exchange(), background=loaded.background)
-    with cli._output(f"exchange model {out}"), cli._as_input_error(f"exchange model {out}"):
-        out.parent.mkdir(parents=True, exist_ok=True)
-        write_exchange(exchange, out)
-    return 0
+    return cli._export_loaded(_load(model_path, "cpu"), out)
 
 
 def _render(backend: str, model_path: Path, request_path: Path, out: Path) -> int:
     """As `ftgs render MODEL --request REQUEST --out OUT --backend BACKEND`, with MODEL read
     as `_load` reads it."""
-    import torch
-
-    from openftgs.io import read_render_request, write_renders
-    from openftgs.render import render_request
-
     device = cli._render_device(backend)
-    loaded = _load(model_path, device)
-    with cli._as_input_error(f"render request {request_path}", OSError):
-        sha = cli._sha256(request_path)
-        request = read_render_request(request_path)
-    if request.time_unit != loaded.model.time_unit:
-        cli._fail(f"the request's time unit {request.time_unit!r} isn't the model's")
-    if request.sh_degree is not None and request.sh_degree > loaded.model.sh_degree:
-        cli._fail(f"the request's sh_degree {request.sh_degree} is above the model's")
-    renders = render_request(
-        loaded.model,
-        request,
-        backend=backend,  # type: ignore[arg-type]
-        frame_dt=loaded.frame_dt,
-        devices=cli._shard_devices(device),
-    )
-    bad = [i for i, rgb in renders.rgb.items() if not bool(torch.isfinite(rgb).all())]
-    bad += [i for i, a in renders.alpha.items() if not bool(torch.isfinite(a).all())]
-    if bad:
-        cli._fail(f"renders that aren't finite: {sorted(set(bad))[:5]}", cli._NUMERIC)
-    with cli._output(f"renders {out}"):
-        out.parent.mkdir(parents=True, exist_ok=True)
-        write_renders(renders, out, producer=cli._producer(), request_sha256=sha)
-    return 0
+    return cli._render_loaded(_load(model_path, device), request_path, out, backend, device)
 
 
 def _unknown_keys(data: Mapping[str, Any], known: Mapping[str, Any], prefix: str = "") -> list[str]:

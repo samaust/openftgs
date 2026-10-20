@@ -42,7 +42,7 @@ __all__ = ["KINDS", "forward"]
 _QUERIES = "ftgs-forward-queries"
 _ANSWERS = "ftgs-forward-answers"
 
-Handler = Callable[[Mapping[str, Any], Mapping[str, Tensor]], dict[str, Tensor]]
+_Handler = Callable[[Mapping[str, Any], Mapping[str, Tensor]], dict[str, Tensor]]
 
 # Q-207: lr_schedule's columns, in the order of §1.3's table.
 _RATE_ORDER = (
@@ -301,7 +301,7 @@ def _growth_decisions(
 
 
 # kind → handler(params, tensors) → answer tensors (§3.3 L2, Q-207).
-KINDS: dict[str, Handler] = {
+KINDS: dict[str, _Handler] = {
     "motion": _motion,
     "temporal_opacity": _temporal_opacity,
     "effective_opacity": _effective_opacity,
