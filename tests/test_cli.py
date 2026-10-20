@@ -579,24 +579,30 @@ _GSPLAT_STAGES = {
 
 
 @pytest.mark.parametrize(
-    "stages",
+    ("stages", "cuda"),
     [
-        pytest.param(_TRAINING_STAGES, id="cpu"),
-        pytest.param(_TRAINING_STAGES | _GSPLAT_STAGES, id="gpu", marks=pytest.mark.gpu),
+        pytest.param(_TRAINING_STAGES, False, id="cpu"),
+        pytest.param(_TRAINING_STAGES | _GSPLAT_STAGES, True, id="gpu", marks=pytest.mark.gpu),
     ],
 )
 def test_profile_trace_carries_the_stage_names(
-    run: dict[str, Path], tmp_path: Path, stages: set[str]
+    run: dict[str, Path], tmp_path: Path, stages: set[str], cuda: bool
 ) -> None:
-    """§3.4 (PRD #220): the profile window turns the stages' profiler ranges on, so the trace
-    names every stage of its iterations (λ_perc = 0 here, so no perceptual stage), once per
-    iteration of the window; they are off again after it."""
+    """§3.4 (PRD #220), Q-200: the profile window turns the stages' profiler ranges on, so the
+    trace's CPU-side ranges name every stage of its iterations (λ_perc = 0 here, so no
+    perceptual stage), `iteration` once per iteration of the window; on CUDA the trace also
+    carries its GPU side, kernels and the profiler's GPU-side copies of the ranges, which are
+    not counted; the ranges are off again after the window."""
     out = tmp_path / "run"
     assert _train(run, out, "--config", run["config"], "--profile", "3:2") == 0
     events = json.loads((out / "profile" / "trace.json").read_text())["traceEvents"]
-    names = [event.get("name") for event in events]
-    assert stages <= set(names)
-    assert names.count("iteration") == 2
+    ranges = [event.get("name") for event in events if event.get("cat") == "user_annotation"]
+    assert stages <= set(ranges)
+    assert ranges.count("iteration") == 2
+    if cuda:
+        assert "kernel" in {event.get("cat") for event in events}
+        gpu_ranges = [e.get("name") for e in events if e.get("cat") == "gpu_user_annotation"]
+        assert "iteration" in gpu_ranges
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
         with _stages.stage("adam"):
             pass
