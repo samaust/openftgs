@@ -1938,3 +1938,136 @@ def test_bench_render_without_the_lpips_weights_exits_2(
     assert _ftgs("bench", "render", tested_scene, "--out", out) == 2
     assert "LPIPS networks" in capsys.readouterr().err
     assert not out.exists()
+
+
+# A benchmark cut short (Q-166 as answered, #272; Q-199): out of GPU memory is exit 2 and a
+# numerical failure exit 3, as in `ftgs train`, and neither writes BENCH.json. `Trainer.step`
+# and the other public calls patched below stand in for CUDA's failures, as `Trainer.step` does
+# in the CLI tests (Q-142).
+
+_EARLIER = b'{"an earlier BENCH.json": true}\n'
+
+
+def _earlier_bench(tmp_path: Path) -> Path:
+    """`--out` in a folder of its own, holding a BENCH.json from an earlier run."""
+    out = tmp_path / "bench" / "B.json"
+    out.parent.mkdir()
+    out.write_bytes(_EARLIER)
+    return out
+
+
+def _assert_untouched(out: Path) -> None:
+    """Q-126: the earlier BENCH.json is as it was, and no temporary is left beside it."""
+    assert out.read_bytes() == _EARLIER
+    assert [p.name for p in out.parent.iterdir()] == [out.name]
+
+
+def _given_model(tmp_path: Path) -> Path:
+    model = tmp_path / "model.safetensors"
+    write_exchange(random_model(64, seed=2, sh_degree=3, time=TIME).to_exchange(), model)
+    return model
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_bench_out_of_gpu_memory_in_a_benchmark_exits_2(
+    scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-166 (as answered), Q-142: out of GPU memory in a benchmark's run, here B-1's first
+    training step, is exit 2, an environment the benchmark can't run in, naming the benchmark
+    and the error; nothing is written, and a BENCH.json already at the path stays as it was."""
+    from openftgs.train import Trainer
+
+    def no_memory(self: Trainer) -> Any:
+        raise torch.OutOfMemoryError("CUDA out of memory (stood in for)")
+
+    model = _given_model(tmp_path)
+    monkeypatch.setattr(Trainer, "step", no_memory)
+    out = _earlier_bench(tmp_path)
+    assert _ftgs("bench", "train-step", scene, "--out", out, "--model", model) == 2
+    err = capsys.readouterr().err
+    assert "B-1" in err and "out of GPU memory" in err and "(stood in for)" in err
+    _assert_untouched(out)
+
+
+@pytest.mark.gpu
+def test_bench_out_of_gpu_memory_reading_the_model_exits_2(
+    tested_scene: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-166 (as answered), D-88: reading MODEL onto the GPU is part of the run, so running out
+    of GPU memory there is exit 2 too, here for B-7, with nothing written."""
+    from openftgs.model import FreeTimeGaussians
+
+    def no_memory(cls: type[FreeTimeGaussians], *args: Any, **kwargs: Any) -> Any:
+        raise torch.OutOfMemoryError("CUDA out of memory (stood in for)")
+
+    model = _given_model(tmp_path)
+    monkeypatch.setattr(FreeTimeGaussians, "from_exchange", classmethod(no_memory))
+    out = _earlier_bench(tmp_path)
+    assert _ftgs("bench", "render", tested_scene, "--out", out, "--model", model) == 2
+    err = capsys.readouterr().err
+    assert "B-7" in err and "out of GPU memory" in err
+    _assert_untouched(out)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.parametrize("subcommand", ["train-step", "data"])
+def test_bench_divergence_in_training_exits_3(
+    scene: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    subcommand: str,
+) -> None:
+    """Q-166 (as answered), §2.1 exit codes, Q-69: a divergence in the training steps of B-1
+    (`train-step`) or B-6 (`data`), which `Trainer.step` reports as FloatingPointError, is
+    exit 3, a numerical failure, naming the benchmark and the divergence, with nothing
+    written."""
+    from openftgs.train import Trainer
+
+    step = Trainer.step
+
+    def diverging(self: Trainer) -> Any:
+        if self.iteration == 2:
+            raise FloatingPointError("training diverged by iteration 3: loss nan (stood in for)")
+        return step(self)
+
+    monkeypatch.setattr("openftgs.cli._bench._TRAIN_STEP_CASES", TRAIN_STEP_CASES)
+    monkeypatch.setattr("openftgs.cli._bench._DATA_N", DATA_N)
+    monkeypatch.setattr("openftgs.cli._bench._MEMORY_N", MEMORY_N)
+    monkeypatch.setattr(Trainer, "step", diverging)
+    out = _earlier_bench(tmp_path)
+    assert _ftgs("bench", subcommand, scene, "--out", out) == 3
+    err = capsys.readouterr().err
+    benchmark = {"train-step": "B-1", "data": "B-6"}[subcommand]
+    assert benchmark in err and "training diverged by iteration 3" in err
+    _assert_untouched(out)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_bench_renders_that_are_not_finite_exit_3(
+    tested_scene: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-199, §2.1 exit codes, Q-129: B-7's evaluation figures go through `evaluate_images`,
+    whose FloatingPointError for renders that aren't finite is exit 3, as in `ftgs eval`,
+    naming the benchmark, with nothing written."""
+    import openftgs.eval
+
+    def not_finite(*args: Any, **kwargs: Any) -> Any:
+        raise FloatingPointError("renders that aren't finite: ['2'] (stood in for)")
+
+    model = _given_model(tmp_path)
+    monkeypatch.setattr(openftgs.eval, "evaluate_images", not_finite)
+    out = _earlier_bench(tmp_path)
+    assert _ftgs("bench", "render", tested_scene, "--out", out, "--model", model) == 3
+    err = capsys.readouterr().err
+    assert "B-7" in err and "renders that aren't finite" in err
+    _assert_untouched(out)

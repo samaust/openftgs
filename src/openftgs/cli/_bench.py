@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from openftgs.cli import (
     _INPUT,
+    _NUMERIC,
     _as_input_error,
     _fail,
     _json_text,
@@ -111,7 +112,8 @@ def add_parser(commands: Any) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """`ftgs bench BENCHMARK SCENE.json --out BENCH.json [--model MODEL]`: exit 0 once the
-    benchmark ran, whatever its budgets; 2 for invalid input or environment (Q-166)."""
+    benchmark ran, whatever its budgets; 2 for invalid input or environment, out of GPU memory
+    included; 3 for a numerical failure (Q-166 as answered, Q-199)."""
     import torch
 
     bench = _BENCHMARKS[args.benchmark]
@@ -121,11 +123,18 @@ def run(args: argparse.Namespace) -> int:
     video = _scene(args.scene)
     if bench.cuda and not torch.cuda.is_available():  # Q-166: an invalid environment
         _fail(f"{bench.id} needs a CUDA device", _INPUT)
-    model = None if args.model is None else _load_model(args.model, "cuda")  # D-88
-    with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after it
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-    date = datetime.now(UTC).isoformat(timespec="seconds")
-    result = bench.run(_Context(args, video, model))
+    # Q-166 (as answered): a run cut short measured nothing, so it writes nothing; out of GPU
+    # memory is exit 2 and a numerical failure exit 3, as in `ftgs train` (Q-142; Q-199).
+    try:
+        model = None if args.model is None else _load_model(args.model, "cuda")  # D-88
+        with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+        date = datetime.now(UTC).isoformat(timespec="seconds")
+        result = bench.run(_Context(args, video, model))
+    except torch.OutOfMemoryError as error:
+        _fail(f"{bench.id} ran out of GPU memory: {error}", _INPUT)
+    except FloatingPointError as error:  # the trainer's divergence (Q-69), a render's (Q-129)
+        _fail(f"{bench.id}: {error}", _NUMERIC)
     command = ["ftgs", "bench", args.benchmark, str(args.scene), "--out", str(args.out)]
     if args.model is not None:
         command += ["--model", str(args.model)]
