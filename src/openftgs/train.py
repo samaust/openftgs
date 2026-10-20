@@ -352,6 +352,12 @@ def _check_perf(perf: PerfConfig) -> None:
             "images_per_step > 1 (D-54) is deferred: training on several GPUs needs at least "
             "two GPUs, and must pass M16's L3 against single-GPU training before it is offered"
         )
+    if perf.slice_impl == "cuda":
+        # D-50: B-1 put the slice under 10% of an iteration (#226), so the operator isn't built.
+        raise NotImplementedError(
+            "perf.slice_impl 'cuda' (D-50) is not built: B-1 measured the temporal slice under "
+            "D-50's 10 % of a training iteration (#226); use 'auto', 'compiled' or 'eager'"
+        )
 
 
 def _bytes_per_row(model: FreeTimeGaussians) -> int:

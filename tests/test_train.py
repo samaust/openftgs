@@ -287,6 +287,16 @@ def test_several_images_per_step_are_refused_naming_two_gpus_and_l3(tmp_path: Pa
         )
 
 
+def test_the_cuda_slice_is_refused_at_construction(tmp_path: Path) -> None:
+    """Q-73, D-50: slice_impl "cuda" names the custom operator B-1 decided against (#226), so the
+    trainer refuses it at construction rather than at its first slice (from the M15 milestone
+    review)."""
+    video = _scene(tmp_path)
+    cfg = _no_perceptual(perf=PerfConfig(slice_impl="cuda"))
+    with pytest.raises(NotImplementedError, match=r"D-50"):
+        Trainer(cfg, video, _init_points(), device="cpu")
+
+
 def test_bf16_perceptual_precision_is_accepted(tmp_path: Path) -> None:
     """D-52, Q-73's note (4): bf16 LPIPS is built in M15 (#228), so the trainer no longer refuses
     it; without the perceptual term it trains as any other run."""

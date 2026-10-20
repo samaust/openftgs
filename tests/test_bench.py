@@ -326,6 +326,42 @@ def test__raster_figures_pairs_each_calls_stages_and_takes_medians() -> None:
     }
 
 
+def test__intersections_gives_gsplat_the_arguments_render_gives_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-187: B-2 counts the tile intersections with gsplat's projection and tile intersection
+    given the arguments `render` gives them (E6, D-6, D-57). `_intersections` restates them as
+    literals, since `cli` uses only public names (Q-153), so this holds them to `render`'s own
+    constants (from the M15 milestone review)."""
+    import gsplat
+
+    from openftgs import render
+    from openftgs.cli._bench import _intersections
+
+    seen: dict[str, Any] = {}
+
+    def projection(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        seen["projection"] = kwargs
+        n = args[0].shape[0]
+        radii = torch.ones(1, n, 2, dtype=torch.int32)
+        return radii, torch.zeros(1, n, 2), torch.ones(1, n), None, None
+
+    def isect_tiles(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        seen["tile_size"] = args[3]
+        return None, torch.zeros(5, dtype=torch.int64), None
+
+    monkeypatch.setattr(gsplat, "fully_fused_projection", projection)
+    monkeypatch.setattr(gsplat, "isect_tiles", isect_tiles)
+    camera = ring(1, width_px=48, height_px=32, focal=44.0)[0]
+    assert _intersections(random_model(8, sh_degree=1), camera, 0.5)[2] == 5
+    kwargs = seen["projection"]
+    assert kwargs["eps2d"] == render._EPS2D
+    assert kwargs["near_plane"] == render._NEAR
+    assert kwargs["far_plane"] == render._FAR
+    assert kwargs["radius_clip"] == render._RADIUS_CLIP
+    assert seen["tile_size"] == render._TILE_SIZE
+
+
 # B-7's setup (Q-168, Q-194) and its rule for T (Q-195): private tests of the helpers of
 # `openftgs.cli._bench._render`.
 
