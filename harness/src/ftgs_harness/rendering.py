@@ -36,6 +36,7 @@ class CaseItem:
     item: RequestItem
     camera: str
     swept: float | None = None  # the probe's swept variable at this item
+    time_unit: str = "s"  # §2.2: the model's or scene's unit, which the request states
 
 
 @dataclass(frozen=True)
@@ -46,9 +47,11 @@ class RenderResult:
 
 
 def request_for(path: Path, items: Sequence[CaseItem], background: Sequence[float]) -> str:
-    """Write the case's request once (a rerun reuses the run's), returning its SHA-256."""
+    """Write the case's request once (a rerun reuses the run's), in its items' time unit
+    (§2.2), returning its SHA-256."""
     if not path.exists():
-        write_request(path, [i.item for i in items], background=background)
+        unit = items[0].time_unit if items else "s"
+        write_request(path, [i.item for i in items], background=background, time_unit=unit)
     return file_sha256(path)
 
 
@@ -107,7 +110,7 @@ def failure_check(
 def where_text(entry: CaseItem, psnr_db: float, swept_name: str | None = None) -> str:
     """The input terms a symptom names its item by: id, camera, τ, the swept variable, PSNR."""
     item = entry.item
-    where = f"in item {item.id} (camera {entry.camera}, τ = {item.timestamp:.4g} s"
+    where = f"in item {item.id} (camera {entry.camera}, τ = {item.timestamp:.4g} {entry.time_unit}"
     if swept_name not in (None, "τ") and entry.swept is not None:
         where += f", {swept_name} = {entry.swept:.4g}"
     return where + f"; PSNR(A, B) = {psnr_db:.1f} dB)"

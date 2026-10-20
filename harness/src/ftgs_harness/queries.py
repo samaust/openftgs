@@ -237,11 +237,12 @@ def _growth_decisions(
     n = 80
     s = float(rng.uniform(0.5, 5.0))
     g = (rng.exponential(threshold, size=n)).astype(np.float32)
-    if edge:
-        g[:6] = np.float32(np.max(g))  # ties at the cap
+    if edge:  # seven rows tied at the largest g, every 13th row, with room for three of them:
+        # the cap falls inside the tie, so D-44's "ties to the lower row index" decides
+        g[::13] = np.float32(np.max(g) * 2)
     scales = (np.exp(rng.uniform(-1.0, 1.0, size=(n, 3))) * split_scale * s).astype(np.float32)
     candidates = int((g > threshold).sum())
-    room = candidates // 2 if edge or rng.random() < 0.5 else candidates + 10
+    room = 3 if edge else (candidates // 2 if rng.random() < 0.5 else candidates + 10)
     params = {
         "spatial_scale": s,
         "grad_threshold": threshold,

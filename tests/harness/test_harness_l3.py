@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 import torch
 from builders import random_model, ring, write_scene
-from harness_runs import ADAPTER, HERE, checks, run_harness
+from harness_runs import ADAPTER, BIN, HERE, checks, run_harness
 
 from ftgs_harness.level3 import QUANTITIES, trace_targets
 from openftgs.config import LossConfig, PerfConfig, TrainConfig, config_to_dict
@@ -152,3 +152,30 @@ def test_a_failed_run_is_reported(tmp_path: Path, scene: dict[str, Path]) -> Non
     assert code == 1
     failed = [c for c in checks(report, "L3.run.tiny.B.").values() if c["status"] == "fail"]
     assert len(failed) == 2 and failed[0]["pattern"] == "crash"
+
+
+def test_a_rerun_of_an_l3_check_reruns_its_own_scene_only(
+    tmp_path: Path, scene: dict[str, Path]
+) -> None:
+    """Q-203: `rerun` of an L3 check replays that scene's 3K runs, not the other scenes'."""
+    entry = {"manifest": str(scene["manifest"]), "init": str(scene["init"])}
+    settings = {"k": 2, "l3": {"scenes": [{"name": "one", **entry}, {"name": "two", **entry}]}}
+    code, _ = run_harness(
+        tmp_path,
+        "L3",
+        a=_replay(scene["source"]),
+        b=_replay(scene["source"]),
+        settings=settings,
+        jobs=1,
+    )
+    assert code == 0
+    done = subprocess.run(
+        [str(BIN / "ftgs-harness"), "rerun", "L3.metric.two.psnr", "--out", str(tmp_path / "run")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["id"] == "L3.metric.two.psnr"
+    rerun = tmp_path / "run" / "reruns" / "L3.metric.two.psnr" / "L3"
+    assert sorted(p.name for p in rerun.iterdir()) == ["two"]

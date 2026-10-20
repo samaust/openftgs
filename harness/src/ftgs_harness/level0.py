@@ -20,7 +20,7 @@ from ftgs_harness.settings import HarnessError
 
 __all__ = ["field_errors", "run"]
 
-_SPEC_REFS = ["§2.2"]
+_SPEC_REFS = ["§2.2", "D-70", "D-71", "D-84"]  # the ftgs-if round trip
 _TOLERANCE = 1e-6  # §3.3 L0: relative
 # Q-208: time centres are judged against the field's largest magnitude, since an implementation
 # may store μt as float32 normalized time, an error of about T_τ·2⁻²⁴ wherever τ lies.

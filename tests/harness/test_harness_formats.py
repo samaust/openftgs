@@ -186,3 +186,50 @@ def test_forward_queries_and_answers_round_trip(tmp_path: Path) -> None:
 def read_exchange_from(model: ExchangeModel, tmp_path: Path) -> Exchange:
     io.write_exchange(model, tmp_path / "src.safetensors")
     return read_exchange(tmp_path / "src.safetensors")
+
+
+@pytest.mark.parametrize("split", [None, "validation"])
+def test_scene_images_must_be_in_the_train_or_test_split(tmp_path: Path, split: str | None) -> None:
+    """§2.2: every image is in the train or the test split, as openftgs's reader requires."""
+    cam = {"width": 4, "height": 3, "K": np.eye(3).tolist(), "world_to_camera": np.eye(4).tolist()}
+    image: dict[str, object] = {"camera": "c", "timestamp": 0.0, "path": "a.png"}
+    if split is not None:
+        image["split"] = split
+    body = {
+        "format": "ftgs-scene",
+        "version": 1,
+        "time_unit": "s",
+        "cameras": {"c": cam},
+        "images": [image],
+    }
+    (tmp_path / "scene.json").write_text(json.dumps(body))
+    with pytest.raises(FormatError, match="split"):
+        read_scene(tmp_path / "scene.json")
+
+
+@pytest.mark.parametrize(
+    ("version", "ok"), [("1", True), ("1.3", True), ("2", False), ("x", False)]
+)
+def test_readers_take_any_minor_version_of_major_1(tmp_path: Path, version: str, ok: bool) -> None:
+    """§2.2: readers reject an unknown major version."""
+    path = tmp_path / "q.safetensors"
+    sha = write_queries(path, "motion", [Query("q0", {}, {})])
+    answers = tmp_path / "a.safetensors"
+    from safetensors.numpy import save_file
+
+    save_file(
+        {"q0/x": np.zeros(1)},
+        str(answers),
+        {
+            "format": "ftgs-forward-answers",
+            "version": version,
+            "kind": "motion",
+            "queries_sha256": sha,
+            "answers": json.dumps([{"id": "q0", "status": "ok", "message": ""}]),
+        },
+    )
+    if ok:
+        assert read_answers(answers, kind="motion", queries_sha256=sha)["q0"].status == "ok"
+    else:
+        with pytest.raises(FormatError, match="version"):
+            read_answers(answers, kind="motion", queries_sha256=sha)

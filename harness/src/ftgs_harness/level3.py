@@ -94,7 +94,7 @@ def _held_out(ctx: Context, scene: Scene) -> tuple[list[CaseItem], list[Path]]:
         item = RequestItem(
             f"h{i:04d}", image.timestamp, cam.K, cam.world_to_camera, cam.width, cam.height
         )
-        items.append(CaseItem(item, image.camera))
+        items.append(CaseItem(item, image.camera, time_unit=info.time_unit))
     return items, [image.path for image in tests]
 
 
@@ -599,10 +599,9 @@ def run(ctx: Context) -> list[Check]:
     by_scene: dict[str, list[_RunResult]] = {}
     checks: list[Check] = []
     for scene in ctx.settings.scenes:
-        if not ctx.wants("L3") and not any(
-            ctx.wants(f"L3.{kind}.{scene.name}")
-            for kind in ("run", "metric", "dist", "trace", "config")
-        ):
+        # A rerun of one L3 check reruns its own scene only (Q-203): every L3 check id names
+        # its scene third.
+        if ctx.only is not None and ctx.only.split(".")[2:3] != [scene.name]:
             continue
         items, paths = _held_out(ctx, scene)
         truths = [_image(scene, p) for p in paths]

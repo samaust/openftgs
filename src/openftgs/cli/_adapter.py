@@ -139,6 +139,39 @@ def _unknown_keys(data: Mapping[str, Any], known: Mapping[str, Any], prefix: str
     return out
 
 
+def _leaves(data: Mapping[str, Any], prefix: str = "") -> list[tuple[str, Any]]:
+    out: list[tuple[str, Any]] = []
+    for key, value in data.items():
+        if isinstance(value, dict):
+            out += _leaves(value, f"{prefix}{key}.")
+        else:
+            out.append((f"{prefix}{key}", value))
+    return out
+
+
+def _nested(dotted: str, value: Any) -> dict[str, Any]:
+    *path, last = dotted.split(".")
+    out: dict[str, Any] = {last: value}
+    for key in reversed(path):
+        out = {key: out}
+    return out
+
+
+def _refused_values(data: Mapping[str, Any]) -> list[str]:
+    """The dotted keys whose value TrainConfig refuses on its own (Q-10's checks), each tried
+    alone over the defaults. A refusal that only a combination of values causes is left to
+    `ftgs train`, which reports it with exit code 2."""
+    from openftgs.config import config_from_dict
+
+    refused = []
+    for dotted, value in _leaves(data):
+        try:
+            config_from_dict(_nested(dotted, value))
+        except ValueError:
+            refused.append(dotted)
+    return refused
+
+
 def _drop(data: dict[str, Any], dotted: str) -> None:
     *path, last = dotted.split(".")
     for key in path:
@@ -147,8 +180,9 @@ def _drop(data: dict[str, Any], dotted: str) -> None:
 
 
 def _train(scene: Path, init: Path, config: Path, seed: str, out: Path) -> int:
-    """`ftgs train` in process (Q-202). Settings TrainConfig doesn't have are left out of the
-    run and listed in OUT_DIR/not_comparable.json (§3.3: reported, never dropped silently)."""
+    """`ftgs train` in process (Q-202). Settings TrainConfig doesn't have, and values it refuses
+    on their own, are left out of the run and listed in OUT_DIR/not_comparable.json (§3.3:
+    reported, never dropped silently)."""
     from openftgs.config import TrainConfig, config_to_dict
 
     with cli._as_input_error(f"config {config}", OSError):
@@ -158,6 +192,10 @@ def _train(scene: Path, init: Path, config: Path, seed: str, out: Path) -> int:
     unknown = _unknown_keys(data, config_to_dict(TrainConfig()))
     for dotted in unknown:
         _drop(data, dotted)
+    refused = _refused_values(data)
+    for dotted in refused:
+        _drop(data, dotted)
+    unknown += refused
     with tempfile.TemporaryDirectory() as scratch:
         honored = Path(scratch) / "config.json"
         honored.write_text(json.dumps(data))

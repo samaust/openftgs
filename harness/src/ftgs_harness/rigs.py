@@ -57,10 +57,11 @@ def frames(model: Exchange) -> np.ndarray:
     return np.linspace(model.tau0, model.tau1, _FRAMES)
 
 
-def _item(item_id: str, cam: Cam, tau: float) -> CaseItem:
+def _item(item_id: str, cam: Cam, tau: float, unit: str) -> CaseItem:
     return CaseItem(
         RequestItem(item_id, float(tau), cam.K, cam.world_to_camera, cam.width, cam.height),
         cam.name,
+        time_unit=unit,
     )
 
 
@@ -101,7 +102,7 @@ def main_items(model: Exchange, rig: Rig, count: int, rng: np.random.Generator) 
     out = []
     for i, (kind, position, tau) in enumerate(plan):
         name = f"c{int(position):02d}" if kind == "train" else f"n{position:.2f}"
-        out.append(_item(f"r{i:04d}", rig.camera(position, name), tau))
+        out.append(_item(f"r{i:04d}", rig.camera(position, name), tau, model.time_unit))
     return out
 
 
@@ -114,4 +115,7 @@ def small_items(model: Exchange, rig: Rig) -> list[CaseItem]:
         (rig.count // 2, times[-1]),
         (rig.count // 2, times[len(times) // 3]),
     ]
-    return [_item(f"r{i:04d}", rig.camera(k, f"c{k:02d}"), t) for i, (k, t) in enumerate(picks)]
+    return [
+        _item(f"r{i:04d}", rig.camera(k, f"c{k:02d}"), t, model.time_unit)
+        for i, (k, t) in enumerate(picks)
+    ]

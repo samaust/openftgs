@@ -47,9 +47,11 @@ class Probe:
     view: bool = False
 
 
-def _camera(name: str, *, eye: np.ndarray = _EYE, cx: float = _WIDTH / 2.0) -> Cam:
+def _camera(
+    name: str, *, eye: np.ndarray = _EYE, cx: float = _WIDTH / 2.0, cy: float = _HEIGHT / 2.0
+) -> Cam:
     K = intrinsics(_WIDTH, _HEIGHT, _FOCAL)
-    K[0, 2] = cx
+    K[0, 2], K[1, 2] = cx, cy
     return Cam(name, K, look_at(eye), _WIDTH, _HEIGHT)
 
 
@@ -98,7 +100,10 @@ def _p3(n: int) -> tuple[Exchange, list[CaseItem]]:
 
 
 def _opacity_items(n: int, values: np.ndarray, sigma: float, duration: float) -> list[CaseItem]:
-    cam = _camera("front")
+    # The primitive's centre projects onto a pixel centre (§1.4: u + ½), so the largest α of
+    # any pixel is σ_eff itself and the sweep's margins from α_max and 1/255 hold per pixel
+    # (Q-39); the other pixels' α is at most 0.8·σ_eff at this size.
+    cam = _camera("front", cx=_WIDTH / 2.0 + 0.5, cy=_HEIGHT / 2.0 + 0.5)
     return [_item(i, cam, _tau_for(e, sigma, duration), e) for i, e in enumerate(values)]
 
 

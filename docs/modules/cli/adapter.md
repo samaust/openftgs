@@ -15,7 +15,7 @@ ftgs-adapter [--backend …] train SCENE INIT CONFIG SEED OUT_DIR
 - `info` prints name, version, the 13 query kinds, the rasterizer identity and `io.render_conventions()` (Q-205, D-73).
 - `import` writes the adapter's **native directory**: `params.safetensors` with the nine §1.1 tensors and `model.json` with `sh_degree`, `tau0`, `tau1`, `time_unit` and `background`.
 - `export` and `render` take as MODEL a native directory, a checkpoint, a run directory (its `checkpoint/`) or an FTGS-IF file.
-- `train` runs `ftgs train SCENE --init INIT --config CONFIG --seed SEED --out OUT_DIR` in process. Config keys that `config_from_dict` rejects are written to `OUT_DIR/not_comparable.json` and left out of the run.
+- `train` runs `ftgs train SCENE --init INIT --config CONFIG --seed SEED --out OUT_DIR` in process. Config keys TrainConfig lacks, and values it refuses on their own, are written to `OUT_DIR/not_comparable.json` and left out of the run.
 - `forward` answers each L2 kind with the package's own functions, always on the CPU (`docs/modules/harness/formats.md`).
 
 ## What answers each query kind

@@ -11,7 +11,7 @@ An adapter's `info` prints one JSON object (Q-205):
 - `rasterizer`: `{name, version}` of the renderer that produced its pixels (openftgs: `openftgs-reference`, or `gsplat` with its version);
 - `render_conventions`: at least the 12 entries of `ftgs-if`'s block (Q-35, D-73). A reply without one of them is a failed `info` check.
 
-The L1 **tier** is "same rasterizer and constants" only when both `rasterizer` objects and every `render_conventions` entry match; otherwise it is "different rasterizers" (Q-206).
+The L1 **tier** is "same rasterizer and constants" only when both `rasterizer` objects and every `render_conventions` entry match, the background aside, since it is each model's (D-84); otherwise it is "different rasterizers" (Q-206).
 
 ## `ftgs-forward-queries` and `ftgs-forward-answers`
 
@@ -36,6 +36,10 @@ Answers: metadata `format` (`ftgs-forward-answers`), `version`, `kind`, `produce
 | relocation_score | `opacity`, `g_sum`, `count`; RelocConfig fields | `score` [N] |
 | spatial_scale | `world_to_camera` [C,4,4], `train` [C]; `factor` | `S` |
 | growth_decisions | `g` [N], `scales` [N,3]; `spatial_scale`, `grad_threshold`, `split_scale`, `n_max` | `clone`, `split` [N] bool |
+
+## `train_log.jsonl`
+
+An adapter's `train` writes `OUT_DIR/train_log.jsonl`: one JSON object per row with `iteration`, `losses` (an object of loss term → value) and `num_gaussians`, as openftgs writes it (Q-132, Q-207). L3 reads the last row at or before each trace iteration; a row that isn't such an object is a schema violation of that run.
 
 ## `not_comparable.json`
 

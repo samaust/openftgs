@@ -5,6 +5,7 @@ weights are downloaded."""
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 from harness_runs import checks, faulty, openftgs, run_harness
 
@@ -65,3 +66,15 @@ def test_a_kind_missing_from_info_is_not_comparable(tmp_path: Path) -> None:
     motion = checks(report)["L2.forward.motion"]
     assert motion["status"] == "not_comparable" and "B" in motion["observed"]
     assert report["summary"]["L2"] == "pass"
+
+
+def test_the_growth_edge_query_puts_the_cap_inside_a_tie() -> None:
+    """D-44: "ties to the lower row index" decides only when the cap falls inside a group of
+    equal g, so the edge query has seven tied rows at the top and room for three."""
+    from ftgs_harness.queries import generate
+
+    edge = generate("growth_decisions", 0, seed=0, config={})[-1]
+    g = edge.tensors["g"]
+    top = np.flatnonzero(g == g.max())
+    room = edge.params["n_max"] - g.size
+    assert top.size == 7 and room == 3

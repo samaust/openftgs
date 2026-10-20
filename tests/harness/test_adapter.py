@@ -118,6 +118,7 @@ def _train_inputs(root: Path) -> dict[str, Path]:
     data["optim"]["iterations"] = 4
     del data["seed"]
     data["growth"]["not_a_field"] = 1  # a setting openftgs can't honor
+    data["growth"]["mode"] = "mcmc"  # a value it refuses
     data["elsewhere"] = {"x": 1}
     (root / "harness_config.json").write_text(json.dumps(data))
     return {
@@ -131,8 +132,8 @@ def test_train_delegates_to_ftgs_train_and_reports_settings_it_cannot_honor(
     tmp_path: Path,
 ) -> None:
     """Q-202, §3.3: train writes the native checkpoint and train_log.jsonl (iteration, loss
-    terms, N); config keys TrainConfig doesn't have are listed in not_comparable.json and the
-    run goes on without them; the seed is the one given."""
+    terms, N); config keys TrainConfig doesn't have, and a value it refuses, are listed in
+    not_comparable.json and the run goes on without them; the seed is the one given."""
     inputs = _train_inputs(tmp_path)
     out = tmp_path / "run"
     done = _adapter("train", inputs["scene"], inputs["init"], inputs["config"], 7, out)
@@ -143,6 +144,7 @@ def test_train_delegates_to_ftgs_train_and_reports_settings_it_cannot_honor(
     assert json.loads((out / "not_comparable.json").read_text()) == [
         "growth.not_a_field",
         "elsewhere",
+        "growth.mode",
     ]
     assert load_checkpoint(out / "checkpoint").config["seed"] == 7
     exported = _adapter("export", out, tmp_path / "trained.safetensors")

@@ -549,7 +549,7 @@ One of the harness's four stages: L0 boundary converters, L1 identical-model ren
 _Avoid_: stage, phase, tier (the tolerance class within L1)
 
 **Tier**:
-The L1 tolerance class chosen from both info replies: same rasterizer and constants when the rasterizer identity and every render convention match, otherwise different rasterizers. §3.3 L1, D-73
+The L1 tolerance class chosen from both info replies: same rasterizer and constants when the rasterizer identity and every render convention but the model's background match, otherwise different rasterizers. §3.3 L1, D-73, D-84
 _Avoid_: level, tolerance mode, strictness
 
 **Run settings**:

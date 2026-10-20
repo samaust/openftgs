@@ -336,6 +336,14 @@ def _matrix(value: Any, shape: tuple[int, int], where: str) -> np.ndarray:
     return a
 
 
+def _split_of(image: Mapping[str, Any], i: int, where: str) -> str:
+    """§2.2: every image is in the train or the test split."""
+    split = image.get("split")
+    if split not in ("train", "test"):
+        raise FormatError(f"{where}: image {i} has split {split!r}, not train or test")
+    return str(split)
+
+
 def _scene_image(
     i: int, image: Any, cameras: Mapping[str, Any], base: Path, where: str
 ) -> SceneImage:
@@ -347,7 +355,7 @@ def _scene_image(
         camera=name,
         timestamp=float(image["timestamp"]),
         path=base / image["path"],
-        split=image.get("split", "train"),
+        split=_split_of(image, i, where),
         K=_matrix(image.get("K", cam["K"]), (3, 3), where),
         world_to_camera=_matrix(
             image.get("world_to_camera", cam["world_to_camera"]), (4, 4), where
