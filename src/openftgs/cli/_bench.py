@@ -3,7 +3,8 @@
 BENCH.json.
 
 Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55, D-56, D-81,
-D-88 (`--model`). Q-166 (BENCH.json and the exit codes), Q-168 (the setups), Q-178 and Q-189
+D-88 (`--model`). Q-166 (BENCH.json and the exit codes), Q-199 (a numerical failure in a
+run), Q-168 (the setups), Q-178 and Q-189
 (B-6), Q-174 (the index threshold T that B-7 sets), Q-194 and Q-195 (B-7), Q-169, Q-192
 and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
@@ -1703,9 +1704,10 @@ _CHILD = (
     "import sys; sys.modules['fused_ssim'] = None; "
     "from openftgs.cli._bench import _losses_child; _losses_child(sys.argv[1])"
 )
-# Q-166 (as answered): the child's exit code when it runs out of GPU memory, its error last on
-# stderr; Python's own for an uncaught exception is 1.
-_CHILD_OUT_OF_MEMORY = 2
+# Q-166 (as answered): the child's exit code when it runs out of GPU memory, its error the last
+# line of its output; one the interpreter never gives (1 for an uncaught exception, 2 for a
+# usage error).
+_CHILD_OUT_OF_MEMORY = 75
 
 
 def _loss_images(
@@ -1902,21 +1904,22 @@ def _losses_child(spec: str) -> None:
     where `fused_ssim` can't be imported (PRD #220): `SPEC` is JSON with the scene's path, the
     sizes, the seed, the repetitions and the setting. Every LPIPS case, then the PyTorch SSIM
     path with TF32 on as in training (D-52), at every size. Prints its cases as one line of
-    JSON; out of GPU memory, prints the error on stderr and exits with `_CHILD_OUT_OF_MEMORY`
-    (Q-166 as answered)."""
+    JSON; out of GPU memory, prints `{"out_of_memory": error}` instead and exits with
+    `_CHILD_OUT_OF_MEMORY` (Q-166 as answered)."""
     import torch
 
     if _fused_ssim_importable():
         raise RuntimeError("fused_ssim can be imported in B-4's child process")
     try:
-        cases = _losses_child_cases(json.loads(spec))
+        cases = _measure_in_child(json.loads(spec))
     except torch.OutOfMemoryError as error:
-        print(error, file=sys.stderr)
+        print(json.dumps({"out_of_memory": str(error)}))
         raise SystemExit(_CHILD_OUT_OF_MEMORY) from None
     print(json.dumps(cases))
 
 
-def _losses_child_cases(given: dict[str, Any]) -> list[dict[str, Any]]:
+def _measure_in_child(given: dict[str, Any]) -> list[dict[str, Any]]:
+    """`_losses_child`'s measurements, from its parsed SPEC: the cases it prints."""
     from openftgs.data import MultiViewVideo
 
     autotuning, repetitions = bool(given["autotuning"]), int(given["repetitions"])
@@ -1964,7 +1967,7 @@ def _child_cases(
         check=False,
     )
     if done.returncode == _CHILD_OUT_OF_MEMORY:
-        error = (done.stderr.strip().splitlines() or [""])[-1]
+        error = json.loads(done.stdout.strip().splitlines()[-1])["out_of_memory"]
         setting = "on" if autotuning else "off"
         raise torch.OutOfMemoryError(f"in the child process with autotuning {setting}: {error}")
     if done.returncode != 0:
