@@ -2,12 +2,11 @@
 """Cameras for the harness's cases, in §1.4's conventions: OpenCV axes (x right, y down, z
 forward), world-to-camera matrices, K in the continuous pixel convention."""
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["Cam", "intrinsics", "look_at", "ring"]
+__all__ = ["Cam", "intrinsics", "look_at"]
 
 
 @dataclass(frozen=True)
@@ -46,27 +45,3 @@ def look_at(eye: np.ndarray, target: np.ndarray | None = None, up: np.ndarray = 
     out[:3, :3] = rotation
     out[:3, 3] = -rotation @ eye
     return out
-
-
-def ring(
-    count: int,
-    *,
-    radius: float,
-    elevation: float,
-    width: int,
-    height: int,
-    focal: float,
-    phase: float = 0.0,
-    prefix: str = "c",
-) -> list[Cam]:
-    """`count` cameras evenly on a horizontal circle at `elevation`, looking at the origin;
-    `phase` (a fraction of the spacing) turns the circle, so a phase between 0 and 1 gives
-    cameras between the phase-0 ones."""
-    cams = []
-    for k in range(count):
-        angle = 2.0 * math.pi * (k + phase) / count
-        eye = np.array([radius * math.cos(angle), radius * math.sin(angle), elevation])
-        cams.append(
-            Cam(f"{prefix}{k:02d}", intrinsics(width, height, focal), look_at(eye), width, height)
-        )
-    return cams
