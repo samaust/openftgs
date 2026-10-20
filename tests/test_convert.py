@@ -9,8 +9,10 @@ frames (U-27). Calibrations and poses are written by hand. Tests that need ffmpe
 it, as U-27 says; CI installs none (#108, item 4).
 """
 
+import concurrent.futures
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -196,6 +198,49 @@ def test_n3dv_outputs_do_not_depend_on_jobs(tmp_path: Path) -> None:
         )
     a, b = json.loads(one.read_text()), json.loads(two.read_text())
     assert a["images"] == b["images"] and a["cameras"] == b["cameras"]
+
+
+def _process_pool_sizes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """The worker counts of every process pool started from here on, which still runs: a spy
+    on the standard library's executor, not on openftgs."""
+    real = concurrent.futures.ProcessPoolExecutor
+    sizes: list[int] = []
+
+    def spy(max_workers: int, *args: Any, **kwargs: Any) -> concurrent.futures.Executor:
+        sizes.append(max_workers)
+        return real(max_workers, *args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", spy)
+    return sizes
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("variables", "budget"),
+    [
+        ({"OMP_NUM_THREADS": "2"}, 2),
+        ({"MKL_NUM_THREADS": "2"}, 2),
+        ({"OMP_NUM_THREADS": "5", "MKL_NUM_THREADS": "3"}, 3),
+        ({}, None),
+    ],
+    ids=["omp", "mkl", "both", "unset"],
+)
+def test_the_encoding_pool_stays_within_the_thread_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variables: dict[str, str], budget: int | None
+) -> None:
+    """Q-215, §2.4: the PNG pool starts at most the thread budget's processes, the smallest
+    positive count of OMP_NUM_THREADS and MKL_NUM_THREADS, as PyTorch takes them; with neither
+    set one per CPU, and never more than the frames. (Values that aren't positive counts are
+    checked on the cache: ffprobe's own OpenMP runtime rejects them.)"""
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+    sizes = _process_pool_sizes(monkeypatch)
+    src = n3dv_source(tmp_path / "s", cameras=3, frames=3)
+    convert_n3dv(src, tmp_path / "out", frames=3, resize=0.5, jobs=2)
+    frames = 9
+    assert sizes == [min(budget or os.cpu_count() or 1, frames)]
 
 
 @needs_ffmpeg
