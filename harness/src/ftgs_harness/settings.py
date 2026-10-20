@@ -55,6 +55,7 @@ class Settings:
     trained_models: tuple[Path, ...] = ()
     scenes: tuple[Scene, ...] = ()
     sizes: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SIZES))
+    l2_lpips: bool = True  # Q-203: LPIPS-VGG in L2's losses (off where weights can't download)
 
     @property
     def reduced(self) -> bool:
@@ -111,7 +112,7 @@ def load_settings(path: Path | None) -> Settings:
     for level, allowed in (
         ("l0", {"models", "trained_models"}),
         ("l1", {"items", "probe_items"}),
-        ("l2", {"queries"}),
+        ("l2", {"queries", "lpips"}),
         ("l3", {"scenes"}),
     ):
         section = raw.get(level, {})
@@ -122,6 +123,9 @@ def load_settings(path: Path | None) -> Settings:
         level, name = key.split(".")
         if name in sections[level]:
             sizes[key] = _int(sections[level][name], key, 1)
+    l2_lpips = sections["l2"].get("lpips", True)
+    if not isinstance(l2_lpips, bool):
+        raise HarnessError(f"settings {path}: l2.lpips must be true or false")
     trained = sections["l0"].get("trained_models", [])
     if not isinstance(trained, list):
         raise HarnessError(f"settings {path}: l0.trained_models must be a list")
@@ -162,6 +166,7 @@ def load_settings(path: Path | None) -> Settings:
         trained_models=tuple(_path(p, "l0.trained_models", base) for p in trained),
         scenes=tuple(scenes),
         sizes=sizes,
+        l2_lpips=l2_lpips,
     )
 
 
