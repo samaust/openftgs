@@ -33,13 +33,15 @@ def _cuda_available() -> bool:
 
 
 def _budget() -> int:
-    """Q-214: the run's CPU threads: OMP_NUM_THREADS or MKL_NUM_THREADS when set (machine.py's
-    `--threads`, a subagent's budget), otherwise the physical cores this process may run on,
-    the count ftgs itself takes (§2.4, Q-176)."""
-    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-        value = os.environ.get(name, "")
-        if value.isdigit() and int(value) > 0:
-            return int(value)
+    """Q-214: the run's CPU threads: the smallest positive count of OMP_NUM_THREADS and
+    MKL_NUM_THREADS (machine.py's `--threads`, a subagent's budget), as `openftgs.data` takes it
+    (Q-215), otherwise the physical cores this process may run on, the count ftgs itself takes
+    (§2.4, Q-176). Not imported from `openftgs.data`, whose NumPy would read the BLAS variable
+    before a worker sets its share."""
+    values = (os.environ.get(name, "") for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"))
+    counts = [int(value) for value in values if value.isdigit() and int(value) > 0]
+    if counts:
+        return min(counts)
     from openftgs.cli import _physical_cores
 
     return _physical_cores()
