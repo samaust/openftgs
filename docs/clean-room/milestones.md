@@ -1,6 +1,6 @@
 # Milestones
 
-Nineteen milestones, M0 to M18, build `openftgs` bottom-up along the dependency bands of spec §2.1 (`docs/spec/openftgs-spec.md`, revision 549l). Each one lands with the spec tests that pin it; a test listed under a milestone must pass before the next milestone starts. The order is the spec author's suggestion, not part of the spec.
+Nineteen milestones, M0 to M18, build `openftgs` bottom-up along the dependency bands of spec §2.1 (`docs/spec/openftgs-spec.md`, revision 549m). Each one lands with the spec tests that pin it; a test listed under a milestone must pass before the next milestone starts. The order is the spec author's suggestion, not part of the spec.
 
 How to run one. Each milestone runs as one PRD through the skills in `.claude/skills/`:
 
@@ -185,7 +185,7 @@ Milestone M15 of docs/clean-room/milestones.md: performance architecture. Read C
 
 Scope: the separate `ftgs_harness` package and this package's adapter.
 Spec: §3.3 in full (adapter contract, L0 to L3, report format) with D-73 (the adapter's `info` reply reports at least the entries of `render_conventions`); §2.2 formats; the `ftgs_harness` row of §2.1. `ftgs_harness` depends on matplotlib, with the Agg backend, for the plots in `artifacts/` (owner decision, 2026-10-11; §2.3 lists no harness dependencies); `openftgs` does not.
-Tests: the harness run with this package as both A and B passes every level; the reference backend against gsplat passes L1 at its tier tolerances.
+Tests: the harness run with this package as both A and B passes every level, that is, with no failed check (§3.3's exit code 0 since revision 549m; Q-211); the reference backend against gsplat passes L1 at its tier tolerances.
 
 ```text
 Milestone M16 of docs/clean-room/milestones.md: differential harness. Read CLAUDE.md and docs/clean-room/questions.md, then spec §3.3 in full with D-73, §2.2, and the ftgs_harness row of §2.1, and the M16 forward notes on issue #37. Plan ftgs_harness as a package that imports nothing from openftgs: the adapter contract commands, harness_config.json in TrainConfig field names, the forward-query and answer formats, levels L0 to L3 with their case generation, comparisons, tolerances and statistics, and report.json, report.md and the artifacts folder exactly as the report format section shows, with plots drawn by matplotlib on its Agg backend, a dependency of ftgs_harness only (owner decision, 2026-10-11). Plan this package's adapter executable, whose info reply reports at least the entries of ftgs-if's render_conventions (D-73). Plan the tests: the harness run with openftgs as both implementations, and L1 between the reference and gsplat backends treated as two implementations. State which levels need a GPU and how long an L3 run takes at the smallest configuration.
