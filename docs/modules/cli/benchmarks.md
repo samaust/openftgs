@@ -69,7 +69,7 @@ One JSON object, replaced atomically through a temporary sibling `.<name>.tmp-<p
 - `date` is the start of the run, in UTC.
 - `setup` holds the benchmark's fixed parameters, so a later run can be checked to have measured the same thing.
 - `cases` holds one entry per measured case: `case` names its parameters, and `figures` its numbers, times in seconds (names ending `_s`) and memory in bytes.
-- `budgets` holds one entry per budget or limit the run is held to, naming the case and the figure: `kind` is `budget` for a §3.4 budget, `bound` for an upper bound standing for one (Q-168's B-1), and `limit` for another spec limit checked on the run, as U-28's recompilations in B-3 and U-8's 1e-6 in B-2's spot check. `pass` is true when `value` is at most `limit`, except for B-6, whose "< 1%" passes only strictly under it, as the baseline comparison judges it. `pass` never changes the exit code.
+- `budgets` holds one entry per budget or limit the run is held to, naming the case and the figure: `kind` is `budget` for a §3.4 budget, `bound` for an upper bound standing for one (Q-168's B-1), and `limit` for another spec limit checked on the run, as U-28's recompilations in B-3 and U-8's 1e-6 in B-2's spot check. `pass` follows the direction of the spec's limit: `value` at most `limit` for the upper bounds and limits, at least `limit` for B-7's ≥ 450 FPS, and strictly under it for B-6's "< 1%", as the baseline comparison judges it. `pass` never changes the exit code.
 
 ## Measurement
 
