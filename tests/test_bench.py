@@ -1634,6 +1634,23 @@ def test_b8_convert_without_its_source_exits_2_naming_the_path(
     assert list(scratch.iterdir()) == []
 
 
+@needs_ffmpeg
+def test_b8_convert_finds_a_relative_srcs_videos_from_another_directory(
+    tmp_path: Path, scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-8, Q-169: a scene converted from a relative SRC records its videos by absolute path,
+    so `bench convert`, run from a directory where that relative path means nothing, finds
+    them; exit 0."""
+    n3dv_source(tmp_path / "data" / "kitchen", cameras=2, frames=3)
+    monkeypatch.chdir(tmp_path / "data")
+    manifest = convert_n3dv(Path("kitchen"), tmp_path / "scene", frames=2, resize=0.5, jobs=1)
+    monkeypatch.chdir(tmp_path / "scene")
+    body = _bench_convert(manifest, tmp_path / "bench.json")
+    assert body["setup"]["source"] == str(tmp_path / "data" / "kitchen")
+    assert {c["case"].get("camera") for c in body["cases"]} == {"cam00", "cam01", None}
+    assert list(scratch.iterdir()) == []
+
+
 def test_b8_convert_needs_a_recorded_n3dv_conversion(
     scene: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
