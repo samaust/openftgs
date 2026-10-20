@@ -6,9 +6,11 @@ cache and the prefetcher must give bitwise the same values (D-51 is exact). Scen
 8-bit images written by hand, so every value is known.
 """
 
+import concurrent.futures
+import os
 import threading
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pytest
@@ -207,3 +209,49 @@ def test_u30_gpu_placement_takes_frames_without_synchronizing(tmp_path: Path, de
     for index, image in zip(order, images, strict=True):
         assert torch.equal(image, video.load_image(index).cuda())
     prefetcher.close()
+
+
+def _thread_pool_sizes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """The worker counts of every thread pool started from here on, which still runs: a spy on
+    the standard library's executor, not on openftgs."""
+    real = concurrent.futures.ThreadPoolExecutor
+    sizes: list[int] = []
+
+    def spy(max_workers: int, *args: Any, **kwargs: Any) -> concurrent.futures.Executor:
+        sizes.append(max_workers)
+        return real(max_workers, *args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", spy)
+    return sizes
+
+
+@pytest.mark.parametrize(
+    ("variables", "jobs", "workers"),
+    [
+        ({"OMP_NUM_THREADS": "2"}, 0, 2),
+        ({"OMP_NUM_THREADS": "5", "MKL_NUM_THREADS": "3"}, 0, 3),
+        ({"OMP_NUM_THREADS": "2"}, 3, 3),
+        ({}, 0, None),
+        ({"OMP_NUM_THREADS": "0"}, 0, None),
+        ({"OMP_NUM_THREADS": "x", "MKL_NUM_THREADS": "2"}, 0, 2),
+    ],
+    ids=["budget", "both", "jobs", "unset", "zero", "invalid"],
+)
+def test_cache_decoding_stays_within_the_thread_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variables: dict[str, str],
+    jobs: int,
+    workers: int | None,
+) -> None:
+    """Q-215: with jobs 0, the cache decodes its PNGs with the thread budget's threads (the
+    smallest positive count of OMP_NUM_THREADS and MKL_NUM_THREADS; a value that isn't one is
+    ignored), one per CPU without one; a jobs count given stands whatever the budget."""
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+    video = _scene(tmp_path)
+    sizes = _thread_pool_sizes(monkeypatch)
+    FrameCache.build(video, jobs=jobs)
+    assert sizes and set(sizes) == {workers or os.cpu_count() or 1}

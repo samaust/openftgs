@@ -803,6 +803,19 @@ class _CameraJob:
     dist: np.ndarray | None = None
 
 
+# Q-215: the budget a process is given through the variables PyTorch reads (Q-176), so that
+# the converters' pool and the frame cache's threads stay within it; None when neither is set.
+def _thread_budget() -> int | None:
+    """The smallest positive count among OMP_NUM_THREADS and MKL_NUM_THREADS, as PyTorch takes
+    them when both are set; other values are ignored."""
+    counts = [
+        int(value)
+        for value in (os.environ.get("OMP_NUM_THREADS"), os.environ.get("MKL_NUM_THREADS"))
+        if value is not None and value.isdigit() and int(value) > 0
+    ]
+    return min(counts) if counts else None
+
+
 def _worker_count(jobs: int) -> int:
     if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs < 0:
         raise ValueError(f"jobs must be an int >= 0, got {jobs!r}")
@@ -824,7 +837,7 @@ def _run_jobs(
     pool (§2.4); outputs don't depend on `workers`. Returns each camera's ffmpeg command."""
     commands: dict[str, list[str]] = {}
     total = sum(len(job.outputs) for job in camera_jobs)
-    pool_size = max(1, min(os.cpu_count() or 1, total))
+    pool_size = max(1, min(_thread_budget() or os.cpu_count() or 1, total))  # Q-215
     in_flight = threading.BoundedSemaphore(2 * pool_size)  # bounds decoded frames held in memory
     context = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(
@@ -1854,12 +1867,13 @@ class FrameCache:
         cls, dataset: "MultiViewVideo", *, directory: Path | None = None, jobs: int = 0
     ) -> Path:
         """Write the cache's files, keeping the valid ones, and return its directory. PNGs are
-        decoded by `jobs` threads (0: one per core)."""
+        decoded by `jobs` threads (0: the thread budget when one is set, else one per CPU;
+        Q-215)."""
         directory = (
             Path(directory) if directory is not None else cls.default_directory(dataset.manifest)
         )
         directory.mkdir(parents=True, exist_ok=True)
-        workers = jobs or os.cpu_count() or 1
+        workers = jobs or _thread_budget() or os.cpu_count() or 1
         for k, (camera, records) in enumerate(_cache_groups(dataset)):
             first = dataset.records[records[0]].camera
             shape = (len(records), first.height, first.width, 3)

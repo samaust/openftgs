@@ -18,7 +18,7 @@ The manifest's metadata records how the scene was made (Q-94): the source and co
 
 ## Decoding with ffmpeg
 
-Frames come from the user's ffmpeg, run as a separate program (D-48); the package never links FFmpeg. Width, height, pixel format and frame count come from ffprobe, and the converter reads exactly W·H·3 bytes per frame from the pipe. Up to `jobs` cameras decode at once (0 means one per four cores), and resizing, undistortion and PNG encoding run in a process pool whose workers use one PyTorch thread (§2.4). Outputs don't depend on `jobs`.
+Frames come from the user's ffmpeg, run as a separate program (D-48); the package never links FFmpeg. Width, height, pixel format and frame count come from ffprobe, and the converter reads exactly W·H·3 bytes per frame from the pipe. Up to `jobs` cameras decode at once (0 means one per four cores), and resizing, undistortion and PNG encoding run in a process pool whose workers use one PyTorch thread (§2.4): one worker per CPU, or, when `OMP_NUM_THREADS` or `MKL_NUM_THREADS` is set, the smallest positive count among them, the thread budget a ledger run or a test worker is given (Q-215), and never more than the frames. Outputs don't depend on `jobs`.
 
 Anything ffmpeg prints at `-v error`, a nonzero exit or a short read fails the conversion (Q-93). SelfCap windows decode the frames before the window too, and ffmpeg's messages carry no frame number, so an error before the window also fails; the message says so.
 
