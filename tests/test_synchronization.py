@@ -10,8 +10,10 @@ the render test of `test_render_gsplat.py` share.
 
 import contextlib
 import dataclasses
+import importlib
 import sys
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -190,6 +192,18 @@ def video(tmp_path_factory: pytest.TempPathFactory) -> MultiViewVideo:
     return MultiViewVideo.from_manifest(write_scene(tmp_path_factory.mktemp("u29"), truth, images))
 
 
+@pytest.fixture
+def without_fused_ssim(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Q-42: openftgs.losses reloaded with fused-ssim made unimportable, as without it installed
+    (as in `test_losses.py`); reloaded again afterwards. The trainer's loss reads `ssim` from the
+    reloaded module's namespace, so it takes the PyTorch path."""
+    monkeypatch.setitem(sys.modules, "fused_ssim", None)
+    importlib.reload(openftgs.losses)
+    yield
+    monkeypatch.undo()
+    importlib.reload(openftgs.losses)
+
+
 def _config(case: _Case) -> TrainConfig:
     """One event, at _EVENT, which grows and relocates; the first log read at 100 (the default
     log_every); every SH band active from iteration 4."""
@@ -225,7 +239,7 @@ def _allowed(sync: Sync, *, compact: bool, forward: int, autograd: int) -> bool:
 
 @pytest.mark.parametrize("case", _CASES)
 def test_u29_training_iterations_synchronize_only_inside_gsplat(
-    video: MultiViewVideo, case: _Case, monkeypatch: pytest.MonkeyPatch
+    video: MultiViewVideo, case: _Case, request: pytest.FixtureRequest
 ) -> None:
     """U-29 (§2.4 rule 3, D-49, D-57, D-76; Q-171): after a warm-up past compilation and the
     first event, 20 iterations with no event and no log read synchronize only inside gsplat's
@@ -236,8 +250,7 @@ def test_u29_training_iterations_synchronize_only_inside_gsplat(
     its tile intersections back every render), so the check can't pass empty, and no more per
     iteration than the U-29 Calibration row records for the case's layout."""
     if case.ssim_fallback:
-        # Q-42: the PyTorch path, as without fused-ssim installed.
-        monkeypatch.setattr(openftgs.losses, "_fused_ssim", lambda: None)
+        request.getfixturevalue("without_fused_ssim")  # Q-42: the PyTorch path
     cfg = _config(case)
     model = random_model(60, seed=2, sh_degree=3, time=video.time, spread=0.6)
     trainer = Trainer(cfg, video, model, device="cuda")
