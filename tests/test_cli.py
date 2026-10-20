@@ -595,7 +595,8 @@ def test_train_refuses_invalid_inputs(
 ) -> None:
     """§2.1 exit code 2 (Q-142): a broken init file, an init file in another time unit, a missing
     scene, a non-empty run directory (Q-132), F·B > N_max (D-24, Q-128), and a configuration this
-    build can't run (bf16, until M15)."""
+    build can't run (`images_per_step > 1`, deferred with multi-GPU training, Q-177; bf16 was
+    one until M15 built it, Q-172)."""
     broken = tmp_path / "broken.safetensors"
     broken.write_bytes(b"not a safetensors file")
     assert _ftgs("train", run["scene"], "--init", broken, "--out", tmp_path / "a") == 2
@@ -615,8 +616,9 @@ def test_train_refuses_invalid_inputs(
     capsys.readouterr()
     assert _train(run, tmp_path / "d", "--config", budget) == 2
     assert "F·B" in capsys.readouterr().err  # D-24's own error
-    bf16 = _config_file(tmp_path / "bf16.json", _cfg(perf=PerfConfig(perc_precision="bf16")))
-    assert _train(run, tmp_path / "e", "--config", bf16) == 2
+    # Q-142: a configuration this build can't run; multi-GPU training is deferred (Q-177).
+    two = _config_file(tmp_path / "two.json", _cfg(perf=PerfConfig(images_per_step=2)))
+    assert _train(run, tmp_path / "e", "--config", two) == 2
 
 
 def test_divergence_is_exit_code_3_and_saves_nothing(
