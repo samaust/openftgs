@@ -11,6 +11,8 @@ column u).
 """
 
 import math
+import sys
+import threading
 import warnings
 from typing import Any, Literal
 
@@ -46,6 +48,7 @@ from render_margins import (
     excluded_share,
     opacity_near_cull,
 )
+from sync_recorder import SyncRecorder, described, in_render_gsplat_stage
 from torch import Tensor
 from torch._dynamo.utils import counters
 
@@ -1022,31 +1025,33 @@ def _on_device(camera: Camera) -> Camera:
     )
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="the recorder needs sys.monitoring (Python 3.12)"
+)
 @LAYOUTS
 def test_render_synchronizes_only_inside_gsplat(packed: bool) -> None:
     """§2.4 rule 3, D-49, D-76: with cameras and background already on the device, a render
     (opacity cull inside the projection) synchronizes with the host only inside gsplat's own
-    calls: every synchronization torch's debug mode reports comes from gsplat's files, with the
-    default black background and with a given one. The debug mode is a prototype that misses some
-    synchronizations, so this pins only the ones it sees."""
+    calls: every synchronization torch's debug mode reports, as a Python warning or printed on
+    standard error (gsplat's tile intersection reads its count back only there;
+    `sync_recorder.py`), comes from one of `render`'s gsplat stage calls, on this thread, with
+    the default black background and with a given one. At least one is seen per render (the
+    tile intersection's), so the check can't pass on nothing. The debug mode is a prototype
+    that misses some synchronizations, so this pins only the ones it sees."""
     cameras = [_on_device(camera) for camera in _CAMERAS]
     model = _random_scene(7, min_rows=20)
     for background in (None, torch.tensor([0.25, 0.5, 0.75], device="cuda")):
         _gsplat(model, cameras, _T, background=background, packed=packed)
         torch.cuda.synchronize()
-        with warnings.catch_warnings(record=True) as records:
-            warnings.simplefilter("always")
-            torch.cuda.set_sync_debug_mode("warn")
-            try:
-                _gsplat(model, cameras, _T, background=background, packed=packed)
-            finally:
-                torch.cuda.set_sync_debug_mode(0)
-        sites = {
-            f"{record.filename}:{record.lineno}"
-            for record in records
-            if "synchronizing CUDA operation" in str(record.message)
-        }
-        assert all("/gsplat/" in site for site in sites), sites
+        with SyncRecorder() as recorder:
+            _gsplat(model, cameras, _T, background=background, packed=packed)
+        sites = recorder.syncs
+        assert sites, "the debug mode saw no synchronization in the render"
+        assert recorder.unattributed == 0
+        outside = [
+            s for s in sites if not in_render_gsplat_stage(s) or s.thread != threading.get_ident()
+        ]
+        assert not outside, described(outside, __file__)
 
 
 def test_render_request_on_gsplat_equals_render_per_item() -> None:
