@@ -162,7 +162,7 @@ class OptimConfig:  # E12, E13, §1.3 Optimizer
 @dataclass
 class PerfConfig:  # §2.4 Settings
     slice_impl: Literal["auto", "eager", "compiled", "cuda"] = "auto"  # D-50
-    packed: bool = True  # gsplat default until B-2 calibrates (D-57)
+    packed: bool = True  # gsplat's default, which B-2 kept (D-57, Q-187)
     precull: Literal["internal", "compact"] = "internal"  # D-32, D-57
     frame_cache: Literal["auto", "gpu", "mmap", "off"] = "auto"  # D-51
     prefetch: int = 8
