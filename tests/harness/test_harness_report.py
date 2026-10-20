@@ -55,12 +55,13 @@ def _check(check_id: str, status: str, pattern: str | None = None) -> Check:
 
 
 def test_level_summary_fails_on_any_failure_then_inconclusive_then_passes() -> None:
-    """Q-211: fail if any check failed, otherwise inconclusive if any was, otherwise pass; a
-    not-comparable check fails nothing."""
+    """Q-211: fail if any check failed, otherwise inconclusive if any was, otherwise pass if any
+    passed, otherwise not comparable; a not-comparable check fails nothing."""
     assert level_summary(["pass", "inconclusive", "fail"]) == "fail"
     assert level_summary(["pass", "inconclusive", "not_comparable"]) == "inconclusive"
     assert level_summary(["pass", "not_comparable"]) == "pass"
-    assert level_summary([]) == "pass"
+    assert level_summary(["not_comparable", "not_comparable"]) == "not_comparable"
+    assert level_summary([]) == "not_comparable"
 
 
 def test_check_writes_non_finite_values_as_null_with_a_note() -> None:
