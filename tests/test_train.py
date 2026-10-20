@@ -43,6 +43,7 @@ from openftgs.config import (
 from openftgs.data import FrameCache, MultiViewVideo
 from openftgs.eval import METRIC_NAMES
 from openftgs.io import load_checkpoint, save_checkpoint
+from openftgs.losses import LPIPSLoss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer, _Sampler, calendar_entry
@@ -1096,6 +1097,49 @@ def test_a_bf16_step_gives_a_finite_perceptual_term_near_float32(
     assert abs(terms["bf16"] - terms["ieee"]) <= 5e-2 * terms["ieee"]
     assert "means" in gradients["bf16"]
     assert all(bool(torch.isfinite(g).all()) for g in gradients["bf16"].values())
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_the_float32_perceptual_precisions_keep_a_plain_lpips_loss_bitwise(
+    tmp_path: Path, device: str, precision: Literal["ieee", "tf32"]
+) -> None:
+    """D-52, Q-172 (#228, PRD #220: "the float32 path is bitwise unchanged"): with
+    perc_precision "ieee" or "tf32" the network the trainer runs for the perceptual term is a
+    plain `LPIPSLoss`, not bf16's, and a training step's perceptual term equals, bitwise, a
+    direct call of a separately built `LPIPSLoss` on the same two images, made at the same
+    moment, so under the global flags the step sets (`cudnn.allow_tf32` per precision). The
+    images are caught by a global forward hook, PyTorch's public `register_module_forward_hook`."""
+    from torch.nn.modules.module import register_module_forward_hook
+
+    cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
+    trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device=device)
+    direct = LPIPSLoss(cfg.loss.perc_net).to(device)
+    seen: list[tuple[type, torch.Tensor, torch.Tensor]] = []
+    busy = False
+
+    def hook(module: torch.nn.Module, args: Any, output: Any) -> None:
+        nonlocal busy
+        if busy or not isinstance(module, LPIPSLoss):
+            return
+        busy = True  # the direct call below runs the same hook
+        try:
+            expected = direct(*(arg.detach().clone() for arg in args))
+        finally:
+            busy = False
+        seen.append((type(module), output.detach().clone(), expected.detach()))
+
+    handle = register_module_forward_hook(hook)
+    try:
+        log = trainer.step()
+    finally:
+        handle.remove()
+    assert len(seen) == 1
+    kind, term, expected = seen[0]
+    assert kind is LPIPSLoss
+    assert torch.equal(term, expected)
+    assert float(log.losses["perceptual"]) == float(expected)
 
 
 def _evaluation_scene(root: Path) -> MultiViewVideo:

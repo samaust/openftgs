@@ -3,46 +3,26 @@
 (§2.4 rule 3, D-49, D-57, D-76; Q-171), checked through `Trainer.step` on CUDA with the gsplat
 backend under `torch.cuda.set_sync_debug_mode("warn")`.
 
-How a synchronization is seen. The debug mode raises a C++ warning at every synchronizing CUDA
-call, and the warning reaches Python by one of three routes (source log 158, 159):
-
-- raised during a call through one of torch's Python bindings (any torch operation, or an
-  autograd Function's `apply`), it becomes a Python warning when the call returns, from the
-  frame that made the call, on the thread that made it. That includes the autograd device
-  thread, when a Python backward calls a torch operation;
-- raised in an extension function that Python calls directly (gsplat's compiled stage functions
-  outside an autograd Function, such as the tile intersection of `isect_tiles`), it never becomes
-  a Python warning: c10 prints it on standard error;
-- raised by C++ code on the autograd device thread, it is replayed when backward returns, as a
-  Python warning from torch's own backward frame, so where it came from is lost.
-
-`_SyncRecorder` takes the first route through `warnings.showwarning` and the second by sending
-standard error to a file and, after each C function returns (`sys.monitoring`), charging what it
-printed to the Python stack that called it. The third arrives as a Python warning whose innermost
-frame is torch's, which the check refuses whoever made it: conservative, and seen in no run.
-Without the second route an unpacked render, whose one synchronization is the tile
-intersection's, would show no warning at all. The debug mode is a prototype that may miss some
-synchronizations; the test pins the ones it sees.
+How a synchronization is seen, by which of three routes, and why a C++ readback replayed from
+the autograd device thread is refused: `sync_recorder.py`, whose `SyncRecorder` this file and
+the render test of `test_render_gsplat.py` share.
 """
 
 import contextlib
 import dataclasses
-import os
+import importlib
 import sys
-import tempfile
 import threading
-import traceback
-import warnings
-from collections.abc import Callable
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import TracebackType
 from typing import Any
 
 import gsplat
 import pytest
 import torch
 from builders import random_model, ring, write_scene
+from sync_recorder import GSPLAT_DIR, Sync, SyncRecorder, described, in_render_gsplat_stage
 from torch import Tensor
 
 import openftgs.losses
@@ -66,148 +46,6 @@ pytestmark = [
         sys.version_info < (3, 12), reason="the recorder needs sys.monitoring (Python 3.12)"
     ),
 ]
-
-_SYNC_MESSAGE = "called a synchronizing CUDA operation"
-_GSPLAT_DIR = Path(gsplat.__file__).resolve().parent
-
-
-# The recorder.
-
-
-@dataclass(frozen=True)
-class _Sync:
-    """One synchronization: the thread it happened on and the Python stack that made it,
-    outermost frame first, so the last frame is the innermost."""
-
-    thread: int
-    thread_name: str
-    stack: tuple[traceback.FrameSummary, ...]
-    route: str  # "python": a Python warning; "stderr": printed by C++ only
-
-    @property
-    def innermost(self) -> traceback.FrameSummary:
-        return self.stack[-1]
-
-    def describe(self) -> str:
-        """The thread, the route and the stack from this test file's outermost frame inward."""
-        ours = [k for k, f in enumerate(self.stack) if f.filename == __file__]
-        frames = self.stack[ours[0] if ours else 0 :]
-        lines = "".join(f"\n    {f.filename}:{f.lineno} in {f.name}" for f in frames)
-        return f"[{self.thread_name}, {self.route}]{lines}"
-
-
-def _described(syncs: list[_Sync]) -> str:
-    """Each distinct synchronization once, with how often it happened."""
-    counts: dict[str, int] = {}
-    for sync in syncs:
-        counts[sync.describe()] = counts.get(sync.describe(), 0) + 1
-    return "\n".join(f"{count} x {text}" for text, count in counts.items())
-
-
-def _warnings_files() -> set[str]:
-    """The files of the standard library's warnings machinery, which sit above the frame that
-    raised a warning when showwarning runs."""
-    names = ("warnings", "_py_warnings")
-    return {m.__file__ for n in names if (m := sys.modules.get(n)) is not None and m.__file__}
-
-
-@dataclass
-class _SyncRecorder:
-    """Every synchronization the debug mode reports while the recorder is active, with its full
-    stack and thread, by the first two routes of the module docstring; `unattributed` counts what
-    C++ printed after the last C function returned, which no stack can claim."""
-
-    syncs: list[_Sync] = field(default_factory=list)
-    unattributed: int = 0
-
-    def __post_init__(self) -> None:
-        self._lock = threading.Lock()
-        self._seen = 0
-        self._exit: list[Callable[[], None]] = []
-
-    def _record(self, route: str, stack: list[traceback.FrameSummary]) -> None:
-        thread = threading.current_thread()
-        self.syncs.append(_Sync(threading.get_ident(), thread.name, tuple(stack), route))
-
-    def _show(self, message: Any, *args: Any, **kwargs: Any) -> None:
-        if _SYNC_MESSAGE not in str(message):
-            return
-        stack = traceback.extract_stack()[:-1]  # without this hook
-        machinery = _warnings_files()
-        while stack and stack[-1].filename in machinery:
-            stack.pop()
-        self._record("python", stack)
-
-    def _c_return(self, code: object, offset: int, function: object, arg0: object) -> None:
-        # Anything new on standard error was printed by the C function that just returned: an
-        # extension function bound with pybind11 holds the GIL unless it releases it, so no other
-        # thread's call returns while it runs. Output charged to the wrong call could pass the
-        # check only if that call were gsplat's too.
-        size = os.fstat(2).st_size
-        if size == self._seen:
-            return
-        with self._lock:
-            printed = os.pread(self._capture.fileno(), size - self._seen, self._seen)
-            self._seen = size
-        for _ in range(printed.count(_SYNC_MESSAGE.encode())):
-            self._record("stderr", traceback.extract_stack()[:-1])
-
-    def _monitor(self) -> Callable[[], None]:
-        if sys.version_info < (3, 12):  # the module is skipped; this tells mypy why
-            raise RuntimeError("sys.monitoring needs Python 3.12")
-        monitoring = sys.monitoring
-        tool = next(i for i in range(6) if monitoring.get_tool(i) is None)
-        events = monitoring.events
-        monitoring.use_tool_id(tool, "openftgs U-29")
-        monitoring.register_callback(tool, events.C_RETURN, self._c_return)
-        monitoring.register_callback(tool, events.C_RAISE, self._c_return)
-        # C_RETURN and C_RAISE come with CALL, which needs no callback of its own.
-        monitoring.set_events(tool, events.CALL | events.C_RETURN | events.C_RAISE)
-
-        def stop() -> None:
-            monitoring.set_events(tool, 0)
-            monitoring.register_callback(tool, events.C_RETURN, None)
-            monitoring.register_callback(tool, events.C_RAISE, None)
-            monitoring.free_tool_id(tool)
-
-        return stop
-
-    def __enter__(self) -> "_SyncRecorder":
-        try:
-            caught = warnings.catch_warnings()
-            caught.__enter__()
-            self._exit.append(lambda: caught.__exit__(None, None, None))
-            warnings.simplefilter("always")
-            warnings.showwarning = self._show
-            sys.stderr.flush()
-            saved = os.dup(2)
-            self._capture = tempfile.TemporaryFile()
-            os.dup2(self._capture.fileno(), 2)
-            self._exit.append(lambda: self._restore_stderr(saved))
-            self._exit.append(self._monitor())
-            torch.cuda.set_sync_debug_mode("warn")
-            self._exit.append(lambda: torch.cuda.set_sync_debug_mode(0))
-        except BaseException:
-            self.__exit__(None, None, None)
-            raise
-        return self
-
-    def _restore_stderr(self, saved: int) -> None:
-        os.dup2(saved, 2)
-        os.close(saved)
-        size = os.fstat(self._capture.fileno()).st_size
-        rest = os.pread(self._capture.fileno(), size - self._seen, self._seen)
-        self.unattributed = rest.count(_SYNC_MESSAGE.encode())
-        self._capture.close()
-
-    def __exit__(
-        self,
-        kind: type[BaseException] | None,
-        error: BaseException | None,
-        trace: TracebackType | None,
-    ) -> None:
-        while self._exit:
-            self._exit.pop()()
 
 
 class _Probe(torch.autograd.Function):
@@ -260,25 +98,26 @@ def test_u29_recorder_sees_each_route_and_the_autograd_device_thread() -> None:
     which U-29 then refuses. The recorder relies on Python's warnings state being shared by all
     threads, which this probe guards."""
     torch.cuda.synchronize()
-    with _SyncRecorder() as on_thread:
+    with SyncRecorder() as on_thread:
         _backward_through_probe("item")
     assert len(on_thread.syncs) == 1 and on_thread.unattributed == 0
     (sync,) = on_thread.syncs
     assert sync.thread == _Probe.thread and sync.thread != threading.get_ident()
-    assert (sync.innermost.filename, sync.innermost.name) == (__file__, "backward")
+    assert (sync.innermost.filename, sync.innermost_qualname) == (__file__, "_Probe.backward")
 
-    with _SyncRecorder() as direct:
+    with SyncRecorder() as direct:
         _isect(torch.device("cuda"))
     assert [s.route for s in direct.syncs] == ["stderr"] and direct.unattributed == 0
-    assert Path(direct.syncs[0].innermost.filename).resolve().is_relative_to(_GSPLAT_DIR)
+    assert Path(direct.syncs[0].innermost.filename).resolve().is_relative_to(GSPLAT_DIR)
     assert direct.syncs[0].thread == threading.get_ident()
+    assert not in_render_gsplat_stage(direct.syncs[0])  # gsplat's, but not through `render`
 
-    with _SyncRecorder() as replayed:
+    with SyncRecorder() as replayed:
         _backward_through_probe("gsplat")
     assert len(replayed.syncs) == 1 and replayed.unattributed == 0
     (sync,) = replayed.syncs
     assert sync.thread == threading.get_ident()
-    assert not Path(sync.innermost.filename).resolve().is_relative_to(_GSPLAT_DIR)
+    assert not Path(sync.innermost.filename).resolve().is_relative_to(GSPLAT_DIR)
 
 
 # U-29 through Trainer.step.
@@ -287,6 +126,24 @@ _TIME = TimeNormalizer(0.0, 4.0 / 30.0)  # five frames at 30 FPS
 _EVENT = 10  # the one growth and relocation event of the run
 _WARM_UP = 12  # past the event and the slice's recompilation for the grown model
 _WINDOW = 20  # U-29's iterations, with no event and no log read
+
+# The U-29 Calibration row (d858525): host synchronizations per iteration away from events, by
+# (packed, compaction): the packed projection's count and the tile intersections, plus the
+# kept-row selection under compaction. A case may see fewer, never more.
+_MAX_PER_ITERATION = {(True, False): 2, (False, False): 1, (True, True): 3, (False, True): 2}
+
+# Q-171: the backward functions of the gsplat autograd Functions that `render`'s stage calls
+# build (gsplat 1.5.3, `gsplat/cuda/_wrapper.py`; source log 184), the only frames a
+# synchronization on the autograd device thread may come from.
+_GSPLAT_WRAPPERS = GSPLAT_DIR / "cuda" / "_wrapper.py"
+_GSPLAT_BACKWARDS = frozenset(
+    {
+        "_FullyFusedProjection.backward",
+        "_FullyFusedProjectionPacked.backward",
+        "_SphericalHarmonics.backward",
+        "_RasterizeToPixels.backward",
+    }
+)
 
 # §2.4 Settings, with the slice compiled for certain and the cache in GPU memory; λ_perc = 0.
 _BASE = PerfConfig(
@@ -335,6 +192,18 @@ def video(tmp_path_factory: pytest.TempPathFactory) -> MultiViewVideo:
     return MultiViewVideo.from_manifest(write_scene(tmp_path_factory.mktemp("u29"), truth, images))
 
 
+@pytest.fixture
+def without_fused_ssim(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Q-42: openftgs.losses reloaded with fused-ssim made unimportable, as without it installed
+    (as in `test_losses.py`); reloaded again afterwards. The trainer's loss reads `ssim` from the
+    reloaded module's namespace, so it takes the PyTorch path."""
+    monkeypatch.setitem(sys.modules, "fused_ssim", None)
+    importlib.reload(openftgs.losses)
+    yield
+    monkeypatch.undo()
+    importlib.reload(openftgs.losses)
+
+
 def _config(case: _Case) -> TrainConfig:
     """One event, at _EVENT, which grows and relocates; the first log read at 100 (the default
     log_every); every SH band active from iteration 4."""
@@ -348,22 +217,29 @@ def _config(case: _Case) -> TrainConfig:
     )
 
 
-def _allowed(sync: _Sync, *, compact: bool, threads: set[int]) -> bool:
-    """Q-171: on the training thread or the autograd device thread, with the innermost frame in
-    gsplat's files or, under compaction, at `render`'s kept-row selection."""
+def _allowed(sync: Sync, *, compact: bool, forward: int, autograd: int) -> bool:
+    """Q-171, §2.4 rule 3: on the training thread, inside one of `render`'s gsplat stage calls
+    or, under compaction, at `render`'s kept-row selection; on the autograd device thread, in the
+    backward of one of gsplat's rasterization autograd Functions (not, say, its optimizers)."""
     frame = sync.innermost
-    in_gsplat = Path(frame.filename).resolve().is_relative_to(_GSPLAT_DIR)
-    kept_rows = (
-        compact
-        and Path(frame.filename).resolve() == Path(openftgs.render.__file__).resolve()
-        and frame.name == "_kept_rows"
-    )
-    return sync.thread in threads and (in_gsplat or kept_rows)
+    if sync.thread == forward:
+        kept_rows = (
+            compact
+            and Path(frame.filename).resolve() == Path(openftgs.render.__file__).resolve()
+            and sync.innermost_qualname == "_kept_rows"
+        )
+        return in_render_gsplat_stage(sync) or kept_rows
+    if sync.thread == autograd:
+        return (
+            Path(frame.filename).resolve() == _GSPLAT_WRAPPERS
+            and sync.innermost_qualname in _GSPLAT_BACKWARDS
+        )
+    return False
 
 
 @pytest.mark.parametrize("case", _CASES)
 def test_u29_training_iterations_synchronize_only_inside_gsplat(
-    video: MultiViewVideo, case: _Case, monkeypatch: pytest.MonkeyPatch
+    video: MultiViewVideo, case: _Case, request: pytest.FixtureRequest
 ) -> None:
     """U-29 (§2.4 rule 3, D-49, D-57, D-76; Q-171): after a warm-up past compilation and the
     first event, 20 iterations with no event and no log read synchronize only inside gsplat's
@@ -371,19 +247,19 @@ def test_u29_training_iterations_synchronize_only_inside_gsplat(
     factor from the base (packed, internal pre-culling, fused Adam, compiled slice, GPU cache,
     λ_perc = 0, not deterministic); with the stage clock active, its events and gradient hooks
     add none (§3.4, #223). At least one synchronization per iteration must be seen (gsplat reads
-    its tile intersections back every render), so the check can't pass empty."""
+    its tile intersections back every render), so the check can't pass empty, and no more per
+    iteration than the U-29 Calibration row records for the case's layout."""
     if case.ssim_fallback:
-        # Q-42: the PyTorch path, as without fused-ssim installed.
-        monkeypatch.setattr(openftgs.losses, "_fused_ssim", lambda: None)
+        request.getfixturevalue("without_fused_ssim")  # Q-42: the PyTorch path
     cfg = _config(case)
     model = random_model(60, seed=2, sh_degree=3, time=video.time, spread=0.6)
     trainer = Trainer(cfg, video, model, device="cuda")
     warm_up = [trainer.step() for _ in range(_WARM_UP)]
     assert warm_up[_EVENT - 1].growth is not None  # the first event is behind
-    threads = {threading.get_ident(), _autograd_device_thread()}
+    forward, autograd = threading.get_ident(), _autograd_device_thread()
     torch.cuda.synchronize()
     clock = _stages.Clock("cuda") if case.stage_clock else contextlib.nullcontext()
-    with _SyncRecorder() as recorder, clock:
+    with SyncRecorder() as recorder, clock:
         logs = [trainer.step() for _ in range(_WINDOW)]
     if isinstance(clock, _stages.Clock):  # read after the window, where the test synchronizes
         names = [timing.name for timing in clock.read()]
@@ -398,10 +274,16 @@ def test_u29_training_iterations_synchronize_only_inside_gsplat(
         for log in logs
     )
     compact = cfg.perf.precull == "compact"
-    outside = [s for s in recorder.syncs if not _allowed(s, compact=compact, threads=threads)]
-    assert not outside, _described(outside)
+    outside = [
+        s
+        for s in recorder.syncs
+        if not _allowed(s, compact=compact, forward=forward, autograd=autograd)
+    ]
+    assert not outside, described(outside, __file__)
     assert recorder.unattributed == 0
     assert len(recorder.syncs) >= _WINDOW
+    limit = _MAX_PER_ITERATION[(cfg.perf.packed, compact)]
+    assert len(recorder.syncs) <= limit * _WINDOW, described(recorder.syncs, __file__)
     routes = {
         route: sum(s.route == route for s in recorder.syncs) for route in ("python", "stderr")
     }

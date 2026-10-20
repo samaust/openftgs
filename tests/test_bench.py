@@ -363,7 +363,7 @@ def test__b7_camera_is_the_test_camera_at_1920_by_1080(scene: Path, tested_scene
         )
 
 
-def test__b7_times_spread_a_request_of_k_times_over_the_scene() -> None:
+def test__spread_times_spread_a_request_of_k_times_over_the_scene() -> None:
     """Q-194: a request of k times takes the timestamps round(j(F − 1)/(k − 1)), rounded half
     up, j = 0 … k − 1, and the middle one for k = 1; the swept sizes are 1, 2, 3, 4, 6, 8, 12,
     16, 24, 32, 48, 64 and 128 below F, then F."""
@@ -866,14 +866,18 @@ def _cases_by(body: dict[str, Any]) -> dict[tuple[tuple[str, Any], ...], dict[st
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b1_times_every_stage_and_bounds_a_training_run(train_step_bench: dict[str, Any]) -> None:
-    """§3.4 B-1 (#226, Q-185): per case, every stage of a training iteration and the three
-    parts of its backward, timed over iterations 121 to 420 by the stage clock, with the mean
-    and median over the 297 iterations without an event and its share of an iteration; the
-    events at 200, 300 and 400; whole iterations 421 to 720 without the clock; peak memory, the
-    active and visible fractions, N at the start and at the end; the cost of copying the
-    relocation scores to the CPU (Q-72 note 5); and the bound on a training run (Q-168) and
-    D-50's 10 % as budget entries, which don't change the exit code (Q-166)."""
+def test__train_step_times_every_stage_and_bounds_a_training_run(
+    train_step_bench: dict[str, Any],
+) -> None:
+    """A private test of `_train_step` at reduced sizes (`_TRAIN_STEP_CASES` patched): §3.4 B-1
+    itself is the recorded BENCH.json runs, not this test. #226, Q-185: per case, every stage of
+    a training iteration and the three parts of its backward, timed over iterations 121 to 420
+    by the stage clock, with the mean and median over the 297 iterations without an event and
+    its share of an iteration; the events at 200, 300 and 400; whole iterations 421 to 720
+    without the clock; peak memory, the active and visible fractions, N at the start and at the
+    end; the cost of copying the relocation scores to the CPU (Q-72 note 5); and the bound on a
+    training run (Q-168) and D-50's 10 % as budget entries, which don't change the exit code
+    (Q-166)."""
     body = train_step_bench
     assert body["benchmark"] == "B-1"
     assert body["command"][:3] == ["ftgs", "bench", "train-step"]
@@ -1057,14 +1061,15 @@ def adam_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[st
 
 
 @pytest.mark.gpu
-def test_b5_times_each_adam_kind_at_each_n_and_holds_fused_against_foreach(
+def test__adam_times_each_kind_at_each_n_and_holds_fused_against_foreach(
     adam_bench: dict[str, Any],
 ) -> None:
-    """§3.4 B-5 (D-53; #229, Q-188): `set_iteration` plus `step` of fused, foreach and
-    selective Adam at each N, with seeded gradients on all nine stored tensors, the median of 50
-    calls after a warm-up; selective Adam's mask at the visible fraction given for that N; per N
-    the budget "fused no slower than foreach" as fused's median over foreach's against 1.0,
-    which doesn't change the exit code (Q-166)."""
+    """A private test of `_adam` at reduced sizes (`_ADAM_CASES` patched): §3.4 B-5 itself is
+    the recorded BENCH.json runs, not this test. D-53; #229, Q-188: `set_iteration` plus `step`
+    of fused, foreach and selective Adam at each N, with seeded gradients on all nine stored
+    tensors, the median of 50 calls after a warm-up; selective Adam's mask at the visible
+    fraction given for that N; per N the budget "fused no slower than foreach" as fused's median
+    over foreach's against 1.0, which doesn't change the exit code (Q-166)."""
     body = adam_bench
     assert body["benchmark"] == "B-5"
     assert body["command"][:3] == ["ftgs", "bench", "adam"]
@@ -1193,7 +1198,9 @@ def test__data_figures_share_the_data_wait_over_iterations_without_an_event() ->
 def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
     """§3.4 B-6, D-51 (#232): the data wait's share is under 1 % for the cache's placements,
     "gpu" and "mmap" at either prefetch depth, at B-6's N; decoding PNGs ("off") and Q-99's
-    case at 3M rows have no budget. A failed budget is recorded, not an error (Q-166)."""
+    case at 3M rows have no budget. The budget is §3.4's strict "< 1%", as the baseline
+    comparison judges it (Q-196), so a share of exactly 1 % fails. A failed budget is recorded,
+    not an error (Q-166)."""
     from openftgs.cli._bench import _data_budgets
 
     def case(placement: str, n: int, share: float, **extra: int) -> dict[str, Any]:
@@ -1204,7 +1211,7 @@ def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
 
     cases = [
         case("gpu", 1_000, 0.001),
-        case("mmap", 1_000, 0.002, prefetch=8),
+        case("mmap", 1_000, 0.01, prefetch=8),  # exactly 1 %: not under it
         case("mmap", 1_000, 0.02, prefetch=0),
         case("off", 1_000, 0.3),
         case("gpu", 3_000, 0.001),
@@ -1218,7 +1225,7 @@ def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
             "pass": passed,
             "kind": "budget",
         }
-        for c, passed in zip(cases[:3], (True, True, False), strict=True)
+        for c, passed in zip(cases[:3], (True, False, False), strict=True)
     ]
 
 
@@ -1242,8 +1249,10 @@ def data_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[st
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b6_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> None:
-    """§3.4 B-6, D-51 (#232, Q-189): with B-1's configuration, the data stage's share of an
+def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> None:
+    """A private test of `_data` at reduced sizes (`_DATA_N` and `_MEMORY_N` patched): §3.4 B-6
+    itself is the recorded BENCH.json runs, not this test. D-51 (#232, Q-189): with B-1's
+    configuration, the data stage's share of an
     iteration, from the stage clock's CUDA events over iterations 121 to 320 (the 198 without an
     event), and its host time over 321 to 420 under the wall clock (the 99 without an event),
     for the GPU cache, the memory-mapped cache at prefetch depths 8 and 0 and PNG decoding; then
@@ -1301,15 +1310,17 @@ def test_b6_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> No
     for budget, entry in zip(budgets, body["cases"], strict=False):
         assert (budget["figure"], budget["limit"], budget["kind"]) == ("data_share", 0.01, "budget")
         assert budget["value"] == entry["figures"]["data_share"]
-        assert budget["pass"] == (budget["value"] <= 0.01)
+        assert budget["pass"] == (budget["value"] < 0.01)  # §3.4: "< 1%"
 
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b6_skips_the_gpu_placement_where_auto_would_not_choose_it(
+def test__data_skips_the_gpu_placement_where_auto_would_not_choose_it(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Q-178, Q-99 (Q-189): the GPU placement is measured only where "auto" would place the
+    """A private test of `_data` at reduced sizes (`_DATA_N`, `_MEMORY_N` and
+    `_DATA_PLACEMENTS` patched): §3.4 B-6 itself is the recorded BENCH.json runs, not this
+    test. Q-178, Q-99 (Q-189): the GPU placement is measured only where "auto" would place the
     cache there after a warm-up iteration; a cache too large for that, as kitchen's on a 24 GiB
     GPU, is skipped at either N, with what "auto" estimated, and gets no case or budget."""
     from openftgs.data import FrameCache
@@ -1445,8 +1456,12 @@ def _timed_figures_are_consistent(figures: dict[str, Any]) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str, Any]) -> None:
-    """§3.4 B-4 (D-52; Q-190): LPIPS-VGG's forward and the prediction's backward for each of
+def test__losses_times_every_lpips_variant_and_both_ssim_paths(
+    losses_bench: dict[str, Any],
+) -> None:
+    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
+    patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. D-52; Q-190:
+    LPIPS-VGG's forward and the prediction's backward for each of
     {IEEE, TF32, bf16} × {NCHW, channels-last inputs, channels-last inputs and weights} ×
     autotuning off and on; SSIM through fused-ssim, when it imports, and through the PyTorch
     path, timed where fused-ssim can't be imported (PRD #220), with autotuning off and on; at
@@ -1486,10 +1501,12 @@ def test_b4_times_every_lpips_variant_and_both_ssim_paths(losses_bench: dict[str
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b4_records_bf16s_deviation_and_the_gains_of_its_comparisons(
+def test__losses_records_bf16s_deviation_and_the_gains_of_its_comparisons(
     losses_bench: dict[str, Any],
 ) -> None:
-    """§3.4 B-4, D-52, Q-173 (Q-190): bf16's and TF32's deviation from IEEE float32 in value
+    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
+    patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. D-52, Q-173
+    (Q-190): bf16's and TF32's deviation from IEEE float32 in value
     and gradient at each size, bf16's within the 5e-2 the bf16 step test allows; each
     comparison's gain, 1 − variant / baseline of the medians, at each size, and whether its
     smallest gain reaches Q-173's 3 %; fused-ssim's gain over the PyTorch path."""
@@ -1695,9 +1712,12 @@ has_init_extra = all(importlib.util.find_spec(m) for m in ("einops", "loguru", "
 def test_b8_init_without_the_init_extra_or_the_weights_exits_2(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """B-8, Q-166, Q-192: `bench init` needs the [init] extra and RoMa's weights already in
-    torch.hub's cache, and is exit 2 without either, with nothing written and nothing
-    downloaded. PyTorch is made to see a CUDA device, which these checks come before."""
+    """B-8, Q-166, Q-192, Q-198: `bench init` needs the [init] extra and RoMa's weights
+    already in torch.hub's cache, the files the public `init.roma_weight_files` names, and is
+    exit 2 without either, with nothing written and nothing downloaded: without the extra (the
+    vendored RoMa made unimportable) `roma_weight_files` raises ImportError, and without the
+    weights (an empty hub folder) the message names each missing file. PyTorch is made to see
+    a CUDA device, which these checks come before."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
     out = tmp_path / "bench.json"
     with monkeypatch.context() as without:  # the vendored RoMa can't be imported

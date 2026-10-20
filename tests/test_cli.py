@@ -595,7 +595,8 @@ def test_train_refuses_invalid_inputs(
 ) -> None:
     """§2.1 exit code 2 (Q-142): a broken init file, an init file in another time unit, a missing
     scene, a non-empty run directory (Q-132), F·B > N_max (D-24, Q-128), and a configuration this
-    build can't run (bf16, until M15)."""
+    build can't run (`images_per_step > 1`, deferred with multi-GPU training, Q-177; bf16 was
+    one until M15 built it, Q-172)."""
     broken = tmp_path / "broken.safetensors"
     broken.write_bytes(b"not a safetensors file")
     assert _ftgs("train", run["scene"], "--init", broken, "--out", tmp_path / "a") == 2
@@ -615,8 +616,9 @@ def test_train_refuses_invalid_inputs(
     capsys.readouterr()
     assert _train(run, tmp_path / "d", "--config", budget) == 2
     assert "F·B" in capsys.readouterr().err  # D-24's own error
-    bf16 = _config_file(tmp_path / "bf16.json", _cfg(perf=PerfConfig(perc_precision="bf16")))
-    assert _train(run, tmp_path / "e", "--config", bf16) == 2
+    # Q-142: a configuration this build can't run; multi-GPU training is deferred (Q-177).
+    two = _config_file(tmp_path / "two.json", _cfg(perf=PerfConfig(images_per_step=2)))
+    assert _train(run, tmp_path / "e", "--config", two) == 2
 
 
 def test_divergence_is_exit_code_3_and_saves_nothing(
@@ -2132,7 +2134,7 @@ def test_bench_checks_its_arguments(
     """Q-166: an unknown benchmark, a missing manifest, and on this CPU-only view a benchmark
     that needs CUDA, are exit 2. So is B-8's `convert`, which needs no CUDA, on a scene whose
     manifest records no conversion to rerun (Q-169; #234 replaced Q-130's exit 1 here, and
-    `tests/test_bench.py` checks that exit 1 for the benchmarks still unbuilt, on a GPU)."""
+    #225 to #235 retired Q-130's stub for every subcommand)."""
     out = tmp_path / "bench.json"
     assert _ftgs("bench", "convert", run["scene"], "--out", out) == 2
     assert "records no converter run" in capsys.readouterr().err

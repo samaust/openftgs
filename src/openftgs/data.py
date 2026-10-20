@@ -1981,7 +1981,7 @@ class Prefetcher:
             self._misses += 1  # read directly: not next in the schedule
             self._drop()
             self._plan.clear()
-            item = self._load(index)
+            item = self._load(index, ring=False)  # on the training thread: no wait (rule 3)
         image = self._finish(item)
         self._fill()
         return image
@@ -1996,7 +1996,7 @@ class Prefetcher:
             return
         while self._plan and len(self._pending) < self._depth:
             index = self._plan.popleft()
-            self._pending.append((index, self._executor.submit(self._load, index)))
+            self._pending.append((index, self._executor.submit(self._load, index, ring=True)))
 
     def _drop(self) -> None:
         while self._pending:
@@ -2004,6 +2004,8 @@ class Prefetcher:
             self._release(future.result())
 
     def _buffer(self, shape: tuple[int, ...]) -> Tensor:
+        """A buffer of the worker's ring, called on the worker thread only: waiting there for
+        the buffer's last copy keeps the wait off the training thread (§2.4 rule 3)."""
         with self._lock:
             free = self._free.get(shape)
             entry = free.pop() if free else None
@@ -2011,7 +2013,7 @@ class Prefetcher:
             return torch.empty(shape, dtype=torch.uint8, pin_memory=True)
         buffer, event = entry
         if event is not None:
-            event.synchronize()  # the buffer's last copy is done (on this worker, not the trainer)
+            event.synchronize()  # the buffer's last copy is done, on the worker thread
         return buffer
 
     def _release(self, item: tuple[Tensor, Any, Tensor | None]) -> None:
@@ -2020,18 +2022,28 @@ class Prefetcher:
             with self._lock:
                 self._free.setdefault(tuple(buffer.shape), []).append((buffer, event))
 
-    def _load(self, index: int) -> tuple[Tensor, Any, Tensor | None]:
+    def _load(self, index: int, *, ring: bool) -> tuple[Tensor, Any, Tensor | None]:
+        """Record `index`'s frame on the device, copied through a pinned buffer on the side
+        stream. `ring`: the worker's own ring of buffers, reused after waiting on their last
+        copy. Otherwise, on the training thread (`depth` 0, or a frame read out of order), a
+        fresh block of PyTorch's caching pinned allocator, dropped after the copy: the copy
+        records its event on the block, which the allocator reuses only once that event has
+        completed, checked without waiting, so the training thread never waits on the host
+        for an earlier copy (§2.4 rule 3). The bytes copied are the same either way."""
         frame = self._cache.frame(index)
         if frame.device == self._device or not self._cuda:
             return frame, None, None
         assert self._stream is not None
-        buffer = self._buffer(tuple(frame.shape))
+        shape = tuple(frame.shape)
+        buffer = (
+            self._buffer(shape) if ring else torch.empty(shape, dtype=torch.uint8, pin_memory=True)
+        )
         buffer.copy_(frame)
         with torch.cuda.stream(self._stream):
             on_device = buffer.to(self._device, non_blocking=True)
             event = torch.cuda.Event()  # type: ignore[no-untyped-call]
             event.record(self._stream)
-        return on_device, event, buffer
+        return on_device, event, buffer if ring else None
 
     def _finish(self, item: tuple[Tensor, Any, Tensor | None]) -> Tensor:
         frame, event, _ = item

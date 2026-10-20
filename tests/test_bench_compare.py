@@ -89,7 +89,7 @@ def _data(share: float) -> dict[str, Any]:
         "figure": "data_share",
         "limit": 0.01,
         "value": share,
-        "pass": share <= 0.01,
+        "pass": share < 0.01,  # §3.4: "< 1%", as `ftgs bench data` records it
         "kind": "budget",
     }
     return _bench("B-6", [{"case": case, "figures": {"data_share": share}}], [budget])
@@ -166,13 +166,15 @@ def test_baseline_of_another_gpu_model_fails(
     assert _run(tmp_path / "b", runs, elsewhere) == 1
 
 
-@pytest.mark.parametrize(("share", "base", "code"), [(0.0099, 0.0003, 0), (0.0101, 0.0101, 1)])
+@pytest.mark.parametrize(
+    ("share", "base", "code"), [(0.0099, 0.0003, 0), (0.01, 0.0003, 1), (0.0101, 0.0101, 1)]
+)
 def test_b6_against_its_absolute_budget(
     tmp_path: Path, share: float, base: float, code: int
 ) -> None:
     """§3.4 B-6, Q-170: the data share is judged against its absolute < 1 %, not the baseline:
-    33 times the baseline's share passes under 1 %, and the baseline's own share fails above
-    it."""
+    33 times the baseline's share passes under 1 %, exactly 1 % fails, as `ftgs bench data`'s
+    budget entry records it, and the baseline's own share fails above it."""
     runs = {"B-6-data.json": _data(share)}
     baselines = {"nvidia-geforce-rtx-4090": {"B-6-data.json": _data(base)}}
     assert _run(tmp_path, runs, baselines) == code

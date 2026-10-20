@@ -14,6 +14,8 @@ import importlib
 import importlib.resources
 import json
 import math
+import pathlib
+import urllib.parse
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn, Protocol
@@ -36,6 +38,7 @@ __all__ = [  # Q-106
     "knn_velocities",
     "roma_init",
     "roma_provenance",
+    "roma_weight_files",  # Q-198
     "triangulate_dlt",
 ]
 
@@ -129,6 +132,38 @@ def roma_provenance(cfg: RomaInitConfig) -> dict[str, str]:
     if cfg.model == "tiny_roma_v1_outdoor":
         record["xfeat_commit"] = _XFEAT_COMMIT
     return {"roma_init": json.dumps(record, separators=(",", ":"), sort_keys=True)}
+
+
+def _model_zoo() -> Any:
+    """The vendored RoMa's model zoo (D-65), imported only when RoMa is used; ImportError
+    without the [init] extra."""
+    return importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
+
+
+def _weight_urls(cfg: RomaInitConfig, zoo: Any) -> list[str]:
+    """The URLs of the checkpoints the default matcher loads for `cfg.model` (D-58), in load
+    order: RoMa's and DINOv2's for roma_outdoor, Tiny RoMa's for Tiny RoMa, whose XFeat is built
+    without weights (Q-123)."""
+    urls = zoo.weight_urls
+    if cfg.model == "roma_outdoor":
+        return [urls["romatch"]["outdoor"], urls["dinov2"]]
+    return [urls["tiny_roma_v1"]["outdoor"]]
+
+
+def roma_weight_files(cfg: RomaInitConfig) -> list[pathlib.Path]:  # Q-198
+    """The checkpoint files `roma_init` loads for `cfg` with its default matcher (D-58), where
+    torch.hub caches them: `torch.hub.get_dir()/checkpoints/`, each under its URL's file name,
+    in load order. `roma_init` downloads the ones missing; this only names them, downloading
+    and creating nothing. Tiny RoMa also fetches XFeat's code archive through torch.hub, which
+    holds no weights (Q-116, Q-123) and isn't listed. Raises ImportError without the [init]
+    extra, which the vendored RoMa needs (D-65)."""
+    _check_config(cfg)
+    folder = pathlib.Path(torch.hub.get_dir()) / "checkpoints"
+    names = [
+        pathlib.PurePosixPath(urllib.parse.urlparse(url).path).name
+        for url in _weight_urls(cfg, _model_zoo())
+    ]
+    return [folder / name for name in names]
 
 
 def _check_point_set(name: str, value: Tensor) -> None:
@@ -596,12 +631,12 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
     """The default dense matcher per `cfg.model` (D-58), from the vendored RoMa (D-65), which
     is imported only here. The weights are fetched once, in the caller's thread, and every
     shard's model is built from them (Q-112)."""
-    zoo: Any = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
-    urls = zoo.weight_urls
+    zoo = _model_zoo()
+    urls = _weight_urls(cfg, zoo)  # the files roma_weight_files names (Q-198)
     fetch = torch.hub.load_state_dict_from_url
     if cfg.model == "roma_outdoor":
-        weights = fetch(urls["romatch"]["outdoor"], map_location="cpu")
-        dinov2_weights = fetch(urls["dinov2"], map_location="cpu")
+        weights = fetch(urls[0], map_location="cpu")
+        dinov2_weights = fetch(urls[1], map_location="cpu")
         use_custom_corr = _use_custom_corr()  # D-58, Q-112
 
         def build_roma(device: torch.device) -> DenseMatcher:
@@ -617,7 +652,7 @@ def _roma_matchers(cfg: RomaInitConfig) -> Callable[[torch.device], DenseMatcher
             return _RomaMatcher(model, device)
 
         return build_roma
-    weights = fetch(urls["tiny_roma_v1"]["outdoor"], map_location="cpu")
+    weights = fetch(urls[0], map_location="cpu")
     # Q-116: XFeat at the commit whose license was read, not the repository's moving default.
     # torch.hub's validation accepts a commit only while it heads a branch or tag (it lists
     # them through GitHub's API; source log row 131), so Q-116's fallback applies: the

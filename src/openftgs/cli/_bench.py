@@ -10,8 +10,8 @@ and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
 the environment, runs the function, which returns its setup, cases and budgets, and writes
-BENCH.json. A benchmark whose ticket hasn't landed has no function yet and keeps Q-130's
-behaviour: it says so, writes nothing and returns 1. Adding one is a function and its entry.
+BENCH.json. Every subcommand runs its benchmark: #225 to #235 retired Q-130's stub, which
+returned 1. Adding one is a function and its entry.
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -64,7 +63,6 @@ if TYPE_CHECKING:
 
 __all__ = ["add_parser", "run"]  # what `openftgs.cli` takes from this private module
 
-_UNBUILT = 1  # Q-130: a benchmark whose ticket hasn't landed
 _FORMAT, _VERSION = "ftgs-bench", 1  # Q-166
 
 
@@ -91,13 +89,11 @@ class _Result:
 
 @dataclass(frozen=True)
 class _Benchmark:
-    """One subcommand: its §3.4 ID, the ticket that builds it, the function that runs it (None
-    until that ticket lands), whether it needs CUDA (all but `convert`, Q-166) and whether it
-    takes `--model` (Q-167)."""
+    """One subcommand: its §3.4 ID, the function that runs it, whether it needs CUDA (all but
+    `convert`, Q-166) and whether it takes `--model` (Q-167)."""
 
     id: str
-    ticket: int
-    run: Callable[[_Context], _Result] | None = None
+    run: Callable[[_Context], _Result]
     cuda: bool = True
     model: bool = False
 
@@ -126,13 +122,6 @@ def run(args: argparse.Namespace) -> int:
     if bench.cuda and not torch.cuda.is_available():  # Q-166: an invalid environment
         _fail(f"{bench.id} needs a CUDA device", _INPUT)
     model = None if args.model is None else _load_model(args.model, "cuda")  # Q-167
-    if bench.run is None:  # Q-130 until its ticket lands
-        print(
-            f"ftgs bench {args.benchmark}: {bench.id} comes with #{bench.ticket}; "
-            "nothing was run or written",
-            file=sys.stderr,
-        )
-        return _UNBUILT
     with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after it
         args.out.parent.mkdir(parents=True, exist_ok=True)
     date = datetime.now(UTC).isoformat(timespec="seconds")
@@ -1485,9 +1474,10 @@ def _data_figures(
 
 def _data_budgets(cases: Sequence[dict[str, Any]], *, n: int) -> list[dict[str, Any]]:
     """§3.4 B-6, D-51 (#232): a budget entry for the data wait's share of every case that reads
-    the cache ("gpu", "mmap" at either depth) at B-6's `n` rows, against 1 %."""
+    the cache ("gpu", "mmap" at either depth) at B-6's `n` rows, strictly under 1 % (§3.4:
+    "< 1%"), as scripts/bench_compare.py judges it (Q-196)."""
     return [
-        _budget(c["case"], c["figures"], "data_share", _DATA_SHARE_LIMIT, "budget")
+        _budget(c["case"], c["figures"], "data_share", _DATA_SHARE_LIMIT, "budget", strict=True)
         for c in cases
         if c["case"]["placement"] in ("gpu", "mmap") and c["case"]["n"] == n
     ]
@@ -1646,16 +1636,23 @@ def _data(ctx: _Context) -> _Result:
 
 
 def _budget(
-    case: dict[str, Any], figures: dict[str, Any], figure: str, limit: float, kind: str
+    case: dict[str, Any],
+    figures: dict[str, Any],
+    figure: str,
+    limit: float,
+    kind: str,
+    *,
+    strict: bool = False,
 ) -> dict[str, Any]:
-    """A budget entry of BENCH.json (Q-166, Q-180) for one figure of one case."""
+    """A budget entry of BENCH.json (Q-166, Q-180) for one figure of one case: it passes at
+    most at `limit`, or, `strict`, only under it (B-6's "< 1%")."""
     value = figures[figure]
     return {
         "case": case,
         "figure": figure,
         "limit": limit,
         "value": value,
-        "pass": value <= limit,
+        "pass": value < limit if strict else value <= limit,
         "kind": kind,
     }
 
@@ -2437,19 +2434,6 @@ def _render(ctx: _Context) -> _Result:
 # -- B-8: initialization on the wall clock (§3.4, D-56, D-58; Q-106, Q-192) ---------------------
 
 
-def _roma_weights() -> list[Path]:
-    """Q-192: where torch.hub keeps the checkpoints `roma_init` loads with the default
-    RomaInitConfig, D-58's roma_outdoor: RoMa's and DINOv2's, each under its URL's file name in
-    `get_dir()/checkpoints` (source log 178). ImportError without the [init] extra, which the
-    vendored RoMa needs (D-65)."""
-    import torch
-
-    zoo: Any = importlib.import_module("openftgs._vendor.romatch.models.model_zoo")
-    urls = (zoo.weight_urls["romatch"]["outdoor"], zoo.weight_urls["dinov2"])
-    folder = Path(torch.hub.get_dir()) / "checkpoints"
-    return [folder / Path(urllib.parse.urlparse(url).path).name for url in urls]
-
-
 def _spread(values: Sequence[float]) -> dict[str, float]:
     return {
         "total_s": float(sum(values)),
@@ -2469,10 +2453,11 @@ def _init(ctx: _Context) -> _Result:
     import torch
 
     from openftgs._stages import Clock
-    from openftgs.init import RomaInitConfig, roma_init, roma_provenance
+    from openftgs.init import RomaInitConfig, roma_init, roma_provenance, roma_weight_files
 
+    cfg = RomaInitConfig()  # D-58's defaults (Q-192)
     try:
-        weights = _roma_weights()
+        weights = roma_weight_files(cfg)  # Q-198: where torch.hub keeps them
     except ImportError as error:  # Q-142, Q-166
         _fail(f"bench init needs the [init] extra (pip install 'openftgs[init]'): {error}")
     missing = [str(path) for path in weights if not path.is_file()]
@@ -2481,7 +2466,6 @@ def _init(ctx: _Context) -> _Result:
             "bench init needs RoMa's weights in torch.hub's cache and doesn't download them; "
             f"missing {', '.join(missing)} (one `ftgs init roma` run fetches them)"
         )
-    cfg = RomaInitConfig()  # D-58's defaults (Q-192)
     devices = [str(torch.device("cuda", i)) for i in range(torch.cuda.device_count())]  # Q-106
     try:
         with _as_input_error("bench init: RoMa initialization"), Clock("wall") as clock:
@@ -2716,13 +2700,13 @@ def _convert(ctx: _Context) -> _Result:
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
-    "train-step": _Benchmark("B-1", 226, _train_step, model=True),
-    "raster": _Benchmark("B-2", 227, _raster),
-    "slice": _Benchmark("B-3", 225, _slice),
-    "losses": _Benchmark("B-4", 228, _losses),
-    "adam": _Benchmark("B-5", 229, _adam),
-    "data": _Benchmark("B-6", 232, _data),
-    "render": _Benchmark("B-7", 231, _render, model=True),
-    "init": _Benchmark("B-8", 234, _init),
-    "convert": _Benchmark("B-8", 234, _convert, cuda=False),
+    "train-step": _Benchmark("B-1", _train_step, model=True),
+    "raster": _Benchmark("B-2", _raster),
+    "slice": _Benchmark("B-3", _slice),
+    "losses": _Benchmark("B-4", _losses),
+    "adam": _Benchmark("B-5", _adam),
+    "data": _Benchmark("B-6", _data),
+    "render": _Benchmark("B-7", _render, model=True),
+    "init": _Benchmark("B-8", _init),
+    "convert": _Benchmark("B-8", _convert, cuda=False),
 }

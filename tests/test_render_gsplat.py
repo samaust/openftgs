@@ -11,6 +11,8 @@ column u).
 """
 
 import math
+import sys
+import threading
 import warnings
 from typing import Any, Literal
 
@@ -46,6 +48,7 @@ from render_margins import (
     excluded_share,
     opacity_near_cull,
 )
+from sync_recorder import SyncRecorder, described, in_render_gsplat_stage
 from torch import Tensor
 from torch._dynamo.utils import counters
 
@@ -1022,31 +1025,33 @@ def _on_device(camera: Camera) -> Camera:
     )
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="the recorder needs sys.monitoring (Python 3.12)"
+)
 @LAYOUTS
 def test_render_synchronizes_only_inside_gsplat(packed: bool) -> None:
     """§2.4 rule 3, D-49, D-76: with cameras and background already on the device, a render
     (opacity cull inside the projection) synchronizes with the host only inside gsplat's own
-    calls: every synchronization torch's debug mode reports comes from gsplat's files, with the
-    default black background and with a given one. The debug mode is a prototype that misses some
-    synchronizations, so this pins only the ones it sees."""
+    calls: every synchronization torch's debug mode reports, as a Python warning or printed on
+    standard error (gsplat's tile intersection reads its count back only there;
+    `sync_recorder.py`), comes from one of `render`'s gsplat stage calls, on this thread, with
+    the default black background and with a given one. At least one is seen per render (the
+    tile intersection's), so the check can't pass on nothing. The debug mode is a prototype
+    that misses some synchronizations, so this pins only the ones it sees."""
     cameras = [_on_device(camera) for camera in _CAMERAS]
     model = _random_scene(7, min_rows=20)
     for background in (None, torch.tensor([0.25, 0.5, 0.75], device="cuda")):
         _gsplat(model, cameras, _T, background=background, packed=packed)
         torch.cuda.synchronize()
-        with warnings.catch_warnings(record=True) as records:
-            warnings.simplefilter("always")
-            torch.cuda.set_sync_debug_mode("warn")
-            try:
-                _gsplat(model, cameras, _T, background=background, packed=packed)
-            finally:
-                torch.cuda.set_sync_debug_mode(0)
-        sites = {
-            f"{record.filename}:{record.lineno}"
-            for record in records
-            if "synchronizing CUDA operation" in str(record.message)
-        }
-        assert all("/gsplat/" in site for site in sites), sites
+        with SyncRecorder() as recorder:
+            _gsplat(model, cameras, _T, background=background, packed=packed)
+        sites = recorder.syncs
+        assert sites, "the debug mode saw no synchronization in the render"
+        assert recorder.unattributed == 0
+        outside = [
+            s for s in sites if not in_render_gsplat_stage(s) or s.thread != threading.get_ident()
+        ]
+        assert not outside, described(outside, __file__)
 
 
 def test_render_request_on_gsplat_equals_render_per_item() -> None:
@@ -1167,11 +1172,12 @@ def test_render_request_keeps_outputs_on_the_gpu_when_asked() -> None:
         _assert_renders_close(moved, on_cpu, 1e-6)
 
 
-def test_render_request_builds_the_index_by_default_from_enough_times(
+def test__temporal_index_is_built_by_default_from_enough_times(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Q-174 (GPU): with temporal_index None, a gsplat request with `_INDEX_MIN_TIMES` distinct
-    times in [0, 1] builds the index once, and a request at one time doesn't."""
+    """Q-174 (GPU), a private test of `render._TemporalIndex`: with temporal_index None, a
+    gsplat request with `_INDEX_MIN_TIMES` distinct times in [0, 1] builds the index once, and
+    a request at one time doesn't."""
     import openftgs.render
 
     built: list[int] = []
@@ -1191,8 +1197,9 @@ def test_render_request_builds_the_index_by_default_from_enough_times(
     assert built == [1]
 
 
-def test_render_request_on_the_gpu_synchronizes_only_in_gsplat_and_the_index_build() -> None:
-    """§2.4 rule 3, Q-174 (GPU): a request on gsplat with the index on and its outputs left on
+def test__temporal_index_build_and_gsplat_are_a_gpu_requests_only_synchronizations() -> None:
+    """§2.4 rule 3, Q-174 (GPU), a private test that reads `render._TemporalIndex`'s source
+    lines: a request on gsplat with the index on and its outputs left on
     the GPU, its cameras held on the host as a request file gives them, synchronizes with the
     host only inside gsplat's calls and while the index is built: every synchronization torch's
     debug mode reports comes from gsplat's files or from the index build. The debug mode is a
