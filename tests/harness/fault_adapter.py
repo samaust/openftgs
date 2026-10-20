@@ -13,8 +13,11 @@ so a level's test can check that the harness sees that change, with the expected
   1e-7, so it all but vanishes; a file can't hold zero rows);
 - request faults, applied to `render`'s request, the renders then filed under the original
   request's SHA-256: `cx=D` (+ D px on every item's principal point);
+- query faults, applied to `forward`'s queries, the answers then filed under the original
+  queries' SHA-256: `lpips_off` (`losses` queries answered as if `lpips` were false, Q-212);
 - output faults: `nan` (a NaN at every render's centre pixel), `drop_key=K` (key K removed
-  from `export`'s file), `answers=E` (every float answer × (1 + E)), `biased_sampler`
+  from `export`'s file), `answers=E` (every float answer × (1 + E)), `drop_answer=N[,N…]`
+  (answer tensors N removed from every `forward` answer), `biased_sampler`
   (`relocation_sampling` counts moved from the last target with draws to the first),
   `no_kind=K` (kind K left out of `info`), `drop_convention=K` (entry K left out of `info`'s
   render_conventions), `rasterizer=NAME` (`info` names another rasterizer);
@@ -121,10 +124,28 @@ def main() -> int:
                 item["camera"]["K"][0][2] += float(faults["cx"])
             args[1] = str(tmp / "request.json")
             Path(args[1]).write_text(json.dumps(request))
+        if command == "forward" and "lpips_off" in faults:
+            queries_path = Path(args[0])
+            original_sha = hashlib.sha256(queries_path.read_bytes()).hexdigest()
+            tensors, meta = _read(queries_path)
+            if meta.get("kind") == "losses":
+                entries = json.loads(meta["queries"])
+                for entry in entries:
+                    entry["params"]["lpips"] = False
+                meta["queries"] = json.dumps(entries)
+            args[0] = str(tmp / "queries.safetensors")
+            _write(Path(args[0]), tensors, meta)
         code = _inner(inner, command, args)
         if code != 0:
             return code
         out = Path(args[-1])
+        if command == "forward" and (original_sha is not None or "drop_answer" in faults):
+            tensors, meta = _read(out)
+            if original_sha is not None:
+                meta["queries_sha256"] = original_sha
+            dropped = set(faults.get("drop_answer", "").split(","))
+            tensors = {k: v for k, v in tensors.items() if k.partition("/")[2] not in dropped}
+            _write(out, tensors, meta)
         if command == "render" and (original_sha is not None or "nan" in faults):
             tensors, meta = _read(out)
             if original_sha is not None:

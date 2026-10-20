@@ -10,7 +10,14 @@ from typing import Any
 import numpy as np
 
 from ftgs_harness.checks import Check, Status, close_absolute, close_relative
-from ftgs_harness.formats import Answer, FormatError, file_sha256, read_answers, write_queries
+from ftgs_harness.formats import (
+    Answer,
+    FormatError,
+    Query,
+    file_sha256,
+    read_answers,
+    write_queries,
+)
 from ftgs_harness.info import QUERY_KINDS
 from ftgs_harness.queries import generate
 from ftgs_harness.rendering import relative
@@ -65,14 +72,21 @@ _PATTERN = {
 }
 
 
-def _worst(kind: str, a: Answer, b: Answer) -> tuple[bool, str, float, str]:
-    """Whether B's answer matches A's, and the worst tensor, its discrepancy and tolerance."""
+def _required(kind: str, query: Query) -> list[str]:
+    """The tensors an ok answer to `query` carries (Q-207): its kind's row, `lpips_vgg` only
+    when the query's `lpips` is true (Q-212)."""
+    names = list(TOLERANCES[kind])
+    if kind == "losses" and not query.params.get("lpips", True):
+        names.remove("lpips_vgg")
+    return names
+
+
+def _worst(kind: str, names: list[str], a: Answer, b: Answer) -> tuple[bool, str, float, str]:
+    """Whether B's answer matches A's on the tensors `names`, which both carry, and the worst
+    tensor, its discrepancy and tolerance."""
     worst = (True, "", 0.0, "")
-    for name, (mode, tol) in TOLERANCES[kind].items():
-        if name not in a.tensors and name not in b.tensors:
-            continue
-        if name not in a.tensors or name not in b.tensors:
-            return False, name, float("inf"), "present in both answers"
+    for name in names:
+        mode, tol = TOLERANCES[kind][name]
         x, y = a.tensors[name], b.tensors[name]
         if x.shape != y.shape:
             return False, name, float("inf"), f"shape {list(x.shape)}"
@@ -209,6 +223,32 @@ def _status_check(
     )
 
 
+def _missing_check(
+    ctx: Context,
+    check_id: str,
+    kind: str,
+    names: list[str],
+    missing: Mapping[str, list[str]],
+    query_id: str,
+    inputs: Mapping[str, object],
+) -> Check:
+    """§3.3: an ok answer without a tensor of its kind's row (Q-207) fails its format."""
+    observed = "; ".join(f"{label} lacks {', '.join(lacks)}" for label, lacks in missing.items())
+    return Check(
+        id=check_id,
+        level="L2",
+        status="fail",
+        spec_refs=_SPEC_REFS[kind],
+        inputs={**inputs, "queries": [query_id]},
+        metric="answer_tensors",
+        expected=", ".join(names),
+        observed=observed,
+        symptom=f"The {kind} query {query_id} got ok answers without their tensors: {observed}.",
+        pattern="schema violation",
+        repro=ctx.repro(check_id),
+    )
+
+
 def _kind_checks(ctx: Context, kind: str) -> list[Check]:
     prefix = f"L2.forward.{kind}"
     missing = [label for label in ("A", "B") if kind not in ctx.query_kinds(label)]
@@ -291,7 +331,16 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
             checks.append(_status_check(ctx, check_id, kind, bad, answers, query.id, inputs))
             continue
         assert a is not None and b is not None
-        ok, name, value, expected = _worst(kind, a, b)
+        names = _required(kind, query)
+        absent = {
+            label: lacks
+            for label, ans in (("A", a), ("B", b))
+            if (lacks := [n for n in names if n not in ans.tensors])
+        }
+        if absent:
+            checks.append(_missing_check(ctx, check_id, kind, names, absent, query.id, inputs))
+            continue
+        ok, name, value, expected = _worst(kind, names, a, b)
         checks.append(
             Check(
                 id=check_id,
