@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U-29: a training iteration synchronizes with the host only inside gsplat's render call
-(§2.4 rule 3, D-49, D-57, D-76; Q-171), checked through `Trainer.step` on CUDA with the gsplat
-backend under `torch.cuda.set_sync_debug_mode("warn")`.
+"""U-29: a training iteration synchronizes with the host only inside gsplat's stage functions
+or, with compaction, at `render`'s selection of the kept rows (§2.4 rule 3, D-49, D-57, D-76;
+Q-171), checked through `Trainer.step` on CUDA with the gsplat backend under
+`torch.cuda.set_sync_debug_mode("warn")`.
 
 How a synchronization is seen, by which of three routes, and why a C++ readback replayed from
 the autograd device thread is refused: `sync_recorder.py`, whose `SyncRecorder` this file and
