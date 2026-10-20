@@ -125,6 +125,24 @@ _EVENT = 10  # the one growth and relocation event of the run
 _WARM_UP = 12  # past the event and the slice's recompilation for the grown model
 _WINDOW = 20  # U-29's iterations, with no event and no log read
 
+# The U-29 Calibration row (d858525): host synchronizations per iteration away from events, by
+# (packed, compaction): the packed projection's count and the tile intersections, plus the
+# kept-row selection under compaction. A case may see fewer, never more.
+_MAX_PER_ITERATION = {(True, False): 2, (False, False): 1, (True, True): 3, (False, True): 2}
+
+# Q-171: the backward functions of the gsplat autograd Functions that `render`'s stage calls
+# build (gsplat 1.5.3, `gsplat/cuda/_wrapper.py`; source log T220.1), the only frames a
+# synchronization on the autograd device thread may come from.
+_GSPLAT_WRAPPERS = GSPLAT_DIR / "cuda" / "_wrapper.py"
+_GSPLAT_BACKWARDS = frozenset(
+    {
+        "_FullyFusedProjection.backward",
+        "_FullyFusedProjectionPacked.backward",
+        "_SphericalHarmonics.backward",
+        "_RasterizeToPixels.backward",
+    }
+)
+
 # §2.4 Settings, with the slice compiled for certain and the cache in GPU memory; λ_perc = 0.
 _BASE = PerfConfig(
     slice_impl="compiled",
@@ -186,16 +204,23 @@ def _config(case: _Case) -> TrainConfig:
 
 
 def _allowed(sync: Sync, *, compact: bool, forward: int, autograd: int) -> bool:
-    """Q-171: on the training thread or the autograd device thread, with the innermost frame in
-    gsplat's files or, under compaction, at `render`'s kept-row selection."""
+    """Q-171, §2.4 rule 3: on the training thread, inside one of `render`'s gsplat stage calls
+    or, under compaction, at `render`'s kept-row selection; on the autograd device thread, in the
+    backward of one of gsplat's rasterization autograd Functions (not, say, its optimizers)."""
     frame = sync.innermost
-    in_gsplat = Path(frame.filename).resolve().is_relative_to(GSPLAT_DIR)
-    kept_rows = (
-        compact
-        and Path(frame.filename).resolve() == Path(openftgs.render.__file__).resolve()
-        and frame.name == "_kept_rows"
-    )
-    return sync.thread in (forward, autograd) and (in_gsplat or kept_rows)
+    if sync.thread == forward:
+        kept_rows = (
+            compact
+            and Path(frame.filename).resolve() == Path(openftgs.render.__file__).resolve()
+            and sync.innermost_qualname == "_kept_rows"
+        )
+        return in_render_gsplat_stage(sync) or kept_rows
+    if sync.thread == autograd:
+        return (
+            Path(frame.filename).resolve() == _GSPLAT_WRAPPERS
+            and sync.innermost_qualname in _GSPLAT_BACKWARDS
+        )
+    return False
 
 
 @pytest.mark.parametrize("case", _CASES)
@@ -208,7 +233,8 @@ def test_u29_training_iterations_synchronize_only_inside_gsplat(
     factor from the base (packed, internal pre-culling, fused Adam, compiled slice, GPU cache,
     λ_perc = 0, not deterministic); with the stage clock active, its events and gradient hooks
     add none (§3.4, #223). At least one synchronization per iteration must be seen (gsplat reads
-    its tile intersections back every render), so the check can't pass empty."""
+    its tile intersections back every render), so the check can't pass empty, and no more per
+    iteration than the U-29 Calibration row records for the case's layout."""
     if case.ssim_fallback:
         # Q-42: the PyTorch path, as without fused-ssim installed.
         monkeypatch.setattr(openftgs.losses, "_fused_ssim", lambda: None)
@@ -243,6 +269,8 @@ def test_u29_training_iterations_synchronize_only_inside_gsplat(
     assert not outside, described(outside, __file__)
     assert recorder.unattributed == 0
     assert len(recorder.syncs) >= _WINDOW
+    limit = _MAX_PER_ITERATION[(cfg.perf.packed, compact)]
+    assert len(recorder.syncs) <= limit * _WINDOW, described(recorder.syncs, __file__)
     routes = {
         route: sum(s.route == route for s in recorder.syncs) for route in ("python", "stderr")
     }
