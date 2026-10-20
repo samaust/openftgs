@@ -2,6 +2,8 @@
 
 `ftgs bench {train-step,raster,slice,losses,adam,data,render,init,convert} SCENE.json --out BENCH.json` runs one of the eight benchmarks of §3.4 and writes its results as BENCH.json. Benchmarks measure speed and memory, never correctness: U-8 and U-28 to U-33 pin the equivalence of every optimized path, and a benchmark only says which path is faster. The code is the private module `openftgs.cli._bench` (PRD #220, owner's decision); `ftgs`'s parser takes the `bench` command from it. The choices the spec leaves open are Q-166 to Q-170, Q-178 to Q-182, Q-185, Q-187 to Q-190, Q-192 to Q-197.
 
+**`<m15-runs>`**: the folder outside the repository where M15's runs were recorded: the converted scenes they ran on (`<m15-runs>/kitchen/scene.json`, `<m15-runs>/kitchen60/scene.json`, `<m15-runs>/ci-scene/scene.json`) and their BENCH.json files (`<m15-runs>/bench/`). This page, the Calibration data rows of `docs/clean-room/questions.md` and the source log name it so. Only the CI baselines are kept in the repository, under `benchmarks/baselines/`, as they were recorded.
+
 ## Subcommands
 
 | Subcommand | Benchmark (§3.4) | Measures | CUDA | `--model` | Built by |
@@ -280,7 +282,7 @@ B-7 times `render.render_request`, the path `ftgs render`, `ftgs eval` and the t
 
 ## B-7's first run
 
-On kitchen (Calibration data, 2026-10-19; `/home/auss/datasets/openftgs-m15/bench/B-7-render.json`, 20 min at the default thread count), at the 300 training times from cam00 at 1920×1080, with the outputs on the GPU, index on / off:
+On kitchen (Calibration data, 2026-10-19; `<m15-runs>/bench/B-7-render.json`, 20 min at the default thread count), at the 300 training times from cam00 at 1920×1080, with the outputs on the GPU, index on / off:
 
 | Model | FPS, index on / off | Build | Break-even |
 | --- | --- | --- | --- |
