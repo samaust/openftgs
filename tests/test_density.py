@@ -35,7 +35,9 @@ from openftgs.density import (
     GradStats,
     GrowthReport,
     RelocationReport,
+    draw_targets,
     grow,
+    growth_masks,
     mcmc_split,
     prune,
     relocate,
@@ -1482,3 +1484,67 @@ def test_an_optimizer_built_for_another_model_is_rejected_before_anything_change
         for key in ("exp_avg", "exp_avg_sq", "step"):
             assert torch.equal(state[key], moments[name][key])
     assert torch.equal(stats.count, torch.ones(4, dtype=torch.int32))
+
+
+# draw_targets and growth_masks, the public parts of relocation and growth (Q-204).
+
+
+def test_draw_targets_gives_relocates_targets_for_the_same_generator_state() -> None:
+    """Q-204, D-15: the draws of draw_targets on the live rows' scores (0 on dead rows), with the
+    generator seeded as relocate's, are the targets relocate gives the dead rows, in row order."""
+    logits = [1.0, LOGIT_DEAD, 0.0, LOGIT_DEAD, LOGIT_DEAD, 2.0, LOGIT_DEAD, -1.0]
+    model, opt = _relocation_scene(logits)
+    dead = torch.tensor([v == LOGIT_DEAD for v in logits])
+    scores = torch.where(dead, 0.0, sampling_score(model, GradStats(len(logits)), RelocConfig()))
+    draws = draw_targets(scores, int(dead.sum()), generator=torch.Generator().manual_seed(4))
+    relocate(
+        model,
+        opt,
+        GradStats(len(logits)),
+        RelocConfig(),
+        generator=torch.Generator().manual_seed(4),
+    )
+    assert torch.equal(draws, _target_of(model, torch.nonzero(dead).squeeze(1)))
+
+
+def test_draw_targets_draws_in_proportion_to_the_scores() -> None:
+    """D-15: 10⁵ draws with replacement from scores (1, 2, 3, 4, 0): χ² test, p > 0.001, and the
+    zero-score row is never drawn."""
+    scores = torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0])
+    draws = draw_targets(scores, 100_000, generator=torch.Generator().manual_seed(2))
+    observed = torch.bincount(draws, minlength=5)
+    assert observed[4] == 0
+    expected = scores[:4].double() / 10.0 * 100_000
+    p_value = scipy.stats.chisquare(observed[:4].double().numpy(), expected.numpy()).pvalue
+    assert p_value > 0.001, p_value
+
+
+@pytest.mark.parametrize(
+    "scores", [[0.0, 0.0], [1.0, float("nan")], [1.0, float("inf")]], ids=["zero", "nan", "inf"]
+)
+def test_draw_targets_rejects_scores_without_a_finite_positive_sum(scores: list[float]) -> None:
+    """Q-51: the scores must be finite with a positive sum."""
+    with pytest.raises(ValueError, match="sampling scores"):
+        draw_targets(torch.tensor(scores), 3, generator=torch.Generator())
+
+
+def test_growth_masks_with_a_full_cap_keep_the_largest_g_ties_to_the_lower_row() -> None:
+    """Q-204, D-44: g = (3, 5, 1, 5, 3, 0) with τ_pos below 1, N = 6 and N_max = 9 leaves room for
+    3 of the 5 candidates: rows 1 and 3 (g = 5), then row 0 (g = 3, before row 4). All small, so
+    all three are clones."""
+    g = torch.tensor([3.0, 5.0, 1.0, 5.0, 3.0, 0.0])
+    scales = torch.full((6, 3), math.exp(-3.0))
+    clone, split = growth_masks(g, scales, GrowthConfig(n_max=9), spatial_scale=S)
+    assert clone.tolist() == [True, True, False, True, False, False]
+    assert not split.any()
+
+
+def test_growth_masks_put_the_clone_split_boundary_at_split_scale_times_s() -> None:
+    """§1.3 Growth step 3: a candidate whose largest scale is at most split_scale·S (0.01 · 100 = 1)
+    is cloned, one above it split; a row with g ≤ τ_pos is neither."""
+    g = torch.tensor([1.0, 1.0, 1.0, 1e-5])
+    scales = torch.tensor([[0.5, 1.0, 0.2], [0.5, 1.0, 0.2], [3.0, 0.1, 0.1], [9.0, 9.0, 9.0]])
+    scales[1, 1] = torch.nextafter(torch.tensor(1.0), torch.tensor(2.0))  # one float32 ulp above
+    clone, split = growth_masks(g, scales, GrowthConfig(), spatial_scale=S)
+    assert clone.tolist() == [True, False, False, False]
+    assert split.tolist() == [False, True, True, False]

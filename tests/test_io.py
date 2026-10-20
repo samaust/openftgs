@@ -34,6 +34,7 @@ from openftgs.io import (
     read_render_request,
     read_renders,
     read_scene_manifest,
+    render_conventions,
     save_checkpoint,
     save_run_checkpoint,
     validate_exchange,
@@ -326,6 +327,34 @@ def test_ftgs_if_metadata_follows_section_2_2(tmp_path: Path) -> None:
         "screen_extent_max": 3.33,
         "rasterize_mode": "classic",
     }
+
+
+def test_render_conventions_is_the_block_write_exchange_writes(tmp_path: Path) -> None:
+    """Q-204, D-73, D-84: render_conventions(background=…) is the block an exchange file with
+    that background records, with Q-35's 12 entries; by default the background is black (D-34),
+    and every call returns a fresh copy."""
+    conventions = render_conventions()
+    assert len(conventions) == 12
+    assert conventions["background"] == [0.0, 0.0, 0.0]
+    conventions["near"] = -1.0
+    conventions["background"].append(9.0)
+    assert render_conventions()["near"] == 0.01
+    assert render_conventions()["background"] == [0.0, 0.0, 0.0]
+    model = ExchangeModel(exchange_arrays(), 3, 0.1, 1.0, "s", "t", background=(1.0, 0.5, 0.0))
+    path = tmp_path / "model.safetensors"
+    write_exchange(model, path)
+    with safe_open(str(path), framework="pt") as f:
+        written = json.loads(f.metadata()["render_conventions"])
+    assert written == render_conventions(background=(1.0, 0.5, 0.0))
+
+
+@pytest.mark.parametrize(
+    "background", [(0.0, 0.0), (0.0, 0.0, 1.5), (0.0, float("nan"), 0.0), (True, 0.0, 0.0)]
+)
+def test_render_conventions_refuses_a_background_outside_d84(background: tuple[float, ...]) -> None:
+    """D-84: three numbers in [0, 1]."""
+    with pytest.raises(ValueError, match="background"):
+        render_conventions(background=background)
 
 
 def test_ftgs_if_records_and_returns_the_exchange_models_background(tmp_path: Path) -> None:

@@ -17,12 +17,14 @@ from openftgs.config import GrowthConfig, RelocConfig
 from openftgs.model import FreeTimeGaussians, rotation_matrix
 from openftgs.optim import FTGSOptimizer
 
-__all__ = [  # Q-48; Q-67
+__all__ = [  # Q-48; Q-67; Q-204
     "OPACITY_RESET_EVERY",
     "GradStats",
     "GrowthReport",
     "RelocationReport",
+    "draw_targets",
     "grow",
+    "growth_masks",
     "mcmc_split",
     "prune",
     "relocate",
@@ -333,11 +335,12 @@ def _check_generator(generator: object) -> None:
         _fail(f"generator must be a torch.Generator, got {type(generator).__name__}")
 
 
-def _draw_targets(scores: Tensor, count: int, generator: torch.Generator) -> Tensor:
-    """`count` rows drawn with replacement, with probability ∝ `scores` (D-15), on the
+def draw_targets(scores: Tensor, count: int, *, generator: torch.Generator) -> Tensor:
+    """`count` rows drawn with replacement, with probability ∝ `scores` (D-15; Q-204), on the
     generator's device (as in `FreeTimeGaussians.from_init_points`), returned on the scores'
     device. The scores must be finite with a positive sum (Q-51): otherwise torch.multinomial
     fails on the CPU and asserts on CUDA."""
+    _check_generator(generator)
     if not bool(torch.isfinite(scores).all()) or not bool(scores.sum() > 0):
         _fail(
             "the live primitives' sampling scores must be finite with a positive sum "
@@ -418,7 +421,7 @@ def relocate(
         stats.reset()
         return RelocationReport(dead=0, targets=0)
     scores = torch.where(dead, 0.0, sampling_score(model, stats, cfg))
-    draws = _draw_targets(scores, n_dead, generator)
+    draws = draw_targets(scores, n_dead, generator=generator)
     dead_rows = torch.nonzero(dead).squeeze(1)  # ascending: they take the draws in draw order
     targets, moved = _relocation_move(model, draws, cfg, generator)
     with torch.no_grad():
@@ -455,6 +458,31 @@ def _resize_all(
     stats.resize_(keep=keep, append_from=parents)
 
 
+def growth_masks(
+    g: Tensor, scales: Tensor, cfg: GrowthConfig, *, spatial_scale: float
+) -> tuple[Tensor, Tensor]:
+    """The rows a growth event clones and splits (§1.3 Growth, D-18, D-44; Q-204): candidates have
+    a mean gradient `g` above `cfg.grad_threshold`; when they exceed the room below `cfg.n_max`
+    (N = len(g); a clone and a split each add one row), the largest g that fit are kept, ties to
+    the lower row. A kept candidate is cloned when its largest `scales` entry (the activated
+    scales, [N, 3]) is at most `cfg.split_scale`·S, split otherwise. Returns two bool masks [N].
+    Synchronizes with the host for the cap."""
+    n = int(g.shape[0])
+    rows = torch.nonzero(g > cfg.grad_threshold).squeeze(1)  # §1.3 Growth step 1, in float32
+    room = max(cfg.n_max - n, 0)
+    if int(rows.shape[0]) > room:
+        # D-44: the largest g that fit, ties to the lower row (a stable sort of rows in order).
+        best = torch.sort(g[rows], descending=True, stable=True).indices[:room]
+        rows = torch.sort(rows[best]).values
+    # §1.3 Growth step 3: a clone when the largest scale is ≤ split_scale·S (in float32).
+    large = scales[rows].amax(dim=-1) > cfg.split_scale * spatial_scale
+    clone = torch.zeros(n, dtype=torch.bool, device=g.device)
+    split = torch.zeros(n, dtype=torch.bool, device=g.device)
+    clone[rows[~large]] = True
+    split[rows[large]] = True
+    return clone, split
+
+
 # Q-52: candidates, the cap, the clone/split boundary, the order of new rows and of the draws.
 def _grow_by_gradient(
     model: FreeTimeGaussians,
@@ -466,22 +494,17 @@ def _grow_by_gradient(
 ) -> GrowthReport:
     n = model.num_gaussians
     g = stats.mean()
-    rows = torch.nonzero(g > cfg.grad_threshold).squeeze(1)  # §1.3 Growth step 1, in float32
-    n_candidates = int(rows.shape[0])
-    room = max(cfg.n_max - n, 0)  # a clone and a split each add one row
-    capped = max(n_candidates - room, 0)
-    if capped:
-        # D-44: the largest g that fit, ties to the lower row (a stable sort of rows in order).
-        best = torch.sort(g[rows], descending=True, stable=True).indices[:room]
-        rows = torch.sort(rows[best]).values
-    if rows.numel() == 0:
-        return GrowthReport(cloned=0, split=0, sampled=0, capped=capped, num_gaussians=n)
     with torch.no_grad():
         params = {name: getattr(model, name).detach() for name in FreeTimeGaussians.PARAM_NAMES}
-        log_scales = params["log_scales"][rows]
-        # §1.3 Growth step 3: a clone when the largest scale is ≤ split_scale·S (in float32).
-        large = torch.exp(log_scales).amax(dim=-1) > cfg.split_scale * spatial_scale
-        clone_rows, split_rows = rows[~large], rows[large]
+        clone, split = growth_masks(
+            g, torch.exp(params["log_scales"]), cfg, spatial_scale=spatial_scale
+        )
+        n_candidates = int((g > cfg.grad_threshold).sum())
+        clone_rows = torch.nonzero(clone).squeeze(1)
+        split_rows = torch.nonzero(split).squeeze(1)
+        capped = n_candidates - int(clone_rows.shape[0]) - int(split_rows.shape[0])
+        if clone_rows.numel() + split_rows.numel() == 0:
+            return GrowthReport(cloned=0, split=0, sampled=0, capped=capped, num_gaussians=n)
         n_split = int(split_rows.shape[0])
         new_rows = [{name: p.index_select(0, clone_rows) for name, p in params.items()}]
         keep = None
@@ -500,7 +523,7 @@ def _grow_by_gradient(
                         "log_scales": child_log_scales,
                     }
                 )
-            keep = torch.ones(n, dtype=torch.bool, device=rows.device).index_fill_(
+            keep = torch.ones(n, dtype=torch.bool, device=g.device).index_fill_(
                 0, split_rows, False
             )
         append = {name: torch.cat([r[name] for r in new_rows]) for name in params}
@@ -563,7 +586,7 @@ def _grow_by_score(
     if not bool(live.any()):  # Q-52: no live row to draw from, so nothing is added
         return GrowthReport(cloned=0, split=0, sampled=0, capped=0, num_gaussians=n)
     scores = torch.where(live, sampling_score(model, stats, reloc), 0.0)
-    draws = _draw_targets(scores, n_add, generator)
+    draws = draw_targets(scores, n_add, generator=generator)
     targets, new_rows = _relocation_move(model, draws, reloc, generator)
     optimizer.reset_rows(targets)
     _resize_all(model, optimizer, stats, keep=None, append=new_rows, parents=draws)

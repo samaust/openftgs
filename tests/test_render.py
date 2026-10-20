@@ -994,9 +994,10 @@ def test_render_constants_agree_with_their_copies() -> None:
     import openftgs.io
     import openftgs.motion
     import openftgs.render
+    import openftgs.sh
     from openftgs.config import PerfConfig, TrainConfig
 
-    conventions = openftgs.io._RENDER_CONVENTIONS
+    conventions = openftgs.io.render_conventions()
     r = openftgs.render
     assert conventions["alpha_max"] == r._ALPHA_MAX == 0.999
     assert conventions["eps2d"] == r._EPS2D == 0.3
@@ -1008,6 +1009,7 @@ def test_render_constants_agree_with_their_copies() -> None:
     assert conventions["pixel_center_offset"] == r._PIXEL_CENTER == 0.5
     assert conventions["background"] == list(r._BACKGROUND) == list(TrainConfig().background)
     assert r._EXTENT_MAX == 3.33 and r._CLAMP_MARGIN == 0.15 and r._SH_OFFSET == 0.5
+    assert openftgs.sh._COLOR_OFFSET == r._SH_OFFSET  # E2's +0.5 on both backends (Q-204)
     # D-73, Q-35: the conventions files record are the ones render applies (D-72).
     assert conventions["jacobian_clamp_margin"] == r._CLAMP_MARGIN
     assert conventions["screen_extent_max"] == r._EXTENT_MAX
