@@ -2,6 +2,7 @@
 """Running `ftgs-harness` as a subprocess, its real entry point, for the level tests."""
 
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -11,6 +12,25 @@ from typing import Any
 HERE = Path(__file__).parent
 BIN = Path(sys.executable).parent
 ADAPTER = str(BIN / "ftgs-adapter")
+
+
+_THREAD_VARIABLES = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "TORCHINDUCTOR_COMPILE_THREADS",
+)
+
+
+def within_budget(jobs: int) -> tuple[int, dict[str, str]]:
+    """`ftgs-harness --jobs` and the environment that keep a harness run inside this process's
+    thread budget (machine.py's `--threads`, or an xdist worker's share, Q-214): at most one
+    adapter process per two threads, each at its share."""
+    value = os.environ.get("OMP_NUM_THREADS", "")
+    budget = int(value) if value.isdigit() and int(value) > 0 else (os.cpu_count() or 2) // 2
+    jobs = max(1, min(jobs, budget // 2))
+    share = str(max(1, budget // jobs))
+    return jobs, {**os.environ, **{name: share for name in _THREAD_VARIABLES}}
 
 
 def openftgs(backend: str = "reference") -> str:
@@ -42,6 +62,7 @@ def run_harness(
     (tmp_path / "harness_config.json").write_text(json.dumps(config or {}))
     (tmp_path / "settings.json").write_text(json.dumps(settings or {}))
     run_dir = tmp_path / out
+    jobs, env = within_budget(jobs)
     done = subprocess.run(
         [
             str(BIN / "ftgs-harness"),
@@ -64,6 +85,7 @@ def run_harness(
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     report_path = run_dir / "report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else {}

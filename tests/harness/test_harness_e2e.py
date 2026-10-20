@@ -17,7 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from harness_runs import ADAPTER, BIN, checks
+from harness_runs import ADAPTER, BIN, checks, within_budget
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -32,6 +32,7 @@ def test_the_harness_passes_every_level_with_openftgs_as_both(
     s9 = tmp_path / "s9"
     subprocess.run([sys.executable, str(ROOT / "scripts" / "harness_s9.py"), str(s9)], check=True)
     adapter = f"{ADAPTER} --backend gsplat"
+    jobs, env = within_budget(4)
     started = time.perf_counter()
     done = subprocess.run(
         [
@@ -50,11 +51,12 @@ def test_the_harness_passes_every_level_with_openftgs_as_both(
             "--out",
             str(tmp_path / "run"),
             "--jobs",
-            "4",
+            str(jobs),
         ],
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     seconds = time.perf_counter() - started
     report = json.loads((tmp_path / "run" / "report.json").read_text())
