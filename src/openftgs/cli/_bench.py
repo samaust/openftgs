@@ -3,7 +3,8 @@
 BENCH.json.
 
 Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55, D-56, D-81,
-D-88 (`--model`). Q-166 (BENCH.json and the exit codes), Q-168 (the setups), Q-178 and Q-189
+D-88 (`--model`). Q-166 (BENCH.json and the exit codes), Q-199 (a numerical failure in a
+run), Q-168 (the setups), Q-178 and Q-189
 (B-6), Q-174 (the index threshold T that B-7 sets), Q-194 and Q-195 (B-7), Q-169, Q-192
 and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
@@ -39,6 +40,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from openftgs.cli import (
     _INPUT,
+    _NUMERIC,
     _as_input_error,
     _fail,
     _json_text,
@@ -111,7 +113,8 @@ def add_parser(commands: Any) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """`ftgs bench BENCHMARK SCENE.json --out BENCH.json [--model MODEL]`: exit 0 once the
-    benchmark ran, whatever its budgets; 2 for invalid input or environment (Q-166)."""
+    benchmark ran, whatever its budgets; 2 for invalid input or environment, out of GPU memory
+    included; 3 for a numerical failure (Q-166 as answered, Q-199)."""
     import torch
 
     bench = _BENCHMARKS[args.benchmark]
@@ -121,11 +124,18 @@ def run(args: argparse.Namespace) -> int:
     video = _scene(args.scene)
     if bench.cuda and not torch.cuda.is_available():  # Q-166: an invalid environment
         _fail(f"{bench.id} needs a CUDA device", _INPUT)
-    model = None if args.model is None else _load_model(args.model, "cuda")  # D-88
-    with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after it
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-    date = datetime.now(UTC).isoformat(timespec="seconds")
-    result = bench.run(_Context(args, video, model))
+    # Q-166 (as answered): a run cut short measured nothing, so it writes nothing; out of GPU
+    # memory is exit 2 and a numerical failure exit 3, as in `ftgs train` (Q-142; Q-199).
+    try:
+        model = None if args.model is None else _load_model(args.model, "cuda")  # D-88
+        with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+        date = datetime.now(UTC).isoformat(timespec="seconds")
+        result = bench.run(_Context(args, video, model))
+    except torch.OutOfMemoryError as error:
+        _fail(f"{bench.id} ran out of GPU memory: {error}", _INPUT)
+    except FloatingPointError as error:  # the trainer's divergence (Q-69), a render's (Q-129)
+        _fail(f"{bench.id}: {error}", _NUMERIC)
     command = ["ftgs", "bench", args.benchmark, str(args.scene), "--out", str(args.out)]
     if args.model is not None:
         command += ["--model", str(args.model)]
@@ -1694,6 +1704,10 @@ _CHILD = (
     "import sys; sys.modules['fused_ssim'] = None; "
     "from openftgs.cli._bench import _losses_child; _losses_child(sys.argv[1])"
 )
+# Q-166 (as answered): the child's exit code when it runs out of GPU memory, its error the last
+# line of its output; one the interpreter never gives (1 for an uncaught exception, 2 for a
+# usage error).
+_CHILD_OUT_OF_MEMORY = 75
 
 
 def _loss_images(
@@ -1890,12 +1904,24 @@ def _losses_child(spec: str) -> None:
     where `fused_ssim` can't be imported (PRD #220): `SPEC` is JSON with the scene's path, the
     sizes, the seed, the repetitions and the setting. Every LPIPS case, then the PyTorch SSIM
     path with TF32 on as in training (D-52), at every size. Prints its cases as one line of
-    JSON."""
+    JSON; out of GPU memory, prints `{"out_of_memory": error}` instead and exits with
+    `_CHILD_OUT_OF_MEMORY` (Q-166 as answered)."""
+    import torch
+
     if _fused_ssim_importable():
         raise RuntimeError("fused_ssim can be imported in B-4's child process")
+    try:
+        cases = _measure_in_child(json.loads(spec))
+    except torch.OutOfMemoryError as error:
+        print(json.dumps({"out_of_memory": str(error)}))
+        raise SystemExit(_CHILD_OUT_OF_MEMORY) from None
+    print(json.dumps(cases))
+
+
+def _measure_in_child(given: dict[str, Any]) -> list[dict[str, Any]]:
+    """`_losses_child`'s measurements, from its parsed SPEC: the cases it prints."""
     from openftgs.data import MultiViewVideo
 
-    given = json.loads(spec)
     autotuning, repetitions = bool(given["autotuning"]), int(given["repetitions"])
     video = MultiViewVideo.from_manifest(Path(given["scene"]))
     images: _Images = {
@@ -1910,14 +1936,17 @@ def _losses_child(spec: str) -> None:
         case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
         case |= {"precision": "tf32", "autotuning": autotuning}
         cases.append({"case": case, "figures": figures})
-    print(json.dumps(cases))
+    return cases
 
 
 def _child_cases(
     scene: Path, sizes: Sequence[tuple[int, int]], *, autotuning: bool
 ) -> list[dict[str, Any]]:
     """The cases of one autotuning setting, from a child process (`_losses_child`) running this
-    openftgs: the folder it is imported from goes first on the child's PYTHONPATH."""
+    openftgs: the folder it is imported from goes first on the child's PYTHONPATH. A child out
+    of GPU memory is torch.OutOfMemoryError here, as in this process (Q-166 as answered)."""
+    import torch
+
     import openftgs
 
     root = str(Path(openftgs.__file__).resolve().parent.parent)
@@ -1937,6 +1966,10 @@ def _child_cases(
         env=env,
         check=False,
     )
+    if done.returncode == _CHILD_OUT_OF_MEMORY:
+        error = json.loads(done.stdout.strip().splitlines()[-1])["out_of_memory"]
+        setting = "on" if autotuning else "off"
+        raise torch.OutOfMemoryError(f"in the child process with autotuning {setting}: {error}")
     if done.returncode != 0:
         raise RuntimeError(f"B-4's child process failed:\n{done.stderr[-4000:]}")
     cases: list[dict[str, Any]] = json.loads(done.stdout.strip().splitlines()[-1])
