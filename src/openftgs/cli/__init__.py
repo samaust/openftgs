@@ -982,17 +982,23 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Q-176 (as answered, #274): the cores of the affinity set, which PyTorch's own default follows.
 def _physical_cores() -> int:
-    """The distinct (package, core) pairs of Linux's CPU topology; the logical CPUs where it
-    can't be read."""
+    """The distinct (package, core) pairs, in Linux's CPU topology, of the CPUs this process may
+    run on; the number of those CPUs where the topology can't be read, and the logical CPUs
+    where Python has no `os.sched_getaffinity` (macOS, Windows)."""
+    if not hasattr(os, "sched_getaffinity"):
+        return os.cpu_count() or 1
+    cpus = os.sched_getaffinity(0)
     cores: set[tuple[str, str]] = set()
     try:
-        for topology in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology"):
+        for cpu in cpus:
+            topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
             package = (topology / "physical_package_id").read_text().strip()
             cores.add((package, (topology / "core_id").read_text().strip()))
     except OSError:
-        cores.clear()
-    return len(cores) or os.cpu_count() or 1
+        return len(cpus)
+    return len(cores)
 
 
 # Q-176: §2.4 "Threads and processes", set at startup by the entry point (as Q-131 sets
