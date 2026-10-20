@@ -59,8 +59,8 @@ class Settings:
 
     @property
     def reduced(self) -> bool:
-        """Whether any case size is below §3.3's."""
-        return any(self.sizes[k] < v for k, v in DEFAULT_SIZES.items())
+        """Whether any case size is below §3.3's (Q-203) or L2 leaves LPIPS out (Q-212)."""
+        return any(self.sizes[k] < v for k, v in DEFAULT_SIZES.items()) or not self.l2_lpips
 
     def to_json(self) -> dict[str, Any]:
         out = asdict(self)
