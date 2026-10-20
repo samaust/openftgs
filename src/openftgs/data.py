@@ -940,7 +940,9 @@ def convert_n3dv(
     belong to the `camXX.mp4` files in name order; the first `frames` frames of each video,
     decoded by the user's ffmpeg, area-resized by `resize` and written as PNG; frame k at k/30 s;
     cam00 the test view. Returns the path of OUT/scene.json."""
-    src = Path(src)
+    # Q-169: absolute, so the recorded commands mean the same from any directory; normalized
+    # lexically, with a symlinked folder kept under the name it was given.
+    src = Path(os.path.abspath(src))
     _check_frames(frames)
     _check_hwaccel(hwaccel)
     workers = _worker_count(jobs)
@@ -1131,7 +1133,7 @@ def convert_opencv_yaml(
     (the first `frames` files by name) or `videos/<camera>.mp4`; frames undistorted with the
     file's K, K shifted by +0.5, frames and K resized; frame k at k/fps s; `test_camera` the
     test view. Returns the path of OUT/scene.json."""
-    src = Path(src)
+    src = Path(os.path.abspath(src))  # Q-169, as in convert_n3dv
     if (
         isinstance(fps, bool)
         or not isinstance(fps, numbers.Real)
