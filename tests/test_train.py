@@ -1142,6 +1142,48 @@ def test_the_float32_perceptual_precisions_keep_a_plain_lpips_loss_bitwise(
     assert float(log.losses["perceptual"]) == float(expected)
 
 
+@pytest.mark.parametrize(("precision", "tf32"), [("ieee", False), ("tf32", True), ("bf16", True)])
+def test_cudnn_tf32_during_a_step_follows_the_perceptual_precision(
+    tmp_path: Path, precision: Literal["tf32", "ieee", "bf16"], tf32: bool
+) -> None:
+    """D-52, Q-172 (#245): during a training iteration's backward pass, cuDNN's TF32 flag is off
+    under perc_precision "ieee" and on under "tf32" and "bf16", whose autocast is local to the
+    perceptual network, so every other convolution (the SSIM fallback's) keeps TF32. The flag
+    is the caller's again after the step."""
+    cudnn = torch.backends.cudnn
+    saved = cudnn.allow_tf32
+    try:
+        cudnn.allow_tf32 = not tf32
+        perf = PerfConfig(perc_precision=precision)
+        trainer = Trainer(_no_perceptual(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
+        seen: list[bool] = []
+        trainer.model.means.register_hook(lambda _: seen.append(cudnn.allow_tf32))  # type: ignore[no-untyped-call]
+        trainer.step()
+        assert seen == [tf32]
+        assert cudnn.allow_tf32 is not tf32
+    finally:
+        cudnn.allow_tf32 = saved
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_a_bf16_step_changes_only_the_perceptual_term(tmp_path: Path, device: str) -> None:
+    """D-52, Q-172 (#245): bf16's autocast is local to the perceptual network, so a "bf16" step
+    and a "tf32" step from the same seed, both with TF32 on, give bitwise the same L1, 1 − SSIM
+    and L_reg terms, and only the perceptual term differs. On the CPU, SSIM takes its PyTorch
+    fallback, whose convolution an autocast around the whole loss would reach."""
+    video = _scene(tmp_path)
+    terms: dict[str, dict[str, torch.Tensor]] = {}
+    for precision in ("tf32", "bf16"):
+        cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
+        trainer = Trainer(cfg, video, _init_points(), device=device)
+        terms[precision] = {name: value.cpu() for name, value in trainer.step().losses.items()}
+    assert terms["bf16"].keys() == terms["tf32"].keys()
+    for name in ("l1", "one_minus_ssim", "reg"):
+        assert torch.equal(terms["bf16"][name], terms["tf32"][name]), name
+    assert not torch.equal(terms["bf16"]["perceptual"], terms["tf32"]["perceptual"])
+
+
 def _evaluation_scene(root: Path) -> MultiViewVideo:
     """64×48 cameras, so the masks' left halves (32 px) are usable dynamic regions (Q-61)."""
     cams = ring(3, radius=4.0, elevation=1.0, width_px=64, height_px=48, focal=60.0)
