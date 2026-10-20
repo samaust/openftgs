@@ -93,7 +93,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 have_cuda = _cuda_available()
             if not have_cuda:
                 item.add_marker(pytest.mark.skip(reason="needs a CUDA device"))
-            # Q-214: under --dist loadgroup, GPU tests take turns on one worker.
+            # Q-214: under --dist loadgroup, GPU tests in no other group take turns on one worker.
             if item.get_closest_marker("xdist_group") is None:
                 item.add_marker(pytest.mark.xdist_group("gpu"))
         if item.get_closest_marker("dataset") is not None and not have_datasets:
