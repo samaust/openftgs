@@ -2071,3 +2071,29 @@ def test_bench_renders_that_are_not_finite_exit_3(
     err = capsys.readouterr().err
     assert "B-7" in err and "renders that aren't finite" in err
     _assert_untouched(out)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test__child_cases_raise_out_of_memory_when_b4s_child_runs_out(scene: Path) -> None:
+    """A private test of `_child_cases`, B-4's child process (Q-190), for Q-166 as answered:
+    a child that runs out of GPU memory, for real here, at a size whose first LPIPS-VGG layer
+    alone (64 float32 channels) outgrows the GPU, makes the parent raise
+    torch.OutOfMemoryError with the child's error, which `ftgs bench` reports as exit 2."""
+    from openftgs.cli._bench import _child_cases
+
+    total = torch.cuda.get_device_properties(0).total_memory
+    side = math.ceil(1.1 * math.sqrt(total / (64 * 4)))
+    with pytest.raises(torch.OutOfMemoryError, match="child process.*out of memory"):
+        _child_cases(scene, [(side, side)], autotuning=False)
+
+
+def test__child_cases_keep_a_runtime_error_for_any_other_failure(tmp_path: Path) -> None:
+    """A private test of `_child_cases` (Q-166 as answered): B-4's child failing for another
+    reason than GPU memory, here a scene manifest it can't read, stays a RuntimeError with the
+    child's stderr, as before #272."""
+    from openftgs.cli._bench import _child_cases
+
+    with pytest.raises(RuntimeError, match="B-4's child process failed") as failure:
+        _child_cases(tmp_path / "absent.json", [(48, 32)], autotuning=False)
+    assert not isinstance(failure.value, torch.OutOfMemoryError)

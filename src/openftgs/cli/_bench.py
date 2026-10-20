@@ -1703,6 +1703,9 @@ _CHILD = (
     "import sys; sys.modules['fused_ssim'] = None; "
     "from openftgs.cli._bench import _losses_child; _losses_child(sys.argv[1])"
 )
+# Q-166 (as answered): the child's exit code when it runs out of GPU memory, its error last on
+# stderr; Python's own for an uncaught exception is 1.
+_CHILD_OUT_OF_MEMORY = 2
 
 
 def _loss_images(
@@ -1899,12 +1902,23 @@ def _losses_child(spec: str) -> None:
     where `fused_ssim` can't be imported (PRD #220): `SPEC` is JSON with the scene's path, the
     sizes, the seed, the repetitions and the setting. Every LPIPS case, then the PyTorch SSIM
     path with TF32 on as in training (D-52), at every size. Prints its cases as one line of
-    JSON."""
+    JSON; out of GPU memory, prints the error on stderr and exits with `_CHILD_OUT_OF_MEMORY`
+    (Q-166 as answered)."""
+    import torch
+
     if _fused_ssim_importable():
         raise RuntimeError("fused_ssim can be imported in B-4's child process")
+    try:
+        cases = _losses_child_cases(json.loads(spec))
+    except torch.OutOfMemoryError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(_CHILD_OUT_OF_MEMORY) from None
+    print(json.dumps(cases))
+
+
+def _losses_child_cases(given: dict[str, Any]) -> list[dict[str, Any]]:
     from openftgs.data import MultiViewVideo
 
-    given = json.loads(spec)
     autotuning, repetitions = bool(given["autotuning"]), int(given["repetitions"])
     video = MultiViewVideo.from_manifest(Path(given["scene"]))
     images: _Images = {
@@ -1919,14 +1933,17 @@ def _losses_child(spec: str) -> None:
         case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
         case |= {"precision": "tf32", "autotuning": autotuning}
         cases.append({"case": case, "figures": figures})
-    print(json.dumps(cases))
+    return cases
 
 
 def _child_cases(
     scene: Path, sizes: Sequence[tuple[int, int]], *, autotuning: bool
 ) -> list[dict[str, Any]]:
     """The cases of one autotuning setting, from a child process (`_losses_child`) running this
-    openftgs: the folder it is imported from goes first on the child's PYTHONPATH."""
+    openftgs: the folder it is imported from goes first on the child's PYTHONPATH. A child out
+    of GPU memory is torch.OutOfMemoryError here, as in this process (Q-166 as answered)."""
+    import torch
+
     import openftgs
 
     root = str(Path(openftgs.__file__).resolve().parent.parent)
@@ -1946,6 +1963,10 @@ def _child_cases(
         env=env,
         check=False,
     )
+    if done.returncode == _CHILD_OUT_OF_MEMORY:
+        error = (done.stderr.strip().splitlines() or [""])[-1]
+        setting = "on" if autotuning else "off"
+        raise torch.OutOfMemoryError(f"in the child process with autotuning {setting}: {error}")
     if done.returncode != 0:
         raise RuntimeError(f"B-4's child process failed:\n{done.stderr[-4000:]}")
     cases: list[dict[str, Any]] = json.loads(done.stdout.strip().splitlines()[-1])
