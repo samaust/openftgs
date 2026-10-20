@@ -26,6 +26,7 @@ __all__ = [
     "relative",
     "render",
     "request_for",
+    "where_text",
 ]
 
 _MAX_ARTIFACTS = 12  # failed items per case that get images
@@ -112,6 +113,15 @@ def failure_check(
     )
 
 
+def where_text(entry: CaseItem, psnr_db: float, swept_name: str | None = None) -> str:
+    """The input terms a symptom names its item by: id, camera, τ, the swept variable, PSNR."""
+    item = entry.item
+    where = f"in item {item.id} (camera {entry.camera}, τ = {item.timestamp:.4g} s"
+    if swept_name not in (None, "τ") and entry.swept is not None:
+        where += f", {swept_name} = {entry.swept:.4g}"
+    return where + f"; PSNR(A, B) = {psnr_db:.1f} dB)"
+
+
 def item_checks(
     ctx: Context,
     *,
@@ -143,11 +153,7 @@ def item_checks(
         if not passed:
             pm = measure_pair(rgb_a, rgb_b, alpha_a, alpha_b)
             pattern = classify(pm, view_dependent=view_dependent)
-            where = f"in item {item.id} (camera {entry.camera}, τ = {item.timestamp:.4g} s"
-            if swept_name is not None and entry.swept is not None:
-                where += f", {swept_name} = {entry.swept:.4g}"
-            where += f"; PSNR(A, B) = {m.psnr_db:.1f} dB)"
-            symptom = describe(pattern, pm, where)
+            symptom = describe(pattern, pm, where_text(entry, m.psnr_db, swept_name))
             diff = np.abs(np.nan_to_num(rgb_a) - np.nan_to_num(rgb_b)).max(axis=-1)
             ys, xs = np.nonzero(diff > 1.0 / 255.0)
             if xs.size:

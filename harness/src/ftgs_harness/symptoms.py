@@ -6,7 +6,7 @@ vocabulary, and a sentence with numbers, units and the controlled variable.
 Measurements (Q-211): the alpha-weighted centroid (offset, px), the alpha-weighted spread
 (scale change), the alpha mass (missing or extra primitive), the mean colour under the alpha
 mask (colour shift), the share of |Δ| near the image border (border band), the alpha where A is
-near opaque (opacity saturation), the gradient energy (blur), and non-finite values.
+near opaque (opacity saturation), the alpha's gradient energy (blur), and non-finite values.
 """
 
 import math
@@ -31,7 +31,7 @@ class PairMeasures:
     color_diff: tuple[float, float, float]  # B − A, mean colour under the alpha mask
     border_share: float  # share of Σ|Δ| within the border band
     saturation_diff: float  # max |Δα| where A's α > 0.9
-    sharpness_ratio: float  # B's gradient energy over A's
+    sharpness_ratio: float  # B's alpha gradient energy over A's
     alpha_diff: float  # max |Δα|
 
     @property
@@ -51,9 +51,9 @@ def _moments(alpha: np.ndarray) -> tuple[float, np.ndarray, float]:
     return mass, np.array([cx, cy]), spread
 
 
-def _gradient_energy(rgb: np.ndarray) -> float:
-    gx = np.diff(rgb, axis=1)
-    gy = np.diff(rgb, axis=0)
+def _gradient_energy(alpha: np.ndarray) -> float:
+    gx = np.diff(alpha, axis=1)
+    gy = np.diff(alpha, axis=0)
     return float((gx**2).sum() + (gy**2).sum())
 
 
@@ -79,7 +79,7 @@ def measure_pair(
     band[:, :_BORDER_PX], band[:, -_BORDER_PX:] = True, True
     total = float(diff.sum())
     near_opaque = aa > 0.9
-    energy_a, energy_b = _gradient_energy(a), _gradient_energy(b)
+    energy_a, energy_b = _gradient_energy(aa), _gradient_energy(ab)
     return PairMeasures(
         nonfinite=nonfinite,
         offset=(float(center_b[0] - center_a[0]), float(center_b[1] - center_a[1])),

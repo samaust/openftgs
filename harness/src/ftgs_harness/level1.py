@@ -4,6 +4,8 @@ implementations render the same FTGS-IF file and the same request; per item, PSN
 mean |Δ|, the share of pixels with |Δ| > 1/255 and the alpha difference, judged at the tier the
 two `info` replies give. The probes P1 to P10 isolate one behaviour each (`probes`)."""
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from ftgs_harness.checks import Check
@@ -21,24 +23,26 @@ from ftgs_harness.rigs import fit_rig, main_items
 from ftgs_harness.runner import Context
 from ftgs_harness.settings import HarnessError
 
-__all__ = ["compare_case", "run"]
+__all__ = ["CaseRenders", "compare_case", "render_case", "run"]
 
 SPEC_REFS = ["E1", "E2", "E3", "E4", "E5", "E6"]
 
 
-def compare_case(
-    ctx: Context,
-    case: str,
-    model: Exchange | None,
-    items: list[CaseItem],
-    *,
-    spec_refs: list[str],
-    swept_name: str | None = None,
-    view_dependent: bool = False,
-) -> list[Check]:
-    """Render one case with A and B and compare item by item. `model` is written to the case
-    file unless it exists already (a rerun reuses the run's files)."""
-    prefix = f"L1.render.{case}"
+@dataclass
+class CaseRenders:
+    """A case's renders by A and B, or the failed checks when a render call failed."""
+
+    inputs: dict[str, object]
+    a: dict[str, tuple[np.ndarray, np.ndarray]] | None
+    b: dict[str, tuple[np.ndarray, np.ndarray]] | None
+    failed: list[Check]
+
+
+def render_case(
+    ctx: Context, case: str, model: Exchange | None, items: list[CaseItem], spec_refs: list[str]
+) -> CaseRenders:
+    """Write the case's model and request (once: a rerun reuses the run's files) and render it
+    with A and B."""
     folder = ctx.cases / "L1"
     folder.mkdir(parents=True, exist_ok=True)
     model_path = folder / f"{case}.ftgs-if.safetensors"
@@ -47,7 +51,10 @@ def compare_case(
         write_exchange(model_path, model)
     request = folder / f"{case}.request.json"
     sha = request_for(ctx, request, items, (0.0, 0.0, 0.0))
-    inputs = {"model": relative(ctx, model_path), "request": relative(ctx, request)}
+    inputs: dict[str, object] = {
+        "model": relative(ctx, model_path),
+        "request": relative(ctx, request),
+    }
     results = dict(
         zip(
             ("A", "B"),
@@ -67,27 +74,37 @@ def compare_case(
         )
     )
     failed = [
-        failure_check(ctx, f"{prefix}.{label}", "L1", r, label, inputs, spec_refs)
+        failure_check(ctx, f"L1.render.{case}.{label}", "L1", r, label, inputs, spec_refs)
         for label, r in results.items()
         if r.renders is None
     ]
-    if failed:
-        return [c for c in failed if ctx.wants(c.id)]
-    a, b = results["A"].renders, results["B"].renders
-    assert a is not None and b is not None
+    return CaseRenders(inputs, results["A"].renders, results["B"].renders, failed)
+
+
+def compare_case(
+    ctx: Context,
+    case: str,
+    model: Exchange | None,
+    items: list[CaseItem],
+    *,
+    spec_refs: list[str],
+) -> list[Check]:
+    """Render one case with A and B and compare item by item at the run's tier."""
+    renders = render_case(ctx, case, model, items, spec_refs)
+    if renders.failed:
+        return [c for c in renders.failed if ctx.wants(c.id)]
+    assert renders.a is not None and renders.b is not None
     return item_checks(
         ctx,
         level="L1",
         case=case,
-        prefix=prefix,
+        prefix=f"L1.render.{case}",
         items=items,
-        first=a,
-        second=b,
+        first=renders.a,
+        second=renders.b,
         tier=ctx.tier,
-        inputs=inputs,
+        inputs=renders.inputs,
         spec_refs=spec_refs,
-        swept_name=swept_name,
-        view_dependent=view_dependent,
     )
 
 
@@ -113,4 +130,6 @@ def run(ctx: Context) -> list[Check]:
         rng = np.random.default_rng([ctx.settings.seed, 1, 1])
         items = main_items(model, fit_rig(model), ctx.settings.sizes["l1.items"], rng)
         checks += compare_case(ctx, "main", model, items, spec_refs=SPEC_REFS)
-    return checks
+    from ftgs_harness import probes  # probes builds on this module's cases
+
+    return checks + probes.run(ctx)
