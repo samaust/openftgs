@@ -3,7 +3,8 @@
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (Q-167), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
 D-50, Q-13), B-4 (`bench losses`; D-52, Q-173, Q-190), B-5 (`bench adam`; D-53, Q-188),
-B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), B-8 (`bench init` and `bench convert`; D-48,
+B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), B-7 (`bench render`; D-55, Q-174, Q-194,
+Q-195), B-8 (`bench init` and `bench convert`; D-48,
 D-56, D-81, Q-169, Q-192, Q-193), and the seeded model synthesizer of the benchmark
 setups (Q-168).
 
@@ -152,15 +153,10 @@ def test_bench_train_step_and_render_take_a_model(
     scene: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Q-167: `train-step` and `render` take `--model MODEL`, an FTGS-IF file or a checkpoint
-    directory, read as `ftgs render` reads one: an unreadable MODEL is exit 2. Until B-7 (#231)
-    lands, a valid one reaches Q-130's message there: exit 1, nothing written. B-1 with a model
-    is `test_b1_takes_a_model`; one of another scene's time normalizer can't be trained on this
-    scene, exit 2 (#226)."""
+    directory, read as `ftgs render` reads one: an unreadable MODEL is exit 2. B-1 with a model
+    is `test_b1_takes_a_model`, B-7 with one `test_b7_times_the_model_given`; one of another
+    scene's time normalizer can't be trained on this scene, exit 2 (#226)."""
     out = tmp_path / "bench.json"
-    model = tmp_path / "model.safetensors"
-    write_exchange(random_model(32, seed=1, sh_degree=1, time=TIME).to_exchange(), model)
-    assert _ftgs("bench", "render", scene, "--out", out, "--model", model) == 1
-    assert "comes with #" in capsys.readouterr().err
     other = tmp_path / "other.safetensors"
     later = TimeNormalizer(1.0, 2.0)
     write_exchange(random_model(32, seed=1, sh_degree=3, time=later).to_exchange(), other)
@@ -327,6 +323,96 @@ def test__raster_figures_pairs_each_calls_stages_and_takes_medians() -> None:
         "backward_s": pytest.approx(5.0),
         "repetitions": 3,
     }
+
+
+# B-7's setup (Q-168, Q-194) and its rule for T (Q-195): private tests of the helpers of
+# `openftgs.cli._bench._render`.
+
+
+@pytest.fixture(scope="module")
+def tested_scene(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The four ring cameras of `scene`, three frames each, the third camera's images in the
+    test split."""
+    root = tmp_path_factory.mktemp("tested")
+    cams = ring(4, radius=4.0, elevation=1.0, width_px=48, height_px=32, focal=44.0)
+    model = random_model(16, seed=0, sh_degree=1, time=TIME, spread=0.6)
+    images = [
+        (cam, k / 30.0, "test" if c == 2 else "train")
+        for k in range(3)
+        for c, cam in enumerate(cams)
+    ]
+    return write_scene(root, model, images)
+
+
+def test__b7_camera_is_the_test_camera_at_1920_by_1080(scene: Path, tested_scene: Path) -> None:
+    """Q-168, Q-194: B-7's camera has the pose of the first camera in the manifest's order
+    that has test images (the first camera when none has), fx and fy scaled by 1080/H (here
+    44 · 1080/32 = 1485), and the principal point at the centre of 1920×1080."""
+    from openftgs.cli._bench import _b7_camera
+    from openftgs.data import MultiViewVideo
+
+    expected_k = torch.tensor([[1485.0, 0.0, 960.0], [0.0, 1485.0, 540.0], [0.0, 0.0, 1.0]])
+    for path, pose in ((tested_scene, "ring02"), (scene, "ring00")):
+        video = MultiViewVideo.from_manifest(path)
+        source = next(r.camera for r in video.records if r.camera.name == pose)
+        camera = _b7_camera(video)
+        assert (camera.width, camera.height, camera.name) == (1920, 1080, pose)
+        torch.testing.assert_close(camera.K, expected_k, rtol=1e-6, atol=0.0)
+        torch.testing.assert_close(
+            camera.world_to_camera, source.world_to_camera, rtol=0.0, atol=0.0
+        )
+
+
+def test__b7_times_spread_a_request_of_k_times_over_the_scene() -> None:
+    """Q-194: a request of k times takes the timestamps round(j(F − 1)/(k − 1)), rounded half
+    up, j = 0 … k − 1, and the middle one for k = 1; the swept sizes are 1, 2, 3, 4, 6, 8, 12,
+    16, 24, 32, 48, 64 and 128 below F, then F."""
+    from openftgs.cli._bench import _request_sizes, _spread_times
+
+    assert _spread_times(300, 1) == [149]
+    assert _spread_times(300, 2) == [0, 299]
+    assert _spread_times(300, 3) == [0, 150, 299]  # 149.5 rounds up
+    assert _spread_times(300, 4) == [0, 100, 199, 299]
+    assert _spread_times(5, 5) == [0, 1, 2, 3, 4]
+    assert _request_sizes(300) == [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 300]
+    assert _request_sizes(3) == [1, 2, 3]
+    assert _request_sizes(1) == [1]
+
+
+def test__index_figures_take_the_build_from_the_one_time_requests() -> None:
+    """Q-194 (owner answer: public API only): the index's build time is the one-time request
+    with the index forced on less the same request forced off; with it, the break-even
+    (Q-195)."""
+    from openftgs.cli._bench import _index_figures
+
+    figures = _index_figures({1: (0.010, 0.004), 2: (0.012, 0.013), 3: (0.014, 0.020)})
+    assert figures["build_s"] == pytest.approx(0.006, rel=1e-12)
+    assert figures["break_even_times"] == 2
+    assert set(figures) == {"build_s", "break_even_times"}
+
+
+def test__break_even_is_the_smallest_size_from_which_the_index_pays() -> None:
+    """Q-195: the break-even is the smallest request size at which the request with the
+    index takes no longer than without it, there and at every larger size; none when the index
+    is slower at the largest size."""
+    from openftgs.cli._bench import _break_even
+
+    # (with the index, without it), in seconds
+    slower_at_8 = {1: (5.0, 3.0), 2: (6.0, 6.0), 4: (7.0, 9.0), 8: (9.0, 8.0), 16: (1.0, 2.0)}
+    assert _break_even(slower_at_8) == 16
+    assert _break_even({1: (5.0, 3.0), 2: (5.0, 6.0), 4: (6.0, 9.0)}) == 2
+    assert _break_even({1: (1.0, 3.0), 3: (2.0, 3.0)}) == 1
+    assert _break_even({1: (5.0, 3.0), 3: (9.0, 8.0)}) is None
+
+
+def test__threshold_is_the_largest_break_even_and_at_least_2() -> None:
+    """Q-195: T is the largest break-even over the models that have one, and at least 2;
+    None when no model has one."""
+    from openftgs.cli._bench import _threshold
+
+    assert _threshold([4, None, 8]) == 8
+    assert _threshold([1, None, 1]) == 2
+    assert _threshold([None, None]) is None
 
 
 # BENCH.json (Q-166) and B-3, `ftgs bench slice` (§3.4, D-50; Q-13, Q-182), run once on the
@@ -1680,3 +1766,155 @@ def test_b8_init_times_matching_per_pair_and_gpu_triangulation_knn_and_the_run(
     knn = cases[(("part", "init.knn"),)]
     assert knn["frames"] == run["init_frames"] == 3 and 0.0 < knn["total_s"] < run["wall_s"]
     assert 0.0 < run["startup_s"] < run["wall_s"] and run["points"] > 0
+
+
+# B-7, `ftgs bench render` (§3.4, D-55; Q-174, Q-194, Q-195), run once on the GPU for the
+# tests below on `tested_scene`: three distinct training times, so requests of 1, 2 and 3 times.
+# It builds the LPIPS networks for its evaluation figures, hence `weights`.
+
+B7_MODELS = [(n, active) for n in (1_000_000, 3_000_000) for active in (0.01, 0.05, 0.2)]
+
+
+@pytest.fixture(scope="module")
+def render_bench(tested_scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("bench") / "B-7.json"
+    assert _ftgs("bench", "render", tested_scene, "--out", out) == 0
+    body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+    return body
+
+
+def _b7_cases(body: dict[str, Any]) -> dict[tuple[Any, ...], dict[str, Any]]:
+    """B-7's cases by their keys' values in a fixed order, absent keys as None."""
+    keys = ("n", "active", "times", "index", "outputs", "evaluation", "threshold")
+    return {tuple(c["case"].get(k) for k in keys): c["figures"] for c in body["cases"]}
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b7_renders_every_training_time_with_and_without_the_index_on_both_devices(
+    render_bench: dict[str, Any],
+) -> None:
+    """B-7 (§3.4; #231, Q-194): on synthesized models at N = 1M and 3M with 1, 5 and 20 % of
+    rows active, `render_request` from one 1920×1080 camera at every distinct training time
+    (3 here), with the index on and off and the outputs on the GPU and on the CPU, and with the
+    outputs on the GPU at requests of fewer times; FPS is renders over the request's median time
+    over 10 calls; buckets one frame interval wide (D-55: here 1/30 s over a span of 2/30 s)."""
+    body = render_bench
+    assert body["benchmark"] == "B-7" and body["command"][:3] == ["ftgs", "bench", "render"]
+    setup = body["setup"]
+    assert setup["camera"]["width"] == 1920 and setup["camera"]["height"] == 1080
+    assert setup["camera"]["pose"] == "ring02"
+    assert (setup["times"], setup["request_sizes"], setup["repetitions"]) == (3, [1, 2, 3], 10)
+    assert setup["frame_dt"] == pytest.approx(0.5)
+    cases = _b7_cases(body)
+    for n, active in B7_MODELS:
+        for k in (1, 2, 3):
+            for outputs in ("cuda", "cpu") if k == 3 else ("cuda",):
+                for index in (True, False):
+                    figures = cases[(n, active, k, index, outputs, None, None)]
+                    assert figures["renders"] == k and figures["repetitions"] == 10
+                    assert 0.0 < figures["request_s"] < 60.0 and figures["first_call_s"] > 0.0
+                    assert figures["fps"] == pytest.approx(k / figures["request_s"])
+                    assert figures["render_s"] == pytest.approx(figures["request_s"] / k)
+        assert (n, active, 1, True, "cpu", None, None) not in cases
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, Any]) -> None:
+    """B-7 (#231, Q-194 as answered, Q-195): per model, the index's build time is the
+    one-time request with the index forced on less the same request forced off (outputs on the
+    GPU), and the break-even is a request size or None; no bucket statistics."""
+    cases = _b7_cases(render_bench)
+    for n, active in B7_MODELS:
+        figures = cases[(n, active, None, None, None, None, None)]
+        assert set(figures) == {"build_s", "break_even_times"}
+        on = cases[(n, active, 1, True, "cuda", None, None)]["request_s"]
+        off = cases[(n, active, 1, False, "cuda", None, None)]["request_s"]
+        assert figures["build_s"] == pytest.approx(on - off)
+        assert figures["break_even_times"] in (None, 1, 2, 3)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b7_holds_the_fps_budget_and_sets_the_threshold(render_bench: dict[str, Any]) -> None:
+    """B-7 (§3.4: ≥ 450 FPS; Q-180, Q-195): a budget entry per model for the requests at
+    every training time with the outputs on the GPU, index on and off, which never changes the
+    exit code; and T, the largest break-even over the models that have one and at least 2, or
+    None when none has."""
+    body = render_bench
+    cases = _b7_cases(body)
+    assert len(body["budgets"]) == 2 * len(B7_MODELS)
+    for budget in body["budgets"]:
+        case = budget["case"]
+        assert (case["times"], case["outputs"]) == (3, "cuda")
+        figures = cases[(case["n"], case["active"], 3, case["index"], "cuda", None, None)]
+        assert budget == {
+            "case": case,
+            "figure": "fps",
+            "limit": 450.0,
+            "value": figures["fps"],
+            "pass": figures["fps"] >= 450.0,
+            "kind": "budget",
+        }
+    found = [cases[(n, a, None, None, None, None, None)]["break_even_times"] for n, a in B7_MODELS]
+    known = [k for k in found if k is not None]
+    threshold = cases[(None, None, None, None, None, None, "T")]["distinct_times"]
+    assert threshold == (max([*known, 2]) if known else None)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b7_times_the_share_of_evaluation_spent_rendering(render_bench: dict[str, Any]) -> None:
+    """PRD #220's rule for `evaluate_images` (Q-68, Q-194): per model, the evaluation of
+    the test split (camera ring02 at 3 times) against the render requests it sends, one per
+    timestamp; the share is the second over the first."""
+    cases = _b7_cases(render_bench)
+    assert render_bench["setup"]["evaluation_split"] == "test"
+    for n, active in B7_MODELS:
+        figures = cases[(n, active, None, None, None, "test", None)]
+        assert (figures["images"], figures["requests"]) == (3, 3)
+        assert 0.0 < figures["render_s"] < figures["evaluation_s"]
+        assert figures["render_share"] == pytest.approx(
+            figures["render_s"] / figures["evaluation_s"]
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
+    """Q-167, Q-194: with `--model`, B-7 times that model alone, its N in the cases and no
+    active fraction; an exchange model carries no Δt_f, so the buckets take the scene's."""
+    model = tmp_path / "model.safetensors"
+    write_exchange(random_model(32, seed=1, sh_degree=1, time=TIME).to_exchange(), model)
+    out = tmp_path / "B-7.json"
+    assert _ftgs("bench", "render", tested_scene, "--out", out, "--model", model) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["command"][-2:] == ["--model", str(model)]
+    assert body["setup"]["model"] == f"given: {model}"
+    assert body["setup"]["frame_dt"] == pytest.approx(0.5)
+    models = {(c["case"].get("n"), c["case"].get("active")) for c in body["cases"]}
+    assert models == {(32, None), (None, None)}  # the threshold case has neither
+    assert len(body["budgets"]) == 2
+
+
+@pytest.mark.gpu
+def test_bench_render_without_the_lpips_weights_exits_2(
+    tested_scene: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-166, Q-142, Q-194: B-7's evaluation figures need the LPIPS networks, built as
+    `ftgs eval` builds them before anything is measured; when their weights can't be had (an
+    OSError of the download) it is exit 2, an invalid environment, with nothing written."""
+    import openftgs.eval
+
+    def offline(self: Any, **kwargs: Any) -> None:
+        raise OSError("no network")
+
+    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", offline)
+    out = tmp_path / "B-7.json"
+    assert _ftgs("bench", "render", tested_scene, "--out", out) == 2
+    assert "LPIPS networks" in capsys.readouterr().err
+    assert not out.exists()
