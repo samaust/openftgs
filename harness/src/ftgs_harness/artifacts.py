@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-__all__ = ["plot_lines", "save_pair"]
+__all__ = ["plot_cdfs", "plot_lines", "save_pair"]
 
 
 def _image(rgb: np.ndarray) -> np.ndarray:
@@ -60,6 +60,30 @@ def plot_lines(
         ax.set_title(title, fontsize=9)
     if len(series) > 1:
         ax.legend(fontsize=8)
+    fig.tight_layout()
+    path = folder / f"{stem}.png"
+    fig.savefig(path)
+    plt.close(fig)
+    return str(path.relative_to(run_dir))
+
+
+def plot_cdfs(
+    run_dir: Path, stem: str, samples: dict[str, np.ndarray], *, xlabel: str, title: str = ""
+) -> str:
+    """Empirical CDFs of pooled samples, one line per series; returns the path relative to
+    `run_dir`."""
+    folder = run_dir / "artifacts"
+    folder.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5, 3), dpi=100)
+    for name, values in samples.items():
+        xs = np.sort(np.asarray(values, dtype=np.float64).ravel())
+        if xs.size:
+            ax.step(xs, np.arange(1, xs.size + 1) / xs.size, where="post", label=name)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("CDF")
+    if title:
+        ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=8)
     fig.tight_layout()
     path = folder / f"{stem}.png"
     fig.savefig(path)
