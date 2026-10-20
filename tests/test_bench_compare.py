@@ -182,8 +182,8 @@ def test_b6_against_its_absolute_budget(
 
 def test_only_median_times_are_judged(tmp_path: Path) -> None:
     """Q-196: B-2's first call, its other figures, its per-model counts and its `limit`
-    entries (the layout comparison's, as the stored baseline carries from before #278, which
-    fails there) are not judged."""
+    entries (here the layout comparison's, as baselines recorded before #278 carry it, failing
+    in the run and passing in the baseline) are not judged."""
     variant = {"n": 1_000_000, "active": 0.2, "packed": False, "precull": "internal"}
 
     def raster(first_call_s: float, raster_s: float, diff: float) -> dict[str, Any]:
