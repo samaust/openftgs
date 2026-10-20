@@ -1,6 +1,6 @@
 # Implementation questions and provisional decisions
 
-Gaps found in the spec (revision 549i; revision 549 until 2026-10-12, then 549a, 549b and 549c until 2026-10-15, then 549d and 549e until 2026-10-16, then 549f, 549g and 549h until 2026-10-19) during implementation. Every row is provisional until the owner confirms it; confirmed rows return to the spec as new D-n decisions in a later export. Code that relies on a row carries a `# Q-n` comment.
+Gaps found in the spec (revision 549j; revision 549 until 2026-10-12, then 549a, 549b and 549c until 2026-10-15, then 549d and 549e until 2026-10-16, then 549f, 549g and 549h until 2026-10-19, then 549i the same day) during implementation. Every row is provisional until the owner confirms it; confirmed rows return to the spec as new D-n decisions in a later export. Code that relies on a row carries a `# Q-n` comment.
 
 Status is one of: `provisional` (a new row), `confirmed` (the owner accepted the provisional decision), `changed (#n)` (the owner chose otherwise; the row's decision is updated and the code follows in issue #n: the row's own ticket when the owner answered during its build, otherwise an issue implemented on its own), or `in spec (D-n, revision r)` (returned to the spec).
 
