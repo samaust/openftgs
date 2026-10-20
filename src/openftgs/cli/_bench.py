@@ -10,8 +10,8 @@ and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
 the environment, runs the function, which returns its setup, cases and budgets, and writes
-BENCH.json. A benchmark whose ticket hasn't landed has no function yet and keeps Q-130's
-behaviour: it says so, writes nothing and returns 1. Adding one is a function and its entry.
+BENCH.json. Every subcommand runs its benchmark: #225 to #235 retired Q-130's stub, which
+returned 1. Adding one is a function and its entry.
 """
 
 from __future__ import annotations
@@ -64,7 +64,6 @@ if TYPE_CHECKING:
 
 __all__ = ["add_parser", "run"]  # what `openftgs.cli` takes from this private module
 
-_UNBUILT = 1  # Q-130: a benchmark whose ticket hasn't landed
 _FORMAT, _VERSION = "ftgs-bench", 1  # Q-166
 
 
@@ -91,13 +90,11 @@ class _Result:
 
 @dataclass(frozen=True)
 class _Benchmark:
-    """One subcommand: its §3.4 ID, the ticket that builds it, the function that runs it (None
-    until that ticket lands), whether it needs CUDA (all but `convert`, Q-166) and whether it
-    takes `--model` (Q-167)."""
+    """One subcommand: its §3.4 ID, the function that runs it, whether it needs CUDA (all but
+    `convert`, Q-166) and whether it takes `--model` (Q-167)."""
 
     id: str
-    ticket: int
-    run: Callable[[_Context], _Result] | None = None
+    run: Callable[[_Context], _Result]
     cuda: bool = True
     model: bool = False
 
@@ -126,13 +123,6 @@ def run(args: argparse.Namespace) -> int:
     if bench.cuda and not torch.cuda.is_available():  # Q-166: an invalid environment
         _fail(f"{bench.id} needs a CUDA device", _INPUT)
     model = None if args.model is None else _load_model(args.model, "cuda")  # Q-167
-    if bench.run is None:  # Q-130 until its ticket lands
-        print(
-            f"ftgs bench {args.benchmark}: {bench.id} comes with #{bench.ticket}; "
-            "nothing was run or written",
-            file=sys.stderr,
-        )
-        return _UNBUILT
     with _output(f"BENCH.json {args.out}"):  # Q-142: found out before the run, not after it
         args.out.parent.mkdir(parents=True, exist_ok=True)
     date = datetime.now(UTC).isoformat(timespec="seconds")
@@ -2716,13 +2706,13 @@ def _convert(ctx: _Context) -> _Result:
 # -- the subcommands (§2.1, §3.4) ------------------------------------------------------------------
 
 _BENCHMARKS: dict[str, _Benchmark] = {
-    "train-step": _Benchmark("B-1", 226, _train_step, model=True),
-    "raster": _Benchmark("B-2", 227, _raster),
-    "slice": _Benchmark("B-3", 225, _slice),
-    "losses": _Benchmark("B-4", 228, _losses),
-    "adam": _Benchmark("B-5", 229, _adam),
-    "data": _Benchmark("B-6", 232, _data),
-    "render": _Benchmark("B-7", 231, _render, model=True),
-    "init": _Benchmark("B-8", 234, _init),
-    "convert": _Benchmark("B-8", 234, _convert, cuda=False),
+    "train-step": _Benchmark("B-1", _train_step, model=True),
+    "raster": _Benchmark("B-2", _raster),
+    "slice": _Benchmark("B-3", _slice),
+    "losses": _Benchmark("B-4", _losses),
+    "adam": _Benchmark("B-5", _adam),
+    "data": _Benchmark("B-6", _data),
+    "render": _Benchmark("B-7", _render, model=True),
+    "init": _Benchmark("B-8", _init),
+    "convert": _Benchmark("B-8", _convert, cuda=False),
 }

@@ -16,7 +16,7 @@
 | `init` | B-8 | the wall time of RoMa initialization: matching per pair and per GPU, triangulation, k-NN | yes | | #234 |
 | `convert` | B-8 | the wall time of conversion per camera and in total, with and without hardware decoding | no | | #234 |
 
-Each subcommand is one entry of `_BENCHMARKS`, at the end of the module: its B-n, the ticket that builds it, the function that runs it, and whether it needs CUDA and takes `--model`. A benchmark whose ticket hasn't landed has no function yet. It keeps Q-130's behaviour: it says which ticket brings it, writes nothing and exits 1, after the same checks as the others. Adding a benchmark is a function that takes the context (the parsed arguments, the scene and the model given with `--model`) and returns its setup, cases and budgets, set as `run` in its entry; the framework does the rest.
+Each subcommand is one entry of `_BENCHMARKS`, at the end of the module: its B-n, the function that runs it, and whether it needs CUDA and takes `--model`. Every subcommand runs its benchmark: #225 to #235 retired Q-130's stub, which wrote nothing and exited 1 (owner answer, 2026-10-19). Adding a benchmark is a function that takes the context (the parsed arguments, the scene and the model given with `--model`) and returns its setup, cases and budgets, set as `run` in its entry; the framework does the rest.
 
 ## Checks and exit codes
 
@@ -26,8 +26,7 @@ The checks run in this order (Q-180):
 2. The scene manifest is read as `MultiViewVideo.from_manifest` reads it; a missing or invalid one is exit 2, for `convert` too.
 3. Every benchmark but `convert` needs a CUDA device; without one it is exit 2, an invalid environment (Q-166).
 4. MODEL is read as `ftgs render` reads it, onto the GPU: a checkpoint directory or an FTGS-IF file; an unreadable one is exit 2 (Q-167).
-5. A benchmark not built yet stops here with exit 1.
-6. BENCH.json's folder is made before the run, so an output that can't be written is exit 2 at once, not after minutes of measuring (Q-142).
+5. BENCH.json's folder is made before the run, so an output that can't be written is exit 2 at once, not after minutes of measuring (Q-142).
 
 Exit 0 means the benchmark ran, whatever its budgets and limits say: a measurement is not a command failure, and the comparison against the stored baselines decides (Q-166, Q-170). A scene the benchmark can't use is exit 2 as well: the synthesized models need more than one timestamp and two training poses (Q-181); `init` needs the `[init]` extra and RoMa's weights in torch.hub's cache (Q-192); `convert` needs a manifest that records a Neural3DV conversion whose source videos are still where its ffmpeg commands read them (Q-169, Q-193); `render` needs a model in the scene's time unit and the LPIPS networks' weights, which B-7's evaluation figures need and which it gets before measuring anything, as `ftgs eval` does (Q-142, Q-194).
 

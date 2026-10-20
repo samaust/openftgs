@@ -2134,7 +2134,7 @@ def test_bench_checks_its_arguments(
     """Q-166: an unknown benchmark, a missing manifest, and on this CPU-only view a benchmark
     that needs CUDA, are exit 2. So is B-8's `convert`, which needs no CUDA, on a scene whose
     manifest records no conversion to rerun (Q-169; #234 replaced Q-130's exit 1 here, and
-    `tests/test_bench.py` checks that exit 1 for the benchmarks still unbuilt, on a GPU)."""
+    #225 to #235 retired Q-130's stub for every subcommand)."""
     out = tmp_path / "bench.json"
     assert _ftgs("bench", "convert", run["scene"], "--out", out) == 2
     assert "records no converter run" in capsys.readouterr().err
