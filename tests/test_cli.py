@@ -196,15 +196,31 @@ def test_python_m_runs_the_cli_and_reports_errors_without_a_traceback(tmp_path: 
     assert "ftgs bench: error:" in bad.stderr and "Traceback" not in bad.stderr
 
 
-def _physical_cores() -> int:
-    """§2.4's physical cores: the distinct sets of hardware threads that share a core."""
-    cores = {
-        p.read_text().strip()
-        for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology/core_cpus_list")
-    }
+def _allowed() -> set[int]:
+    """The CPUs this process may run on (its affinity set)."""
+    if not hasattr(os, "sched_getaffinity"):
+        pytest.skip("needs os.sched_getaffinity (Linux)")
+    return os.sched_getaffinity(0)
+
+
+def _cpu_list(text: str) -> frozenset[int]:
+    """The CPUs of a sysfs CPU list such as "0-1,12"."""
+    cpus: set[int] = set()
+    for part in text.strip().split(","):
+        first, _, last = part.partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    return frozenset(cpus)
+
+
+def _cores() -> set[frozenset[int]]:
+    """§2.4's physical cores among the CPUs this process may run on, each as the hardware
+    threads that share it (its `core_cpus_list`)."""
+    root = Path("/sys/devices/system/cpu")
+    lists = (root / f"cpu{c}" / "topology" / "core_cpus_list" for c in _allowed())
+    cores = {_cpu_list(p.read_text()) for p in lists if p.exists()}
     if not cores:
         pytest.skip("needs Linux's CPU topology in /sys")
-    return len(cores)
+    return cores
 
 
 @pytest.fixture
@@ -225,10 +241,10 @@ def test_ftgs_sets_the_intra_op_threads_to_the_physical_cores_at_startup(
     variable: str | None,
 ) -> None:
     """§2.4 "Threads and processes", Q-176: a command sets PyTorch's intra-op threads to the
-    number of physical cores at startup, before it runs (here one that fails at once), unless
-    OMP_NUM_THREADS or MKL_NUM_THREADS is set: then the count PyTorch took from the variable
-    stands. --help runs no command and leaves the count alone."""
-    cores = _physical_cores()
+    number of physical cores among the CPUs it may run on at startup, before it runs (here one
+    that fails at once), unless OMP_NUM_THREADS or MKL_NUM_THREADS is set: then the count
+    PyTorch took from the variable stands. --help runs no command and leaves the count alone."""
+    cores = len(_cores())
     other = cores + 1
     monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
     monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
@@ -241,6 +257,51 @@ def test_ftgs_sets_the_intra_op_threads_to_the_physical_cores_at_startup(
     assert _ftgs("export", missing, "--format", "ftgs-if", "--out", tmp_path / "m") == 2
     assert torch.get_num_threads() == (cores if variable is None else other)
     capsys.readouterr()
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_ftgs_counts_the_physical_cores_of_the_cpus_it_may_run_on(
+    tmp_path: Path, count: int
+) -> None:
+    """§2.4 "Threads and processes", Q-176 as answered (#274): in a process restricted to the
+    hardware threads of `count` physical cores, a command sets PyTorch's intra-op threads to
+    `count`, not to the machine's physical cores nor to the CPUs it may run on."""
+    allowed = _allowed()
+    whole = sorted((c for c in _cores() if c <= allowed), key=lambda c: (-len(c), min(c)))
+    if len(whole) < count:
+        pytest.skip(f"needs {count} physical cores whose hardware threads this process may use")
+    cpus = sorted(set().union(*whole[:count]))
+    child = (
+        "import os, sys\n"
+        f"os.sched_setaffinity(0, {cpus})\n"
+        "import torch\n"
+        "from openftgs.cli import main\n"
+        "main(sys.argv[1:])\n"
+        "print(torch.get_num_threads())\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")}
+    missing = tmp_path / "absent"
+    argv = ["export", str(missing), "--format", "ftgs-if", "--out", str(tmp_path / "m")]
+    ran = subprocess.run(
+        [sys.executable, "-c", child, *argv], capture_output=True, text=True, env=env
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert int(ran.stdout) == count
+
+
+def test_physical_cores_counts_the_allowed_cpus_without_a_topology(tmp_path: Path) -> None:
+    """Q-176 (private), as answered (#274): where the topology can't be read (an empty root),
+    the count is the number of CPUs this process may run on, not the machine's CPUs."""
+    from openftgs.cli import _physical_cores as counted
+
+    allowed = _allowed()
+    if len(allowed) < 2 or (os.cpu_count() or 1) <= 2:
+        pytest.skip("needs more than two CPUs, two of them allowed")
+    os.sched_setaffinity(0, sorted(allowed)[:2])  # this thread only, restored below
+    try:
+        assert counted(tmp_path) == 2
+    finally:
+        os.sched_setaffinity(0, allowed)
 
 
 # ftgs train (§2.1; Q-131 to Q-135).
