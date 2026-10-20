@@ -104,20 +104,20 @@ def test_all_lists_exactly_the_public_names(name: str) -> None:
 
 
 def _declared_all(module_file: Path) -> list[str]:
-    """A module's `__all__` as its source assigns it, or [] when it assigns none."""
+    """A module's `__all__` as its source assigns it, or [] when it assigns none (allowed only
+    for a module without public names)."""
     tree = ast.parse(module_file.read_text(encoding="utf-8"))
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
-        ):
-            return list(ast.literal_eval(node.value))
-        if (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "__all__"
-            and node.value is not None
-        ):
-            return list(ast.literal_eval(node.value))
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+            exported = ast.literal_eval(value)
+            assert isinstance(exported, list), module_file.name
+            return exported
     return []
 
 
