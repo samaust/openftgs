@@ -19,7 +19,7 @@ One safetensors file per query kind (Q-207).
 
 Queries: metadata `format` (`ftgs-forward-queries`), `version` (1), `kind`, `producer`, and `queries`, a JSON list of `{id, params}`. Tensors are keyed `<id>/<name>`. FTGS-IF arrays sit under `<id>/model/<ftgs-if key>` with §2.2's dtypes, and `params.model` holds `sh_degree`, `tau0`, `tau1` and `time_unit`. Times are raw τ in float64; images are [H, W, 3] float32.
 
-Answers: metadata `format` (`ftgs-forward-answers`), `version`, `kind`, `producer`, `queries_sha256` and `answers`, a JSON list of `{id, status, message}` with status `ok`, `error` or `not_comparable`. Tensors are keyed `<id>/<name>`.
+Answers: metadata `format` (`ftgs-forward-answers`), `version`, `kind`, `producer`, `queries_sha256` and `answers`, a JSON list of `{id, status, message}` with status `ok`, `error` or `not_comparable` (a kind the adapter doesn't answer, or a setting of the query it cannot honor, §3.3). An answer that is `not_comparable` on one side, with no error on the other, makes its L2 check `not_comparable`. Tensors are keyed `<id>/<name>`.
 
 | Kind | Inputs | Answer |
 | --- | --- | --- |

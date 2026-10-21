@@ -127,7 +127,7 @@ def test_info_problems_names_each_missing_render_convention() -> None:
     """D-73: an info reply reports at least the 12 entries of render_conventions (Q-35)."""
     assert info_problems(INFO) == []
     partial = {**INFO, "render_conventions": {k: v for k, v in CONVENTIONS.items() if k != "near"}}
-    assert info_problems(partial) == ["`render_conventions` lacks near"]
+    assert info_problems(partial) == ["`render_conventions` lacks 1 of its 12 entries: near"]
     assert info_problems([]) == ["the reply is not a JSON object"]
 
 
@@ -256,6 +256,8 @@ def test_runner_fails_the_check_of_an_incomplete_info_reply(
     check = next(c for c in report["checks"] if c["id"] == "L0.info.B")
     assert check["status"] == "fail" and check["pattern"] == "schema violation"
     assert "far" in check["observed"]
+    # §3.3 symptom rule 3: a number with its unit.
+    assert "1 of its 12 entries" in check["symptom"]
     assert report["run"]["tier"] == "different"
 
 
@@ -307,6 +309,24 @@ def test_runner_rerun_reproduces_one_check(
     assert main(["rerun", "L0.fake.A", "--out", str(run_dir)]) == 1
     assert main(["rerun", "L0.info.A", "--out", str(run_dir)]) == 0
     assert main(["rerun", "L0.nothing", "--out", str(run_dir)]) == 2
+
+
+@pytest.mark.parametrize("changed", ["config", "settings"])
+def test_runner_rerun_refuses_inputs_changed_since_the_run(
+    tmp_path: Path, fake_l0: None, changed: str
+) -> None:
+    """§3.3 symptom rule 6: a reproduction uses the exact input files, so `rerun` exits 2 when
+    harness_config.json or the settings file no longer hashes as it did in the run."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"seed": 0}))
+    assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 0
+    run_dir = tmp_path / "run"
+    assert main(["rerun", "L0.fake.B", "--out", str(run_dir)]) == 0
+    if changed == "config":
+        _config(tmp_path, {"optim": {"iterations": 200}})
+    else:
+        settings.write_text(json.dumps({"seed": 1}))
+    assert main(["rerun", "L0.fake.B", "--out", str(run_dir)]) == 2
 
 
 @pytest.mark.parametrize(

@@ -95,6 +95,12 @@ def test_a_perfect_fit_keeps_the_lower_degree() -> None:
     assert fit_trend([0.0, 1.0, 2.0], [4.0, 4.0, 4.0]).model == "constant"
 
 
+def test_a_discrepancy_of_zero_everywhere_is_a_constant_zero() -> None:
+    """§3.3: a probe whose discrepancy is 0 on every item fits the constant 0."""
+    trend = fit_trend([0.0, 1.0, 2.0], [0.0, 0.0, 0.0])
+    assert trend.model == "constant" and trend.coefficients == (0.0,)
+
+
 _IDENTIFIER = re.compile(r"\b[a-z]+_[a-z_]+\(|\.py\b|\bdef\b|\bline \d+")
 
 

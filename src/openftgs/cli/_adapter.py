@@ -15,6 +15,7 @@ Exit codes follow `ftgs`'s (§2.1): 2 for invalid input, 3 for a render that isn
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.metadata
 import json
 import os
@@ -179,23 +180,31 @@ def _drop(data: dict[str, Any], dotted: str) -> None:
     del data[last]
 
 
+def _honored(data: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """`data`, nested as TrainConfig, without the settings TrainConfig doesn't have and the
+    values it refuses on their own, and the dotted keys of those (§3.3: a setting the adapter
+    cannot honor is reported as not comparable, never dropped silently)."""
+    from openftgs.config import TrainConfig, config_to_dict
+
+    honored = copy.deepcopy(dict(data))
+    unknown = _unknown_keys(honored, config_to_dict(TrainConfig()))
+    for dotted in unknown:
+        _drop(honored, dotted)
+    refused = _refused_values(honored)
+    for dotted in refused:
+        _drop(honored, dotted)
+    return honored, unknown + refused
+
+
 def _train(scene: Path, init: Path, config: Path, seed: str, out: Path) -> int:
     """`ftgs train` in process (Q-202). Settings TrainConfig doesn't have, and values it refuses
     on their own, are left out of the run and listed in OUT_DIR/not_comparable.json (§3.3:
     reported, never dropped silently)."""
-    from openftgs.config import TrainConfig, config_to_dict
-
     with cli._as_input_error(f"config {config}", OSError):
         data = json.loads(config.read_text())
         if not isinstance(data, dict):
             raise ValueError("the config must be a JSON object")
-    unknown = _unknown_keys(data, config_to_dict(TrainConfig()))
-    for dotted in unknown:
-        _drop(data, dotted)
-    refused = _refused_values(data)
-    for dotted in refused:
-        _drop(data, dotted)
-    unknown += refused
+    data, unknown = _honored(data)
     with tempfile.TemporaryDirectory() as scratch:
         honored = Path(scratch) / "config.json"
         honored.write_text(json.dumps(data))

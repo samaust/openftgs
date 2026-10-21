@@ -207,9 +207,8 @@ def _status_check(
     symptom = (
         ""
         if not_comparable
-        else f"The {kind} query {query_id} got no usable answer from {', '.join(labels)}: "
-        + ", ".join(f"{k} {v}" for k, v in statuses.items())
-        + "."
+        else f"The {kind} query {query_id} got no usable answer from {len(labels)} of the 2 "
+        "adapters: " + ", ".join(f"{k} {v}" for k, v in statuses.items()) + "."
     )
     return Check(
         id=check_id,

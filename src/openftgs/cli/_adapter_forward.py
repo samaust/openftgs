@@ -5,7 +5,7 @@ own functions, always on the CPU (Q-202, Q-207).
 The files are ftgs-forward-queries and ftgs-forward-answers (Q-207): one kind per file; a
 query's tensors under `<id>/<name>`, its FTGS-IF model under `<id>/model/<key>`; each answer
 carries a status, `ok`, `error` (the query couldn't be answered) or `not_comparable` (a kind
-this adapter doesn't answer).
+this adapter doesn't answer, or a query holding a TrainConfig setting it cannot honor, §3.3).
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
+import re
 import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -24,6 +26,7 @@ from safetensors.torch import save_file
 from torch import Tensor
 
 from openftgs import cli
+from openftgs.cli._adapter import _honored
 from openftgs.config import GrowthConfig, LossConfig, OptimConfig, RelocConfig, config_from_dict
 from openftgs.data import spatial_scale
 from openftgs.density import GradStats, draw_targets, growth_masks, mcmc_split, sampling_score
@@ -41,6 +44,7 @@ __all__ = ["KINDS", "forward"]
 
 _QUERIES = "ftgs-forward-queries"
 _ANSWERS = "ftgs-forward-answers"
+_VERSION_1 = re.compile(r"1(?:\.(?:0|[1-9][0-9]*))?")
 
 _Handler = Callable[[Mapping[str, Any], Mapping[str, Tensor]], dict[str, Tensor]]
 
@@ -190,13 +194,19 @@ def _lr_schedule(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> di
 
 
 def _relocation_math(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    """E11 with D-14's whole clamp: `mcmc_split` applies the upper bound, and the lower one,
-    which the trainer applies to the stored logit, is applied here to σ_new (Q-50)."""
+    """E11 with D-14's whole clamp: `mcmc_split` applies the upper bound, and the lower one is
+    applied here as the trainer applies it to the stored logit (Q-50)."""
     cfg = RelocConfig(**params.get("reloc", {}))
     sigma, scales = mcmc_split(
         tensors["opacity"].double(), tensors["scales"].double(), tensors["n"].long()
     )
-    return {"opacity_new": torch.clamp(sigma, min=cfg.dead_opacity), "scales_new": scales}
+    # Q-50: ô = max(float32(logit σ_new), ô_dead), ô_dead the float32 logit of dead_opacity;
+    # a row the bound binds answers the opacity of ô_dead, the others σ_new.
+    p = cfg.dead_opacity
+    dead = torch.tensor(math.log(p) - math.log1p(-p), dtype=torch.float32)
+    bound = torch.logit(sigma).float() < dead
+    opacity = torch.where(bound, torch.sigmoid(dead.double()), sigma)
+    return {"opacity_new": opacity, "scales_new": scales}
 
 
 def _velocity_init(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:
@@ -318,11 +328,20 @@ KINDS: dict[str, _Handler] = {
 }
 
 
+def _settings(kind: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    """The query's TrainConfig settings, nested as in TrainConfig: grad_stats's `config` subset,
+    the other kinds' `loss`, `optim` and `reloc` sections (Q-207)."""
+    if kind == "grad_stats":
+        return dict(params.get("config", {}))
+    return {k: params[k] for k in ("loss", "optim", "reloc") if k in params}
+
+
 def _read(path: Path) -> tuple[str, list[tuple[str, dict[str, Any], dict[str, Tensor]]]]:
     with safe_open(str(path), framework="pt") as f:
         meta = dict(f.metadata() or {})
         tensors = {k: f.get_tensor(k) for k in f.keys()}  # noqa: SIM118
-    if meta.get("format") != _QUERIES or meta.get("version") != "1":
+    # §2.2: an unknown major version is rejected; any minor version of 1 is read.
+    if meta.get("format") != _QUERIES or not _VERSION_1.fullmatch(str(meta.get("version"))):
         raise ValueError(f"{path}: not a {_QUERIES} v1 file")
     entries = json.loads(meta["queries"])
     queries = []
@@ -335,7 +354,8 @@ def _read(path: Path) -> tuple[str, list[tuple[str, dict[str, Any], dict[str, Te
 
 def forward(queries_path: Path, out: Path, *, backend: str) -> int:
     """Answer every query of the file; a query that fails is an `error` answer, the others
-    are still answered (Q-207)."""
+    are still answered (Q-207). A query with a setting TrainConfig doesn't have, or a value it
+    refuses, is `not_comparable`, naming the settings (§3.3 adapter contract)."""
     with cli._as_input_error(f"forward queries {queries_path}", OSError, KeyError):
         sha = hashlib.sha256(queries_path.read_bytes()).hexdigest()
         kind, queries = _read(queries_path)
@@ -344,6 +364,11 @@ def forward(queries_path: Path, out: Path, *, backend: str) -> int:
     for query_id, params, inputs in queries:
         if handler is None:
             entries.append({"id": query_id, "status": "not_comparable", "message": kind})
+            continue
+        _, unhonored = _honored(_settings(kind, params))
+        if unhonored:
+            message = "settings not honored: " + ", ".join(unhonored)
+            entries.append({"id": query_id, "status": "not_comparable", "message": message})
             continue
         try:
             with torch.no_grad() if kind != "grad_stats" else torch.enable_grad():

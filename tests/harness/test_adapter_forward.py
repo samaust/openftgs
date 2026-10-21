@@ -42,15 +42,22 @@ def _exchange(n: int = 8, sh_degree: int = 2, seed: int = 0) -> Exchange:
     return Exchange(arrays, sh_degree, TAU0, TAU1)
 
 
-def _ask(
+def _answer(
     tmp_path: Path, kind: str, params: dict[str, Any], tensors: dict[str, np.ndarray]
 ) -> Answer:
-    """One query of `kind` through `ftgs-adapter forward`, in process."""
+    """One query of `kind` through `ftgs-adapter forward`, in process, whatever its status."""
     queries = tmp_path / f"{kind}.q.safetensors"
     sha = write_queries(queries, kind, [Query("q0", params, tensors)])
     answers = tmp_path / f"{kind}.a.safetensors"
     assert _adapter.main(["--backend", "gsplat", "forward", str(queries), str(answers)]) == 0
-    answer = read_answers(answers, kind=kind, queries_sha256=sha)["q0"]
+    return read_answers(answers, kind=kind, queries_sha256=sha)["q0"]
+
+
+def _ask(
+    tmp_path: Path, kind: str, params: dict[str, Any], tensors: dict[str, np.ndarray]
+) -> Answer:
+    """One query of `kind` through `ftgs-adapter forward`, answered ok."""
+    answer = _answer(tmp_path, kind, params, tensors)
     assert answer.status == "ok", answer.message
     return answer
 
@@ -198,12 +205,19 @@ def _e11(sigma: float, a: float, n: int) -> tuple[float, float]:
         for i in range(1, n + 1)
         for k in range(i)
     )
-    return min(max(new, 0.005), 1.0 - 2.0**-23), a * sigma / denominator
+    return min(max(new, _sigma_dead()), 1.0 - 2.0**-23), a * sigma / denominator
+
+
+def _sigma_dead(p: float = 0.005) -> float:
+    """D-14's lower bound as Q-50 stores it: the opacity of ô_dead, the float32 logit of p."""
+    logit = float(np.float32(math.log(p) - math.log1p(-p)))
+    return 1.0 / (1.0 + math.exp(-logit))
 
 
 def test_relocation_math_is_e11_with_the_whole_clamp(tmp_path: Path) -> None:
-    """E11, D-14: σ_new = 1 − (1 − σ)^(1/n) clamped to [0.005, 1 − 2⁻²³] (the lower bound too,
-    Q-50), a_new from the unclamped σ_new; tolerance 1e-5 relative."""
+    """E11, D-14: σ_new = 1 − (1 − σ)^(1/n) clamped to [0.005, 1 − 2⁻²³], the lower bound on
+    the float32 logit as the trainer stores it (Q-50), a_new from the unclamped σ_new;
+    tolerance 1e-5 relative."""
     cases = [(0.75, 0.3, 2), (0.5, 1.0, 1), (0.9, 0.05, 7), (0.01, 0.2, 51), (0.999, 2.0, 3)]
     sigma = np.array([c[0] for c in cases])
     scales = np.array([[c[1], 2 * c[1], 0.5 * c[1]] for c in cases])
@@ -213,7 +227,9 @@ def test_relocation_math_is_e11_with_the_whole_clamp(tmp_path: Path) -> None:
         new, a_new = _e11(s, a, k)
         assert float(got.tensors["opacity_new"][row]) == pytest.approx(new, rel=1e-5)
         assert float(got.tensors["scales_new"][row, 0]) == pytest.approx(a_new, rel=1e-5)
-    assert float(got.tensors["opacity_new"][3]) == 0.005  # the lower bound binds (σ = 0.01, n = 51)
+    # The lower bound binds (σ = 0.01, n = 51): the opacity of ô_dead, not 0.005 itself.
+    assert float(got.tensors["opacity_new"][3]) == pytest.approx(_sigma_dead(), rel=1e-12)
+    assert _sigma_dead() != 0.005
 
 
 def test_velocity_init_is_e15(tmp_path: Path) -> None:
@@ -352,3 +368,81 @@ def test_a_query_that_fails_is_an_error_answer_and_the_others_are_answered(
     assert (
         read_answers(out, kind="no_such_kind", queries_sha256=sha)["q0"].status == "not_comparable"
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "params", "tensors", "unhonored"),
+    [
+        (
+            "lr_schedule",
+            {"optim": {"not_a_field": 1}, "spatial_scale": 1.0, "frame_dt": 0.1},
+            {"iterations": np.array([1, 2], dtype=np.int64)},
+            "optim.not_a_field",
+        ),
+        (
+            "relocation_math",
+            {"reloc": {"dead_opacity": 1.5}},
+            {"opacity": np.array([0.5]), "scales": np.ones((1, 3)), "n": np.array([2])},
+            "reloc.dead_opacity",
+        ),
+        (
+            "relocation_score",
+            {"reloc": {"elsewhere": 0.1}},
+            {
+                "opacity": np.array([0.5]),
+                "g_sum": np.zeros(1, np.float32),
+                "count": np.zeros(1, np.int32),
+            },
+            "reloc.elsewhere",
+        ),
+    ],
+)
+def test_a_setting_the_adapter_cannot_honor_is_a_not_comparable_answer(
+    tmp_path: Path,
+    kind: str,
+    params: dict[str, Any],
+    tensors: dict[str, np.ndarray],
+    unhonored: str,
+) -> None:
+    """§3.3 adapter contract: a TrainConfig setting the adapter doesn't have, or a value it
+    refuses, makes the query's answer `not_comparable`, naming the setting, never an error."""
+    answer = _answer(tmp_path, kind, params, tensors)
+    assert answer.status == "not_comparable"
+    assert unhonored in answer.message
+
+
+def test_grad_stats_names_an_unhonored_setting_of_its_config_subset(tmp_path: Path) -> None:
+    """§3.3 adapter contract: grad_stats carries a TrainConfig subset, whose settings are named
+    by their dotted TrainConfig keys."""
+    params, tensors = _with_model(
+        _exchange(),
+        width=8,
+        height=8,
+        iteration=1,
+        config={"loss": {"lambda_perc": 0.0, "not_a_field": 1.0}},
+    )
+    answer = _answer(tmp_path, "grad_stats", params, tensors)
+    assert answer.status == "not_comparable"
+    assert "loss.not_a_field" in answer.message
+
+
+@pytest.mark.parametrize(("version", "read"), [("1.1", True), ("2", False)])
+def test_forward_reads_any_minor_version_of_major_1(
+    tmp_path: Path, version: str, read: bool
+) -> None:
+    """§2.2: readers reject an unknown major version, so a 1.1 queries file is answered and a
+    version 2 file is an input error (exit 2)."""
+    from safetensors import safe_open
+    from safetensors.numpy import save_file
+
+    queries = tmp_path / "q.safetensors"
+    tensors = {"g": np.zeros(2, np.float32), "scales": np.ones((2, 3), np.float32)}
+    params = {"spatial_scale": 1.0, "grad_threshold": 0.5, "split_scale": 0.01, "n_max": 9}
+    write_queries(queries, "growth_decisions", [Query("q0", params, tensors)])
+    with safe_open(str(queries), framework="np") as f:
+        meta = dict(f.metadata() or {})
+        arrays = {k: f.get_tensor(k) for k in f.keys()}  # noqa: SIM118
+    save_file(arrays, str(queries), {**meta, "version": version})
+    out = tmp_path / "a.safetensors"
+    code = _adapter.main(["--backend", "gsplat", "forward", str(queries), str(out)])
+    assert code == (0 if read else 2)

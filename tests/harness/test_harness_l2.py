@@ -19,6 +19,9 @@ def test_l2_passes_with_openftgs_as_both_implementations(tmp_path: Path) -> None
     """Every kind, random and edge queries, at §3.3's tolerances."""
     code, report = run_harness(tmp_path, "L2", a=openftgs(), b=openftgs(), settings=SETTINGS)
     assert code == 0, [c["id"] for c in report["checks"] if c["status"] != "pass"]
+    # Every query compared: a not-comparable answer fails nothing, so the exit code alone
+    # wouldn't show one.
+    assert {c["status"] for c in checks(report, "L2.forward.").values()} == {"pass"}
     kinds = {c["id"].split(".")[2] for c in checks(report, "L2.forward.").values()}
     assert kinds == set(QUERY_KINDS)
     assert len(checks(report, "L2.forward.motion.")) == 3  # two random, one edge
@@ -158,3 +161,55 @@ def test_the_growth_edge_query_puts_the_cap_inside_a_tie() -> None:
     top = np.flatnonzero(g == g.max())
     room = edge.params["n_max"] - g.size
     assert top.size == 7 and room == 3
+
+
+def test_the_losses_queries_predict_only_colors_a_render_can_produce() -> None:
+    """E2 clamps a color at 0 and E7 leaves it unclamped only above 1, so a losses query's
+    prediction lies in [0, ∞): none below 0, some above 1."""
+    from ftgs_harness.queries import generate
+
+    preds = [q.tensors["pred"] for q in generate("losses", 8, seed=0, config={})]
+    assert min(float(p.min()) for p in preds) >= 0.0
+    assert max(float(p.max()) for p in preds) > 1.0
+
+
+def test_queries_with_a_setting_the_adapters_cannot_honor_are_not_comparable(
+    tmp_path: Path,
+) -> None:
+    """§3.3 adapter contract: a harness_config setting the adapter cannot honor is reported as
+    not comparable, never silently dropped; it fails nothing, and the other kinds are judged."""
+    code, report = run_harness(
+        tmp_path,
+        "L2",
+        a=openftgs(),
+        b=openftgs(),
+        settings=SETTINGS,
+        config={"loss": {"not_a_field": 1.0}},
+    )
+    assert code == 0
+    for kind in ("losses", "grad_stats"):
+        found = checks(report, f"L2.forward.{kind}.")
+        assert found and {c["status"] for c in found.values()} == {"not_comparable"}
+        messages = next(iter(found.values()))["localization"]["adapter_messages"]
+        assert all("loss.not_a_field" in m for m in messages.values())
+    assert {c["status"] for c in checks(report, "L2.forward.motion.").values()} == {"pass"}
+
+
+# A private test of the answer-status check: no fault of the wrapper makes an adapter answer
+# `error`, so it is built from two answers directly.
+def test_a_query_without_a_usable_answer_says_how_many_adapters_gave_none() -> None:
+    """§3.3 symptom rule 3: the symptom has a number with its unit, the adapters without a
+    usable answer out of the two."""
+    from types import SimpleNamespace
+
+    from ftgs_harness.formats import Answer
+    from ftgs_harness.level2 import _status_check
+
+    answers = {
+        "A": {"q0": Answer("q0", "ok", "", {})},
+        "B": {"q0": Answer("q0", "error", "boom", {})},
+    }
+    ctx = SimpleNamespace(repro=lambda check_id: f"ftgs-harness rerun {check_id}")
+    check = _status_check(ctx, "L2.forward.motion.q0", "motion", ["B"], answers, "q0", {})  # type: ignore[arg-type]
+    assert check.status == "fail" and check.pattern == "crash"
+    assert "1 of the 2 adapters" in check.symptom
