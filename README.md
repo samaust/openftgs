@@ -1,6 +1,8 @@
-openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors.
-
 # openftgs
+
+[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml)
+
+openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors.
 
 Python package `openftgs`, under the Apache-2.0 license, with the command-line tool `ftgs`.
 
