@@ -277,10 +277,10 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # Global PyTorch flags around a training iteration (Q-73).
 
-# Q-173: cuDNN autotuning during a training iteration that isn't deterministic, turned on only
-# when B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +4.3 % and
-# −1.0 % at its two sizes (Calibration data, #228).
-_AUTOTUNE = False
+# Q-173 (changed, #326), Q-223: cuDNN autotuning during a training iteration that isn't
+# deterministic (§2.4 rule 2, D-52). B-4 measured it alone at +4.3 % and −1.0 % (#228); with the
+# perceptual network's NCHW inputs (_NCHWLPIPSLoss) at +7.2 % and +3.9 % (Calibration data).
+_AUTOTUNE = True
 
 
 @contextlib.contextmanager
@@ -315,9 +315,19 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
 
 # Q-173: the training perceptual network's weights in channels-last memory, turned on only when
 # B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
-# at its two sizes (Calibration data, #228). Its inputs are channels-last already: `LPIPSLoss`
-# views a render's [..., H, W, 3] batch first.
+# at its two sizes (Calibration data, #228), with the inputs channels-last as `LPIPSLoss` views
+# a render's [..., H, W, 3] batch first; they are NCHW since #326 (_NCHWLPIPSLoss).
 _CHANNELS_LAST_WEIGHTS = False
+
+
+# Q-173 (changed, #326), Q-223: with autotuning, B-4 measured NCHW inputs the fastest layout in
+# TF32 and IEEE float32 and slower than channels-last in bfloat16, which keeps the plain view.
+class _NCHWLPIPSLoss(LPIPSLoss):
+    """LPIPS with its two images copied to contiguous NCHW memory, the trainer's network under
+    `perc_precision` "tf32" and "ieee". The copy is exact (§2.4 rule 2); the evaluator's
+    networks stay plain."""
+
+    _nchw_inputs = True
 
 
 # Q-172: autocast is local to the perceptual network, which only the trainer builds this way.
@@ -519,10 +529,10 @@ class Trainer:
         self._training = [i for i, r in enumerate(dataset.records) if r.split == "train"]
         self._background = torch.tensor(cfg.background, dtype=torch.float32, device=self._device)
         # D-77: one perceptual network, built only when its weight is positive; D-52: in bfloat16
-        # when asked (Q-172).
+        # when asked (Q-172), otherwise with NCHW inputs (Q-223).
         self._perceptual: LPIPSLoss | None = None
         if cfg.loss.lambda_perc > 0.0:
-            network = _Bf16LPIPSLoss if cfg.perf.perc_precision == "bf16" else LPIPSLoss
+            network = _Bf16LPIPSLoss if cfg.perf.perc_precision == "bf16" else _NCHWLPIPSLoss
             perceptual = network(cfg.loss.perc_net).to(self._device)
             if _CHANNELS_LAST_WEIGHTS:  # Q-173
                 perceptual = perceptual.to(memory_format=torch.channels_last)

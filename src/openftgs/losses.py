@@ -149,6 +149,10 @@ class LPIPSLoss(torch.nn.Module):
     the lpips_vgg_raw metric (Q-58). The network is lpips 0.1.4's, frozen and kept in
     evaluation mode (Q-41)."""
 
+    # Q-223: a subclass sets it to copy the channels-last batch-first views to contiguous NCHW
+    # memory before the network, an exact copy (the trainer's float32 networks, #326).
+    _nchw_inputs = False
+
     def __init__(self, net: Literal["vgg", "alex"] = "vgg") -> None:
         super().__init__()
         if net not in ("vgg", "alex"):
@@ -178,6 +182,8 @@ class LPIPSLoss(torch.nn.Module):
             _fail(f"map_inputs must be a bool, got {map_inputs!r}")
         _check_pair(pred, gt)
         x, y = _batch_first(pred), _batch_first(gt)
+        if self._nchw_inputs:
+            x, y = x.contiguous(), y.contiguous()
         if map_inputs:
             # D-68: the network's documented input range.
             x, y = 2 * x - 1, 2 * y - 1
