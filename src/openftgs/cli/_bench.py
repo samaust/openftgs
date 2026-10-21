@@ -1423,7 +1423,8 @@ def _data_config(
 class _AutoEstimate:
     """What "auto" measures after a warm-up iteration on CUDA (Q-99), in bytes: the free GPU
     memory, `mem_get_info`'s plus what the allocator holds unused; what growth to N_max adds;
-    the cache's size; the memory allocated and reserved then; and the device's total."""
+    the cache's size; the memory allocated and reserved then, whose difference is the
+    iteration's working memory (Q-223); and the device's total."""
 
     free: int
     growth: int
@@ -1433,9 +1434,15 @@ class _AutoEstimate:
     total: int
 
     @property
+    def reserve(self) -> int:
+        """Q-223: the working memory the warm-up iteration left in the allocator."""
+        return self.reserved - self.allocated
+
+    @property
     def limit(self) -> float:
-        """D-51, Q-99: the largest cache "auto" puts on the GPU, ½·free − growth."""
-        return 0.5 * self.free - self.growth
+        """D-51, Q-99, Q-223: the largest cache "auto" puts on the GPU, ½·(free − reserve) −
+        growth, as `openftgs.train`'s rule."""
+        return 0.5 * (self.free - self.reserve) - self.growth
 
     @property
     def fits(self) -> bool:
@@ -1456,12 +1463,13 @@ class _AutoEstimate:
         }
 
     def margin(self, *, peak_reserved: int) -> dict[str, float]:
-        """Q-99's note (Q-189): what a run with the cache on the GPU took after the warm-up
-        iteration beyond the cache and the growth, its peak reserved memory less what was
-        allocated then, and that as a share of the ½·free the rule leaves for it; above 1, a cache
-        at the rule's limit wouldn't have fit."""
-        beyond = peak_reserved - self.allocated - self.cache - self.growth
-        return {"beyond_estimate_bytes": beyond, "margin_used": beyond / (0.5 * self.free)}
+        """Q-99's note (Q-189, Q-223): what a run with the cache on the GPU took after the
+        warm-up iteration beyond the cache, the growth and the reserve, its peak reserved memory
+        less what was reserved then, and that as a share of the ½·(free − reserve) the rule
+        leaves for it; above 1, a cache at the rule's limit wouldn't have fit."""
+        beyond = peak_reserved - self.reserved - self.cache - self.growth
+        margin = 0.5 * (self.free - self.reserve)
+        return {"beyond_estimate_bytes": beyond, "margin_used": beyond / margin}
 
 
 def _data_figures(
@@ -1521,7 +1529,8 @@ def _data_trainer(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> T
 def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
     """Q-99, Q-189: what "auto" measures on CUDA, taken as it takes it: a trainer of B-6's
     configuration at `n` rows runs its first iteration on decoded PNGs, as "auto" does, and the
-    free memory and growth are read when that iteration returns."""
+    free memory, the working memory left reserved (Q-223) and growth are read when that
+    iteration returns."""
     import torch
 
     from openftgs.data import FrameCache
@@ -1606,9 +1615,10 @@ def _data(ctx: _Context) -> _Result:
             estimate = _probe(ctx, volume, n)
             if not estimate.fits:
                 reason = (
-                    f'"auto" would memory-map the cache (Q-99): its {estimate.cache / 1e9:.2f} GB '
-                    f"exceed half the {estimate.free / 1e9:.2f} GB free after a warm-up "
-                    f"iteration less growth's {estimate.growth / 1e9:.3f} GB"
+                    f'"auto" would memory-map the cache (Q-99, Q-223): its '
+                    f"{estimate.cache / 1e9:.2f} GB exceed half the {estimate.free / 1e9:.2f} GB "
+                    f"free after a warm-up iteration less its {estimate.reserve / 1e9:.2f} GB "
+                    f"of working memory, less growth's {estimate.growth / 1e9:.3f} GB"
                 )
                 skipped.append({"case": case, "reason": reason, "estimate": estimate.figures()})
                 continue
@@ -1632,8 +1642,9 @@ def _data(ctx: _Context) -> _Result:
         ),
         "frame_cache": "built before timing",
         "gpu": (
-            'measured where "auto" would place the cache on the GPU (Q-99): a trainer decoding '
-            "PNGs runs one iteration first, and the free memory and growth are read after it"
+            'measured where "auto" would place the cache on the GPU (Q-99, Q-223): a trainer '
+            "decoding PNGs runs one iteration first, and the free memory, the working memory it "
+            "left reserved and growth are read after it"
         ),
         "warmup": _DATA_TIMED[0] - 1,
         "timed": list(_DATA_TIMED),
