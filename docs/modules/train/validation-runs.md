@@ -37,6 +37,9 @@ The reference images themselves have flaws, seen by eye (owner, 2026-10-21): som
 | 10 | B-7 on kitchen | `ftgs bench render $K/scene.json --model $M/kitchen/default/checkpoint --out $M/bench/B-7-kitchen.json` | 30e4885 | 5 min 34 s | 187.7 / 180.7 FPS (index on / off) | §3.4 B-7 on kitchen |
 | 7 | B-6 on kitchen | `ftgs bench data $K/scene.json --out $M/bench/B-6-kitchen.json` | 30e4885 | 2 min 20 s | at most 0.044 % | §3.4 B-6 on kitchen |
 | 9 | B-8 conversion | `ftgs bench convert $K/scene.json --out $M/bench/B-8-convert-kitchen.json` | 30e4885 | 1 min 24 s | 40.8 / 41.0 s | §3.4 B-8, conversion |
+| 11 | courtyard convert and cache | `ftgs convert opencv-yaml $D/enerf_outdoor/courtyard $M/courtyard/scene --fps 60 --frames 300 --resize 1.0 --test-camera 0009`; `ftgs cache $M/courtyard/scene/scene.json` | 3a3f075, a0b584e | 20 min 40 s; 34 s | 31.73 GB cache | B-8 beside it, courtyard |
+| 12 | courtyard init and default | `ftgs init roma $M/courtyard/scene/scene.json $M/courtyard/init.safetensors`; `ftgs train $M/courtyard/scene/scene.json --init $M/courtyard/init.safetensors --out $M/courtyard/default` | a0b584e | 27 min 19 s; 83 min 9 s | 300,000 points; PSNR 30.27 dB on 0009, LPIPS-VGG 0.2321; N reaches 3,000,000 at iteration 7,700 | Growth and E16 on courtyard; B-8 beside it |
+| 13 | B-7 on courtyard | `ftgs bench render $M/courtyard/scene/scene.json --model $M/courtyard/default/checkpoint --out $M/bench/B-7-courtyard.json` | a0b584e | 5 min 38 s | 220.5 / 192.5 FPS (index on / off) | §3.4 B-7 on courtyard |
 | 8 | B-8 initialization | `ftgs bench init $K/scene.json --out $M/bench/B-8-init-kitchen.json` | 30e4885 | 30 min 14 s | 1,811.8 s, 3,900 pairs | §3.4 B-8, initialization |
 
 Kitchen's default run reached N_max inside the growth window, so the τ_pos = 10⁻⁴ run of Q-220's first decision is replaced by one at τ_pos = 4·10⁻⁴ (Q-220 as answered).
