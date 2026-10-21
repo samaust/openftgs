@@ -41,8 +41,8 @@ import torch
 
 from openftgs.io import load_checkpoint
 
-_BINS = 10
-_HIGH = 0.9  # the share of primitives above it, as S-5 counts them
+_BINS = 10  # Q-220: D-10's opacity trace as a 10-bin histogram of σ over [0, 1]
+_HIGH = 0.9  # Q-220: the share of primitives above it, as S-5 counts them
 
 
 def _n_trace(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
@@ -162,7 +162,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="the summary of a ftgs train run directory")
     parser.add_argument("run", type=Path, help="the run directory (ftgs train --out)")
     parser.add_argument("--out", type=Path, help="where to write it (RUN_DIR/SUMMARY.json)")
-    parser.add_argument("--block", type=int, default=1000, help="iterations per loss block")
+    parser.add_argument(
+        "--block", type=int, default=1000, help="iterations per loss block"
+    )  # Q-220
     parser.add_argument("--time", type=Path, help="the report of /usr/bin/time -v")
     parser.add_argument("--gpu-log", type=Path, help="nvidia-smi's memory.used samples")
     args = parser.parse_args(argv)

@@ -86,11 +86,12 @@ def test_synth_window_holds_the_test_views_fastest_frames() -> None:
         assert n0 <= start and start + 10 <= n0 + length
 
 
-def test_synth_window_longer_than_the_scene_exits_2() -> None:
+def test_synth_window_outside_10_to_the_scenes_frames_exits_2() -> None:
     """A window longer than the scene's frames, or shorter than D-69's 10, is exit 2."""
     root = _root()
-    camera = str(_truth(root)["test_camera"])
-    for length in (9, 13):
+    truth = _truth(root)
+    camera = str(truth["test_camera"])
+    for length in (9, int(truth["num_frames"]) + 1):
         done = _run(
             "synth_window.py", root / "ground_truth" / SCENE, "--camera", camera, "--length", length
         )

@@ -58,7 +58,7 @@ def window(scene: Path, camera: str, length: int, layout: str = "selfcap") -> di
             yield torch.from_numpy(np.array(Image.open(path).convert("RGB")))
 
     start = fastest_frames(images(), count=_FASTEST)
-    n0 = min(max(start + _FASTEST // 2 - length // 2, 0), frames - length)
+    n0 = min(max(start + _FASTEST // 2 - length // 2, 0), frames - length)  # Q-219
     return {
         "camera": camera,
         "frames": frames,

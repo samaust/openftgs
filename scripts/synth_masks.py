@@ -75,7 +75,7 @@ def write_masks(
         "mask_source": (
             f"openftgs-synth {version} ground_truth/{scene.name}/masks/{gt['name']} (exact)"
         ),
-        "masks_approximate": False,
+        "masks_approximate": False,  # Q-219: copied from the ground truth, so exact
     }
     out.mkdir(parents=True, exist_ok=True)
     for path in sources:
