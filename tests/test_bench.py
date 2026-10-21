@@ -400,6 +400,37 @@ def test__b7_camera_is_the_test_camera_at_1920_by_1080(scene: Path, tested_scene
         )
 
 
+def test__b7_times_on_an_unsynchronized_scene_are_the_b7_cameras_own(
+    tmp_path: Path, tested_scene: Path
+) -> None:
+    """Q-221: where the scene's distinct training times outnumber the B-7 camera's frames, as
+    on an unsynchronized scene, B-7 renders at that camera's own timestamps; on a synchronized
+    scene it keeps every distinct training time (Q-194). Here three ring cameras of three frames
+    at 30 FPS are offset by 0, 4 and 8 ms, the third in the test split: 6 distinct training
+    times, and the test camera's 8, 41.33… and 74.67 ms."""
+    from openftgs.cli._bench import _b7_camera, _b7_times
+    from openftgs.data import MultiViewVideo
+
+    cams = ring(3, radius=4.0, elevation=1.0, width_px=48, height_px=32, focal=44.0)
+    span = TimeNormalizer(0.0, 2.0 / 30.0 + 0.008)  # the ground truth covers every camera's times
+    model = random_model(16, seed=0, sh_degree=1, time=span, spread=0.6)
+    offsets = (0.0, 0.004, 0.008)
+    images = [
+        (cam, k / 30.0 + offsets[c], "test" if c == 2 else "train")
+        for k in range(3)
+        for c, cam in enumerate(cams)
+    ]
+    video = MultiViewVideo.from_manifest(write_scene(tmp_path / "unsync", model, images))
+    times, chosen = _b7_times(video, _b7_camera(video))
+    assert times == pytest.approx([0.008, 1 / 30 + 0.008, 2 / 30 + 0.008], abs=1e-12)
+    assert "Q-221" in chosen
+
+    video = MultiViewVideo.from_manifest(tested_scene)
+    times, chosen = _b7_times(video, _b7_camera(video))
+    assert times == pytest.approx([0.0, 1 / 30, 2 / 30], abs=1e-12)
+    assert "Q-194" in chosen
+
+
 def test__spread_times_spread_a_request_of_k_times_over_the_scene() -> None:
     """Q-194: a request of k times takes the timestamps round(j(F − 1)/(k − 1)), rounded half
     up, j = 0 … k − 1, and the middle one for k = 1; the swept sizes are 1, 2, 3, 4, 6, 8, 12,
