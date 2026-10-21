@@ -19,6 +19,9 @@ def test_l2_passes_with_openftgs_as_both_implementations(tmp_path: Path) -> None
     """Every kind, random and edge queries, at §3.3's tolerances."""
     code, report = run_harness(tmp_path, "L2", a=openftgs(), b=openftgs(), settings=SETTINGS)
     assert code == 0, [c["id"] for c in report["checks"] if c["status"] != "pass"]
+    # Every query compared: a not-comparable answer fails nothing, so the exit code alone
+    # wouldn't show one.
+    assert {c["status"] for c in checks(report, "L2.forward.").values()} == {"pass"}
     kinds = {c["id"].split(".")[2] for c in checks(report, "L2.forward.").values()}
     assert kinds == set(QUERY_KINDS)
     assert len(checks(report, "L2.forward.motion.")) == 3  # two random, one edge
