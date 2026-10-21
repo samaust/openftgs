@@ -107,3 +107,46 @@ def test_probes_pass_with_openftgs_as_both_implementations(tmp_path: Path) -> No
     assert {c["id"].split(".")[2] for c in checks(report, "L1.render.P").values()} == {
         f"P{k}" for k in range(1, 11)
     }
+
+
+# A private test of the probe analysis: it holds which item names a failing probe's pattern
+# when its items failed on different measures.
+def test_probes_name_a_failing_probe_by_its_lowest_psnr_item(tmp_path: Path) -> None:
+    """§3.3 L1 probes: the probe takes its worst item's pattern, the item of lowest PSNR,
+    whichever measure failed each item (PSNR, where low is bad, or max |Δ|, where high is)."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from ftgs_harness import probes
+    from ftgs_harness.checks import Check
+
+    probe = probes.PROBES[0]  # P1, neither time-swept nor view-dependent
+    _, items = probe.build(3)
+    ids = [e.item.id for e in items]
+    base = np.random.default_rng(0).random((16, 24, 3)).astype(np.float32)
+    alpha = np.ones((*base.shape[:2], 1), np.float32)
+    a = {i: (base, alpha) for i in ids}
+    b = {**a, ids[0]: (base + 0.002, alpha), ids[1]: (base + 0.02, alpha)}  # ≈ 54 dB, ≈ 34 dB
+
+    def failed(i: int, metric: str, observed: float, pattern: str) -> Check:
+        return Check(
+            id=f"L1.render.P1.{ids[i]}",
+            level="L1",
+            status="fail",
+            spec_refs=probe.spec_refs,
+            inputs={"items": [ids[i]]},
+            metric=metric,
+            expected="",
+            observed=observed,
+            symptom="s",
+            pattern=pattern,
+        )
+
+    found = [
+        failed(0, "max_abs_A_vs_B", 0.002, "offset"),
+        failed(1, "psnr_A_vs_B_db", 34.0, "color shift"),
+    ]
+    ctx = SimpleNamespace(out=tmp_path, run_dir=tmp_path)
+    probes._analyse(ctx, probe, items, a, b, found)  # type: ignore[arg-type]
+    assert {c.pattern for c in found} == {"color shift"}

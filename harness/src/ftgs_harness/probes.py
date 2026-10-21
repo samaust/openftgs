@@ -353,8 +353,13 @@ def _analyse(
                 f"{check.expected})."
             )
     else:
-        # One pattern for the probe: its worst item's, so the mismatch points at one quantity.
-        worst = min(failing, key=lambda c: c.observed if isinstance(c.observed, float) else -1.0)
+        # One pattern for the probe: its worst item's, the lowest PSNR whichever measure failed
+        # each item, so the mismatch points at one quantity.
+        def item_psnr(check: Check) -> float:
+            item_id = check.inputs["items"][0]
+            return measure(a[item_id][0], b[item_id][0], a[item_id][1], b[item_id][1]).psnr_db
+
+        worst = min(failing, key=item_psnr)
         pattern = worst.pattern or "color shift"
         if probe.view and pattern == "color shift":
             diffs = np.array([measures[e.item.id].color_diff for e in items])
