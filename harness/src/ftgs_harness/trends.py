@@ -48,7 +48,9 @@ def fit_trend(x: npt.ArrayLike, y: npt.ArrayLike) -> Trend:
             break
         coeffs = np.polynomial.polynomial.polyfit(xs, ys, degree)
         rss = float(((np.polynomial.polynomial.polyval(xs, coeffs) - ys) ** 2).sum())
-        floor = (1e-3 * scale) ** 2 * n  # a fit within 0.1 % of the data is exact
+        # A fit within 0.1 % of the data is exact; the floor stays positive when the data are
+        # all 0, whose square underflows.
+        floor = max((1e-3 * scale) ** 2 * n, float(np.finfo(np.float64).tiny))
         bic = n * math.log(max(rss, floor) / n) + (degree + 1) * math.log(max(n, 2))
         if best is None or bic < best[0] - 1e-9:
             best = (bic, degree, coeffs)
