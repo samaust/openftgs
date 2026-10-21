@@ -160,6 +160,16 @@ def test_the_growth_edge_query_puts_the_cap_inside_a_tie() -> None:
     assert top.size == 7 and room == 3
 
 
+def test_the_losses_queries_predict_only_colors_a_render_can_produce() -> None:
+    """E2 clamps a color at 0 and E7 leaves it unclamped only above 1, so a losses query's
+    prediction lies in [0, ∞): none below 0, some above 1."""
+    from ftgs_harness.queries import generate
+
+    preds = [q.tensors["pred"] for q in generate("losses", 8, seed=0, config={})]
+    assert min(float(p.min()) for p in preds) >= 0.0
+    assert max(float(p.max()) for p in preds) > 1.0
+
+
 def test_queries_with_a_setting_the_adapters_cannot_honor_are_not_comparable(
     tmp_path: Path,
 ) -> None:

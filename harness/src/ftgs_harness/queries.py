@@ -93,7 +93,8 @@ def _losses(
     gt = rng.random((48, 48, 3)).astype(np.float32)
     noise = 0.0 if edge else 0.1
     tensors["gt"] = gt
-    tensors["pred"] = np.clip(gt + rng.normal(scale=noise, size=gt.shape), -0.1, 1.2).astype(
+    # E2 clamps a render's colors at 0 and E7 leaves them unclamped above 1: pred in [0, 1.2].
+    tensors["pred"] = np.clip(gt + rng.normal(scale=noise, size=gt.shape), 0.0, 1.2).astype(
         np.float32
     )
     tensors["t"] = np.array(rng.uniform(_TAU0, _TAU1))
