@@ -259,6 +259,33 @@ def test_runner_fails_the_check_of_an_incomplete_info_reply(
     assert report["run"]["tier"] == "different"
 
 
+@pytest.mark.parametrize(
+    ("settings", "reduced", "named"),
+    [
+        ({}, False, []),
+        ({"l2": {"queries": 2}}, True, ["case sizes"]),
+        ({"l2": {"lpips": False}}, True, ["LPIPS"]),
+        ({"l1": {"items": 10}, "l2": {"lpips": False}}, True, ["case sizes", "LPIPS"]),
+    ],
+)
+def test_runner_marks_smaller_case_sizes_or_lpips_off_as_a_reduced_run(
+    tmp_path: Path, fake_l0: None, settings: dict[str, Any], reduced: bool, named: list[str]
+) -> None:
+    """Q-203, Q-212: a run is reduced when a case size is below §3.3's or `l2.lpips` is false,
+    whatever levels it ran; report.md's header names what is reduced, and a reduced run fails
+    nothing by being reduced."""
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(settings))
+    assert _run(tmp_path, "--levels", "L0", "--settings", str(path)) == 0
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert report["run"]["settings"]["reduced"] is reduced
+    md = (tmp_path / "run" / "report.md").read_text().splitlines()
+    header = next(line for line in md if line.startswith("Started "))
+    assert ("reduced" in header) is reduced
+    for what in ("case sizes", "LPIPS"):
+        assert (what in header) is (what in named), header
+
+
 def test_runner_rerun_reproduces_one_check(
     tmp_path: Path,
     fake_l0: None,
