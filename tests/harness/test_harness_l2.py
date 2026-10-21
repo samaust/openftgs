@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """L2 · forward behaviour on random inputs (§3.3 L2; Q-207, Q-208, Q-209), with openftgs as
-both implementations and with the fault-injecting wrapper as B. LPIPS is off (l2.lpips), so no
-weights are downloaded."""
+both implementations and with the fault-injecting wrapper as B. LPIPS is off (l2.lpips), or
+left out of the losses queries by the wrapper's lpips_off, so no weights are downloaded."""
 
 from pathlib import Path
 
@@ -58,10 +58,11 @@ def test_ok_answers_without_a_tensor_of_their_kind_are_schema_violations(
     assert code == 1
     for kind, name in first.items():
         found = checks(report, f"L2.forward.{kind}.")
-        assert len(found) == 3, kind
+        assert len(found) == 3, kind  # two random, one edge
         for check in found.values():
             assert check["status"] == "fail" and check["pattern"] == "schema violation"
             assert check["observed"] == "; ".join(f"{label} lacks {name}" for label in lacking)
+            assert check["symptom"].endswith(f"lacks 1 ({name}).")
     sampling = checks(report, "L2.forward.relocation_sampling.")
     assert sampling and all(c["status"] == "pass" for c in sampling.values())
 
@@ -82,7 +83,7 @@ def test_losses_with_lpips_on_fail_without_lpips_vgg(tmp_path: Path) -> None:
     )
     assert code == 1
     losses = checks(report, "L2.forward.losses.")
-    assert len(losses) == 2
+    assert len(losses) == 2  # one random, one edge
     for check in losses.values():
         assert check["status"] == "fail" and check["pattern"] == "schema violation"
         assert check["observed"] == "A lacks lpips_vgg; B lacks lpips_vgg"

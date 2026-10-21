@@ -126,15 +126,15 @@ def main() -> int:
             Path(args[1]).write_text(json.dumps(request))
         if command == "forward" and "lpips_off" in faults:
             queries_path = Path(args[0])
-            original_sha = hashlib.sha256(queries_path.read_bytes()).hexdigest()
             tensors, meta = _read(queries_path)
             if meta.get("kind") == "losses":
+                original_sha = hashlib.sha256(queries_path.read_bytes()).hexdigest()
                 entries = json.loads(meta["queries"])
                 for entry in entries:
                     entry["params"]["lpips"] = False
                 meta["queries"] = json.dumps(entries)
-            args[0] = str(tmp / "queries.safetensors")
-            _write(Path(args[0]), tensors, meta)
+                args[0] = str(tmp / "queries.safetensors")
+                _write(Path(args[0]), tensors, meta)
         code = _inner(inner, command, args)
         if code != 0:
             return code
@@ -143,8 +143,9 @@ def main() -> int:
             tensors, meta = _read(out)
             if original_sha is not None:
                 meta["queries_sha256"] = original_sha
-            dropped = set(faults.get("drop_answer", "").split(","))
-            tensors = {k: v for k, v in tensors.items() if k.partition("/")[2] not in dropped}
+            if "drop_answer" in faults:
+                dropped = set(faults["drop_answer"].split(","))
+                tensors = {k: v for k, v in tensors.items() if k.partition("/")[2] not in dropped}
             _write(out, tensors, meta)
         if command == "render" and (original_sha is not None or "nan" in faults):
             tensors, meta = _read(out)
