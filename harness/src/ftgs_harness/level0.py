@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ftgs_harness.checks import Check, close_relative, relative_error
+from ftgs_harness.checks import Check, relative_error
 from ftgs_harness.formats import EXCHANGE_KEYS, Exchange, FormatError, read_exchange, write_exchange
 from ftgs_harness.models import random_exchange
 from ftgs_harness.rendering import failure_check, item_checks, relative, render, request_for
@@ -25,7 +25,7 @@ _SPEC_REFS = ["§2.2", "D-70", "D-71", "D-84"]  # the ftgs-if round trip
 _TOLERANCE = 1e-6  # §3.3 L0: relative
 # Q-208: the signed fields pass through 0, and a faithful float32 implementation holds them only
 # to their rounding at the field's largest magnitude, which is their floor: it may store μt as
-# normalized time, positions in a normalised scene frame or the DC coefficient as RGB. The
+# normalized time, positions in a normalized scene frame or the DC coefficient as RGB. The
 # positive fields (scale, duration, opacity) keep a floor of 1e-3 of it, so that an error in
 # their small entries still shows.
 _SIGNED_FIELDS = ("position", "velocity", "rotation", "sh", "time_center")
@@ -81,8 +81,9 @@ def field_errors(a: Exchange, b: Exchange) -> dict[str, float]:
         if key == "rotation":  # up to sign
             y = np.where((x * y).sum(-1, keepdims=True) < 0, -y, y)
         floor = 1.0 if key in _SIGNED_FIELDS else 1e-3
-        if not np.all(close_relative(y, x, _TOLERANCE, floor=floor)):
-            errors[key] = float(np.max(relative_error(y, x, floor=floor)))
+        error = relative_error(y, x, floor=floor)
+        if not np.all(error <= _TOLERANCE):
+            errors[key] = float(np.max(error))
     return errors
 
 

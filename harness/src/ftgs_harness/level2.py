@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from ftgs_harness.checks import Check, Status, close_absolute, close_relative, relative_error
+from ftgs_harness.checks import Check, Status, close_absolute, relative_error
 from ftgs_harness.formats import Answer, FormatError, file_sha256, read_answers, write_queries
 from ftgs_harness.info import QUERY_KINDS
 from ftgs_harness.queries import generate
@@ -44,7 +44,7 @@ TOLERANCES: dict[str, dict[str, tuple[str, float]]] = {
 # Q-208: the signed answers, held by a faithful float32 implementation only to their rounding
 # at the answer's largest magnitude, which is their floor; the other relative answers are
 # positive and keep a floor of 1e-3 of it.
-_SIGNED = {("motion", "means_t")}
+_SIGNED_ANSWERS = {("motion", "means_t")}
 _SAMPLING_P = 0.001  # §3.3: χ² test, p > 0.001
 
 _SPEC_REFS = {
@@ -87,13 +87,12 @@ def _worst(kind: str, a: Answer, b: Answer) -> tuple[bool, str, float, str]:
                 return False, name, mismatches, "exact"
             continue
         if mode == "relative":
-            floor = 1.0 if (kind, name) in _SIGNED else 1e-3
-            ok = close_relative(y, x, tol, floor=floor)
-            diff = relative_error(y, x, floor=floor)
+            diff = relative_error(y, x, floor=1.0 if (kind, name) in _SIGNED_ANSWERS else 1e-3)
+            ok = diff <= tol
         else:
             ok = close_absolute(y, x, tol)
-            diff = np.abs(x.astype(np.float64) - y.astype(np.float64))
-        value = float(np.max(np.nan_to_num(diff, nan=np.inf))) if diff.size else 0.0
+            diff = np.nan_to_num(np.abs(x.astype(np.float64) - y.astype(np.float64)), nan=np.inf)
+        value = float(np.max(diff)) if diff.size else 0.0
         if not bool(np.all(ok)):
             return False, name, value, f"<= {tol:g} {mode}"
         if value > worst[2]:

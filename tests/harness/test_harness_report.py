@@ -161,7 +161,7 @@ def test_relative_tolerance_judges_near_zero_entries_against_the_arrays_scale() 
     # f = 1: the zero entry may move by 1e-6 · 1000 = 1e-3.
     assert close_relative([1000.0, 9e-4, 5.0], b, 1e-6, floor=1.0).tolist() == [True] * 3
     assert not close_relative([1000.0, 1.1e-3, 5.0], b, 1e-6, floor=1.0)[1]
-    # f = 1e-3: only by 1e-6 · 1e-3 · 1000 = 1e-6; 5.000004 is within 1e-6 of itself either way.
+    # f = 1e-3: only by 1e-6 · 1e-3 · 1000 = 1e-6; 5.000004 is within 1e-6 relative of 5 at both.
     assert close_relative([1000.0005, 9e-7, 5.000004], b, 1e-6, floor=1e-3).tolist() == [True] * 3
     assert not close_relative([1000.0, 1.1e-6, 5.0], b, 1e-6, floor=1e-3)[1]
     # M is the larger of the two arrays' largest magnitudes, whichever is A.

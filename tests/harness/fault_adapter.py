@@ -11,7 +11,7 @@ so a level's test can check that the harness sees that change, with the expected
   (× F), `duration=F` (× F), `scale=F` (× F), `dc=D` (+ D on the l = 0 coefficients),
   `sh_sign` (l ≥ 1 coefficients negated), `drop_primitive` (row 0's opacity to the floor
   1e-7, so it all but vanishes; a file can't hold zero rows), `position_frame` (positions
-  through a normalised scene frame (x − c)/r in float32 and back, as a faithful implementation
+  through a normalized scene frame (x − c)/r in float32 and back, as a faithful implementation
   may store them), `position_zero=F` (position entries below F·‖position‖∞ set to 0),
   `duration_small=E` (durations below 1 % of the largest × (1 + E));
 - request faults, applied to `render`'s request, the renders then filed under the original
