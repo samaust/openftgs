@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """L0 · boundary converters (§3.3 L0; Q-206, Q-208, Q-209): FTGS-IF models, trained and random,
 go through import → export in each implementation. Fields must match within 1e-6 relative
-(opacity after the logit clamp, quaternions up to sign), every produced file must pass the
-schema validator, and the implementation's renders before and after its round trip must agree
-within the strict L1 tolerance."""
+(opacity after the logit clamp, quaternions up to sign), the signed fields against the field's
+largest magnitude and the positive ones with a floor of 1e-3 of it (Q-208), every produced file
+must pass the schema validator, and the implementation's renders before and after its round
+trip must agree within the strict L1 tolerance."""
 
 import shutil
 from pathlib import Path
 
 import numpy as np
 
-from ftgs_harness.checks import Check, close_relative
+from ftgs_harness.checks import Check, close_relative, relative_error
 from ftgs_harness.formats import EXCHANGE_KEYS, Exchange, FormatError, read_exchange, write_exchange
 from ftgs_harness.models import random_exchange
 from ftgs_harness.rendering import failure_check, item_checks, relative, render, request_for
@@ -22,9 +23,12 @@ __all__ = ["field_errors", "run"]
 
 _SPEC_REFS = ["§2.2", "D-70", "D-71", "D-84"]  # the ftgs-if round trip
 _TOLERANCE = 1e-6  # §3.3 L0: relative
-# Q-208: time centres are judged against the field's largest magnitude, since an implementation
-# may store μt as float32 normalized time, an error of about T_τ·2⁻²⁴ wherever τ lies.
-_TIME_FIELDS = ("time_center",)
+# Q-208: the signed fields pass through 0, and a faithful float32 implementation holds them only
+# to their rounding at the field's largest magnitude, which is their floor: it may store μt as
+# normalized time, positions in a normalised scene frame or the DC coefficient as RGB. The
+# positive fields (scale, duration, opacity) keep a floor of 1e-3 of it, so that an error in
+# their small entries still shows.
+_SIGNED_FIELDS = ("position", "velocity", "rotation", "sh", "time_center")
 
 # The pattern a field's difference shows as (§3.3 symptom rule 4).
 _PATTERN = {
@@ -76,17 +80,9 @@ def field_errors(a: Exchange, b: Exchange) -> dict[str, float]:
             x, y = np.clip(x, 1e-7, 1 - 1e-7), np.clip(y, 1e-7, 1 - 1e-7)
         if key == "rotation":  # up to sign
             y = np.where((x * y).sum(-1, keepdims=True) < 0, -y, y)
-        if key in _TIME_FIELDS:
-            scale = max(float(np.abs(x).max()), 1e-300)
-            ok = np.abs(x - y) <= _TOLERANCE * np.maximum(np.maximum(np.abs(x), np.abs(y)), scale)
-            relative_error = np.abs(x - y) / np.maximum(np.maximum(np.abs(x), np.abs(y)), scale)
-        else:
-            ok = close_relative(y, x, _TOLERANCE)
-            floor = 1e-3 * float(np.abs(x).max()) if x.size else 0.0
-            denom = np.maximum(np.maximum(np.abs(x), np.abs(y)), max(floor, 1e-300))
-            relative_error = np.abs(x - y) / denom
-        if not np.all(ok):
-            errors[key] = float(np.max(np.nan_to_num(relative_error, nan=np.inf)))
+        floor = 1.0 if key in _SIGNED_FIELDS else 1e-3
+        if not np.all(close_relative(y, x, _TOLERANCE, floor=floor)):
+            errors[key] = float(np.max(relative_error(y, x, floor=floor)))
     return errors
 
 

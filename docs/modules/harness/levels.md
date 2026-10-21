@@ -4,7 +4,7 @@ The harness runs the four **levels** of §3.3. Case generation, tolerances and s
 
 ## Tolerances
 
-A bare tolerance is absolute; "relative" means |a − b| ≤ tol · max(|a|, |b|, 1e-3 · ‖b‖∞), elementwise (Q-208).
+A bare tolerance is absolute; "relative" means |a − b| ≤ tol · max(|a|, |b|, f · M), elementwise, where M = max(‖a‖∞, ‖b‖∞) over the compared array, so swapping A and B gives the same verdict; NaN never passes (Q-208). f = 1 for signed quantities, which a faithful float32 implementation holds only to their rounding at M: L0's position, velocity, rotation, SH and time centre, and L2's `means_t`. f = 1e-3 for positive quantities, so that an error in their small entries still shows: L0's scale, duration and opacity, and L2's other relative answers. A check reports its relative error with the same denominator.
 
 ## Cases and check IDs
 
@@ -12,7 +12,7 @@ Every case file goes under `cases/`, written once, so `rerun` replays the run's 
 
 ## L0 · boundary converters
 
-The trained models of the run settings, then seeded random models up to `l0.models`, in a mix of five: 60 rows, saturated opacities, a single timestamp, wide scales (e⁻⁹ to e⁻¹) and durations (e⁻⁶ to e⁴ × T_τ), and a single row, over SH degrees 0 to 3. Each goes import → export through each implementation; the fields must agree within 1e-6 relative, opacity after the [10⁻⁷, 1 − 10⁻⁷] clamp, quaternions up to sign, and the metadata exactly, the background of D-84 included. The time centres are judged against the field's largest magnitude, durations by the general rule (Q-208). Each implementation also renders a 4-item request at 64×48 before and after its round trip, compared at the strict L1 tolerance, since both renders come from one implementation (Q-206, Q-209); the check reports the worst item. A field's difference is named by the pattern it would show: position and velocity an offset, time centre a temporal shift, duration a temporal widening or narrowing, scale and rotation a scale change, opacity opacity saturation, SH a colour shift.
+The trained models of the run settings, then seeded random models up to `l0.models`, in a mix of five: 60 rows, saturated opacities, a single timestamp, wide scales (e⁻⁹ to e⁻¹) and durations (e⁻⁶ to e⁴ × T_τ), and a single row, over SH degrees 0 to 3. Each goes import → export through each implementation; the fields must agree within 1e-6 relative, opacity after the [10⁻⁷, 1 − 10⁻⁷] clamp, quaternions up to sign, and the metadata exactly, the background of D-84 included. The signed fields are judged against the field's largest magnitude, the positive ones (scale, duration, opacity) with the 1e-3 floor (Q-208). Each implementation also renders a 4-item request at 64×48 before and after its round trip, compared at the strict L1 tolerance, since both renders come from one implementation (Q-206, Q-209); the check reports the worst item. A field's difference is named by the pattern it would show: position and velocity an offset, time centre a temporal shift, duration a temporal widening or narrowing, scale and rotation a scale change, opacity opacity saturation, SH a colour shift.
 
 ## L1 · identical model, near-exact renders
 
