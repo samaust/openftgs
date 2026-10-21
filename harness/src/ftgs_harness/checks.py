@@ -23,6 +23,7 @@ __all__ = [
     "close_relative",
     "json_value",
     "level_summary",
+    "relative_error",
 ]
 
 LEVELS = ("L0", "L1", "L2", "L3")
@@ -129,13 +130,24 @@ def level_summary(statuses: Sequence[str]) -> str:
     return "not_comparable"
 
 
-def close_relative(a: npt.ArrayLike, b: npt.ArrayLike, tol: float) -> np.ndarray:
-    """Q-208: |a − b| ≤ tol · max(|a|, |b|, 1e-3 · ‖b‖∞), elementwise. NaN never passes."""
+def relative_error(a: npt.ArrayLike, b: npt.ArrayLike, *, floor: float) -> np.ndarray:
+    """Q-208: |a − b| / max(|a|, |b|, floor · M), elementwise, where M = max(‖a‖∞, ‖b‖∞) over
+    the finite entries, so swapping a and b changes nothing. `floor` is 1 for signed
+    quantities, whose faithful float32 rounding is about M · 2⁻²⁴ wherever they pass through 0,
+    and 1e-3 for positive ones. An entry that is NaN or infinite in either array has error inf."""
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    floor = 1e-3 * float(np.max(np.abs(b))) if b.size and np.all(np.isfinite(b)) else 0.0
-    scale = np.maximum(np.maximum(np.abs(a), np.abs(b)), floor)
-    with np.errstate(invalid="ignore"):
-        return np.asarray(np.abs(a - b) <= tol * scale)
+    finite = np.isfinite(a) & np.isfinite(b)
+    magnitudes = np.concatenate([np.abs(a[np.isfinite(a)]), np.abs(b[np.isfinite(b)])])
+    m = float(magnitudes.max()) if magnitudes.size else 0.0
+    scale = np.maximum(np.maximum(np.abs(a), np.abs(b)), max(floor * m, 1e-300))
+    with np.errstate(invalid="ignore", over="ignore"):
+        return np.where(finite, np.abs(a - b) / np.where(finite, scale, 1.0), np.inf)
+
+
+def close_relative(a: npt.ArrayLike, b: npt.ArrayLike, tol: float, *, floor: float) -> np.ndarray:
+    """Q-208: |a − b| ≤ tol · max(|a|, |b|, floor · M), elementwise (`relative_error`). NaN never
+    passes."""
+    return np.asarray(relative_error(a, b, floor=floor) <= tol)
 
 
 def close_absolute(a: npt.ArrayLike, b: npt.ArrayLike, tol: float) -> np.ndarray:
