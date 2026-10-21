@@ -553,8 +553,12 @@ The L1 tolerance class chosen from both info replies: same rasterizer and consta
 _Avoid_: level, tolerance mode, strictness
 
 **Run settings**:
-The harness's own settings for one run (case seed, seed count K, GPUs, trained models, L3 scenes, case sizes), kept apart from harness_config.json, which holds TrainConfig values only. §3.3
+The harness's own settings for one run (case seed, seed count K, GPUs, trained models, L3 scenes, case sizes, whether L2 compares LPIPS), kept apart from harness_config.json, which holds TrainConfig values only. §3.3, Q-203, Q-212
 _Avoid_: harness config (reserved for harness_config.json), options file, run config
+
+**Reduced run**:
+A harness run whose run settings ask for less than §3.3 does, a case size below §3.3's or LPIPS left out of L2, and whose report says so; it fails no check by being reduced. Q-203, Q-212
+_Avoid_: partial run, quick run, smoke run, reduced case sizes (only one of the two reasons)
 
 **Probe**:
 One of the ten L1 scenes, P1 to P10, that isolates a single behavior by sweeping one variable so a mismatch points at one quantity. §3.3 L1

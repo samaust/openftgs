@@ -22,6 +22,10 @@ def test_l2_passes_with_openftgs_as_both_implementations(tmp_path: Path) -> None
     kinds = {c["id"].split(".")[2] for c in checks(report, "L2.forward.").values()}
     assert kinds == set(QUERY_KINDS)
     assert len(checks(report, "L2.forward.motion.")) == 3  # two random, one edge
+    # Q-212: with LPIPS off the run is reduced, and report.md's header says why.
+    assert report["run"]["settings"]["reduced"] is True
+    md = (tmp_path / "run" / "report.md").read_text().splitlines()
+    assert "LPIPS left out of L2" in next(line for line in md if line.startswith("Started "))
 
 
 @pytest.mark.parametrize(("scale", "fails"), [(2e-6, True), (5e-7, False)])
