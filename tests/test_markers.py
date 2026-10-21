@@ -6,10 +6,17 @@ weights tests are skipped when their resource is missing. Under pytest-xdist, th
 share the run's thread budget.
 """
 
+import os
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
 import pytest
+
+# At module level, not in a test: pytester drops the modules a test imported, and a second
+# import of torch's extension in the same process fails (#313).
+import torch
 
 pytest_plugins = ["pytester"]
 
@@ -58,8 +65,6 @@ def test_unmarked_tests_get_cpu_marker(suite: pytest.Pytester) -> None:
 
 
 def test_missing_resources_skip(suite: pytest.Pytester) -> None:
-    import torch
-
     result = suite.runpytest_subprocess("-rs", "-p", "no:cacheprovider")
     if torch.cuda.is_available():
         result.assert_outcomes(passed=2, skipped=2)
@@ -84,8 +89,8 @@ import os
 import torch
 
 def test_threads():
-    expected = int(os.environ["EXPECTED_THREADS"])
-    assert int(os.environ["OMP_NUM_THREADS"]) == torch.get_num_threads() == expected
+    assert os.environ["OMP_NUM_THREADS"] == os.environ["EXPECTED_OMP_NUM_THREADS"]
+    assert torch.get_num_threads() == int(os.environ["EXPECTED_THREADS"])
 """
 
 
@@ -101,14 +106,27 @@ def budget(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> pytest
     return pytester
 
 
-@pytest.mark.parametrize(("workers", "threads"), [("auto", 2), ("4", 1), ("3", 1), ("0", 4)])
+@pytest.mark.parametrize(("workers", "threads"), [("auto", 2), ("4", 1), ("3", 1), ("0", None)])
 def test_xdist_workers_share_the_thread_budget(
-    budget: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, workers: str, threads: int
+    budget: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, workers: str, threads: int | None
 ) -> None:
     """Q-214: `-n auto` starts a worker per two threads of the budget, and each worker runs at
-    the budget over the workers, in its variables and in PyTorch; without workers nothing
-    changes."""
-    monkeypatch.setenv("EXPECTED_THREADS", str(threads))
+    the budget over the workers, in its variables and in PyTorch. Without workers nothing
+    changes: the variables keep the budget and PyTorch its own count, which a fresh interpreter
+    reports. That count isn't always the budget: PyTorch's MKL builds cap it at the physical
+    cores, as on CI's 2-core runner (#313)."""
+    if threads is None:
+        variable = os.environ["OMP_NUM_THREADS"]
+        count = subprocess.run(
+            [sys.executable, "-c", "import torch; print(torch.get_num_threads())"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    else:
+        variable = count = str(threads)
+    monkeypatch.setenv("EXPECTED_OMP_NUM_THREADS", variable)
+    monkeypatch.setenv("EXPECTED_THREADS", count)
     result = budget.runpytest_subprocess("-n", workers, "-p", "no:cacheprovider")
     result.assert_outcomes(passed=1)
     if workers == "auto":
