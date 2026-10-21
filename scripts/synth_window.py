@@ -55,7 +55,7 @@ def window(scene: Path, camera: str, length: int, layout: str = "selfcap") -> di
             path = folder / f"{n:06d}.png"
             if not path.is_file():
                 raise ValueError(f"missing ground-truth frame {path}")
-            yield torch.from_numpy(np.asarray(Image.open(path).convert("RGB")))
+            yield torch.from_numpy(np.array(Image.open(path).convert("RGB")))
 
     start = fastest_frames(images(), count=_FASTEST)
     n0 = min(max(start + _FASTEST // 2 - length // 2, 0), frames - length)
