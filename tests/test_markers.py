@@ -6,6 +6,9 @@ weights tests are skipped when their resource is missing. Under pytest-xdist, th
 share the run's thread budget.
 """
 
+import os
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -86,8 +89,8 @@ import os
 import torch
 
 def test_threads():
-    expected = int(os.environ["EXPECTED_THREADS"])
-    assert int(os.environ["OMP_NUM_THREADS"]) == torch.get_num_threads() == expected
+    assert os.environ["OMP_NUM_THREADS"] == os.environ["EXPECTED_VARIABLE"]
+    assert torch.get_num_threads() == int(os.environ["EXPECTED_THREADS"])
 """
 
 
@@ -103,18 +106,40 @@ def budget(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> pytest
     return pytester
 
 
-@pytest.mark.parametrize(("workers", "threads"), [("auto", 2), ("4", 1), ("3", 1), ("0", 4)])
+@pytest.mark.parametrize(("workers", "threads"), [("auto", 2), ("4", 1), ("3", 1)])
 def test_xdist_workers_share_the_thread_budget(
     budget: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, workers: str, threads: int
 ) -> None:
     """Q-214: `-n auto` starts a worker per two threads of the budget, and each worker runs at
-    the budget over the workers, in its variables and in PyTorch; without workers nothing
-    changes."""
+    the budget over the workers, in its variables and in PyTorch."""
+    monkeypatch.setenv("EXPECTED_VARIABLE", str(threads))
     monkeypatch.setenv("EXPECTED_THREADS", str(threads))
     result = budget.runpytest_subprocess("-n", workers, "-p", "no:cacheprovider")
     result.assert_outcomes(passed=1)
     if workers == "auto":
         result.stdout.fnmatch_lines(["*2 workers*"])
+
+
+def test_without_xdist_workers_the_threads_are_left_alone(
+    budget: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-214: without workers nothing changes: the variables keep the budget and PyTorch its own
+    count, which a fresh interpreter reports. That count isn't always the variables': the budget
+    here is above the CPUs, as CI's 4 threads were above its runner's 2 physical cores, and
+    PyTorch's MKL builds then take the physical cores (#313)."""
+    over = str((os.cpu_count() or 1) + 1)
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        monkeypatch.setenv(name, over)
+    default = subprocess.run(
+        [sys.executable, "-c", "import torch; print(torch.get_num_threads())"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    monkeypatch.setenv("EXPECTED_VARIABLE", over)
+    monkeypatch.setenv("EXPECTED_THREADS", default)
+    result = budget.runpytest_subprocess("-n", "0", "-p", "no:cacheprovider")
+    result.assert_outcomes(passed=1)
 
 
 def test_more_xdist_workers_than_the_budget_is_a_usage_error(budget: pytest.Pytester) -> None:
