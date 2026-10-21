@@ -2,14 +2,15 @@
 """L2 · forward behaviour on random inputs (§3.3 L2; Q-207, Q-208, Q-209): both
 implementations answer the same seeded queries, kind by kind, compared at §3.3's tolerances;
 `relocation_sampling` by χ² tests instead. A kind missing from an `info` reply is not
-comparable."""
+comparable. A relative tolerance judges the signed `means_t` against the answer's largest
+magnitude and the positive answers with a floor of 1e-3 of it (Q-208)."""
 
 from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
 
-from ftgs_harness.checks import Check, Status, close_absolute, close_relative
+from ftgs_harness.checks import Check, Status, close_absolute, relative_error
 from ftgs_harness.formats import Answer, FormatError, file_sha256, read_answers, write_queries
 from ftgs_harness.info import QUERY_KINDS
 from ftgs_harness.queries import generate
@@ -40,6 +41,10 @@ TOLERANCES: dict[str, dict[str, tuple[str, float]]] = {
     "spatial_scale": {"S": ("relative", 1e-9)},
     "growth_decisions": {"clone": ("exact", 0.0), "split": ("exact", 0.0)},
 }
+# Q-208: the signed answers, held by a faithful float32 implementation only to their rounding
+# at the answer's largest magnitude, which is their floor; the other relative answers are
+# positive and keep a floor of 1e-3 of it.
+_SIGNED_ANSWERS = {("motion", "means_t")}
 _SAMPLING_P = 0.001  # §3.3: χ² test, p > 0.001
 
 _SPEC_REFS = {
@@ -81,14 +86,13 @@ def _worst(kind: str, a: Answer, b: Answer) -> tuple[bool, str, float, str]:
             if mismatches:
                 return False, name, mismatches, "exact"
             continue
-        ok = close_relative(y, x, tol) if mode == "relative" else close_absolute(y, x, tol)
-        xd, yd = x.astype(np.float64), y.astype(np.float64)
-        diff = np.abs(xd - yd)
         if mode == "relative":
-            floor = 1e-3 * float(np.abs(xd).max()) if xd.size else 0.0
-            denom = np.maximum(np.maximum(np.abs(xd), np.abs(yd)), max(floor, 1e-300))
-            diff = diff / denom
-        value = float(np.max(np.nan_to_num(diff, nan=np.inf))) if diff.size else 0.0
+            diff = relative_error(y, x, floor=1.0 if (kind, name) in _SIGNED_ANSWERS else 1e-3)
+            ok = diff <= tol
+        else:
+            ok = close_absolute(y, x, tol)
+            diff = np.nan_to_num(np.abs(x.astype(np.float64) - y.astype(np.float64)), nan=np.inf)
+        value = float(np.max(diff)) if diff.size else 0.0
         if not bool(np.all(ok)):
             return False, name, value, f"<= {tol:g} {mode}"
         if value > worst[2]:

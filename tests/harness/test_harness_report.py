@@ -9,11 +9,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 from stub_adapter import CONVENTIONS, INFO
 
 from ftgs_harness import runner
-from ftgs_harness.checks import Check, close_absolute, close_relative, level_summary
+from ftgs_harness.checks import (
+    Check,
+    close_absolute,
+    close_relative,
+    level_summary,
+    relative_error,
+)
 from ftgs_harness.cli import main
 from ftgs_harness.info import choose_tier, info_problems
 from ftgs_harness.report import build_report, render_markdown
@@ -147,11 +154,35 @@ def test_tier_is_same_only_for_the_same_rasterizer_and_conventions(
 
 
 def test_relative_tolerance_judges_near_zero_entries_against_the_arrays_scale() -> None:
-    """Q-208: |a − b| ≤ tol·max(|a|, |b|, 1e-3·‖b‖∞); NaN never passes."""
+    """Q-208: |a − b| ≤ tol·max(|a|, |b|, f·M), elementwise, with M = max(‖a‖∞, ‖b‖∞); f = 1 for
+    signed quantities, 1e-3 for positive ones. Swapping A and B gives the same verdict; NaN
+    never passes; a bare tolerance is absolute."""
     b = [1000.0, 0.0, 5.0]
-    # The floor is 1e-3 · 1000 = 1, so the zero entry may move by 1e-6 · 1 = 1e-6.
-    assert close_relative([1000.0005, 5e-7, 5.000004], b, 1e-6).tolist() == [True, True, True]
-    assert close_relative([1000.0, 2e-6, float("nan")], b, 1e-6).tolist() == [True, False, False]
+    # f = 1: the zero entry may move by 1e-6 · 1000 = 1e-3.
+    assert close_relative([1000.0, 9e-4, 5.0], b, 1e-6, floor=1.0).tolist() == [True] * 3
+    assert not close_relative([1000.0, 1.1e-3, 5.0], b, 1e-6, floor=1.0)[1]
+    # f = 1e-3: only by 1e-6 · 1e-3 · 1000 = 1e-6; 5.000004 is within 1e-6 relative of 5 at both.
+    assert close_relative([1000.0005, 9e-7, 5.000004], b, 1e-6, floor=1e-3).tolist() == [True] * 3
+    assert not close_relative([1000.0, 1.1e-6, 5.0], b, 1e-6, floor=1e-3)[1]
+    # M is the larger of the two arrays' largest magnitudes, whichever is A.
+    assert close_relative([0.0, 9e-4], [1000.0, 0.0], 1e-6, floor=1.0)[1]
+    assert close_relative([1000.0, 0.0], [0.0, 9e-4], 1e-6, floor=1.0)[1]
+    assert not close_relative([100.0, 9e-4], [100.0, 0.0], 1e-6, floor=1.0)[1]
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=200) * np.exp(rng.uniform(-12.0, 0.0, size=200))
+    y = x + rng.normal(size=200) * 1e-6 * np.abs(x).max()
+    for floor in (1.0, 1e-3):
+        forward = close_relative(x, y, 1e-6, floor=floor)
+        assert 0 < forward.sum() < forward.size
+        assert forward.tolist() == close_relative(y, x, 1e-6, floor=floor).tolist()
+    # NaN and infinities fail, and leave the scale of the other entries alone.
+    nan, inf = float("nan"), float("inf")
+    assert close_relative([nan, 1e-7], [1.0, 0.0], 1e-6, floor=1.0).tolist() == [False, True]
+    assert close_relative([inf, 1e-7], [1.0, 0.0], 1e-6, floor=1.0).tolist() == [False, True]
+    assert close_relative([0.0, 0.0], [0.0, 0.0], 1e-6, floor=1.0).tolist() == [True, True]
+    # The reported relative error has the same denominator as the pass test.
+    errors = relative_error([1000.0, 1e-3, nan], [1000.0, 0.0, 0.0], floor=1.0)
+    assert errors.tolist() == pytest.approx([0.0, 1e-6, inf])
     assert close_absolute([1.0, 1.1], [1.0, 1.0], 0.05).tolist() == [True, False]
 
 
@@ -226,6 +257,33 @@ def test_runner_fails_the_check_of_an_incomplete_info_reply(
     assert check["status"] == "fail" and check["pattern"] == "schema violation"
     assert "far" in check["observed"]
     assert report["run"]["tier"] == "different"
+
+
+@pytest.mark.parametrize(
+    ("settings", "reduced", "named"),
+    [
+        ({}, False, []),
+        ({"l2": {"queries": 2}}, True, ["case sizes"]),
+        ({"l2": {"lpips": False}}, True, ["LPIPS"]),
+        ({"l1": {"items": 10}, "l2": {"lpips": False}}, True, ["case sizes", "LPIPS"]),
+    ],
+)
+def test_runner_marks_smaller_case_sizes_or_lpips_off_as_a_reduced_run(
+    tmp_path: Path, fake_l0: None, settings: dict[str, Any], reduced: bool, named: list[str]
+) -> None:
+    """Q-203, Q-212: a run is reduced when a case size is below §3.3's or `l2.lpips` is false,
+    whatever levels it ran; report.md's header names what is reduced, and a reduced run fails
+    nothing by being reduced."""
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(settings))
+    assert _run(tmp_path, "--levels", "L0", "--settings", str(path)) == 0
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert report["run"]["settings"]["reduced"] is reduced
+    md = (tmp_path / "run" / "report.md").read_text().splitlines()
+    header = next(line for line in md if line.startswith("Started "))
+    assert ("reduced" in header) is reduced
+    for what in ("case sizes", "LPIPS"):
+        assert (what in header) is (what in named), header
 
 
 def test_runner_rerun_reproduces_one_check(

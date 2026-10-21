@@ -53,7 +53,12 @@ def test_without_a_fault_the_outputs_are_the_wrapped_adapters(tmp_path: Path) ->
 
 @pytest.mark.parametrize(
     ("fault", "changed"),
-    [("velocity=1.1", "velocity"), ("duration=1.2", "duration"), ("dc=0.05", "sh")],
+    [
+        ("velocity=1.1", "velocity"),
+        ("duration=1.2", "duration"),
+        ("dc=0.05", "sh"),
+        ("position_zero=0.5", "position"),
+    ],
 )
 def test_a_model_fault_changes_only_its_field(tmp_path: Path, fault: str, changed: str) -> None:
     model = exchange_file(tmp_path / "m.safetensors")
