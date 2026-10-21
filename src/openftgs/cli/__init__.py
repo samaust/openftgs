@@ -534,7 +534,7 @@ def _train(args: argparse.Namespace) -> int:
             except _Failure as failure:  # Q-159 (as answered): stop here, as a signal does
                 log_failure = failure
                 return True
-            total = sum(log.mean_losses.values())
+            total = log.mean_losses["total"]  # E9; D-77 reports the terms beside it
             print(
                 f"iteration {log.iteration}/{last}  loss {total:.6g}  N {log.num_gaussians}",
                 file=sys.stderr,

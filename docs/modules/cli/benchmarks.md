@@ -4,7 +4,7 @@
 
 **`<m15-runs>`**: the folder outside the repository where M15's runs were recorded: the converted scenes they ran on (`<m15-runs>/kitchen/scene.json`, `<m15-runs>/kitchen60/scene.json`, `<m15-runs>/ci-scene/scene.json`) and their BENCH.json files (`<m15-runs>/bench/`). This page, the Calibration data rows of `docs/clean-room/questions.md` and the source log name it so. Only the CI baselines are kept in the repository, under `benchmarks/baselines/`, as they were recorded.
 
-**`<m17-runs>`**: the folder outside the repository where M17's validation runs are recorded, `/home/auss/datasets/openftgs-m17`: the converted `courtyard` and `studio` scenes, the init points, the run directories, their summaries, the TrainConfig override files and the BENCH.json files (`<m17-runs>/bench/`). M17 reads `kitchen` from `<m15-runs>/kitchen` (its `scene.json` and its frame cache) and never writes there. The runs are listed in `docs/modules/train/validation-runs.md` (#317).
+**`<m17-runs>`**: the folder outside the repository where M17's validation runs are recorded, `/home/auss/datasets/openftgs-m17`: the converted `courtyard` and `studio` scenes, the init points, the run directories, their summaries, the TrainConfig override files and the BENCH.json files (`<m17-runs>/bench/`). M17 reads `kitchen` from `<m15-runs>/kitchen` (its `scene.json` and its frame cache) and never writes there. The runs are listed in `docs/clean-room/validation-runs.md` (#317).
 
 ## Subcommands
 
