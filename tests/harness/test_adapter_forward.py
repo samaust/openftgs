@@ -205,12 +205,19 @@ def _e11(sigma: float, a: float, n: int) -> tuple[float, float]:
         for i in range(1, n + 1)
         for k in range(i)
     )
-    return min(max(new, 0.005), 1.0 - 2.0**-23), a * sigma / denominator
+    return min(max(new, _sigma_dead()), 1.0 - 2.0**-23), a * sigma / denominator
+
+
+def _sigma_dead(p: float = 0.005) -> float:
+    """D-14's lower bound as Q-50 stores it: the opacity of ô_dead, the float32 logit of p."""
+    logit = float(np.float32(math.log(p) - math.log1p(-p)))
+    return 1.0 / (1.0 + math.exp(-logit))
 
 
 def test_relocation_math_is_e11_with_the_whole_clamp(tmp_path: Path) -> None:
-    """E11, D-14: σ_new = 1 − (1 − σ)^(1/n) clamped to [0.005, 1 − 2⁻²³] (the lower bound too,
-    Q-50), a_new from the unclamped σ_new; tolerance 1e-5 relative."""
+    """E11, D-14: σ_new = 1 − (1 − σ)^(1/n) clamped to [0.005, 1 − 2⁻²³], the lower bound on
+    the float32 logit as the trainer stores it (Q-50), a_new from the unclamped σ_new;
+    tolerance 1e-5 relative."""
     cases = [(0.75, 0.3, 2), (0.5, 1.0, 1), (0.9, 0.05, 7), (0.01, 0.2, 51), (0.999, 2.0, 3)]
     sigma = np.array([c[0] for c in cases])
     scales = np.array([[c[1], 2 * c[1], 0.5 * c[1]] for c in cases])
@@ -220,7 +227,9 @@ def test_relocation_math_is_e11_with_the_whole_clamp(tmp_path: Path) -> None:
         new, a_new = _e11(s, a, k)
         assert float(got.tensors["opacity_new"][row]) == pytest.approx(new, rel=1e-5)
         assert float(got.tensors["scales_new"][row, 0]) == pytest.approx(a_new, rel=1e-5)
-    assert float(got.tensors["opacity_new"][3]) == 0.005  # the lower bound binds (σ = 0.01, n = 51)
+    # The lower bound binds (σ = 0.01, n = 51): the opacity of ô_dead, not 0.005 itself.
+    assert float(got.tensors["opacity_new"][3]) == pytest.approx(_sigma_dead(), rel=1e-12)
+    assert _sigma_dead() != 0.005
 
 
 def test_velocity_init_is_e15(tmp_path: Path) -> None:

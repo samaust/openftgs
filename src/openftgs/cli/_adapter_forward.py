@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import re
 import warnings
 from collections.abc import Callable, Mapping
@@ -193,13 +194,19 @@ def _lr_schedule(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> di
 
 
 def _relocation_math(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    """E11 with D-14's whole clamp: `mcmc_split` applies the upper bound, and the lower one,
-    which the trainer applies to the stored logit, is applied here to σ_new (Q-50)."""
+    """E11 with D-14's whole clamp: `mcmc_split` applies the upper bound, and the lower one is
+    applied here as the trainer applies it to the stored logit (Q-50)."""
     cfg = RelocConfig(**params.get("reloc", {}))
     sigma, scales = mcmc_split(
         tensors["opacity"].double(), tensors["scales"].double(), tensors["n"].long()
     )
-    return {"opacity_new": torch.clamp(sigma, min=cfg.dead_opacity), "scales_new": scales}
+    # Q-50: ô = max(float32(logit σ_new), ô_dead), ô_dead the float32 logit of dead_opacity;
+    # a row the bound binds answers the opacity of ô_dead, the others σ_new.
+    p = cfg.dead_opacity
+    dead = torch.tensor(math.log(p) - math.log1p(-p), dtype=torch.float32)
+    bound = torch.logit(sigma).float() < dead
+    opacity = torch.where(bound, torch.sigmoid(dead.double()), sigma)
+    return {"opacity_new": opacity, "scales_new": scales}
 
 
 def _velocity_init(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:

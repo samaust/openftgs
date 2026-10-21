@@ -30,7 +30,7 @@ ftgs-adapter [--backend …] train SCENE INIT CONFIG SEED OUT_DIR
 | sh_color | `model.at_time(t, sh_degree=…)`, then `sh.sh_to_color` from the camera centre to the moved mean (E2) |
 | losses | `l1_loss`, `ssim`, `reg4d_loss`, `LPIPSLoss("vgg")` when `lpips` is true, and `total_loss` at `iteration` (E7 to E9) |
 | lr_schedule | `build_optimizer(…, adam="foreach")` on a one-row model, then `set_iteration` per iteration, columns in §1.3's order (E12, E13) |
-| relocation_math | `density.mcmc_split`, then D-14's lower bound on σ_new (Q-50) |
+| relocation_math | `density.mcmc_split`, then D-14's lower bound on the float32 logit, as the trainer applies it (Q-50) |
 | velocity_init | `init.knn_velocities` (E15) |
 | relocation_sampling | `density.draw_targets` per seed, counted per row (D-15) |
 | grad_stats | the trainer's steps 3 to 5 for one image on the reference backend: `render(…, return_aux=True, packed=False)`, `total_loss`, backward, `GradStats.update` (D-12) |
