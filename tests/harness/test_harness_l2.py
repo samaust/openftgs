@@ -47,6 +47,34 @@ def test_answers_off_by_twice_the_tolerance_fail_and_by_half_pass(
         assert "means_t" in symptom and "1e-06 relative" in symptom
 
 
+def test_an_exact_float64_motion_passes_against_openftgs(tmp_path: Path) -> None:
+    """Q-208: means_t is signed, so it is judged against the answer's largest magnitude. An
+    exact float64 evaluation of E1 differs from openftgs's float32 answers by their rounding at
+    that scale, and passes."""
+    _, report = run_harness(
+        tmp_path,
+        "L2",
+        a=openftgs(),
+        b=faulty("exact_motion", on=("forward",)),
+        settings=SETTINGS,
+    )
+    motion = checks(report, "L2.forward.motion.")
+    assert len(motion) == 3 and {c["status"] for c in motion.values()} == {"pass"}
+
+
+def test_signed_answers_zeroed_below_a_hundredth_of_their_scale_fail(tmp_path: Path) -> None:
+    """Q-208: the largest-magnitude floor still sees means_t's entries below 10⁻²·M set to 0."""
+    _, report = run_harness(
+        tmp_path,
+        "L2",
+        a=openftgs(),
+        b=faulty("zero_answers=0.01", on=("forward",)),
+        settings=SETTINGS,
+    )
+    motion = checks(report, "L2.forward.motion.")
+    assert len(motion) == 3 and {c["status"] for c in motion.values()} == {"fail"}
+
+
 def test_a_biased_sampler_fails_the_chi2_test(tmp_path: Path) -> None:
     """§3.3: relocation_sampling's counts against the scores, p > 0.001."""
     code, report = run_harness(

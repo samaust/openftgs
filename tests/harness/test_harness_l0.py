@@ -5,6 +5,7 @@ short (Q-203)."""
 
 from pathlib import Path
 
+import pytest
 from harness_runs import checks, faulty, openftgs, run_harness
 
 
@@ -43,6 +44,44 @@ def test_l0_reports_a_changed_field_and_a_schema_violation(tmp_path: Path) -> No
     )
     assert code == 1
     assert checks(report)["L0.roundtrip.m00.B"]["pattern"] == "schema violation"
+
+
+def test_l0_passes_positions_stored_in_a_normalized_frame(tmp_path: Path) -> None:
+    """Q-208: a B that stores positions as (x − c)/r in float32 holds them only to their rounding
+    at the field's largest magnitude, which is position's floor, so its round trips pass."""
+    code, report = run_harness(
+        tmp_path,
+        "L0",
+        a=openftgs(),
+        b=faulty("position_frame", on=("import",)),
+        settings={"l0": {"models": 5}},
+    )
+    assert code == 0, [c["symptom"] for c in checks(report, "L0.roundtrip.").values()]
+
+
+@pytest.mark.parametrize(
+    ("fault", "field", "models"),
+    [("position_zero=0.01", "position", 1), ("duration_small=1e-4", "duration", 4)],
+)
+def test_l0_fails_errors_in_a_fields_small_entries(
+    tmp_path: Path, fault: str, field: str, models: int
+) -> None:
+    """Q-208: positions zeroed below 10⁻²·M fail against position's largest magnitude, and a
+    10⁻⁴ relative error in only the durations below 1 % of the largest (m03 has durations from
+    e⁻⁶ to e⁴ × T_τ, Q-209) fails duration's floor of 1e-3 of it. The last model is checked."""
+    code, report = run_harness(
+        tmp_path,
+        "L0",
+        a=openftgs(),
+        b=faulty(fault, on=("import",)),
+        settings={"l0": {"models": models}},
+    )
+    assert code == 1
+    model = f"m{models - 1:02d}"
+    found = checks(report, f"L0.roundtrip.{model}.")
+    assert found[f"L0.roundtrip.{model}.A"]["status"] == "pass"
+    b = found[f"L0.roundtrip.{model}.B"]
+    assert b["status"] == "fail" and b["localization"]["fields"] == [field]
 
 
 def test_l0_reports_a_crash(tmp_path: Path) -> None:
