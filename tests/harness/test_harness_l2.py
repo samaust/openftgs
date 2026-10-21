@@ -158,3 +158,25 @@ def test_the_growth_edge_query_puts_the_cap_inside_a_tie() -> None:
     top = np.flatnonzero(g == g.max())
     room = edge.params["n_max"] - g.size
     assert top.size == 7 and room == 3
+
+
+def test_queries_with_a_setting_the_adapters_cannot_honor_are_not_comparable(
+    tmp_path: Path,
+) -> None:
+    """§3.3 adapter contract: a harness_config setting the adapter cannot honor is reported as
+    not comparable, never silently dropped; it fails nothing, and the other kinds are judged."""
+    code, report = run_harness(
+        tmp_path,
+        "L2",
+        a=openftgs(),
+        b=openftgs(),
+        settings=SETTINGS,
+        config={"loss": {"not_a_field": 1.0}},
+    )
+    assert code == 0
+    for kind in ("losses", "grad_stats"):
+        found = checks(report, f"L2.forward.{kind}.")
+        assert found and {c["status"] for c in found.values()} == {"not_comparable"}
+        messages = next(iter(found.values()))["localization"]["adapter_messages"]
+        assert all("loss.not_a_field" in m for m in messages.values())
+    assert {c["status"] for c in checks(report, "L2.forward.motion.").values()} == {"pass"}

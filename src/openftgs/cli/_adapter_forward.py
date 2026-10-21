@@ -5,7 +5,7 @@ own functions, always on the CPU (Q-202, Q-207).
 The files are ftgs-forward-queries and ftgs-forward-answers (Q-207): one kind per file; a
 query's tensors under `<id>/<name>`, its FTGS-IF model under `<id>/model/<key>`; each answer
 carries a status, `ok`, `error` (the query couldn't be answered) or `not_comparable` (a kind
-this adapter doesn't answer).
+this adapter doesn't answer, or a query holding a TrainConfig setting it cannot honor, §3.3).
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from safetensors.torch import save_file
 from torch import Tensor
 
 from openftgs import cli
+from openftgs.cli._adapter import _honored
 from openftgs.config import GrowthConfig, LossConfig, OptimConfig, RelocConfig, config_from_dict
 from openftgs.data import spatial_scale
 from openftgs.density import GradStats, draw_targets, growth_masks, mcmc_split, sampling_score
@@ -318,6 +319,14 @@ KINDS: dict[str, _Handler] = {
 }
 
 
+def _settings(kind: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    """The query's TrainConfig settings, nested as in TrainConfig: grad_stats's `config` subset,
+    the other kinds' `loss`, `optim` and `reloc` sections (Q-207)."""
+    if kind == "grad_stats":
+        return dict(params.get("config", {}))
+    return {k: params[k] for k in ("loss", "optim", "reloc") if k in params}
+
+
 def _read(path: Path) -> tuple[str, list[tuple[str, dict[str, Any], dict[str, Tensor]]]]:
     with safe_open(str(path), framework="pt") as f:
         meta = dict(f.metadata() or {})
@@ -335,7 +344,8 @@ def _read(path: Path) -> tuple[str, list[tuple[str, dict[str, Any], dict[str, Te
 
 def forward(queries_path: Path, out: Path, *, backend: str) -> int:
     """Answer every query of the file; a query that fails is an `error` answer, the others
-    are still answered (Q-207)."""
+    are still answered (Q-207). A query with a setting TrainConfig doesn't have, or a value it
+    refuses, is `not_comparable`, naming the settings (§3.3 adapter contract)."""
     with cli._as_input_error(f"forward queries {queries_path}", OSError, KeyError):
         sha = hashlib.sha256(queries_path.read_bytes()).hexdigest()
         kind, queries = _read(queries_path)
@@ -344,6 +354,11 @@ def forward(queries_path: Path, out: Path, *, backend: str) -> int:
     for query_id, params, inputs in queries:
         if handler is None:
             entries.append({"id": query_id, "status": "not_comparable", "message": kind})
+            continue
+        _, unhonored = _honored(_settings(kind, params))
+        if unhonored:
+            message = "settings not honored: " + ", ".join(unhonored)
+            entries.append({"id": query_id, "status": "not_comparable", "message": message})
             continue
         try:
             with torch.no_grad() if kind != "grad_stats" else torch.enable_grad():

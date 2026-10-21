@@ -38,4 +38,4 @@ ftgs-adapter [--backend …] train SCENE INIT CONFIG SEED OUT_DIR
 | spatial_scale | `data.spatial_scale` over records built from the cameras, no image read (D-27) |
 | growth_decisions | `density.growth_masks` (D-18, D-44) |
 
-A query that raises is an `error` answer; the others in the file are still answered. A kind the module doesn't know is `not_comparable`.
+A query that raises is an `error` answer; the others in the file are still answered. A kind the module doesn't know is `not_comparable`, and so is a query whose `loss`, `optim` or `reloc` section (grad_stats: its `config` subset) holds a key TrainConfig lacks or a value it refuses on its own; the message names those dotted keys (§3.3: a setting the adapter cannot honor is reported, never dropped silently).

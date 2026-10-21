@@ -42,15 +42,22 @@ def _exchange(n: int = 8, sh_degree: int = 2, seed: int = 0) -> Exchange:
     return Exchange(arrays, sh_degree, TAU0, TAU1)
 
 
-def _ask(
+def _answer(
     tmp_path: Path, kind: str, params: dict[str, Any], tensors: dict[str, np.ndarray]
 ) -> Answer:
-    """One query of `kind` through `ftgs-adapter forward`, in process."""
+    """One query of `kind` through `ftgs-adapter forward`, in process, whatever its status."""
     queries = tmp_path / f"{kind}.q.safetensors"
     sha = write_queries(queries, kind, [Query("q0", params, tensors)])
     answers = tmp_path / f"{kind}.a.safetensors"
     assert _adapter.main(["--backend", "gsplat", "forward", str(queries), str(answers)]) == 0
-    answer = read_answers(answers, kind=kind, queries_sha256=sha)["q0"]
+    return read_answers(answers, kind=kind, queries_sha256=sha)["q0"]
+
+
+def _ask(
+    tmp_path: Path, kind: str, params: dict[str, Any], tensors: dict[str, np.ndarray]
+) -> Answer:
+    """One query of `kind` through `ftgs-adapter forward`, answered ok."""
+    answer = _answer(tmp_path, kind, params, tensors)
     assert answer.status == "ok", answer.message
     return answer
 
@@ -352,3 +359,59 @@ def test_a_query_that_fails_is_an_error_answer_and_the_others_are_answered(
     assert (
         read_answers(out, kind="no_such_kind", queries_sha256=sha)["q0"].status == "not_comparable"
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "params", "tensors", "unhonored"),
+    [
+        (
+            "lr_schedule",
+            {"optim": {"not_a_field": 1}, "spatial_scale": 1.0, "frame_dt": 0.1},
+            {"iterations": np.array([1, 2], dtype=np.int64)},
+            "optim.not_a_field",
+        ),
+        (
+            "relocation_math",
+            {"reloc": {"dead_opacity": 1.5}},
+            {"opacity": np.array([0.5]), "scales": np.ones((1, 3)), "n": np.array([2])},
+            "reloc.dead_opacity",
+        ),
+        (
+            "relocation_score",
+            {"reloc": {"elsewhere": 0.1}},
+            {
+                "opacity": np.array([0.5]),
+                "g_sum": np.zeros(1, np.float32),
+                "count": np.zeros(1, np.int32),
+            },
+            "reloc.elsewhere",
+        ),
+    ],
+)
+def test_a_setting_the_adapter_cannot_honor_is_a_not_comparable_answer(
+    tmp_path: Path,
+    kind: str,
+    params: dict[str, Any],
+    tensors: dict[str, np.ndarray],
+    unhonored: str,
+) -> None:
+    """§3.3 adapter contract: a TrainConfig setting the adapter doesn't have, or a value it
+    refuses, makes the query's answer `not_comparable`, naming the setting, never an error."""
+    answer = _answer(tmp_path, kind, params, tensors)
+    assert answer.status == "not_comparable"
+    assert unhonored in answer.message
+
+
+def test_grad_stats_names_an_unhonored_setting_of_its_config_subset(tmp_path: Path) -> None:
+    """§3.3 adapter contract: grad_stats carries a TrainConfig subset, whose settings are named
+    by their dotted TrainConfig keys."""
+    params, tensors = _with_model(
+        _exchange(),
+        width=8,
+        height=8,
+        iteration=1,
+        config={"loss": {"lambda_perc": 0.0, "not_a_field": 1.0}},
+    )
+    answer = _answer(tmp_path, "grad_stats", params, tensors)
+    assert answer.status == "not_comparable"
+    assert "loss.not_a_field" in answer.message
