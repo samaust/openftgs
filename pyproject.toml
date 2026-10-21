@@ -47,6 +47,7 @@ fast = []
 dev = [
     "pytest",
     "pytest-xdist",  # Q-214: parallel CPU tests
+    "pytest-cov",  # Q-216: coverage in CI
     "hypothesis",
     "ruff",
     "mypy",
@@ -73,6 +74,18 @@ markers = [
     "dataset: needs a real dataset under $OPENFTGS_DATASETS; skipped otherwise (Q-7)",
     "weights: downloads pretrained weights at run time (RoMa, DINOv2, LPIPS backbones); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1 (Q-7)",
 ]
+
+# Q-216: coverage of the CPU suite in CI, the ftgs and harness subprocesses included; the vendored
+# RoMa (D-65) is left out, as for ruff and mypy.
+[tool.coverage.run]
+source_pkgs = ["openftgs", "ftgs_harness"]
+omit = ["*/openftgs/_vendor/*"]
+branch = true
+relative_files = true
+patch = ["subprocess"]
+
+[tool.coverage.report]
+skip_empty = true
 
 [tool.ruff]
 target-version = "py311"

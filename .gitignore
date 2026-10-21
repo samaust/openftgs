@@ -23,6 +23,7 @@ venv/
 .hypothesis/
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
 
 # Run directories, converted datasets and frame caches (never committed; §2.3)

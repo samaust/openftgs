@@ -64,6 +64,7 @@ ftgs eval RUN_DIR/checkpoint OUT/scene.json --split test --out METRICS.json
 ```bash
 pytest                       # CPU tests; GPU, dataset and weights tests skip when their resource is missing
 pytest -n auto --dist loadgroup -m "not gpu"      # the CPU tests on every physical core (Q-214)
+pytest -n auto --dist loadgroup -m "not gpu" --cov --cov-report=html   # with coverage, in htmlcov/ (Q-216)
 pytest -m gpu                # tests that need a CUDA device
 OPENFTGS_DATASETS=/path pytest -m dataset         # converter checks on real datasets
 OPENFTGS_ALLOW_DOWNLOADS=1 pytest -m weights      # tests that download pretrained weights
