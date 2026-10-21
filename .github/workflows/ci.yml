@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# CI for the CPU suite (§3 introduction) and the license scan (§2.3 notes; Q-4).
+# CI for the CPU suite (§3 introduction) with its coverage (Q-216), and the license scan (§2.3 notes;
+# Q-4).
 name: CI
 
 on:
@@ -40,7 +41,20 @@ jobs:
           mypy
       - name: CPU tests
         if: matrix.job == 'test'
-        run: pytest -n auto --dist loadgroup -m "not gpu and not dataset and not weights"
+        run: >-
+          pytest -n auto --dist loadgroup -m "not gpu and not dataset and not weights"
+          --cov --cov-report=xml --cov-report=html
+      - name: Coverage summary (Q-216; no threshold)
+        if: matrix.job == 'test' && !cancelled()
+        run: coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the coverage reports
+        if: matrix.job == 'test' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            htmlcov/
       - name: License scan (GPL, AGPL, non-commercial fail; others need a sign-off)
         if: matrix.job == 'licenses'
         run: python scripts/license_scan.py
