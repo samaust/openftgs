@@ -309,6 +309,24 @@ def test_runner_rerun_reproduces_one_check(
     assert main(["rerun", "L0.nothing", "--out", str(run_dir)]) == 2
 
 
+@pytest.mark.parametrize("changed", ["config", "settings"])
+def test_runner_rerun_refuses_inputs_changed_since_the_run(
+    tmp_path: Path, fake_l0: None, changed: str
+) -> None:
+    """§3.3 symptom rule 6: a reproduction uses the exact input files, so `rerun` exits 2 when
+    harness_config.json or the settings file no longer hashes as it did in the run."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"seed": 0}))
+    assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 0
+    run_dir = tmp_path / "run"
+    assert main(["rerun", "L0.fake.B", "--out", str(run_dir)]) == 0
+    if changed == "config":
+        _config(tmp_path, {"optim": {"iterations": 200}})
+    else:
+        settings.write_text(json.dumps({"seed": 1}))
+    assert main(["rerun", "L0.fake.B", "--out", str(run_dir)]) == 2
+
+
 @pytest.mark.parametrize(
     "case",
     ["config_not_json", "seed_in_config", "missing_adapter", "l3_without_scenes", "bad_level"],

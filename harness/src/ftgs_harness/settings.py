@@ -207,13 +207,15 @@ def load_config(path: Path) -> tuple[dict[str, Any], str]:
 
 @dataclass(frozen=True)
 class RunRecord:
-    """`run.json`: what `rerun` needs to replay a check (Q-203)."""
+    """`run.json`: what `rerun` needs to replay a check (Q-203), with the hashes of the input
+    files it must find unchanged (§3.3 symptom rule 6)."""
 
     a: str
     b: str
     config: Path
     config_sha256: str
     settings_path: Path | None
+    settings_sha256: str | None
     levels: tuple[str, ...]
     jobs: int
     timeout: float
@@ -247,6 +249,7 @@ def read_run(path: Path) -> RunRecord:
         config=Path(body["config"]),
         config_sha256=body["config_sha256"],
         settings_path=None if settings is None else Path(settings),
+        settings_sha256=body["settings_sha256"],
         levels=tuple(body["levels"]),
         jobs=int(body["jobs"]),
         timeout=float(body["timeout"]),

@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 
 from ftgs_harness.adapter import Adapter
 from ftgs_harness.checks import LEVELS, Check, Status
+from ftgs_harness.formats import file_sha256
 from ftgs_harness.info import Tier, choose_tier, info_problems
 from ftgs_harness.report import build_report, write_report
 from ftgs_harness.settings import (
@@ -196,6 +197,7 @@ def run(
         config=config.resolve(),
         config_sha256=cfg_sha,
         settings_path=None if settings_path is None else settings_path.resolve(),
+        settings_sha256=None if settings_path is None else file_sha256(settings_path),
         levels=chosen,
         jobs=jobs,
         timeout=timeout,
@@ -242,8 +244,18 @@ def rerun(check_id: str, run_dir: Path) -> int:
     level = check_id.split(".")[0]
     if level not in record.levels:
         raise HarnessError(f"{check_id}: level {level} was not part of the run in {run_dir}")
-    config, _ = load_config(record.config)
+    config, config_sha = load_config(record.config)
     settings = load_settings(record.settings_path)
+    settings_sha = None if record.settings_path is None else file_sha256(record.settings_path)
+    # §3.3 symptom rule 6: the reproduction runs on the exact input files of the run.
+    for name, path, then, now in (
+        ("harness_config", record.config, record.config_sha256, config_sha),
+        ("settings", record.settings_path, record.settings_sha256, settings_sha),
+    ):
+        if now != then:
+            raise HarnessError(
+                f"{name} {path} has changed since the run (SHA-256 {then} then, {now} now)"
+            )
     if level == "L3":
         _check_l3(settings)
     out = run_dir / "reruns" / check_id
