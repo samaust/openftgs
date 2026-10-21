@@ -37,6 +37,8 @@ Answers: metadata `format` (`ftgs-forward-answers`), `version`, `kind`, `produce
 | spatial_scale | `world_to_camera` [C,4,4], `train` [C]; `factor` | `S` |
 | growth_decisions | `g` [N], `scales` [N,3]; `spatial_scale`, `grad_threshold`, `split_scale`, `n_max` | `clone`, `split` [N] bool |
 
+An `ok` answer carries every tensor of its kind's row, `lpips_vgg` only when the query's `lpips` is true (Q-212). One that lacks any fails its query as a schema violation, naming each adapter and the tensors it lacks; tensors outside the row are not compared.
+
 ## `train_log.jsonl`
 
 An adapter's `train` writes `OUT_DIR/train_log.jsonl`: one JSON object per row with `iteration`, `losses` (an object of loss term → value) and `num_gaussians`, as openftgs writes it (Q-132, Q-207). L3 reads the last row at or before each trace iteration; a row that isn't such an object is a schema violation of that run.

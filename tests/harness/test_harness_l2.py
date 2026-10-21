@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """L2 · forward behaviour on random inputs (§3.3 L2; Q-207, Q-208, Q-209), with openftgs as
-both implementations and with the fault-injecting wrapper as B. LPIPS is off (l2.lpips), so no
-weights are downloaded."""
+both implementations and with the fault-injecting wrapper as B. LPIPS is off (l2.lpips), or
+left out of the losses queries by the wrapper's lpips_off, so no weights are downloaded."""
 
 from pathlib import Path
 
@@ -10,6 +10,7 @@ import pytest
 from harness_runs import checks, faulty, openftgs, run_harness
 
 from ftgs_harness.info import QUERY_KINDS
+from ftgs_harness.level2 import TOLERANCES
 
 SETTINGS = {"l2": {"queries": 2, "lpips": False}}
 
@@ -73,6 +74,53 @@ def test_signed_answers_zeroed_below_a_hundredth_of_their_scale_fail(tmp_path: P
     )
     motion = checks(report, "L2.forward.motion.")
     assert len(motion) == 3 and {c["status"] for c in motion.values()} == {"fail"}
+
+
+@pytest.mark.parametrize("lacking", [("A", "B"), ("B",)])
+def test_ok_answers_without_a_tensor_of_their_kind_are_schema_violations(
+    tmp_path: Path, lacking: tuple[str, ...]
+) -> None:
+    """Q-207: an ok answer carries every tensor of its kind's row. Each kind compared by
+    tolerance loses one tensor, from both answers or from B's only: each of its queries fails
+    as a schema violation naming the adapters and the tensor."""
+    first = {kind: next(iter(names)) for kind, names in TOLERANCES.items()}
+    dropping = faulty("drop_answer=" + ",".join(first.values()), on=("forward",))
+    a = dropping if "A" in lacking else openftgs()
+    code, report = run_harness(tmp_path, "L2", a=a, b=dropping, settings=SETTINGS)
+    assert code == 1
+    for kind, name in first.items():
+        found = checks(report, f"L2.forward.{kind}.")
+        assert len(found) == 3, kind  # two random, one edge
+        for check in found.values():
+            assert check["status"] == "fail" and check["pattern"] == "schema violation"
+            assert check["observed"] == "; ".join(f"{label} lacks {name}" for label in lacking)
+            assert check["symptom"].endswith(f"lacks 1 ({name}).")
+    sampling = checks(report, "L2.forward.relocation_sampling.")
+    assert sampling and all(c["status"] == "pass" for c in sampling.values())
+
+
+def test_losses_with_lpips_on_fail_without_lpips_vgg(tmp_path: Path) -> None:
+    """Q-212: with `lpips` true, losses answers that both lack lpips_vgg fail; with it false
+    the other four tensors suffice (the lpips-off runs above). The fault answers each losses
+    query as if `lpips` were false, and λ_perc = 0 keeps grad_stats off LPIPS, so no weights
+    are downloaded."""
+    adapter = faulty("lpips_off", on=("forward",))
+    code, report = run_harness(
+        tmp_path,
+        "L2",
+        a=adapter,
+        b=adapter,
+        settings={"l2": {"queries": 1, "lpips": True}},
+        config={"loss": {"lambda_perc": 0.0}},
+    )
+    assert code == 1
+    losses = checks(report, "L2.forward.losses.")
+    assert len(losses) == 2  # one random, one edge
+    for check in losses.values():
+        assert check["status"] == "fail" and check["pattern"] == "schema violation"
+        assert check["observed"] == "A lacks lpips_vgg; B lacks lpips_vgg"
+    others = {k: c for k, c in checks(report, "L2.forward.").items() if k not in losses}
+    assert others and all(c["status"] == "pass" for c in others.values()), others.keys()
 
 
 def test_a_biased_sampler_fails_the_chi2_test(tmp_path: Path) -> None:
