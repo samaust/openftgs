@@ -2,7 +2,7 @@
 
 M17's training and evaluation runs on openftgs-synth's `kitchen`, `courtyard` and `studio` (§1.4 "Validation data", D-79; PRD #317). Each run is listed here with its command, commit, the configuration's differences from the default, its wall time, its files and its headline metrics. The measured values themselves are rows of the Calibration data table of `docs/clean-room/questions.md`, which carry the owner's decisions; this page points to them. No result is compared with the paper's tables (D-79).
 
-The runs are under `<m17-runs>` (`docs/modules/cli/benchmarks.md`), outside the repository; `kitchen` is M15's conversion at `<m15-runs>/kitchen`, read and never written.
+The runs are under `<m17-runs>` (`docs/modules/cli/benchmarks.md`), outside the repository; `kitchen` is M15's conversion at `<m15-runs>/kitchen`, read and never written. Nothing a run produces is deleted: every final checkpoint, the reg_until runs' periodic checkpoints, the converted scenes and their frame caches stay, for the test-view renders and diagnostics of #318 (owner, 2026-10-21).
 
 ## The scenes
 
