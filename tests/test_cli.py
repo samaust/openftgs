@@ -312,21 +312,21 @@ def test_train_progress_line_prints_the_total_loss(
     """#319: each stderr progress line, `iteration <it>/<T_it>  loss <value>  N <count>`, is
     one train_log.jsonl row: its loss is the row's E9 total (D-77's "total") in the line's 6
     significant digits and its N the row's. The total is checked against E9 rebuilt from the
-    row's terms and config.json's weights (E7, E9; L_reg on for the whole run, D-10), so the
-    line can't be checked against a wrong total."""
+    row's terms and config.json's weights (E7, E9; λ_perc = 0, so no perceptual term; L_reg on
+    for the whole run, D-10), so the line can't be checked against a wrong total."""
     out = tmp_path / "run"
     capsys.readouterr()
     assert _train(run, out, "--config", run["config"]) == 0
     lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("iteration ")]
     rows = [json.loads(line) for line in (out / "train_log.jsonl").read_text().splitlines()]
     weights = json.loads((out / "config.json").read_text())["loss"]
-    assert weights["reg_until"] is None and len(lines) == len(rows) == 4
+    assert weights["lambda_perc"] == 0.0 and weights["reg_until"] is None  # the E9 below
+    assert len(lines) == len(rows) == 4
     for line, row in zip(lines, rows, strict=True):
         losses = row["losses"]
         e9 = (
             weights["lambda_img"] * losses["l1"]
             + weights["lambda_ssim"] * losses["one_minus_ssim"]
-            + weights["lambda_perc"] * losses.get("perceptual", 0.0)  # absent at λ_perc = 0
             + weights["lambda_reg"] * losses["reg"]
         )
         assert math.isclose(losses["total"], e9, rel_tol=1e-5)
