@@ -18,7 +18,14 @@ import torch
 from builders import random_model, ring, shortened_config, write_scene
 
 from openftgs.cli import main
-from openftgs.config import GrowthConfig, LossConfig, PerfConfig, TrainConfig, config_to_dict
+from openftgs.config import (
+    GrowthConfig,
+    InitConfig,
+    LossConfig,
+    PerfConfig,
+    TrainConfig,
+    config_to_dict,
+)
 from openftgs.io import load_checkpoint, write_init_points
 from openftgs.types import InitPoints, TimeNormalizer
 
@@ -132,6 +139,51 @@ def test_summary_opacity_statistics_are_the_checkpoints(tmp_path: Path) -> None:
         assert entry["opacity_share_above_0_9"] == pytest.approx(share, rel=1e-12)
     assert body["n_trace"]["last"]["iteration"] == 30
     assert [b["iterations"] for b in body["loss_blocks"]] == [[1, 10], [11, 20], [21, 30]]
+
+
+def test_summary_of_a_real_run_traces_n_and_finds_the_cap(tmp_path: Path) -> None:
+    """D-24, D-44, Q-220: on a short CPU `ftgs train` run whose `growth.n_max` equals its start
+    budget F·B = 3·10 and its 30 initial points, so the cap holds from the start: the N trace is
+    the log's own first, last and last-in-growth rows, read here from `train_log.jsonl` directly,
+    and the first iteration at n_max is the log's first row."""
+    cams = ring(3, radius=4.0, elevation=1.0, width_px=48, height_px=32, focal=44.0)
+    gt = random_model(16, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
+    scene = write_scene(
+        tmp_path / "scene", gt, [(c, k / 30.0, "train") for k in range(3) for c in cams]
+    )
+    g = torch.Generator().manual_seed(1)
+    init = tmp_path / "init.safetensors"
+    points = InitPoints(
+        positions=(torch.rand(30, 3, generator=g) - 0.5) * 1.2,
+        colors=torch.full((30, 3), 0.5),
+        timestamps=torch.rand(30, generator=g, dtype=torch.float64) * TAU1,
+    )
+    write_init_points(points, init, time_unit="s", producer="openftgs tests")
+    base = TrainConfig(
+        loss=LossConfig(lambda_perc=0.0),
+        init=InitConfig(points_per_frame=10),
+        growth=GrowthConfig(n_max=30),
+        perf=PerfConfig(log_every=5),
+    )
+    cfg = shortened_config(30, base)
+    config = tmp_path / "cfg.json"
+    config.write_text(json.dumps(config_to_dict(cfg)))
+    run = tmp_path / "run"
+    argv = ["train", scene, "--init", init, "--out", run, "--config", config]
+    assert main([str(a) for a in argv]) == 0
+    code, body, err = _summary(run)
+    assert code == 0, err
+    rows = [json.loads(line) for line in (run / "train_log.jsonl").read_text().splitlines()]
+    grown = [r for r in rows if r["iteration"] <= cfg.growth.stop]
+
+    def at(row: dict[str, Any]) -> dict[str, int]:
+        return {"iteration": row["iteration"], "num_gaussians": row["num_gaussians"]}
+
+    trace = body["n_trace"]
+    assert trace["first"] == at(rows[0]) and trace["last"] == at(rows[-1])
+    assert trace["growth_end"] == at(grown[-1])
+    assert all(r["num_gaussians"] == 30 for r in rows)
+    assert trace["n_max"] == 30 and trace["first_at_n_max"] == rows[0]["iteration"]
 
 
 def test_summary_reads_metrics_and_the_wall_time(tmp_path: Path) -> None:
