@@ -1,6 +1,6 @@
 # openftgs
 
-[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml)
+[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml) [![Coverage](docs/coverage.svg)](#tests)
 
 openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors.
 
@@ -70,6 +70,8 @@ OPENFTGS_DATASETS=/path pytest -m dataset         # converter checks on real dat
 OPENFTGS_ALLOW_DOWNLOADS=1 pytest -m weights      # tests that download pretrained weights
 python scripts/license_scan.py                    # GPL, AGPL, non-commercial fail; others need a sign-off in scripts/license_signoff.json
 ```
+
+The coverage badge is the CPU and GPU suites' total on a machine with a CUDA device, the dataset and weights tests left out. `python scripts/coverage_local.py` runs both suites, writes `htmlcov/` and `coverage.xml`, and rewrites `docs/coverage.svg` when both pass; commit the SVG to update the badge (Q-217). CI's `test` job reports the CPU suite's coverage in its summary (Q-216).
 
 The license scan passes in CI's environment (CPU torch). With CUDA torch it also lists the NVIDIA runtime wheels, which stay unapproved until they are signed off for the release (milestone M18).
 
