@@ -10,14 +10,19 @@ so a level's test can check that the harness sees that change, with the expected
 - model faults, applied to the FTGS-IF file given to `import` and `render`: `velocity=F`
   (× F), `duration=F` (× F), `scale=F` (× F), `dc=D` (+ D on the l = 0 coefficients),
   `sh_sign` (l ≥ 1 coefficients negated), `drop_primitive` (row 0's opacity to the floor
-  1e-7, so it all but vanishes; a file can't hold zero rows);
+  1e-7, so it all but vanishes; a file can't hold zero rows), `position_frame` (positions
+  through a normalized scene frame (x − c)/r in float32 and back, as a faithful implementation
+  may store them), `position_zero=F` (position entries below F·‖position‖∞ set to 0),
+  `duration_small=E` (durations below 1 % of the largest × (1 + E));
 - request faults, applied to `render`'s request, the renders then filed under the original
   request's SHA-256: `cx=D` (+ D px on every item's principal point);
 - query faults, applied to `forward`'s queries, the answers then filed under the original
   queries' SHA-256: `lpips_off` (`losses` queries answered as if `lpips` were false, Q-212);
 - output faults: `nan` (a NaN at every render's centre pixel), `drop_key=K` (key K removed
   from `export`'s file), `answers=E` (every float answer × (1 + E)), `drop_answer=N[,N…]`
-  (answer tensors N removed from every `forward` answer), `biased_sampler`
+  (answer tensors N removed from every `forward` answer), `exact_motion`
+  (`motion` answered by E1 in float64 from the queries file), `zero_answers=F` (every float
+  answer's entries below F·‖answer‖∞ set to 0), `biased_sampler`
   (`relocation_sampling` counts moved from the last target with draws to the first),
   `no_kind=K` (kind K left out of `info`), `drop_convention=K` (entry K left out of `info`'s
   render_conventions), `rasterizer=NAME` (`info` names another rasterizer);
@@ -41,7 +46,18 @@ import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
-MODEL_FAULTS = {"velocity", "duration", "scale", "dc", "sh_sign", "drop_primitive"}
+MODEL_FAULTS = {
+    "velocity",
+    "duration",
+    "scale",
+    "dc",
+    "sh_sign",
+    "drop_primitive",
+    "position_frame",
+    "position_zero",
+    "duration_small",
+}
+FORWARD_FAULTS = {"answers", "biased_sampler", "exact_motion", "zero_answers"}
 
 
 def _read(path: Path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
@@ -70,7 +86,36 @@ def _perturb_model(source: Path, target: Path, faults: dict[str, str]) -> None:
     if "drop_primitive" in faults:
         arrays["opacity"] = arrays["opacity"].copy()
         arrays["opacity"][0] = np.float32(1e-7)
+    if "position_frame" in faults:
+        x = arrays["position"].astype(np.float32)
+        c = x.mean(axis=0, dtype=np.float32)
+        r = np.float32(np.linalg.norm(x - c, axis=1).max() or 1.0)
+        arrays["position"] = ((x - c) / r).astype(np.float32) * r + c
+    if "position_zero" in faults:
+        x = arrays["position"].copy()
+        x[np.abs(x) < float(faults["position_zero"]) * np.abs(x).max()] = 0.0
+        arrays["position"] = x
+    if "duration_small" in faults:
+        d = arrays["duration"].copy()
+        small = d < 0.01 * d.max()
+        d[small] *= 1.0 + float(faults["duration_small"])
+        arrays["duration"] = d
     _write(target, arrays, meta)
+
+
+def _exact_motion(queries: Path, tensors: dict[str, np.ndarray]) -> None:
+    """E1 in float64 from the FTGS-IF model, whose velocity is per unit of τ: μx(τ) = μx +
+    v·(τ − τc), for each answer's `means_t` [K, N, 3]."""
+    model, _ = _read(queries)
+    for key in tensors:
+        query_id, _, name = key.partition("/")
+        if name != "means_t":
+            continue
+        position = model[f"{query_id}/model/position"].astype(np.float64)
+        velocity = model[f"{query_id}/model/velocity"].astype(np.float64)
+        center = model[f"{query_id}/model/time_center"].astype(np.float64)
+        times = model[f"{query_id}/times"].astype(np.float64)
+        tensors[key] = position + velocity * (times[:, None, None] - center[None, :, None])
 
 
 def _inner(argv: list[str], command: str, args: list[str]) -> int:
@@ -162,8 +207,18 @@ def main() -> int:
             tensors, meta = _read(out)
             tensors.pop(faults["drop_key"], None)
             _write(out, tensors, meta)
-        if command == "forward" and ("answers" in faults or "biased_sampler" in faults):
+        if command == "forward" and FORWARD_FAULTS & faults.keys():
             tensors, meta = _read(out)
+            if "exact_motion" in faults and meta.get("kind") == "motion":
+                _exact_motion(Path(args[0]), tensors)
+            if "zero_answers" in faults:
+                for key, value in tensors.items():
+                    if value.dtype.kind == "f" and value.size:
+                        value = value.copy()
+                        value[
+                            np.abs(value) < float(faults["zero_answers"]) * np.abs(value).max()
+                        ] = 0
+                        tensors[key] = value
             if "answers" in faults:
                 factor = 1.0 + float(faults["answers"])
                 for key, value in tensors.items():

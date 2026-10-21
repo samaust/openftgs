@@ -9,11 +9,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 from stub_adapter import CONVENTIONS, INFO
 
 from ftgs_harness import runner
-from ftgs_harness.checks import Check, close_absolute, close_relative, level_summary
+from ftgs_harness.checks import (
+    Check,
+    close_absolute,
+    close_relative,
+    level_summary,
+    relative_error,
+)
 from ftgs_harness.cli import main
 from ftgs_harness.info import choose_tier, info_problems
 from ftgs_harness.report import build_report, render_markdown
@@ -147,11 +154,35 @@ def test_tier_is_same_only_for_the_same_rasterizer_and_conventions(
 
 
 def test_relative_tolerance_judges_near_zero_entries_against_the_arrays_scale() -> None:
-    """Q-208: |a − b| ≤ tol·max(|a|, |b|, 1e-3·‖b‖∞); NaN never passes."""
+    """Q-208: |a − b| ≤ tol·max(|a|, |b|, f·M), elementwise, with M = max(‖a‖∞, ‖b‖∞); f = 1 for
+    signed quantities, 1e-3 for positive ones. Swapping A and B gives the same verdict; NaN
+    never passes; a bare tolerance is absolute."""
     b = [1000.0, 0.0, 5.0]
-    # The floor is 1e-3 · 1000 = 1, so the zero entry may move by 1e-6 · 1 = 1e-6.
-    assert close_relative([1000.0005, 5e-7, 5.000004], b, 1e-6).tolist() == [True, True, True]
-    assert close_relative([1000.0, 2e-6, float("nan")], b, 1e-6).tolist() == [True, False, False]
+    # f = 1: the zero entry may move by 1e-6 · 1000 = 1e-3.
+    assert close_relative([1000.0, 9e-4, 5.0], b, 1e-6, floor=1.0).tolist() == [True] * 3
+    assert not close_relative([1000.0, 1.1e-3, 5.0], b, 1e-6, floor=1.0)[1]
+    # f = 1e-3: only by 1e-6 · 1e-3 · 1000 = 1e-6; 5.000004 is within 1e-6 relative of 5 at both.
+    assert close_relative([1000.0005, 9e-7, 5.000004], b, 1e-6, floor=1e-3).tolist() == [True] * 3
+    assert not close_relative([1000.0, 1.1e-6, 5.0], b, 1e-6, floor=1e-3)[1]
+    # M is the larger of the two arrays' largest magnitudes, whichever is A.
+    assert close_relative([0.0, 9e-4], [1000.0, 0.0], 1e-6, floor=1.0)[1]
+    assert close_relative([1000.0, 0.0], [0.0, 9e-4], 1e-6, floor=1.0)[1]
+    assert not close_relative([100.0, 9e-4], [100.0, 0.0], 1e-6, floor=1.0)[1]
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=200) * np.exp(rng.uniform(-12.0, 0.0, size=200))
+    y = x + rng.normal(size=200) * 1e-6 * np.abs(x).max()
+    for floor in (1.0, 1e-3):
+        forward = close_relative(x, y, 1e-6, floor=floor)
+        assert 0 < forward.sum() < forward.size
+        assert forward.tolist() == close_relative(y, x, 1e-6, floor=floor).tolist()
+    # NaN and infinities fail, and leave the scale of the other entries alone.
+    nan, inf = float("nan"), float("inf")
+    assert close_relative([nan, 1e-7], [1.0, 0.0], 1e-6, floor=1.0).tolist() == [False, True]
+    assert close_relative([inf, 1e-7], [1.0, 0.0], 1e-6, floor=1.0).tolist() == [False, True]
+    assert close_relative([0.0, 0.0], [0.0, 0.0], 1e-6, floor=1.0).tolist() == [True, True]
+    # The reported relative error has the same denominator as the pass test.
+    errors = relative_error([1000.0, 1e-3, nan], [1000.0, 0.0, 0.0], floor=1.0)
+    assert errors.tolist() == pytest.approx([0.0, 1e-6, inf])
     assert close_absolute([1.0, 1.1], [1.0, 1.0], 0.05).tolist() == [True, False]
 
 
