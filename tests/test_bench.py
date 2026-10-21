@@ -1489,6 +1489,8 @@ COMPARISONS = {  # Q-190: (baseline, variant) as (precision, layout, autotuning)
         ("tf32", "channels_last_inputs", False),
         ("tf32", "channels_last_inputs_and_weights", True),
     ),
+    # Q-223: the path Q-173's change adopted (#326) against training's earlier one
+    "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
 }
@@ -1543,7 +1545,12 @@ def test__losses_times_every_lpips_variant_and_both_ssim_paths(
     assert setup["sizes"] == [list(size) for size in LOSS_SIZES]
     assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
     assert setup["precisions"] == list(PRECISIONS) and setup["layouts"] == list(LAYOUTS)
-    assert setup["training_layout"] == "channels_last_inputs"
+    # Q-223: training's layout per precision since #326
+    assert setup["training_layout"] == {
+        "ieee": "nchw",
+        "tf32": "nchw",
+        "bf16": "channels_last_inputs",
+    }
     fused = importlib.util.find_spec("fused_ssim") is not None
     assert setup["fused_ssim"] == fused
     assert "one child process per autotuning setting" in setup["processes"]

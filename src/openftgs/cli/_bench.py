@@ -1678,9 +1678,11 @@ def _budget(
 _LOSS_SIZES: tuple[tuple[int, int], ...] = ((1352, 1014), (1920, 1080))  # §3.4 B-4: width, height
 _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52
 # Q-190: contiguous NCHW inputs; channels-last inputs, as `LPIPSLoss` passes a render (its
-# batch-first view of [..., H, W, 3] is channels-last), so training's path until #228; and both
+# batch-first view of [..., H, W, 3] is channels-last), so training's path until #326; and both
 # the inputs and the network's weights channels-last.
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
+# Q-223: the layout training gives the network per precision since #326 (train._NCHWLPIPSLoss).
+_TRAINING_LAYOUTS = {"ieee": "nchw", "tf32": "nchw", "bf16": "channels_last_inputs"}
 _LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
 _LOSS_REPETITIONS = 30  # Q-190
 _LOSS_NOISE = 0.05  # Q-190: the prediction's seeded Gaussian noise
@@ -1697,6 +1699,8 @@ _LPIPS_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, bool]
         ("tf32", "channels_last_inputs", False),
         ("tf32", "channels_last_inputs_and_weights", True),
     ),
+    # Q-223: the path Q-173's change adopted (#326) against training's earlier one
+    "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
 }
@@ -1997,8 +2001,8 @@ def _lpips_case(
 
 def _lpips_deviations(network: Any, images: _Images) -> list[dict[str, Any]]:
     """Per size, TF32's and bf16's deviation from IEEE float32 in value and in the prediction's
-    gradient (Q-190), with the network as training runs it: NCHW weights, channels-last
-    inputs, autotuning off."""
+    gradient (Q-190), with the network as training ran it until #326 (and bf16 still does, but
+    for autotuning; Q-223): NCHW weights, channels-last inputs, autotuning off."""
     import torch
 
     cases: list[dict[str, Any]] = []
@@ -2117,7 +2121,7 @@ def _losses(ctx: _Context) -> _Result:
         "lpips": "lpips 0.1.4, VGG, called directly; inputs mapped to [−1, 1] (D-68)",
         "precisions": list(_LOSS_PRECISIONS),
         "layouts": list(_LOSS_LAYOUTS),
-        "training_layout": "channels_last_inputs",
+        "training_layout": dict(_TRAINING_LAYOUTS),
         "autotuning": list(_LOSS_AUTOTUNING),
         "processes": (
             "the deviations and fused-ssim in the benchmark's process; LPIPS and the PyTorch "
