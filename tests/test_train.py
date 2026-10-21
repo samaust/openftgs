@@ -1333,6 +1333,26 @@ def test_sampler_peek_matches_the_next_draws() -> None:
     assert len(upcoming) == 5  # one left of this epoch, four of the next
 
 
+def test__fits_on_gpu_reserves_the_working_memory() -> None:
+    """Q-99 (changed, #325), Q-223: "auto" puts the cache on the GPU when it fits in half the
+    free memory less the working memory the warm-up iteration left reserved, minus growth to
+    N_max, the boundary included. At B-6's figures on studio at 3M rows (#317), which Q-99's
+    first rule placed on the GPU, the 8.58 GB cache is memory-mapped."""
+    from openftgs.train import _fits_on_gpu
+
+    gib = 2**30
+    # ½·(20 − 8) − 1 = 5 GiB.
+    assert _fits_on_gpu(5 * gib, free=20 * gib, reserve=8 * gib, growth=gib)
+    assert not _fits_on_gpu(5 * gib + 1, free=20 * gib, reserve=8 * gib, growth=gib)
+    # Studio: free 21,834,286,592 B; reserved 11,681,136,640 less allocated 2,396,011,008 is a
+    # reserve of 9,285,125,632 B; growth 61,920,000 B. ½·12,549,160,960 − 61,920,000 =
+    # 6,212,660,480 B, under the cache's 8,584,704,000 (½·free − growth was 10,855,223,296).
+    studio = {"free": 21_834_286_592, "reserve": 9_285_125_632, "growth": 61_920_000}
+    assert not _fits_on_gpu(8_584_704_000, **studio)
+    assert _fits_on_gpu(6_212_660_480, **studio)
+    assert _fits_on_gpu(4 * 10**9, **studio)
+
+
 def test_auto_placement_falls_back_when_no_cache_can_be_made(tmp_path: Path) -> None:
     """Q-99: when the cache directory can't be created, "auto" decodes PNGs with a warning,
     and an explicit placement is a ValueError (Q-26)."""
