@@ -50,9 +50,10 @@ _TILE_SIZE = 16  # D-57
 _RADIUS_CLIP = 0.0  # D-57: no primitive is skipped for its size
 
 # D-55's temporal index (Q-174).
-# Q-174, Q-195: T, the distinct times from which temporal_index None builds the index; B-7's
-# recorded run on kitchen (Calibration data, "Q-174's T": the 1 % models break even at 6).
-_INDEX_MIN_TIMES = 6
+# Q-174, Q-195: T, the distinct times from which temporal_index None builds the index; B-7 on
+# M17's trained kitchen, courtyard and studio models (Calibration data, "Q-195's T on the trained
+# models": they break even at 32, 12 and 32).
+_INDEX_MIN_TIMES = 32
 _INDEX_OPACITY_MARGIN = 1e-4  # D-55's margin: rows are listed where 255σ(1 + 10⁻⁴)·σt can reach 1
 _INDEX_TIME_MARGIN = 1e-6  # D-55's margin: added to each row's reach, in normalized time
 _INDEX_LONG = 8  # Q-174: rows whose reach covers more buckets go to the long list

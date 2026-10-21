@@ -2193,6 +2193,18 @@ def _spread_times(count: int, k: int) -> list[int]:
     return [(2 * j * (count - 1) + (k - 1)) // (2 * (k - 1)) for j in range(k)]
 
 
+def _b7_times(video: MultiViewVideo, camera: Camera) -> tuple[list[float], str]:
+    """B-7's request times (Q-194): every distinct training timestamp; or, where those
+    outnumber the frames of the camera whose pose B-7 uses, as every camera's own sync offset
+    makes them on an unsynchronized scene, that camera's own timestamps (Q-221), so the
+    request's outputs stay one per frame. Also the rule that chose them, for the setup."""
+    taus = sorted({r.timestamp for r in video.records if r.split == "train"})
+    own = sorted({r.timestamp for r in video.records if r.camera.name == camera.name})
+    if len(taus) > len(own):  # Q-221
+        return own, f"the timestamps of {camera.name}, the B-7 camera (Q-221)"
+    return taus, "every distinct training timestamp (Q-194)"
+
+
 def _request_sizes(count: int) -> list[int]:
     """Q-194: the sizes of B-7's requests on a scene of `count` distinct training times."""
     return [k for k in _B7_REQUEST_SIZES if k < count] + [count]
@@ -2369,7 +2381,7 @@ def _render(ctx: _Context) -> _Result:
     with _environment_error("LPIPS networks"):  # as `ftgs eval` builds them; found before the run
         evaluator = Evaluator(device="cuda")
     camera = _b7_camera(video)
-    taus = sorted({r.timestamp for r in video.records if r.split == "train"})
+    taus, chosen = _b7_times(video, camera)  # Q-194, Q-221
     count = len(taus)
     sizes = _request_sizes(count)
     # D-55: buckets one training frame interval wide, a checkpoint's Δt_f or the scene's.
@@ -2450,6 +2462,7 @@ def _render(ctx: _Context) -> _Result:
             "K": camera.K.tolist(),
         },
         "times": count,
+        "times_rule": chosen,
         "request_sizes": sizes,
         "frame_dt": frame_dt,
         "outputs": list(_B7_OUTPUTS),
