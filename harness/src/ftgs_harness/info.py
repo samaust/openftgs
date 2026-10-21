@@ -82,7 +82,10 @@ def info_problems(info: Any) -> list[str]:
     else:
         missing = [k for k in RENDER_CONVENTIONS if k not in conventions]
         if missing:
-            problems.append("`render_conventions` lacks " + ", ".join(missing))
+            problems.append(
+                f"`render_conventions` lacks {len(missing)} of its {len(RENDER_CONVENTIONS)} "
+                f"entries: {', '.join(missing)}"
+            )
     return problems
 
 

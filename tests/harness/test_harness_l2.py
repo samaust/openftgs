@@ -190,3 +190,23 @@ def test_queries_with_a_setting_the_adapters_cannot_honor_are_not_comparable(
         messages = next(iter(found.values()))["localization"]["adapter_messages"]
         assert all("loss.not_a_field" in m for m in messages.values())
     assert {c["status"] for c in checks(report, "L2.forward.motion.").values()} == {"pass"}
+
+
+# A private test of the answer-status check: no fault of the wrapper makes an adapter answer
+# `error`, so it is built from two answers directly.
+def test_a_query_without_a_usable_answer_says_how_many_adapters_gave_none() -> None:
+    """§3.3 symptom rule 3: the symptom has a number with its unit, the adapters without a
+    usable answer out of the two."""
+    from types import SimpleNamespace
+
+    from ftgs_harness.formats import Answer
+    from ftgs_harness.level2 import _status_check
+
+    answers = {
+        "A": {"q0": Answer("q0", "ok", "", {})},
+        "B": {"q0": Answer("q0", "error", "boom", {})},
+    }
+    ctx = SimpleNamespace(repro=lambda check_id: f"ftgs-harness rerun {check_id}")
+    check = _status_check(ctx, "L2.forward.motion.q0", "motion", ["B"], answers, "q0", {})  # type: ignore[arg-type]
+    assert check.status == "fail" and check.pattern == "crash"
+    assert "1 of the 2 adapters" in check.symptom

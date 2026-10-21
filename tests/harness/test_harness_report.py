@@ -127,7 +127,7 @@ def test_info_problems_names_each_missing_render_convention() -> None:
     """D-73: an info reply reports at least the 12 entries of render_conventions (Q-35)."""
     assert info_problems(INFO) == []
     partial = {**INFO, "render_conventions": {k: v for k, v in CONVENTIONS.items() if k != "near"}}
-    assert info_problems(partial) == ["`render_conventions` lacks near"]
+    assert info_problems(partial) == ["`render_conventions` lacks 1 of its 12 entries: near"]
     assert info_problems([]) == ["the reply is not a JSON object"]
 
 
@@ -256,6 +256,8 @@ def test_runner_fails_the_check_of_an_incomplete_info_reply(
     check = next(c for c in report["checks"] if c["id"] == "L0.info.B")
     assert check["status"] == "fail" and check["pattern"] == "schema violation"
     assert "far" in check["observed"]
+    # §3.3 symptom rule 3: a number with its unit.
+    assert "1 of its 12 entries" in check["symptom"]
     assert report["run"]["tier"] == "different"
 
 
