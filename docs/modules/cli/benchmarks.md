@@ -303,6 +303,8 @@ On kitchen (Calibration data, 2026-10-19; `<m15-runs>/bench/B-7-render.json`, 20
 
 So T = 6 (Q-195), now `render._INDEX_MIN_TIMES`. The 5 % and 20 % models' rows all sit on the long list, where the index only costs (`docs/modules/render/backends.md`, "The switch and the width"). The 450 FPS budget holds at 1M and only for the 1 % model at 3M; it is calibrated on the trained models in M17. With the outputs on the CPU every case stays between 108 and 212 FPS, the copy adding about 4.1 ms per render. Rendering is 2.4 to 3.9 % of `evaluate_images`, so evaluation keeps one request per timestamp.
 
+M17 (#317) reran B-7 on the trained kitchen, courtyard and studio models (N = 3M each, outputs on the GPU): 187.7 / 180.7, 220.5 / 192.5 and 150.9 / 149.0 FPS with the index on / off, every one under 450; break-evens 32, 12 and 32 (studio at its test view's 60 times, Q-221), so T = 32 by the same rule, now `render._INDEX_MIN_TIMES`. Every model has a break-even. Rendering is 2.8 to 4.6 % of `evaluate_images`.
+
 ## B-8: `ftgs bench init` and `ftgs bench convert`
 
 B-8 reports the wall time of the two steps that run once per scene, initialization and conversion, on one Neural3DV-layout scene, openftgs-synth's `kitchen` in this project (D-79). It has no budget, only the regression rule, so its BENCH.json has no budget entries. Both run once, under the wall clock, and read the stages that `roma_init` and the converters record (`docs/modules/train/trainer.md`, "Stages").
