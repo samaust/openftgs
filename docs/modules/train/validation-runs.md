@@ -12,6 +12,8 @@ The runs are under `<m17-runs>` (`docs/modules/cli/benchmarks.md`), outside the 
 | `courtyard` | `enerf_outdoor/courtyard` with `ftgs convert opencv-yaml --fps 60 --frames 300 --resize 1.0 --test-camera 0009` | 0009 (Q-218) | 18 × 300, 1920×1080, 60 fps | LPIPS label `vgg` |
 | `studio` | `selfcap` with `ftgs convert selfcap --scene studio --window N0:N1 --test-camera 0007 --undistort internal --resize 1.0 --masks DIR` | 0007 (the dataset card's) | 24 × 60, 1920×1080, 60 fps, unsynchronized | 60-frame window around the test view's fastest range, exact ground-truth masks (Q-219); LPIPS label `vgg` |
 
+The reference images themselves have flaws, seen by eye (owner, 2026-10-21): some scenes have over-bright regions clipped to white, and soft cloth textures that look blurry and change from frame to frame in a way the motion doesn't explain. Where the reference changes in a way the scene's geometry and motion can't account for, no model can match it, so part of every metric's error, and its spread from frame to frame and region to region, belongs to the data rather than to the run.
+
 ## How a run is made and summarized
 
 - Every timed command runs under `/usr/bin/time -v` (wall time, peak resident memory), with the GPU's memory sampled once a second by `nvidia-smi` into the run's folder, alone on the machine.
