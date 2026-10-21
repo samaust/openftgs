@@ -21,4 +21,17 @@ The runs are under `<m17-runs>` (`docs/modules/cli/benchmarks.md`), outside the 
 
 ## Runs
 
-The runs are added here as they finish.
+`$K` is `<m15-runs>/kitchen`, `$M` is `<m17-runs>`. Each run's logs are `<m17-runs>/logs/<step>.*`: the command, the commit, `uptime` at the start, `/usr/bin/time -v`'s report and the GPU samples.
+
+| Step | Run | Command | Commit | Wall time | Result | Calibration row |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | G-1 to G-7, C-4's dots | `OPENFTGS_DATASETS=… pytest -s tests/test_synthetic_conversion.py tests/test_converter_checks.py -k "g1 or … or (c4 and dots)"` | a16a3fe | 2 min 57 s | 23 passed | §3.1 G-1 to G-7, M17's precondition |
+| 1 | kitchen init | `ftgs init roma $K/scene.json $M/kitchen/init.safetensors` | 30e4885 | 30 min 26 s | 300,000 points | §1.5, §3.4 B-1 |
+| 2 | kitchen default (B-1's run) | `ftgs train $K/scene.json --init $M/kitchen/init.safetensors --out $M/kitchen/default` | 30e4885 | 58 min 18 s | PSNR 27.33 dB on cam00; N reaches 3,000,000 at iteration 3,600 | §1.5, §3.4 B-1; §1.3 Growth on kitchen; E16 on kitchen |
+| 6 | B-1 on the trained model | `ftgs bench train-step $K/scene.json --model $M/kitchen/default/checkpoint --out $M/bench/B-1-kitchen-trained.json` | 30e4885 | 1 min 35 s | 118.3 ms an iteration, bound 3,557 s | §3.4 B-1 on the trained model |
+| 10 | B-7 on kitchen | `ftgs bench render $K/scene.json --model $M/kitchen/default/checkpoint --out $M/bench/B-7-kitchen.json` | 30e4885 | 5 min 34 s | 187.7 / 180.7 FPS (index on / off) | §3.4 B-7 on kitchen |
+| 7 | B-6 on kitchen | `ftgs bench data $K/scene.json --out $M/bench/B-6-kitchen.json` | 30e4885 | 2 min 20 s | at most 0.044 % | §3.4 B-6 on kitchen |
+| 9 | B-8 conversion | `ftgs bench convert $K/scene.json --out $M/bench/B-8-convert-kitchen.json` | 30e4885 | 1 min 24 s | 40.8 / 41.0 s | §3.4 B-8, conversion |
+| 8 | B-8 initialization | `ftgs bench init $K/scene.json --out $M/bench/B-8-init-kitchen.json` | 30e4885 | 30 min 14 s | 1,811.8 s, 3,900 pairs | §3.4 B-8, initialization |
+
+Kitchen's default run reached N_max inside the growth window, so the τ_pos = 10⁻⁴ run of Q-220's first decision is replaced by one at τ_pos = 4·10⁻⁴ (Q-220 as answered).
