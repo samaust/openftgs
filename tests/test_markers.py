@@ -11,6 +11,10 @@ from pathlib import Path
 
 import pytest
 
+# At module level, not in a test: pytester drops the modules a test imported, and a second
+# import of torch's extension in the same process fails (#313).
+import torch
+
 pytest_plugins = ["pytester"]
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,8 +62,6 @@ def test_unmarked_tests_get_cpu_marker(suite: pytest.Pytester) -> None:
 
 
 def test_missing_resources_skip(suite: pytest.Pytester) -> None:
-    import torch
-
     result = suite.runpytest_subprocess("-rs", "-p", "no:cacheprovider")
     if torch.cuda.is_available():
         result.assert_outcomes(passed=2, skipped=2)
