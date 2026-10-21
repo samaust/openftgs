@@ -1681,7 +1681,8 @@ _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52
 # batch-first view of [..., H, W, 3] is channels-last), so training's path until #326; and both
 # the inputs and the network's weights channels-last.
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
-# Q-223: the layout training gives the network per precision since #326 (train._NCHWLPIPSLoss).
+# Q-223: the layout training gives the network per precision since #326, with autotuning (under
+# `deterministic`, TF32 keeps channels-last inputs); `train._perceptual_network` decides.
 _TRAINING_LAYOUTS = {"ieee": "nchw", "tf32": "nchw", "bf16": "channels_last_inputs"}
 _LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
 _LOSS_REPETITIONS = 30  # Q-190
@@ -1699,12 +1700,14 @@ _LPIPS_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, bool]
         ("tf32", "channels_last_inputs", False),
         ("tf32", "channels_last_inputs_and_weights", True),
     ),
-    # Q-223: the path Q-173's change adopted (#326) against training's earlier one
+    # Q-223: the path Q-173's change adopted (#326) against training's earlier one; B-4's NCHW
+    # cases start from an NCHW leaf, so they leave out the trainer's copy, which B-1 includes
     "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
 }
-_TURN_ON = ("autotuning", "channels_last_weights")  # the exact options Q-173's rule decides
+# The exact options Q-173's rule decides: since #326, autotuning together with NCHW inputs (Q-223)
+_TURN_ON = ("autotuning_and_nchw_inputs", "channels_last_weights")
 # The child process of one autotuning setting (Q-190). cuDNN caches the algorithm it picked
 # for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off
 # and on can't be compared in one process. `fused_ssim` can't be imported there, so

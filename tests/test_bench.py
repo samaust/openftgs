@@ -1610,7 +1610,11 @@ def test__losses_records_bf16s_deviation_and_the_gains_of_its_comparisons(
         summary = cases[(("comparison", name),)]
         assert summary["smallest_gain"] == min(gains)
         assert summary["meets_gain_threshold"] == (min(gains) >= 0.03)
-    assert losses_bench["setup"]["turn_on"] == ["autotuning", "channels_last_weights"]
+    # Q-173 (changed, #326), Q-223: the adopted combination replaces autotuning alone
+    assert losses_bench["setup"]["turn_on"] == [
+        "autotuning_and_nchw_inputs",
+        "channels_last_weights",
+    ]
     assert losses_bench["setup"]["gain_threshold"] == 0.03
     if importlib.util.find_spec("fused_ssim") is not None:
         for width, height in LOSS_SIZES:
