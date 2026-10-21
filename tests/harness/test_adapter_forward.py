@@ -415,3 +415,25 @@ def test_grad_stats_names_an_unhonored_setting_of_its_config_subset(tmp_path: Pa
     answer = _answer(tmp_path, "grad_stats", params, tensors)
     assert answer.status == "not_comparable"
     assert "loss.not_a_field" in answer.message
+
+
+@pytest.mark.parametrize(("version", "read"), [("1.1", True), ("2", False)])
+def test_forward_reads_any_minor_version_of_major_1(
+    tmp_path: Path, version: str, read: bool
+) -> None:
+    """§2.2: readers reject an unknown major version, so a 1.1 queries file is answered and a
+    version 2 file is an input error (exit 2)."""
+    from safetensors import safe_open
+    from safetensors.numpy import save_file
+
+    queries = tmp_path / "q.safetensors"
+    tensors = {"g": np.zeros(2, np.float32), "scales": np.ones((2, 3), np.float32)}
+    params = {"spatial_scale": 1.0, "grad_threshold": 0.5, "split_scale": 0.01, "n_max": 9}
+    write_queries(queries, "growth_decisions", [Query("q0", params, tensors)])
+    with safe_open(str(queries), framework="np") as f:
+        meta = dict(f.metadata() or {})
+        arrays = {k: f.get_tensor(k) for k in f.keys()}  # noqa: SIM118
+    save_file(arrays, str(queries), {**meta, "version": version})
+    out = tmp_path / "a.safetensors"
+    code = _adapter.main(["--backend", "gsplat", "forward", str(queries), str(out)])
+    assert code == (0 if read else 2)

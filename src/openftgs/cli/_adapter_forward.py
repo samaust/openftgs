@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -42,6 +43,7 @@ __all__ = ["KINDS", "forward"]
 
 _QUERIES = "ftgs-forward-queries"
 _ANSWERS = "ftgs-forward-answers"
+_VERSION_1 = re.compile(r"1(?:\.(?:0|[1-9][0-9]*))?")
 
 _Handler = Callable[[Mapping[str, Any], Mapping[str, Tensor]], dict[str, Tensor]]
 
@@ -331,7 +333,8 @@ def _read(path: Path) -> tuple[str, list[tuple[str, dict[str, Any], dict[str, Te
     with safe_open(str(path), framework="pt") as f:
         meta = dict(f.metadata() or {})
         tensors = {k: f.get_tensor(k) for k in f.keys()}  # noqa: SIM118
-    if meta.get("format") != _QUERIES or meta.get("version") != "1":
+    # §2.2: an unknown major version is rejected; any minor version of 1 is read.
+    if meta.get("format") != _QUERIES or not _VERSION_1.fullmatch(str(meta.get("version"))):
         raise ValueError(f"{path}: not a {_QUERIES} v1 file")
     entries = json.loads(meta["queries"])
     queries = []
