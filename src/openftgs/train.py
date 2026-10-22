@@ -392,6 +392,13 @@ def _bytes_per_row(model: FreeTimeGaussians) -> int:
     return 4 * (4 * floats + 2)
 
 
+def _fits_on_gpu(cache: int, *, free: int, reserve: int, growth: int) -> bool:
+    """D-51, Q-99, Q-225: whether "auto" puts a cache of `cache` bytes on the GPU: it fits in
+    half the free memory less the working memory `reserve` held for the iterations, minus what
+    growth to N_max adds."""
+    return cache <= 0.5 * (free - reserve) - growth
+
+
 def _stored_tensors(model: FreeTimeGaussians) -> dict[str, Tensor]:
     """The model's nine stored tensors (§1.1), by name."""
     return {name: getattr(model, name) for name in FreeTimeGaussians.PARAM_NAMES}
@@ -615,14 +622,25 @@ class Trainer:
 
     def _choose_placement(self) -> None:
         """Q-99: after the first CUDA iteration, the cache goes to GPU memory when it fits in half
-        the free memory minus what growth to N_max will add (D-51), and is memory-mapped
-        otherwise; a cache that can't be made falls back to PNGs with a warning."""
+        the free memory, less the working memory that iteration left reserved, minus what growth
+        to N_max will add (D-51, Q-225), and is memory-mapped otherwise; a cache that can't be
+        made falls back to PNGs with a warning."""
         self._placement_pending = False
-        free, _ = torch.cuda.mem_get_info(self._device)
-        free += torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(self._device)
+        unheld, _ = torch.cuda.mem_get_info(self._device)
+        # Q-225: the allocator's unused reserve is the iteration's working memory (the render's
+        # and the losses' buffers at the image's size, the gradients), which Q-99's free memory
+        # counts and the rule sets aside again.
+        reserve = torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(
+            self._device
+        )
         model = self._run.model
         growth = max(0, self._cfg.growth.n_max - model.num_gaussians) * _bytes_per_row(model)
-        fits = FrameCache.size_of(self._dataset) <= 0.5 * free - growth
+        fits = _fits_on_gpu(
+            FrameCache.size_of(self._dataset),
+            free=unheld + reserve,
+            reserve=reserve,
+            growth=growth,
+        )
         self._open_frame_cache("gpu" if fits else "mmap", automatic=True)
         self._schedule()
 

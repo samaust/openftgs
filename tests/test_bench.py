@@ -1195,13 +1195,14 @@ def test__data_config_is_b1s_with_the_case_placement() -> None:
 
 
 def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
-    """Q-99 (D-51): "auto" puts the cache on the GPU when it fits in half the GPU memory free
-    after a warm-up iteration, minus what growth to N_max adds, the boundary included. Q-99's
-    note (Q-189): what a run with the cache on the GPU then took beyond the cache and the
-    growth, from its peak reserved memory and the memory allocated after that iteration,
-    against the half of the free memory the rule leaves for it. With the device's total, what
-    lies outside this process's allocator (other processes, the CUDA context), which the free
-    memory leaves out."""
+    """Q-99 (D-51), Q-225: "auto" puts the cache on the GPU when it fits in half the GPU memory
+    free after a warm-up iteration, less the working memory that iteration left reserved
+    (reserved − allocated), minus what growth to N_max adds, the boundary included. Q-99's
+    note (Q-189, Q-225): what a run with the cache on the GPU then took beyond the cache, the
+    growth and that reserve, from its peak reserved memory and the memory reserved after that
+    iteration, against the half the rule leaves. With the device's total, what lies outside
+    this process's allocator (other processes, the CUDA context), which the free memory leaves
+    out."""
     import dataclasses
 
     from openftgs.cli._bench import _AutoEstimate
@@ -1210,13 +1211,14 @@ def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
     rule = _AutoEstimate(
         free=10 * gib,
         growth=gib,
-        cache=4 * gib,
+        cache=3 * gib,
         allocated=3 * gib,
         reserved=5 * gib,
         total=24 * gib,
     )
-    assert rule.limit == 4 * gib and rule.fits
-    assert not dataclasses.replace(rule, cache=4 * gib + 1).fits
+    # A reserve of 5 − 3 = 2 GiB: ½·(10 − 2) − 1 = 3 GiB.
+    assert rule.limit == 3 * gib and rule.fits
+    assert not dataclasses.replace(rule, cache=3 * gib + 1).fits
     # Free on the device: 10 − (5 − 3) = 8 GiB; so 24 − 8 − 5 reserved = 11 GiB lie outside.
     assert rule.figures() == {
         "auto_free_bytes": 10 * gib,
@@ -1225,14 +1227,14 @@ def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
         "auto_reserved_bytes": 5 * gib,
         "auto_total_bytes": 24 * gib,
         "auto_outside_bytes": 11 * gib,
-        "cache_bytes": 4 * gib,
-        "auto_limit_bytes": 4 * gib,
+        "cache_bytes": 3 * gib,
+        "auto_limit_bytes": 3 * gib,
     }
-    # 11 GiB reserved at the peak less the 3 allocated after the warm-up iteration is 8 GiB, of
-    # which the cache takes 4 and growth 1: 3 GiB beyond the estimate, of the 5 the rule leaves.
+    # 11 GiB reserved at the peak less the 5 reserved after the warm-up iteration is 6 GiB, of
+    # which the cache takes 3 and growth 1: 2 GiB beyond the estimate, of the 4 the rule leaves.
     assert rule.margin(peak_reserved=11 * gib) == {
-        "beyond_estimate_bytes": 3 * gib,
-        "margin_used": 0.6,
+        "beyond_estimate_bytes": 2 * gib,
+        "margin_used": 0.5,
     }
 
 
@@ -1355,8 +1357,9 @@ def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) ->
             continue
         # Q-99: "auto" would have placed the cache on the GPU, which then holds it.
         assert figures["cache_bytes"] <= figures["auto_limit_bytes"], case
+        reserve = figures["auto_reserved_bytes"] - figures["auto_allocated_bytes"]  # Q-225
         assert figures["auto_limit_bytes"] == pytest.approx(
-            0.5 * figures["auto_free_bytes"] - figures["auto_growth_bytes"]
+            0.5 * (figures["auto_free_bytes"] - reserve) - figures["auto_growth_bytes"]
         )
         assert figures["auto_growth_bytes"] > 0  # n_max = ⌈1.02·N⌉ > N
         assert figures["auto_total_bytes"] == torch.cuda.mem_get_info()[1]
@@ -1364,12 +1367,12 @@ def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) ->
         assert figures["peak_allocated_bytes"] >= figures["cache_bytes"], case
         assert figures["beyond_estimate_bytes"] == (
             figures["peak_reserved_bytes"]
-            - figures["auto_allocated_bytes"]
+            - figures["auto_reserved_bytes"]
             - figures["cache_bytes"]
             - figures["auto_growth_bytes"]
         )
         assert figures["margin_used"] == pytest.approx(
-            figures["beyond_estimate_bytes"] / (0.5 * figures["auto_free_bytes"])
+            figures["beyond_estimate_bytes"] / (0.5 * (figures["auto_free_bytes"] - reserve))
         )
     budgets = body["budgets"]
     assert [b["case"] for b in budgets] == want[:3]
