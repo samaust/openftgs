@@ -1477,16 +1477,17 @@ def test__step_chooses_the_placement_from_the_second_iterations_allocator(
 
 def _two_size_scene(root: Path) -> MultiViewVideo:
     """Two 32×24 cameras of `_scene`'s ring and a 40×30 camera, all training at frames k/30 for
-    k < 3, and a 32×24 test view."""
+    k < 3, and a 48×36 test view, whose size "auto" doesn't wait for."""
     cams = ring(4, radius=4.0, elevation=1.0, width_px=32, height_px=24, focal=30.0)
     wide = look_at((0.0, -4.0, 1.0), width=40, height=30, focal=37.5, name="wide")
     gt = random_model(24, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
     images = [(cam, k / 30.0, "train") for k in range(3) for cam in (cams[0], cams[1], wide)]
-    images += [(cams[3], k / 30.0, "test") for k in range(3)]
+    test = look_at((0.0, 4.0, 1.0), width=48, height=36, focal=45.0, name="test")
+    images += [(test, k / 30.0, "test") for k in range(3)]
     return MultiViewVideo.from_manifest(write_scene(root, gt, images))
 
 
-def _wide_fourth(trainer: Trainer, video: MultiViewVideo) -> None:
+def _order_wide_image_fourth(trainer: Trainer, video: MultiViewVideo) -> None:
     """Sets the first epoch of `_two_size_scene` to three 32×24 images, then a 40×30 one."""
     train = [i for i, r in enumerate(video.records) if r.split == "train"]
     small = [i for i in train if video.records[i].camera.width == 32]
@@ -1509,7 +1510,7 @@ def test__step_chooses_the_placement_after_every_image_size_has_run(
         _no_perceptual(perf=PerfConfig(frame_cache="off")), video, _init_points(), device="cpu"
     )
     trainer._await_placement()  # what "auto" does on CUDA at construction
-    _wide_fourth(trainer, video)
+    _order_wide_image_fourth(trainer, video)
     unheld = {i: 20 * gib for i in range(1, 5)} | {5: 12 * gib}
     reserved = {i: gib for i in range(1, 5)} | {5: 9 * gib}
     chosen: list[tuple[int, str]] = []
@@ -1580,7 +1581,7 @@ def test_cuda_auto_placement_waits_for_every_image_size(tmp_path: Path) -> None:
     cuDNN for the new size, and opens the cache only after iteration 5."""
     video = _two_size_scene(tmp_path / "scene")
     trainer = Trainer(_with_cache(ONE_EVENT, "auto"), video, _u21_model(video), device="cuda")
-    _wide_fourth(trainer, video)
+    _order_wide_image_fourth(trainer, video)
     for _ in range(4):
         trainer.step()
         assert trainer._frames is None

@@ -291,18 +291,17 @@ class _PlacementWait:
     training images' sizes to appear: after the second when they all have one size."""
 
     def __init__(self, dataset: MultiViewVideo) -> None:
-        self._dataset = dataset
+        self._sizes = [(r.camera.width, r.camera.height) for r in dataset.records]
         self._unseen = {
-            (r.camera.width, r.camera.height) for r in dataset.records if r.split == "train"
+            size for size, r in zip(self._sizes, dataset.records, strict=True) if r.split == "train"
         }
 
     def decides_after(self, index: int) -> bool:
-        """Whether "auto" decides after the iteration that trained on record `index`; asked once
-        an iteration, in order."""
+        """Records that an iteration trained on record `index`, and says whether "auto" decides
+        after it; called once an iteration, in order."""
         if not self._unseen:
             return True
-        camera = self._dataset.records[index].camera
-        self._unseen.discard((camera.width, camera.height))
+        self._unseen.discard(self._sizes[index])
         return False
 
 
@@ -620,9 +619,9 @@ class Trainer:
 
     def _open_frame_cache(self, placement: str, *, automatic: bool = False) -> None:
         """D-51, Q-99: "off" decodes PNGs; "gpu" and "mmap" open the cache now; "auto" is mmap on
-        a CPU device and, on CUDA, decided once every training image size has run (Q-232). A
-        cache directory that can't be made turns "auto" into "off" with a warning, and is a
-        ValueError for an explicit placement (Q-26)."""
+        a CPU device and, on CUDA, decided after the iteration that follows the first at the last
+        training image size to appear (Q-232). A cache directory that can't be made turns "auto"
+        into "off" with a warning, and is a ValueError for an explicit placement (Q-26)."""
         if placement == "off":
             return
         if placement == "auto" and self._device.type == "cuda":

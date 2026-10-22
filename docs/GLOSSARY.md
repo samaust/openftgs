@@ -431,7 +431,7 @@ The uint8 copy of every training image, one safetensors tensor per camera keyed 
 _Avoid_: image cache, dataloader, preload
 
 **Cache placement**:
-Where the frame cache lives during training: "gpu", the whole cache in GPU memory, or "mmap", memory-mapped files read one frame at a time; "auto" chooses from the free GPU memory once every training image size has had its first iteration, after the second iteration when there is one size (Q-232). D-51, §2.4 Settings
+Where the frame cache lives during training: "gpu", the whole cache in GPU memory, or "mmap", memory-mapped files read one frame at a time; "auto" chooses from the free GPU memory after the iteration that follows the first at the last training image size to appear, the second when there is one size (Q-232). D-51, §2.4 Settings
 _Avoid_: cache mode, storage backend, residency
 
 **Prefetcher**:
