@@ -14,15 +14,17 @@ exit 2, for the owner to look at.
 For each test frame, at the record's time:
 - **expected depth** (Q-226): the model rendered through `render()` with SH degree 0 and each
   primitive's colour set to its camera-space depth z, so that image ÷ alpha = Σ wᵢ zᵢ / Σ wᵢ
-  (E2, E6). It is compared with the ground truth over pixels with a surface, alpha ≥ 0.5
-  (Q-227) and away from depth edges (Q-228), on all of them, on static pixels and on dynamic
-  pixels: the number of pixels, their share of the surface pixels, and the mean, median and
-  root mean square of |error| and the mean signed error, in metres (Q-231);
-- **geometry residual**: for every primitive the render reports visible with σ_eff ≥ 1/255,
-  r = its centre's camera-space z − the ground-truth depth at the pixel its centre projects to
-  (Q-230), negative in front of the surface. Weighted by σ_eff: the median and 90th percentile
-  of |r|, and the shares with r < −δ and r > +δ, δ = 0.02·S with S the checkpoint's spatial
-  scale (D-27, Q-229), split by whether that pixel is static or dynamic.
+  (E2, E6). Its error, expected depth − ground-truth depth (negative in front of the surface),
+  is taken over pixels with a surface and alpha ≥ 0.5 (Q-227) away from depth edges (Q-228), on
+  all of them, on static pixels and on dynamic pixels, and apart on the edge pixels left out:
+  the number of pixels, their share of the surface pixels, and the mean, median and root mean
+  square of |error| and the mean error, in metres (Q-231);
+- **geometry residual**: for every primitive the render reports visible (inside the view, its
+  footprint on screen, whether or not something hides it; E6) with σ_eff ≥ 1/255, r = its
+  centre's camera-space z − the ground-truth depth at the pixel its centre projects to (Q-230),
+  negative in front of the surface. Weighted by σ_eff: the median and 90th percentile of |r|,
+  and the shares with r < −kδ and r > +kδ for k = ½, 1, 2, δ = 0.02·S with S the checkpoint's
+  spatial scale (D-27, Q-229), split by whether that pixel is static or dynamic.
 
 RESULT.json holds every frame's figures and the same over all frames, whose quantiles come from
 histograms of 0.1 mm bins (Q-231). These are diagnostics, not pass criteria: the spec defines no
@@ -40,7 +42,7 @@ import sys
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -48,18 +50,22 @@ if TYPE_CHECKING:
     import torch
 
     from openftgs.model import FreeTimeGaussians
-    from openftgs.types import Camera
+    from openftgs.types import Camera, ImageRecord
 
-ALPHA_MIN = 0.5  # Q-227
-EDGE_JUMP = 0.05  # Q-228: a relative depth jump above it, within 1 px, marks an edge
-DELTA_OF_S = 0.02  # Q-229: δ = 0.02·S
-OPACITY_MIN = 1.0 / 255.0  # D-32's cull, which the render applies too
+_Backend = Literal["gsplat", "reference"]
+
+_ALPHA_MIN = 0.5  # Q-227
+_EDGE_JUMP = 0.05  # Q-228: a relative depth jump above it, within 1 px, marks an edge
+_DELTA_OF_S = 0.02  # Q-229: δ = 0.02·S
+_DELTA_MULTIPLES = (0.5, 1.0, 2.0)  # Q-229's check: the shares as δ varies by 2× either way
+_SIGMA_EFF_MIN = 1.0 / 255.0  # D-32's cull, which the render applies too
 # Q-231: matching a record to the ground truth
-TIME_TOLERANCE_S = 1e-6
-POSE_TOLERANCE = 1e-5
-K_TOLERANCE = 1e-6  # relative
-BIN_M = 1e-4  # Q-231: the pooled histograms' bins
-BINS = 200_000  # 20 m; larger values land in the last bin
+_TIME_TOLERANCE_S = 1e-6
+_POSE_TOLERANCE = 1e-5
+_K_TOLERANCE = 1e-6  # relative and absolute
+_BIN_M = 1e-4  # Q-231: the pooled histograms' bins
+_BINS = 200_000  # 20 m; larger values land in the last bin
+_REGIONS = ("all", "static", "dynamic")
 
 
 class InputError(Exception):
@@ -81,7 +87,9 @@ _FLOAT = 2
 
 
 def _cstring(data: bytes, at: int) -> tuple[str, int]:
-    end = data.index(b"\0", at)
+    end = data.find(b"\0", at)
+    if end < 0:
+        raise IndexError("a string runs past the end of the file")
     return data[at:end].decode("ascii"), end + 1
 
 
@@ -104,8 +112,15 @@ def _unzip(packed: bytes, size: int) -> bytes:
 
 def read_exr(path: Path) -> np.ndarray:
     """The single FLOAT channel "Y" of a scanline EXR file (uncompressed, ZIPS or ZIP) as
-    float32 [H, W]; ValueError for any other kind of file."""
+    float32 [H, W]; ValueError for any other kind of file, a truncated one included."""
     data = Path(path).read_bytes()
+    try:
+        return _parse_exr(data, path)
+    except (struct.error, IndexError, KeyError, UnicodeDecodeError, zlib.error) as err:
+        raise ValueError(f"{path}: not a readable EXR file ({err!r})") from None
+
+
+def _parse_exr(data: bytes, path: Path) -> np.ndarray:
     if data[:4] != _MAGIC:
         raise ValueError(f"{path}: not an EXR file")
     (version,) = struct.unpack_from("<i", data, 4)
@@ -152,15 +167,15 @@ def read_exr(path: Path) -> np.ndarray:
 
 
 @dataclass(frozen=True)
-class DepthRender:
-    depth: torch.Tensor  # [H, W] expected depth, 0 where alpha is 0
+class ExpectedDepth:
+    expected_depth: torch.Tensor  # [H, W], 0 where alpha is 0
     alpha: torch.Tensor  # [H, W]
     means: torch.Tensor  # [N, 3] μ(t), world
-    opacities: torch.Tensor  # [N] σ_eff(t)
+    sigma_eff: torch.Tensor  # [N] σ_eff(t)
     visible: torch.Tensor  # [N] bool, as the render reports it
 
 
-class DepthRenderer:
+class ExpectedDepthRenderer:
     """Q-226: a copy of a model with SH degree 0, whose sh0 is set per camera and time so that
     each primitive's colour is its camera-space depth."""
 
@@ -179,30 +194,23 @@ class DepthRenderer:
             params, sh_degree=0, time=model.time, time_unit=model.time_unit
         )
         self.model.requires_grad_(False)
-        self._torch = torch
+        self._no_grad = torch.no_grad
 
-    def __call__(self, camera: Camera, tau: float, *, backend: str) -> DepthRender:
+    def __call__(self, camera: Camera, tau: float, *, backend: _Backend) -> ExpectedDepth:
         from openftgs.render import render
         from openftgs.sh import C0
 
-        torch = self._torch
-        with torch.no_grad():
+        with self._no_grad():
             g = self.model.at_time(self.model.time.to_t(tau))
             w2c = camera.world_to_camera.to(g.means_t)
             z = g.means_t @ w2c[2, :3] + w2c[2, 3]
             # Q-226: colour = C0·sh0 + 0.5 = z (E2, which clamps only at 0)
             self.model.sh0.copy_(((z - 0.5) / C0)[:, None, None].expand(-1, 1, 3))
-            out = render(self.model, camera, tau, backend=backend, return_aux=True)  # type: ignore[arg-type]
+            out = render(self.model, camera, tau, backend=backend, return_aux=True)
         image, alpha = out.image[0, ..., 0], out.alpha[0, ..., 0]
-        depth = torch.where(alpha > 0, image / alpha.clamp_min(1e-12), torch.zeros_like(image))
+        expected = (image / alpha.clamp_min(1e-12)).where(alpha > 0, 0.0)
         assert out.visible is not None
-        return DepthRender(depth, alpha, g.means_t, g.opacities_t, out.visible[0])
-
-
-def depth_render(
-    model: FreeTimeGaussians, camera: Camera, tau: float, *, backend: str
-) -> DepthRender:
-    return DepthRenderer(model)(camera, tau, backend=backend)
+        return ExpectedDepth(expected, alpha, g.means_t, g.opacities_t, out.visible[0])
 
 
 def _neighbourhood(values: np.ndarray, fill: float) -> list[np.ndarray]:
@@ -229,7 +237,7 @@ def away_from_edges(gt: np.ndarray) -> np.ndarray:
     safe = np.where(gt > 0, gt, 1.0)
     for nb in _neighbourhood(gt, np.nan):
         jump = np.abs(nb - gt) / safe
-        keep &= ~(jump > EDGE_JUMP)  # NaN beyond the image compares False
+        keep &= ~(jump > _EDGE_JUMP)  # NaN beyond the image compares False
     return keep
 
 
@@ -237,25 +245,31 @@ def residuals(
     means: torch.Tensor, camera: Camera, gt: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The geometry residual r = z − D of each centre (world, [M, 3]) whose nearest pixel and its
-    3×3 neighbours have a ground-truth surface (Q-230): r, the rows kept and their pixels
-    (u, v)."""
+    3×3 neighbours have a ground-truth surface (Q-230): r, the indices of the centres kept and
+    their pixels (u, v)."""
     w2c = camera.world_to_camera.double().cpu().numpy()
     K = camera.K.double().cpu().numpy()
     x = means.detach().double().cpu().numpy() @ w2c[:3, :3].T + w2c[:3, 3]
     z = x[:, 2]
     with np.errstate(divide="ignore", invalid="ignore"):
         uv = (x @ K.T)[:, :2] / z[:, None]
-    u, v = np.floor(uv[:, 0]), np.floor(uv[:, 1])  # §1.4: pixel (u, v) spans [u, u + 1)
+    # Q-230: the pixel the centre falls in (§1.4: pixel (u, v) spans [u, u + 1))
+    u, v = np.floor(uv[:, 0]), np.floor(uv[:, 1])
     h, w = gt.shape
     inside = (z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    rows = np.flatnonzero(inside)
-    ui, vi = u[rows].astype(np.int64), v[rows].astype(np.int64)
+    kept = np.flatnonzero(inside)
+    ui, vi = u[kept].astype(np.int64), v[kept].astype(np.int64)
     ok = _surface_around(gt)[vi, ui]
-    rows, ui, vi = rows[ok], ui[ok], vi[ok]
-    return z[rows] - gt[vi, ui].astype(np.float64), rows, np.stack([ui, vi], axis=1)
+    kept, ui, vi = kept[ok], ui[ok], vi[ok]
+    return z[kept] - gt[vi, ui].astype(np.float64), kept, np.stack([ui, vi], axis=1)
 
 
 # -- Statistics -----------------------------------------------------------------------------------
+
+
+def _regions(dynamic: np.ndarray) -> dict[str, np.ndarray]:
+    """All, static and dynamic, from a boolean dynamic mask over pixels or primitives."""
+    return {"all": np.ones_like(dynamic), "static": ~dynamic, "dynamic": dynamic}
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float | None:
@@ -266,37 +280,60 @@ def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> flo
     return float(values[order][np.searchsorted(cumulative, q * cumulative[-1])])
 
 
-class _Pool:
-    """Q-231: figures over all frames, quantiles from a histogram of |value| in 0.1 mm bins."""
+def _shares(r: np.ndarray, w: np.ndarray, delta: float) -> dict[str, dict[str, float | None]]:
+    """The weight shares with r < −kδ and r > +kδ, keyed by k (Q-229)."""
+    total = float(w.sum())
+    front, behind = {}, {}
+    for k in _DELTA_MULTIPLES:
+        front[str(k)] = float(w[r < -k * delta].sum()) / total if total > 0 else None
+        behind[str(k)] = float(w[r > k * delta].sum()) / total if total > 0 else None
+    return {"share_in_front": front, "share_behind": behind}
+
+
+class _HistogramPool:
+    """Q-231: weighted figures over all frames, quantiles of |value| from a histogram of 0.1 mm
+    bins."""
 
     def __init__(self) -> None:
-        self.hist = np.zeros(BINS)
+        self.hist = np.zeros(_BINS)
         self.weight = 0.0
         self.count = 0
         self.sum_abs = self.sum_sq = self.sum = 0.0
-        self.front = self.behind = 0.0
 
-    def add(self, values: np.ndarray, weights: np.ndarray, delta: float | None = None) -> None:
-        bins = np.minimum((np.abs(values) / BIN_M).astype(np.int64), BINS - 1)
-        self.hist += np.bincount(bins, weights=weights, minlength=BINS)
+    def add(self, values: np.ndarray, weights: np.ndarray) -> None:
+        bins = np.minimum((np.abs(values) / _BIN_M).astype(np.int64), _BINS - 1)
+        self.hist += np.bincount(bins, weights=weights, minlength=_BINS)
         self.weight += float(weights.sum())
         self.count += int(values.size)
         self.sum_abs += float((weights * np.abs(values)).sum())
         self.sum_sq += float((weights * values**2).sum())
         self.sum += float((weights * values).sum())
-        if delta is not None:
-            self.front += float(weights[values < -delta].sum())
-            self.behind += float(weights[values > delta].sum())
 
     def quantile(self, q: float) -> float | None:
         if self.weight <= 0:
             return None
         k = int(np.searchsorted(np.cumsum(self.hist), q * self.weight))
-        return (k + 0.5) * BIN_M
+        return round((k + 0.5) * _BIN_M, 6)  # the bin's centre
 
 
-def _depth_figures(error: np.ndarray, surface: int) -> dict[str, Any]:
-    """Q-231: an expected-depth comparison over its kept pixels, in metres."""
+class _ResidualPool(_HistogramPool):
+    """The residual's pool, which also sums the weight in front of and behind the surface."""
+
+    def __init__(self, delta: float) -> None:
+        super().__init__()
+        self.delta = delta
+        self.front = dict.fromkeys(_DELTA_MULTIPLES, 0.0)
+        self.behind = dict.fromkeys(_DELTA_MULTIPLES, 0.0)
+
+    def add(self, values: np.ndarray, weights: np.ndarray) -> None:
+        super().add(values, weights)
+        for k in _DELTA_MULTIPLES:
+            self.front[k] += float(weights[values < -k * self.delta].sum())
+            self.behind[k] += float(weights[values > k * self.delta].sum())
+
+
+def _error_figures(error: np.ndarray, surface: int) -> dict[str, Any]:
+    """Q-231: an expected-depth comparison over its pixels, in metres."""
     n = int(error.size)
     if n == 0:
         return _no_pixels(surface)
@@ -316,7 +353,7 @@ def _no_pixels(surface: int) -> dict[str, Any]:
     return {"pixels": 0, "share_of_surface": 0.0 if surface else None, **empty}
 
 
-def _pooled_depth(pool: _Pool, surface: int) -> dict[str, Any]:
+def _pooled_error(pool: _HistogramPool, surface: int) -> dict[str, Any]:
     if pool.count == 0:
         return _no_pixels(surface)
     return {
@@ -330,34 +367,32 @@ def _pooled_depth(pool: _Pool, surface: int) -> dict[str, Any]:
 
 
 def _residual_figures(r: np.ndarray, w: np.ndarray, delta: float) -> dict[str, Any]:
-    total = float(w.sum())
     a = np.abs(r)
     return {
         "primitives": int(r.size),
-        "weight": total,
+        "weight": float(w.sum()),
         "median_abs": _weighted_quantile(a, w, 0.5),
         "p90_abs": _weighted_quantile(a, w, 0.9),
-        "share_in_front": float(w[r < -delta].sum()) / total if total > 0 else None,
-        "share_behind": float(w[r > delta].sum()) / total if total > 0 else None,
+        **_shares(r, w, delta),
     }
 
 
-def _pooled_residual(pool: _Pool) -> dict[str, Any]:
+def _pooled_residual(pool: _ResidualPool) -> dict[str, Any]:
     total = pool.weight
     return {
         "primitives": pool.count,
         "weight": total,
         "median_abs": pool.quantile(0.5),
         "p90_abs": pool.quantile(0.9),
-        "share_in_front": pool.front / total if total > 0 else None,
-        "share_behind": pool.behind / total if total > 0 else None,
+        "share_in_front": {str(k): f / total if total > 0 else None for k, f in pool.front.items()},
+        "share_behind": {str(k): b / total if total > 0 else None for k, b in pool.behind.items()},
     }
 
 
 # -- Matching the scene to the ground truth -------------------------------------------------------
 
 
-def _ground_truth_frame(record: Any, cameras: dict[str, Any]) -> tuple[str, int]:
+def _ground_truth_frame(record: ImageRecord, cameras: dict[str, Any]) -> tuple[str, int]:
     """Q-231: the ground-truth camera and decode index n of a test record, after checking its
     camera against the ground truth's."""
     cam = record.camera
@@ -369,18 +404,18 @@ def _ground_truth_frame(record: Any, cameras: dict[str, Any]) -> tuple[str, int]
             f"camera {cam.name}: {cam.width}×{cam.height} isn't the ground truth's size"
         )
     K, gt_K = cam.K.double().numpy(), np.array(gt["K_continuous"])
-    if not np.allclose(K, gt_K, rtol=K_TOLERANCE, atol=K_TOLERANCE):
+    if not np.allclose(K, gt_K, rtol=_K_TOLERANCE, atol=_K_TOLERANCE):
         raise InputError(f"camera {cam.name}: K differs from the ground truth's K_continuous")
     pose = cam.world_to_camera.double().numpy()
-    if np.abs(pose - np.array(gt["world_to_camera"])).max() > POSE_TOLERANCE:
+    if np.abs(pose - np.array(gt["world_to_camera"])).max() > _POSE_TOLERANCE:
         raise InputError(f"camera {cam.name}: the pose differs from the ground truth's")
-    hits = [f["n"] for f in gt["frames"] if abs(f["t"] - record.timestamp) <= TIME_TOLERANCE_S]
+    hits = [f["n"] for f in gt["frames"] if abs(f["t"] - record.timestamp) <= _TIME_TOLERANCE_S]
     if len(hits) != 1:
         raise InputError(f"camera {cam.name}: {len(hits)} frames at t = {record.timestamp}")
     return cam.name, int(hits[0])
 
 
-def run(checkpoint: Path, scene: Path, gt_dir: Path, *, backend: str) -> dict[str, Any]:
+def run(checkpoint: Path, scene: Path, gt_dir: Path, *, backend: _Backend) -> dict[str, Any]:
     from PIL import Image
 
     from openftgs.config import config_from_dict
@@ -393,12 +428,12 @@ def run(checkpoint: Path, scene: Path, gt_dir: Path, *, backend: str) -> dict[st
             c["name"]: c for c in json.loads((gt_dir / "cameras.json").read_text())["cameras"]
         }
         state = load_checkpoint(checkpoint)
-    except (OSError, ValueError, KeyError) as err:
-        raise InputError(str(err)) from None
-    records = [r for r in manifest.records if r.split == "test"]
+        records = [r for r in manifest.records if r.split == "test"]
+        frames = [_ground_truth_frame(r, cameras) for r in records]
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        raise InputError(f"{type(err).__name__}: {err}") from None
     if not records:
         raise InputError(f"the test split of {scene} holds no images")
-    frames = [_ground_truth_frame(r, cameras) for r in records]
     device = "cuda" if backend == "gsplat" else "cpu"
     model = FreeTimeGaussians(
         {k: v.to(device) for k, v in state.params.items()},
@@ -406,13 +441,12 @@ def run(checkpoint: Path, scene: Path, gt_dir: Path, *, backend: str) -> dict[st
         time=state.time,
         time_unit=state.time_unit,
     )
-    renderer = DepthRenderer(model)
-    delta = DELTA_OF_S * state.spatial_scale  # Q-229
-    regions = ("all", "static", "dynamic")
-    depth_pools = {k: _Pool() for k in regions}
-    residual_pools = {k: _Pool() for k in regions}
-    surface_totals = dict.fromkeys(regions, 0)
-    rows_out = []
+    renderer = ExpectedDepthRenderer(model)
+    delta = _DELTA_OF_S * state.spatial_scale  # Q-229
+    error_pools = {k: _HistogramPool() for k in (*_REGIONS, "edges")}
+    residual_pools = {k: _ResidualPool(delta) for k in _REGIONS}
+    surface_totals = dict.fromkeys((*_REGIONS, "edges"), 0)
+    frames_out = []
     for record, (name, n) in zip(records, frames, strict=True):
         try:
             gt = read_exr(gt_dir / "depth" / name / f"{n:06d}.exr")
@@ -420,45 +454,53 @@ def run(checkpoint: Path, scene: Path, gt_dir: Path, *, backend: str) -> dict[st
                 dynamic = np.asarray(image.convert("L")) > 127
         except (OSError, ValueError) as err:
             raise InputError(str(err)) from None
+        if gt.shape != dynamic.shape or gt.shape != (record.camera.height, record.camera.width):
+            raise InputError(f"camera {name}, frame {n}: depth, mask and image sizes differ")
         out = renderer(record.camera, record.timestamp, backend=backend)
-        depth, alpha = out.depth.double().cpu().numpy(), out.alpha.cpu().numpy()
-        kept = away_from_edges(gt) & (alpha >= ALPHA_MIN)  # Q-227, Q-228
-        error = depth - gt
-        masks = {"all": np.ones_like(dynamic), "static": ~dynamic, "dynamic": dynamic}
+        expected = out.expected_depth.double().cpu().numpy()
+        alpha = out.alpha.cpu().numpy()
+        covered = (gt > 0) & (alpha >= _ALPHA_MIN)  # Q-227
+        away = away_from_edges(gt)  # Q-228
+        error = expected - gt
         frame: dict[str, Any] = {"camera": name, "n": n, "timestamp": record.timestamp}
-        frame["depth"] = {}
-        for region, mask in masks.items():
+        frame["expected_depth"] = {}
+        pixels = {**_regions(dynamic), "edges": np.ones_like(dynamic)}
+        for region, mask in pixels.items():
+            kept = covered & mask & (~away if region == "edges" else away)
             surface = int(((gt > 0) & mask).sum())
-            e = error[kept & mask]
-            frame["depth"][region] = _depth_figures(e, surface)
-            depth_pools[region].add(e, np.ones_like(e))
+            frame["expected_depth"][region] = _error_figures(error[kept], surface)
+            error_pools[region].add(error[kept], np.ones(int(kept.sum())))
             surface_totals[region] += surface
-        chosen = (out.visible & (out.opacities >= OPACITY_MIN)).nonzero().squeeze(1)
-        r, rows, pixels = residuals(out.means[chosen], record.camera, gt)
-        w = out.opacities[chosen].double().cpu().numpy()[rows]
-        at_dynamic = dynamic[pixels[:, 1], pixels[:, 0]]
+        chosen = (out.visible & (out.sigma_eff >= _SIGMA_EFF_MIN)).nonzero().squeeze(1)
+        r, kept_rows, at = residuals(out.means[chosen], record.camera, gt)
+        w = out.sigma_eff[chosen].double().cpu().numpy()[kept_rows]
         frame["residual"] = {}
-        for region, select in (("all", np.ones_like(at_dynamic)), ("static", ~at_dynamic),
-                               ("dynamic", at_dynamic)):  # fmt: skip
+        for region, select in _regions(dynamic[at[:, 1], at[:, 0]]).items():
             frame["residual"][region] = _residual_figures(r[select], w[select], delta)
-            residual_pools[region].add(r[select], w[select], delta)
-        rows_out.append(frame)
+            residual_pools[region].add(r[select], w[select])
+        frames_out.append(frame)
     return {
         "checkpoint": str(checkpoint),
         "iteration": state.iteration,
         "scene": str(scene),
         "ground_truth": str(gt_dir),
         "backend": backend,
-        "alpha_min": ALPHA_MIN,
-        "edge_jump": EDGE_JUMP,
+        "alpha_min": _ALPHA_MIN,
+        "edge_jump": _EDGE_JUMP,
         "spatial_scale": state.spatial_scale,
         "delta": delta,
         "overall": {
-            "depth": {k: _pooled_depth(depth_pools[k], surface_totals[k]) for k in regions},
-            "residual": {k: _pooled_residual(residual_pools[k]) for k in regions},
+            "expected_depth": {
+                k: _pooled_error(pool, surface_totals[k]) for k, pool in error_pools.items()
+            },
+            "residual": {k: _pooled_residual(pool) for k, pool in residual_pools.items()},
         },
-        "frames": rows_out,
+        "frames": frames_out,
     }
+
+
+def _metres(value: float | None) -> str:
+    return "none" if value is None else f"{value:.4f} m"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -476,10 +518,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=1), encoding="utf-8")
-    overall = result["overall"]
+    depth = result["overall"]["expected_depth"]["all"]
+    residual = result["overall"]["residual"]["all"]
     print(
-        f"gt_depth: median |depth error| {overall['depth']['all']['median_abs']} m, "
-        f"median |r| {overall['residual']['all']['median_abs']} m, {len(result['frames'])} frames"
+        f"gt_depth: expected depth median |error| {_metres(depth['median_abs'])}, "
+        f"bias {_metres(depth['bias'])}; median |r| {_metres(residual['median_abs'])}; "
+        f"{len(result['frames'])} frames"
     )
     return 0
 
