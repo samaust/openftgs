@@ -16,14 +16,14 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pytest
 import torch
 from builders import look_at, model_from_rows, pinhole
+from exr_writer import write_exr
 from PIL import Image
-from test_gt_depth import write_exr
 
 from openftgs.config import TrainConfig, config_to_dict
 from openftgs.eval import psnr
@@ -273,27 +273,32 @@ def test_scene_flags_the_planted_flaws(tmp_path: Path) -> None:
     assert (out / "maps" / "b_flicker.png").exists()
 
 
-def test_run_reports_psnr_with_and_without_the_flagged_pixels(tmp_path: Path) -> None:
-    """Q-233 at the script's level: each test frame's PSNR is E16's, the render composited over
-    the run's background, and wherever a flag marks no pixel, the kept-pixel PSNR equals it;
-    frame 0's clipped share is its 16 pixels."""
+@pytest.mark.parametrize("backend", ["reference", pytest.param("gsplat", marks=pytest.mark.gpu)])
+def test_run_reports_psnr_with_and_without_the_flagged_pixels(
+    tmp_path: Path, backend: Literal["gsplat", "reference"]
+) -> None:
+    """Q-233 at the script's level, on both backends (gsplat is `run`'s default): each test
+    frame's PSNR is E16's, the render composited over the run's background, and wherever a flag
+    marks no pixel, the kept-pixel PSNR equals it; frame 0's clipped share is its 16 pixels."""
     scene, gt, checkpoint = _flawed_scene(tmp_path)
     module = _module()
     flags = tmp_path / "reference"
     assert module.main(["scene", str(scene), str(gt), "--out", str(flags)]) == 0
     out = tmp_path / "REFERENCE_PSNR.json"
     assert module.main(["run", str(checkpoint), str(scene), str(flags / "flags"),
-                        "--out", str(out), "--backend", "reference"]) == 0  # fmt: skip
+                        "--out", str(out), "--backend", backend]) == 0  # fmt: skip
     result = json.loads(out.read_text())
     assert result["iteration"] == 3 and len(result["frames"]) == _FRAMES
-    model = model_from_rows([_ROW], time=_TIME)
-    background = torch.tensor(_BACKGROUND)
+    assert result["backend"] == backend
+    device = "cuda" if backend == "gsplat" else "cpu"
+    model = model_from_rows([_ROW], time=_TIME).to(device)
+    background = torch.tensor(_BACKGROUND, device=device)
     for n, frame in enumerate(result["frames"]):
         with Image.open(scene.parent / f"images/b/{n:06d}.png") as image:
-            gt_b = torch.from_numpy(np.asarray(image).astype(np.float32)) / 255.0
+            gt_b = torch.from_numpy(np.asarray(image).astype(np.float32)).to(device) / 255.0
         with torch.no_grad():
             image_b = render(model, _camera("b", 0.0), n / 30, background=background,
-                             backend="reference").image[0]  # fmt: skip
+                             backend=backend).image[0]  # fmt: skip
         assert frame["psnr"] == pytest.approx(float(psnr(image_b, gt_b)), abs=1e-6)  # E16
         if n == 0:  # the clipped patch: the render's mean error there, in levels
             patch = image_b.clamp(0, 1)[_CLIP] - gt_b[_CLIP]
