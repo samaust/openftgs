@@ -1391,6 +1391,10 @@ def _adam(ctx: _Context) -> _Result:
 
 _DATA_N = 1_000_000  # #232: B-1's configuration at N = 1M
 _DATA_ACTIVE = 0.2  # Q-189: as B-1's case at 1M rows (#226)
+# Q-225 (changed, #341): the probe's iterations before it reads, as many as the trainer's "auto"
+# runs before it decides (`openftgs.train._PLACEMENT_AFTER`); the first may autotune cuDNN and
+# empty the allocator.
+_PROBE_ITERATIONS = 2
 _MEMORY_N = 3_000_000  # #232, Q-99's note: peak memory at N = 3M with the cache on the GPU
 _DATA_TIMED = (121, 320)  # #232: 200 iterations under the CUDA clock, after B-1's warm-up
 _DATA_HOST = (321, 420)  # Q-189: 100 iterations under the wall clock, a diagnostic
@@ -1537,8 +1541,7 @@ def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
 
     cfg = _data_config(n, "off", None)
     trainer = _data_trainer(ctx, volume, cfg, n)
-    # Q-225 (changed, #341): the first iteration may autotune cuDNN and empty the allocator.
-    for _ in range(2):
+    for _ in range(_PROBE_ITERATIONS):
         trainer.step()
     free, total = torch.cuda.mem_get_info()
     allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
