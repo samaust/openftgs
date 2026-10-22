@@ -534,6 +534,22 @@ _Avoid_: masked metric, foreground metric, dynamic PSNR (unqualified)
 The METRICS.json file `ftgs eval` writes, holding the E16 metrics per test image and per scene under `entire`, under `dynamic` when the scene has dynamic-region masks, and under `fastest_10` when the manifest names the Fastest-10 frames. E16, D-67, D-69
 _Avoid_: metrics file, results JSON, eval report
 
+**Expected depth**:
+A pixel's camera-space depth averaged over the primitives composited there with their compositing weights and normalized by alpha; the depth the diagnostics compare with openftgs-synth's planar ground-truth depth, which the package doesn't render. E6, #318
+_Avoid_: depth (unqualified, where the ground-truth depth could be meant), rendered depth, median depth (a different statistic)
+
+**Geometry residual**:
+The signed difference, at one time, between the camera-space depth of a visible primitive's centre and the ground-truth depth at the pixel the centre projects to, negative in front of the surface; the per-frame geometry diagnostic. #318
+_Avoid_: geometry error, depth error (that compares expected depth), chamfer distance (a different measure)
+
+**Flagged pixel**:
+A pixel of a converted reference frame that the reference-quality diagnostics mark as one no model could match: clipped, inconsistent across cameras, or changing on static pixels beyond what the scene explains. #318
+_Avoid_: bad pixel, outlier, masked pixel (masks are the dynamic-region masks)
+
+**Kept-pixel PSNR**:
+PSNR over the pixels of a test image left after removing the flagged pixels, with no crop and no fill; unlike a dynamic-region metric, SSIM and LPIPS have no kept-pixel form. E16, #318
+_Avoid_: masked PSNR, masked metric, clean PSNR
+
 ### Differential harness
 
 **Harness**:
