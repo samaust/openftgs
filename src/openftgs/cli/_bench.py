@@ -1424,7 +1424,7 @@ class _AutoEstimate:
     """What "auto" measures after a warm-up iteration on CUDA (Q-99), in bytes: the free GPU
     memory, `mem_get_info`'s plus what the allocator holds unused; what growth to N_max adds;
     the cache's size; the memory allocated and reserved then, whose difference is the
-    iteration's working memory (Q-223); and the device's total."""
+    iteration's working memory (Q-224); and the device's total."""
 
     free: int
     growth: int
@@ -1435,12 +1435,12 @@ class _AutoEstimate:
 
     @property
     def reserve(self) -> int:
-        """Q-223: the working memory the warm-up iteration left in the allocator."""
+        """Q-224: the working memory the warm-up iteration left in the allocator."""
         return self.reserved - self.allocated
 
     @property
     def limit(self) -> float:
-        """D-51, Q-99, Q-223: the largest cache "auto" puts on the GPU, ½·(free − reserve) −
+        """D-51, Q-99, Q-224: the largest cache "auto" puts on the GPU, ½·(free − reserve) −
         growth, as `openftgs.train`'s rule."""
         return 0.5 * (self.free - self.reserve) - self.growth
 
@@ -1463,7 +1463,7 @@ class _AutoEstimate:
         }
 
     def margin(self, *, peak_reserved: int) -> dict[str, float]:
-        """Q-99's note (Q-189, Q-223): what a run with the cache on the GPU took after the
+        """Q-99's note (Q-189, Q-224): what a run with the cache on the GPU took after the
         warm-up iteration beyond the cache, the growth and the reserve, its peak reserved memory
         less what was reserved then, and that as a share of the ½·(free − reserve) the rule
         leaves for it; above 1, a cache at the rule's limit wouldn't have fit."""
@@ -1529,7 +1529,7 @@ def _data_trainer(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> T
 def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
     """Q-99, Q-189: what "auto" measures on CUDA, taken as it takes it: a trainer of B-6's
     configuration at `n` rows runs its first iteration on decoded PNGs, as "auto" does, and the
-    free memory, the working memory left reserved (Q-223) and growth are read when that
+    free memory, the working memory left reserved (Q-224) and growth are read when that
     iteration returns."""
     import torch
 
@@ -1615,7 +1615,7 @@ def _data(ctx: _Context) -> _Result:
             estimate = _probe(ctx, volume, n)
             if not estimate.fits:
                 reason = (
-                    f'"auto" would memory-map the cache (Q-99, Q-223): its '
+                    f'"auto" would memory-map the cache (Q-99, Q-224): its '
                     f"{estimate.cache / 1e9:.2f} GB exceed half the {estimate.free / 1e9:.2f} GB "
                     f"free after a warm-up iteration less its {estimate.reserve / 1e9:.2f} GB "
                     f"of working memory, less growth's {estimate.growth / 1e9:.3f} GB"
@@ -1642,7 +1642,7 @@ def _data(ctx: _Context) -> _Result:
         ),
         "frame_cache": "built before timing",
         "gpu": (
-            'measured where "auto" would place the cache on the GPU (Q-99, Q-223): a trainer '
+            'measured where "auto" would place the cache on the GPU (Q-99, Q-224): a trainer '
             "decoding PNGs runs one iteration first, and the free memory, the working memory it "
             "left reserved and growth are read after it"
         ),
@@ -1689,9 +1689,12 @@ def _budget(
 _LOSS_SIZES: tuple[tuple[int, int], ...] = ((1352, 1014), (1920, 1080))  # §3.4 B-4: width, height
 _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52
 # Q-190: contiguous NCHW inputs; channels-last inputs, as `LPIPSLoss` passes a render (its
-# batch-first view of [..., H, W, 3] is channels-last), so training's path until #228; and both
+# batch-first view of [..., H, W, 3] is channels-last), so training's path until #326; and both
 # the inputs and the network's weights channels-last.
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
+# Q-223: the layout training gives the network per precision since #326, with autotuning (under
+# `deterministic`, TF32 keeps channels-last inputs); `train._perceptual_network` decides.
+_TRAINING_LAYOUTS = {"ieee": "nchw", "tf32": "nchw", "bf16": "channels_last_inputs"}
 _LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
 _LOSS_REPETITIONS = 30  # Q-190
 _LOSS_NOISE = 0.05  # Q-190: the prediction's seeded Gaussian noise
@@ -1708,10 +1711,14 @@ _LPIPS_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, bool]
         ("tf32", "channels_last_inputs", False),
         ("tf32", "channels_last_inputs_and_weights", True),
     ),
+    # Q-223: the path Q-173's change adopted (#326) against training's earlier one; B-4's NCHW
+    # cases start from an NCHW leaf, so they leave out the trainer's copy, which B-1 includes
+    "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
 }
-_TURN_ON = ("autotuning", "channels_last_weights")  # the exact options Q-173's rule decides
+# The exact options Q-173's rule decides: since #326, autotuning together with NCHW inputs (Q-223)
+_TURN_ON = ("autotuning_and_nchw_inputs", "channels_last_weights")
 # The child process of one autotuning setting (Q-190). cuDNN caches the algorithm it picked
 # for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off
 # and on can't be compared in one process. `fused_ssim` can't be imported there, so
@@ -2008,8 +2015,8 @@ def _lpips_case(
 
 def _lpips_deviations(network: Any, images: _Images) -> list[dict[str, Any]]:
     """Per size, TF32's and bf16's deviation from IEEE float32 in value and in the prediction's
-    gradient (Q-190), with the network as training runs it: NCHW weights, channels-last
-    inputs, autotuning off."""
+    gradient (Q-190), with the network as training ran it until #326 (and bf16 still does, but
+    for autotuning; Q-223): NCHW weights, channels-last inputs, autotuning off."""
     import torch
 
     cases: list[dict[str, Any]] = []
@@ -2128,7 +2135,7 @@ def _losses(ctx: _Context) -> _Result:
         "lpips": "lpips 0.1.4, VGG, called directly; inputs mapped to [−1, 1] (D-68)",
         "precisions": list(_LOSS_PRECISIONS),
         "layouts": list(_LOSS_LAYOUTS),
-        "training_layout": "channels_last_inputs",
+        "training_layout": dict(_TRAINING_LAYOUTS),
         "autotuning": list(_LOSS_AUTOTUNING),
         "processes": (
             "the deviations and fused-ssim in the benchmark's process; LPIPS and the PyTorch "

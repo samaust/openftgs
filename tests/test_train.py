@@ -758,18 +758,14 @@ def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_pat
         torch.set_float32_matmul_precision(matmul)
 
 
-# Q-173: B-4 left cuDNN autotuning off for training steps (Calibration data, #228).
-AUTOTUNING = False
-
-
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("caller", [False, True])
-def test_cudnn_autotuning_during_a_step_follows_b4_and_deterministic(
+def test_cudnn_autotuning_during_a_step_is_on_unless_deterministic(
     tmp_path: Path, deterministic: bool, caller: bool
 ) -> None:
-    """D-52, Q-73, Q-173: during a training iteration's backward pass, cuDNN autotuning is off
-    under `deterministic`; otherwise it is on when B-4 turned it on, and else left as the caller
-    set it. Every flag is the caller's again after the step."""
+    """D-52, Q-73, Q-173 (changed, #326): during a training iteration's backward pass, cuDNN
+    autotuning is off under `deterministic` and on otherwise, whatever the caller set. Every
+    flag is the caller's again after the step."""
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
     try:
@@ -779,8 +775,7 @@ def test_cudnn_autotuning_during_a_step_follows_b4_and_deterministic(
         seen: list[bool] = []
         trainer.model.means.register_hook(lambda _: seen.append(cudnn.benchmark))  # type: ignore[no-untyped-call]
         trainer.step()
-        expected = False if deterministic else (True if AUTOTUNING else caller)
-        assert seen == [expected]
+        assert seen == [not deterministic]
         assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (caller, *saved[1:])
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
@@ -1112,33 +1107,53 @@ def test_a_bf16_step_gives_a_finite_perceptual_term_near_float32(
 @pytest.mark.weights
 @pytest.mark.parametrize("precision", ["ieee", "tf32"])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
-def test_the_float32_perceptual_precisions_keep_a_plain_lpips_loss_bitwise(
+def test_a_float32_steps_perceptual_term_takes_nchw_inputs_within_rounding_of_channels_last(
     tmp_path: Path, device: str, precision: Literal["ieee", "tf32"]
 ) -> None:
-    """D-52, Q-172 (#228, PRD #220: "the float32 path is bitwise unchanged"): with
-    perc_precision "ieee" or "tf32" the network the trainer runs for the perceptual term is a
-    plain `LPIPSLoss`, not bf16's, and a training step's perceptual term equals, bitwise, a
-    direct call of a separately built `LPIPSLoss` on the same two images, made at the same
-    moment, so under the global flags the step sets (`cudnn.allow_tf32` per precision). The
-    images are caught by a global forward hook, PyTorch's public `register_module_forward_hook`."""
+    """D-52, Q-172 (#228), Q-173 (changed, #326), Q-223: with perc_precision "ieee" or "tf32" a
+    training step's perceptual term equals, bitwise, a direct call of a separately built
+    plain `LPIPSLoss`, so float32 and not bf16's, on the same two images laid out so that
+    their batch-first views are contiguous NCHW; and that NCHW path's value and the
+    prediction's gradient are within rounding of the channels-last path the trainer ran
+    before #326, the copy being exact (§2.4 rule 2). The direct calls are made at the same
+    moment, so under the global flags the step sets (`cudnn.allow_tf32` per precision,
+    autotuning). Tolerances (Q-223): the value within 1e-5 relative and the gradient within
+    1e-4 in relative L2 in IEEE float32, which the CPU always computes; TF32 on CUDA rounds
+    to 10 mantissa bits, about 2·10⁻⁵ in value and 3 % in gradient L2 from IEEE float32 in
+    B-4 (Calibration data), so two TF32 kernels are held to 1e-3 and 0.1. The images are
+    caught by a global forward hook, PyTorch's public `register_module_forward_hook`."""
     from torch.nn.modules.module import register_module_forward_hook
+
+    def nchw(image: torch.Tensor) -> torch.Tensor:
+        # [..., H, W, 3] whose batch-first view [B, 3, H, W] is contiguous
+        return image.detach().movedim(-1, -3).contiguous().movedim(-3, -1)
+
+    def value_and_gradient(
+        pred: torch.Tensor, gt: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pred = pred.requires_grad_()
+        value = direct(pred, gt)
+        (gradient,) = torch.autograd.grad(value, pred)
+        return value.detach(), gradient
 
     cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
     trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device=device)
     direct = LPIPSLoss(cfg.loss.perc_net).to(device)
-    seen: list[tuple[type, torch.Tensor, torch.Tensor]] = []
+    seen: list[tuple[torch.Tensor, ...]] = []
     busy = False
 
     def hook(module: torch.nn.Module, args: Any, output: Any) -> None:
         nonlocal busy
         if busy or not isinstance(module, LPIPSLoss):
             return
-        busy = True  # the direct call below runs the same hook
+        busy = True  # the direct calls below run the same hook
         try:
-            expected = direct(*(arg.detach().clone() for arg in args))
+            pred, gt = args
+            first = value_and_gradient(nchw(pred), nchw(gt))
+            last = value_and_gradient(pred.detach().clone(), gt.detach().clone())
         finally:
             busy = False
-        seen.append((type(module), output.detach().clone(), expected.detach()))
+        seen.append((output.detach().clone(), *first, *last))
 
     handle = register_module_forward_hook(hook)
     try:
@@ -1146,10 +1161,52 @@ def test_the_float32_perceptual_precisions_keep_a_plain_lpips_loss_bitwise(
     finally:
         handle.remove()
     assert len(seen) == 1
-    kind, term, expected = seen[0]
-    assert kind is LPIPSLoss
-    assert torch.equal(term, expected)
-    assert float(log.losses["perceptual"]) == float(expected)
+    term, value, gradient, value_last, gradient_last = seen[0]
+    assert torch.equal(term, value)
+    assert float(log.losses["perceptual"]) == float(value)
+    tf32 = device == "cuda" and precision == "tf32"
+    rtol, gtol = (1e-3, 0.1) if tf32 else (1e-5, 1e-4)
+    torch.testing.assert_close(value, value_last, rtol=rtol, atol=0.0)
+    difference = torch.linalg.vector_norm((gradient - gradient_last).double())
+    assert float(difference) <= gtol * float(torch.linalg.vector_norm(gradient_last.double()))
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("precision", ["ieee", "tf32", "bf16"])
+def test_the_trainers_perceptual_network_gets_nchw_inputs_where_b4_measured_them_faster(
+    tmp_path: Path, precision: Literal["ieee", "tf32", "bf16"], deterministic: bool
+) -> None:
+    """Q-173 (changed, #326), Q-223: during a training step, lpips's network gets both images as
+    contiguous NCHW tensors under perc_precision "ieee", and under "tf32" when the step
+    autotunes (not `deterministic`); otherwise, and always under "bf16", it gets the
+    channels-last view of the render, the layout B-4 measured faster there. A plain
+    `LPIPSLoss`, as the evaluator builds (E16), still passes the channels-last view. The inputs
+    are caught by PyTorch's public `register_module_forward_pre_hook`."""
+    import lpips
+    from torch.nn.modules.module import register_module_forward_pre_hook
+
+    layouts: list[list[tuple[bool, bool]]] = []
+
+    def hook(module: torch.nn.Module, args: Any) -> None:
+        if isinstance(module, lpips.LPIPS):
+            last = torch.channels_last
+            layouts.append([(a.is_contiguous(), a.is_contiguous(memory_format=last)) for a in args])
+
+    perf = PerfConfig(perc_precision=precision, deterministic=deterministic, frame_cache="off")
+    trainer = Trainer(TrainConfig(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
+    plain = LPIPSLoss(TrainConfig().loss.perc_net)
+    generator = torch.Generator().manual_seed(0)
+    handle = register_module_forward_pre_hook(hook)
+    try:
+        trainer.step()
+        plain(*(torch.rand(32, 40, 3, generator=generator) for _ in range(2)))
+    finally:
+        handle.remove()
+    nchw, channels_last = (True, False), (False, True)
+    faster = precision == "ieee" or (precision == "tf32" and not deterministic)
+    expected = nchw if faster else channels_last
+    assert layouts == [[expected, expected], [channels_last, channels_last]]
 
 
 @pytest.mark.parametrize(("precision", "tf32"), [("ieee", False), ("tf32", True), ("bf16", True)])
@@ -1334,7 +1391,7 @@ def test_sampler_peek_matches_the_next_draws() -> None:
 
 
 def test__fits_on_gpu_reserves_the_working_memory() -> None:
-    """Q-99 (changed, #325), Q-223: "auto" puts the cache on the GPU when it fits in half the
+    """Q-99 (changed, #325), Q-224: "auto" puts the cache on the GPU when it fits in half the
     free memory less the working memory the warm-up iteration left reserved, minus growth to
     N_max, the boundary included. At B-6's figures on studio at 3M rows (#317), which the rule
     before #325 placed on the GPU, the 8.58 GB cache is memory-mapped."""
@@ -1359,7 +1416,7 @@ def test__fits_on_gpu_reserves_the_working_memory() -> None:
 def test__choose_placement_sets_the_allocators_unused_reserve_aside(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_gib: int, placement: str
 ) -> None:
-    """Q-99 (changed, #325), Q-223: the trainer reads the free memory and the reserve from the
+    """Q-99 (changed, #325), Q-224: the trainer reads the free memory and the reserve from the
     allocator after the first iteration. With 12 GiB free on the device, 9 GiB reserved and
     1 GiB allocated, and no growth, the limit is ½·(12 + 8 − 8) = 6 GiB: a 6 GiB cache goes
     to the GPU and a 7 GiB one is memory-mapped (½·free, 10 GiB, would have taken it)."""

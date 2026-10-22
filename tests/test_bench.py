@@ -1195,10 +1195,10 @@ def test__data_config_is_b1s_with_the_case_placement() -> None:
 
 
 def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
-    """Q-99 (D-51), Q-223: "auto" puts the cache on the GPU when it fits in half the GPU memory
+    """Q-99 (D-51), Q-224: "auto" puts the cache on the GPU when it fits in half the GPU memory
     free after a warm-up iteration, less the working memory that iteration left reserved
     (reserved − allocated), minus what growth to N_max adds, the boundary included. Q-99's
-    note (Q-189, Q-223): what a run with the cache on the GPU then took beyond the cache, the
+    note (Q-189, Q-224): what a run with the cache on the GPU then took beyond the cache, the
     growth and that reserve, from its peak reserved memory and the memory reserved after that
     iteration, against the half the rule leaves. With the device's total, what lies outside
     this process's allocator (other processes, the CUDA context), which the free memory leaves
@@ -1357,7 +1357,7 @@ def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) ->
             continue
         # Q-99: "auto" would have placed the cache on the GPU, which then holds it.
         assert figures["cache_bytes"] <= figures["auto_limit_bytes"], case
-        reserve = figures["auto_reserved_bytes"] - figures["auto_allocated_bytes"]  # Q-223
+        reserve = figures["auto_reserved_bytes"] - figures["auto_allocated_bytes"]  # Q-224
         assert figures["auto_limit_bytes"] == pytest.approx(
             0.5 * (figures["auto_free_bytes"] - reserve) - figures["auto_growth_bytes"]
         )
@@ -1492,6 +1492,8 @@ COMPARISONS = {  # Q-190: (baseline, variant) as (precision, layout, autotuning)
         ("tf32", "channels_last_inputs", False),
         ("tf32", "channels_last_inputs_and_weights", True),
     ),
+    # Q-223: the path Q-173's change adopted (#326) against training's earlier one
+    "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
 }
@@ -1546,7 +1548,12 @@ def test__losses_times_every_lpips_variant_and_both_ssim_paths(
     assert setup["sizes"] == [list(size) for size in LOSS_SIZES]
     assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
     assert setup["precisions"] == list(PRECISIONS) and setup["layouts"] == list(LAYOUTS)
-    assert setup["training_layout"] == "channels_last_inputs"
+    # Q-223: training's layout per precision since #326
+    assert setup["training_layout"] == {
+        "ieee": "nchw",
+        "tf32": "nchw",
+        "bf16": "channels_last_inputs",
+    }
     fused = importlib.util.find_spec("fused_ssim") is not None
     assert setup["fused_ssim"] == fused
     assert "one child process per autotuning setting" in setup["processes"]
@@ -1606,7 +1613,11 @@ def test__losses_records_bf16s_deviation_and_the_gains_of_its_comparisons(
         summary = cases[(("comparison", name),)]
         assert summary["smallest_gain"] == min(gains)
         assert summary["meets_gain_threshold"] == (min(gains) >= 0.03)
-    assert losses_bench["setup"]["turn_on"] == ["autotuning", "channels_last_weights"]
+    # Q-173 (changed, #326), Q-223: the adopted combination replaces autotuning alone
+    assert losses_bench["setup"]["turn_on"] == [
+        "autotuning_and_nchw_inputs",
+        "channels_last_weights",
+    ]
     assert losses_bench["setup"]["gain_threshold"] == 0.03
     if importlib.util.find_spec("fused_ssim") is not None:
         for width, height in LOSS_SIZES:

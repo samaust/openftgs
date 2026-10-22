@@ -277,10 +277,10 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # Global PyTorch flags around a training iteration (Q-73).
 
-# Q-173: cuDNN autotuning during a training iteration that isn't deterministic, turned on only
-# when B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +4.3 % and
-# −1.0 % at its two sizes (Calibration data, #228).
-_AUTOTUNE = False
+# Q-173 (changed, #326), Q-223: cuDNN autotuning during a training iteration that isn't
+# deterministic (§2.4 rule 2, D-52). B-4 measured it alone at +4.3 % and −1.0 % (#228); with the
+# perceptual network's NCHW inputs (_NCHWLPIPSLoss) at +7.2 % and +3.9 % (Calibration data).
+_AUTOTUNE = True
 
 
 @contextlib.contextmanager
@@ -315,9 +315,22 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
 
 # Q-173: the training perceptual network's weights in channels-last memory, turned on only when
 # B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
-# at its two sizes (Calibration data, #228). Its inputs are channels-last already: `LPIPSLoss`
-# views a render's [..., H, W, 3] batch first.
+# at its two sizes (Calibration data, #228), with the inputs channels-last as `LPIPSLoss` views
+# a render's [..., H, W, 3] batch first; since #326 mostly NCHW (_perceptual_network, Q-223).
 _CHANNELS_LAST_WEIGHTS = False
+
+
+# Q-173 (changed, #326), Q-223: B-4 measured NCHW inputs the fastest layout in IEEE float32, and
+# in TF32 with autotuning; slower in TF32 without it and in bfloat16, which keep the plain view.
+class _NCHWLPIPSLoss(LPIPSLoss):
+    """LPIPS with its two images copied so that the network gets them as contiguous NCHW
+    tensors: the trainer's network under `perc_precision` "ieee", and "tf32" with autotuning.
+    The copy is exact (§2.4 rule 2); the evaluator's networks stay plain."""
+
+    def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
+        # [..., H, W, 3] in memory whose batch-first view, `LPIPSLoss`'s, is contiguous NCHW
+        pred, gt = (image.movedim(-1, -3).contiguous().movedim(-3, -1) for image in (pred, gt))
+        return super().forward(pred, gt, map_inputs=map_inputs)
 
 
 # Q-172: autocast is local to the perceptual network, which only the trainer builds this way.
@@ -331,6 +344,17 @@ class _Bf16LPIPSLoss(LPIPSLoss):
         with torch.autocast(pred.device.type, dtype=torch.bfloat16):
             out = super().forward(pred, gt, map_inputs=map_inputs)
         return out.float()
+
+
+def _perceptual_network(perf: PerfConfig) -> type[LPIPSLoss]:
+    """The trainer's perceptual network for `perf`: bf16's (Q-172), NCHW inputs where B-4
+    measured them faster (Q-223), else plain `LPIPSLoss` with its channels-last view."""
+    if perf.perc_precision == "bf16":
+        return _Bf16LPIPSLoss
+    autotuned = _AUTOTUNE and not perf.deterministic
+    if perf.perc_precision == "ieee" or autotuned:
+        return _NCHWLPIPSLoss
+    return LPIPSLoss
 
 
 def _check_ablation(cfg: TrainConfig) -> None:
@@ -369,7 +393,7 @@ def _bytes_per_row(model: FreeTimeGaussians) -> int:
 
 
 def _fits_on_gpu(cache: int, *, free: int, reserve: int, growth: int) -> bool:
-    """D-51, Q-99, Q-223: whether "auto" puts a cache of `cache` bytes on the GPU: it fits in
+    """D-51, Q-99, Q-224: whether "auto" puts a cache of `cache` bytes on the GPU: it fits in
     half the free memory less the working memory `reserve` held for the iterations, minus what
     growth to N_max adds."""
     return cache <= 0.5 * (free - reserve) - growth
@@ -526,11 +550,10 @@ class Trainer:
         self._training = [i for i, r in enumerate(dataset.records) if r.split == "train"]
         self._background = torch.tensor(cfg.background, dtype=torch.float32, device=self._device)
         # D-77: one perceptual network, built only when its weight is positive; D-52: in bfloat16
-        # when asked (Q-172).
+        # when asked (Q-172), otherwise with NCHW inputs where they are faster (Q-223).
         self._perceptual: LPIPSLoss | None = None
         if cfg.loss.lambda_perc > 0.0:
-            network = _Bf16LPIPSLoss if cfg.perf.perc_precision == "bf16" else LPIPSLoss
-            perceptual = network(cfg.loss.perc_net).to(self._device)
+            perceptual = _perceptual_network(cfg.perf)(cfg.loss.perc_net).to(self._device)
             if _CHANNELS_LAST_WEIGHTS:  # Q-173
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
@@ -600,11 +623,11 @@ class Trainer:
     def _choose_placement(self) -> None:
         """Q-99: after the first CUDA iteration, the cache goes to GPU memory when it fits in half
         the free memory, less the working memory that iteration left reserved, minus what growth
-        to N_max will add (D-51, Q-223), and is memory-mapped otherwise; a cache that can't be
+        to N_max will add (D-51, Q-224), and is memory-mapped otherwise; a cache that can't be
         made falls back to PNGs with a warning."""
         self._placement_pending = False
         unheld, _ = torch.cuda.mem_get_info(self._device)
-        # Q-223: the allocator's unused reserve is the iteration's working memory (the render's
+        # Q-224: the allocator's unused reserve is the iteration's working memory (the render's
         # and the losses' buffers at the image's size, the gradients), which Q-99's free memory
         # counts and the rule sets aside again.
         reserve = torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(
