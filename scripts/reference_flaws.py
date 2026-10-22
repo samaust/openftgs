@@ -79,6 +79,7 @@ _CROSS_LEVELS = 10.0  # Q-236
 _FLICKER_LEVELS = 2.0  # Q-236
 _SCALES = (0.5, 1.0, 2.0)  # Q-236's check: the thresholds at ½, 1 and 2 times
 _SAME_INSTANT_S = 1e-6  # Q-237: frames closer in time are the same instant
+_MATCH_S = 1e-6  # Q-231: a record's timestamp against the flag index's
 _SNAP_PX = 1e-6  # a sample this close to a pixel centre is taken at it
 _REGIONS = ("all", "static", "dynamic")
 
@@ -167,7 +168,7 @@ def clipped(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return full.any(axis=-1), full.all(axis=-1)
 
 
-def dilate(mask: np.ndarray) -> np.ndarray:
+def _dilate(mask: np.ndarray) -> np.ndarray:
     """A boolean mask grown by 1 px (its 3×3 neighbourhood)."""
     padded = np.pad(mask, 1)
     h, w = mask.shape
@@ -381,7 +382,7 @@ def _cross(
         & source.away[ys, xs]
         & (np.abs(w.z - other_depth) <= _OCCLUSION * other_depth)
     )
-    static = ~dilate(target.dynamic) & ~dilate(source.dynamic)[ys, xs]
+    static = ~_dilate(target.dynamic) & ~_dilate(source.dynamic)[ys, xs]  # Q-236, Q-237
     dt = source_frame.timestamp - frame.timestamp
     same_instant = abs(dt) <= _SAME_INSTANT_S
     compared = seen if same_instant else seen & static  # Q-237
@@ -412,7 +413,7 @@ def _flicker_pair(
     1 px) and inside them, and per pixel the largest channel change in levels where static (inf
     elsewhere)."""
     diff = np.abs(a.image.astype(np.float64) - b.image.astype(np.float64))
-    static = ~dilate(a.dynamic | b.dynamic)
+    static = ~_dilate(a.dynamic | b.dynamic)  # Q-236
     regions = {
         "static": pools["static"].figures(diff[static], None),
         "dynamic": pools["dynamic"].figures(diff[~static], None),
@@ -714,13 +715,11 @@ def run_report(
     full: list[float] = []
     frames: list[dict[str, Any]] = []
     for record in records:
-        # The index holds the scene's own timestamps, so a match is to within rounding, as
-        # Q-231 matches records to the ground truth.
         hits = [
             e
             for e in index
             if e["camera"] == record.camera.name
-            and abs(e["timestamp"] - record.timestamp) <= _SAME_INSTANT_S
+            and abs(e["timestamp"] - record.timestamp) <= _MATCH_S
         ]
         if len(hits) != 1:
             raise InputError(
@@ -749,10 +748,10 @@ def run_report(
             "psnr": _finite(value),
         }
         for name, flagged in _flag_sets(flags).items():
-            mask = torch.from_numpy(flagged).to(device)
+            on = torch.from_numpy(flagged).to(device)
             share = float(flagged.mean())
-            kept = _finite(kept_psnr(pred, gt, ~mask))  # Q-233
-            on_flagged = _finite(kept_psnr(pred, gt, mask))
+            kept = _finite(kept_psnr(pred, gt, ~on))  # Q-233
+            on_flagged = _finite(kept_psnr(pred, gt, on))
             frame[name] = {"share": share, "kept_psnr": kept, "flagged_psnr": on_flagged}
             sums[name]["share"].append(share)
             for figure, slot in ((kept, "kept"), (on_flagged, "flagged")):
@@ -815,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
         figures = result["overall"]["test_cameras"]
         cross = figures["cross"]["all"]["psnr"] or figures["cross"]["static"]["psnr"]
         print(
-            f"reference_flaws: test cameras' cross-camera PSNR {cross}, clipped (any channel) "
+            f"reference_flaws: test views' cross-camera PSNR {cross}, clipped (any channel) "
             f"{figures['clipped']['any']:.4f}; {len(result['cameras'])} cameras"
         )
     else:

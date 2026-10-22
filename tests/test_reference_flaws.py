@@ -121,7 +121,7 @@ def test_kept_psnr_with_no_pixel_flagged_is_e16s_psnr() -> None:
 
 
 # A three-camera scene: cameras a, b, c on the x axis 0.2 apart, looking down +z at a plane at
-# depth 2 with one colour everywhere; b is the test camera, c's frames are 4 ms late (Q-237).
+# depth 2 with one colour everywhere; b holds the test view, c's frames are 4 ms late (Q-237).
 _W, _H, _F = 40, 30, 40.0
 _BASE = (100, 120, 140)
 _FRAMES = 5
