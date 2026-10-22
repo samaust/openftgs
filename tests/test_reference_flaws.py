@@ -295,11 +295,17 @@ def test_run_reports_psnr_with_and_without_the_flagged_pixels(tmp_path: Path) ->
             image_b = render(model, _camera("b", 0.0), n / 30, background=background,
                              backend="reference").image[0]  # fmt: skip
         assert frame["psnr"] == pytest.approx(float(psnr(image_b, gt_b)), abs=1e-6)  # E16
+        if n == 0:  # the clipped patch: the render's mean error there, in levels
+            patch = image_b.clamp(0, 1)[_CLIP] - gt_b[_CLIP]
+            error = float(patch.double().mean()) * 255
+            assert frame["clipped"]["flagged_error"] == pytest.approx(error, abs=1e-4)
+            assert error < 0  # the render is darker than 255
     for frame in result["frames"]:
         for name in ("clipped", "cross", "flicker", "union"):
             if frame[name]["share"] == 0.0:
                 assert frame[name]["kept_psnr"] == pytest.approx(frame["psnr"], abs=1e-9)
                 assert frame[name]["flagged_psnr"] is None
+                assert frame[name]["flagged_error"] is None
     first = result["frames"][0]
     assert first["clipped"]["share"] == 16 / (_W * _H)
     assert first["clipped"]["kept_psnr"] > first["psnr"]  # the clipped patch is far off

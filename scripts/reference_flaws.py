@@ -46,8 +46,9 @@ a bit field (`FLAG_BITS`) indexed by `flags/index.json`.
 `run` renders each test record of SCENE.json from CHECKPOINT through `render()` and reports, per
 frame and averaged over frames as E16 does, its PSNR as E16 computes it, and the PSNR over the
 pixels left once those flagged in FLAGS_DIR are removed (Q-233), for each flag alone, for their
-union, and for the union at ½ and 2 times the thresholds; with the PSNR over the flagged pixels
-and their share. SSIM and LPIPS have no kept-pixel form.
+union, and for the union at ½ and 2 times the thresholds; with the PSNR over the flagged pixels,
+their mean error (render − reference, in levels: below 0 where the render is darker) and their
+share. SSIM and LPIPS have no kept-pixel form.
 
 These are diagnostics, not pass criteria: the spec defines no metric for them. Exit 0 once
 written; 2 for an input that can't be read or matched.
@@ -189,6 +190,16 @@ def kept_psnr(pred: torch.Tensor, gt: torch.Tensor, keep: torch.Tensor) -> float
     diff = pred.double().clamp(0.0, 1.0) - gt.double()
     mse = float(diff.square()[keep].sum()) / (3 * count)
     return math.inf if mse == 0.0 else -10.0 * math.log10(mse)
+
+
+def _mean_error(pred: torch.Tensor, gt: torch.Tensor, on: torch.Tensor) -> float | None:
+    """The mean of render − ground truth over the pixels `on`, all three channels, in levels of
+    255, the render clamped as E16 does: below 0 where the render is darker; None without pixels."""
+    count = int(on.sum())
+    if count == 0:
+        return None
+    diff = pred.double().clamp(0.0, 1.0) - gt.double()
+    return float(diff[on].sum()) / (3 * count) * 255.0
 
 
 def _psnr_of(mse: float | None) -> float | None:
@@ -710,7 +721,7 @@ def run_report(
     model.requires_grad_(False)
     sets = tuple(_flag_sets(np.zeros((1, 1), np.uint8)))
     sums: dict[str, dict[str, list[float]]] = {
-        name: {"kept": [], "flagged": [], "share": []} for name in sets
+        name: {"kept": [], "flagged": [], "error": [], "share": []} for name in sets
     }
     full: list[float] = []
     frames: list[dict[str, Any]] = []
@@ -752,9 +763,15 @@ def run_report(
             share = float(flagged.mean())
             kept = _finite(kept_psnr(pred, gt, ~on))  # Q-233
             on_flagged = _finite(kept_psnr(pred, gt, on))
-            frame[name] = {"share": share, "kept_psnr": kept, "flagged_psnr": on_flagged}
+            error = _mean_error(pred, gt, on)
+            frame[name] = {
+                "share": share,
+                "kept_psnr": kept,
+                "flagged_psnr": on_flagged,
+                "flagged_error": error,
+            }
             sums[name]["share"].append(share)
-            for figure, slot in ((kept, "kept"), (on_flagged, "flagged")):
+            for figure, slot in ((kept, "kept"), (on_flagged, "flagged"), (error, "error")):
                 if figure is not None:
                     sums[name][slot].append(figure)
         frames.append(frame)
@@ -766,6 +783,7 @@ def run_report(
             "kept_frames": len(values["kept"]),
             "flagged_psnr": float(np.mean(values["flagged"])) if values["flagged"] else None,
             "flagged_frames": len(values["flagged"]),
+            "flagged_error": float(np.mean(values["error"])) if values["error"] else None,
         }
     return {
         "checkpoint": str(checkpoint),
