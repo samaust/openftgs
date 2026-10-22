@@ -231,3 +231,52 @@ def test_summary_reads_metrics_and_the_wall_time(tmp_path: Path) -> None:
         "max_rss_kib": 123456,
         "gpu_memory_used_peak_mib": 9000,
     }
+
+
+def test_summary_derives_the_fastest_10_means_from_the_per_image_rows(tmp_path: Path) -> None:
+    """`--fastest N0:N1` (Q-222): the means over the images with N0 ≤ frame_index < N1, as
+    `eval.metrics_report` writes `fastest_10` for a manifest that carries the range, from a
+    METRICS.json written by hand. Twelve images at frame indices 0 to 11, every metric equal to
+    the frame index; their dynamic rows 100 more, image 5's skipped (no values). Over 2:12 the
+    entire means are mean(2, …, 11) = 6.5 and the dynamic ones 100 + 60 / 9, image 5 left out; a
+    range of other than 10 frames, or no METRICS.json, exits 2."""
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "config.json").write_text(json.dumps(config_to_dict(TrainConfig())))
+    (run / "train_log.jsonl").write_text(json.dumps(_log_row(100, 10, 0.1, 0.5)) + "\n")
+    names = ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "lpips_alex", "lpips_vgg",
+             "lpips_vgg_raw")  # fmt: skip
+
+    def row(n: int, value: float | None) -> dict[str, Any]:
+        where = {"camera": "0007", "timestamp": n / 60, "frame_index": n,
+                 "path": f"images/0007/{n:06d}.png"}  # fmt: skip
+        return {**where, **dict.fromkeys(names, value)}
+
+    entire = [row(n, float(n)) for n in range(12)]
+    dynamic = [row(n, None if n == 5 else 100.0 + n) for n in range(12)]
+    recorded = {"range": [0, 10], "count": 10, "entire": {"psnr": 1.0}}
+    metrics = {
+        "format": "ftgs-metrics",
+        "version": 1,
+        "split": "test",
+        "lpips_backbone": "vgg",
+        "entire": {"scene": dict.fromkeys(names, 5.5), "images": entire},
+        "dynamic": {"mask_source": "m", "masks_approximate": False, "count": 11, "skipped": 1,
+                    "missing": 0, "scene": dict.fromkeys(names, 0.0), "images": dynamic},
+        "fastest_10": recorded,
+    }  # fmt: skip
+    (run / "METRICS.json").write_text(json.dumps(metrics))
+    code, body, err = _summary(run, "--fastest", "2:12")
+    assert code == 0, err
+    derived = body["metrics"]["fastest_10_derived"]
+    assert derived["range"] == [2, 12]
+    assert derived["count"] == 10
+    assert derived["entire"] == pytest.approx(dict.fromkeys(names, 6.5))
+    assert derived["dynamic"] == pytest.approx(dict.fromkeys(names, 100.0 + 60.0 / 9.0))
+    assert "Q-222" in derived["source"]
+    assert body["metrics"]["fastest_10"] == recorded  # the run's own block is kept as it is
+    code, _, _ = _summary(run, "--fastest", "2:11")
+    assert code == 2
+    (run / "METRICS.json").unlink()
+    code, _, _ = _summary(run, "--fastest", "2:12")
+    assert code == 2
