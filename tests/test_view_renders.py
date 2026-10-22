@@ -255,8 +255,8 @@ def test_comparison_flags_nulls_on_one_side_only() -> None:
     assert both["blocks"]["dynamic"]["psnr"] is None
     one = compare(_metrics(dynamic_scene_psnr=None), _metrics(entire_image_ssim1=None))
     assert one["findings"] == [
-        "entire: images/cam02/000000.png ssim1 is null on one side only",
-        "dynamic: scene psnr is null on one side only",
+        "entire: images/cam02/000000.png ssim1 is null in the given METRICS.json",
+        "dynamic: scene psnr is null in this run's METRICS.json",
     ]
     assert one["blocks"]["dynamic"]["psnr"] is None
     assert "ssim1" not in one["largest_image_difference"]["entire"]
@@ -281,4 +281,5 @@ def test_comparison_flags_what_one_file_holds_alone() -> None:
         "dynamic: images/cam02/000000.png metric ssim1 is only in this run's METRICS.json",
     ]
     assert result["blocks"]["entire"] == {"psnr": 0.0, "ssim1": 0.0}
+    assert result["largest_image_difference"]["entire"]["lpips_alex"] == 0.0  # both rows hold it
     assert result["largest_image_difference"]["dynamic"] == {"psnr": 0.0, "lpips_alex": 0.0}

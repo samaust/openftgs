@@ -154,11 +154,14 @@ def _difference(ours: Any, theirs: Any) -> float | None:
     return None if ours is None or theirs is None else float(ours) - float(theirs)
 
 
+def _side(ours: bool) -> str:
+    return "this run's" if ours else "the given"
+
+
 def _one_sided(what: str, theirs: set[str], ours: set[str], findings: list[str]) -> None:
     """Q-224: a finding for each name in one file only."""
     for name in sorted(theirs ^ ours):
-        side = "this run's" if name in ours else "the given"
-        findings.append(f"{what} {name} is only in {side} METRICS.json")
+        findings.append(f"{what} {name} is only in {_side(name in ours)} METRICS.json")
 
 
 def _compare_values(
@@ -175,7 +178,7 @@ def _compare_values(
         if delta is not None and abs(delta) > limit:
             findings.append(f"{where} {name} differs by {delta:+.4g}")
         elif delta is None and (ours[name] is None) != (theirs[name] is None):
-            findings.append(f"{where} {name} is null on one side only")
+            findings.append(f"{where} {name} is null in {_side(ours[name] is None)} METRICS.json")
     return deltas
 
 
@@ -191,7 +194,7 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
             continue
         our_means, their_means = ours[block]["scene"], theirs[block]["scene"]
         blocks[block] = _compare_values(f"{block}: scene", our_means, their_means, findings)
-        metrics = [name for name in their_means if name in our_means]
+        metrics = list(dict.fromkeys([*their_means, *our_means]))  # a row's other keys aren't
         our_images = {row["path"]: row for row in ours[block].get("images", [])}
         their_images = {row["path"]: row for row in theirs[block].get("images", [])}
         _one_sided(f"{block}: image", set(their_images), set(our_images), findings)
@@ -200,13 +203,13 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
             if path not in our_images:
                 continue
             our_row = our_images[path]
-            values = _compare_values(
+            row_deltas = _compare_values(
                 f"{block}: {path}",
                 {name: our_row[name] for name in metrics if name in our_row},
                 {name: their_row[name] for name in metrics if name in their_row},
                 findings,
             )
-            for name, delta in values.items():
+            for name, delta in row_deltas.items():
                 if delta is not None:
                     image_deltas[name].append(delta)
         largest[block] = {
