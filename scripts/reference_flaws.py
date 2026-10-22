@@ -697,9 +697,12 @@ def run_report(
     if not records:
         raise InputError(f"the test split of {scene} holds no images")
     device = torch.device("cuda" if backend == "gsplat" else "cpu")
+    config = config_from_dict(state.config)
+    # E16's Î is the render composited over the run's background (D-34), as evaluate() renders.
+    background = torch.tensor(config.background, dtype=torch.float32, device=device)
     model = FreeTimeGaussians(
         {k: v.to(device) for k, v in state.params.items()},
-        sh_degree=config_from_dict(state.config).sh_degree,
+        sh_degree=config.sh_degree,
         time=state.time,
         time_unit=state.time_unit,
     )
@@ -734,7 +737,9 @@ def run_report(
             raise InputError(f"{hits[0]['path']}: the flags and the frame sizes differ")
         gt = torch.from_numpy(pixels.astype(np.float32)).to(device) / 255.0
         with torch.no_grad():
-            pred = render(model, record.camera, record.timestamp, backend=backend).image[0]
+            pred = render(
+                model, record.camera, record.timestamp, background=background, backend=backend
+            ).image[0]
         value = float(psnr(pred, gt))  # E16
         full.append(value)
         frame: dict[str, Any] = {

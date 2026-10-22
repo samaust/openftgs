@@ -28,6 +28,7 @@ from test_gt_depth import write_exr
 from openftgs.config import TrainConfig, config_to_dict
 from openftgs.eval import psnr
 from openftgs.io import save_checkpoint
+from openftgs.render import render
 from openftgs.types import Camera, TimeNormalizer, TrainerState
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -127,6 +128,9 @@ _FRAMES = 5
 _CLIP = (slice(10, 14), slice(10, 14))  # b, frame 0: at 255, in no other camera or frame
 _FLICKER = (slice(20, 24), slice(25, 29))  # b, frame 2: 5 levels brighter
 _MOVER = (slice(0, 5), slice(0, 5))  # b, frame 4: dynamic
+_TIME = TimeNormalizer(0.0, 0.2)
+_ROW = {"mean": (0.0, 0.0, 2.0), "scale": 0.3, "logit": 2.0, "sh0": (0.0, 0.2, 0.4)}
+_BACKGROUND = (0.3, 0.5, 0.7)  # the checkpoint's, not D-34's black
 
 
 def _camera(name: str, x: float) -> Camera:
@@ -195,13 +199,11 @@ def _flawed_scene(root: Path) -> tuple[Path, Path, Path]:
         "metadata": {"source": "synthetic"},
     }
     (images / "scene.json").write_text(json.dumps(manifest))
-    time = TimeNormalizer(0.0, 0.2)
-    row = {"mean": (0.0, 0.0, 2.0), "scale": 0.3, "logit": 2.0, "sh0": (0.0, 0.2, 0.4)}
-    model = model_from_rows([row], time=time)
+    model = model_from_rows([_ROW], time=_TIME)
     state = TrainerState(
         iteration=3,
-        config=config_to_dict(TrainConfig(sh_degree=0)),
-        time=time,
+        config=config_to_dict(TrainConfig(sh_degree=0, background=_BACKGROUND)),
+        time=_TIME,
         spatial_scale=1.0,
         frame_dt=1 / 6,
         params={k: v.detach() for k, v in model.named_parameters()},
@@ -272,8 +274,9 @@ def test_scene_flags_the_planted_flaws(tmp_path: Path) -> None:
 
 
 def test_run_reports_psnr_with_and_without_the_flagged_pixels(tmp_path: Path) -> None:
-    """Q-233 at the script's level: each test frame's PSNR is E16's, and wherever a flag marks
-    no pixel, the kept-pixel PSNR equals it; frame 0's clipped share is its 16 pixels."""
+    """Q-233 at the script's level: each test frame's PSNR is E16's, the render composited over
+    the run's background, and wherever a flag marks no pixel, the kept-pixel PSNR equals it;
+    frame 0's clipped share is its 16 pixels."""
     scene, gt, checkpoint = _flawed_scene(tmp_path)
     module = _module()
     flags = tmp_path / "reference"
@@ -283,6 +286,15 @@ def test_run_reports_psnr_with_and_without_the_flagged_pixels(tmp_path: Path) ->
                         "--out", str(out), "--backend", "reference"]) == 0  # fmt: skip
     result = json.loads(out.read_text())
     assert result["iteration"] == 3 and len(result["frames"]) == _FRAMES
+    model = model_from_rows([_ROW], time=_TIME)
+    background = torch.tensor(_BACKGROUND)
+    for n, frame in enumerate(result["frames"]):
+        with Image.open(scene.parent / f"images/b/{n:06d}.png") as image:
+            gt_b = torch.from_numpy(np.asarray(image).astype(np.float32)) / 255.0
+        with torch.no_grad():
+            image_b = render(model, _camera("b", 0.0), n / 30, background=background,
+                             backend="reference").image[0]  # fmt: skip
+        assert frame["psnr"] == pytest.approx(float(psnr(image_b, gt_b)), abs=1e-6)  # E16
     for frame in result["frames"]:
         for name in ("clipped", "cross", "flicker", "union"):
             if frame[name]["share"] == 0.0:
@@ -294,6 +306,34 @@ def test_run_reports_psnr_with_and_without_the_flagged_pixels(tmp_path: Path) ->
     overall = result["overall"]
     assert overall["frames"] == _FRAMES
     assert overall["psnr"] == pytest.approx(np.mean([f["psnr"] for f in result["frames"]]))
+
+
+def test_scene_leaves_out_what_the_other_camera_doesnt_see(tmp_path: Path) -> None:
+    """Q-234 with Q-228: an occluder at depth 1 in a's frame 1, 10 × 10 px and painted black,
+    hides the plane from a there. b's pixels that land on it fail the 1 % depth test, and those
+    that land within 1 px of its edge in a are left out too, so b's comparison with a loses
+    12 × 12 pixels (the 4 px shift between the cameras is whole) and compares none painted."""
+    scene, gt, _ = _flawed_scene(tmp_path)
+    module = _module()
+
+    def against_a() -> dict[str, Any]:
+        out = tmp_path / f"reference-{len(list(tmp_path.glob('reference-*')))}"
+        assert module.main(["scene", str(scene), str(gt), "--out", str(out)]) == 0
+        result = json.loads((out / "REFERENCE.json").read_text())
+        figures: dict[str, Any] = result["cameras"]["b"]["frames"][1]["cross"]["a"]
+        return dict(figures["regions"]["all"])
+
+    clear = against_a()
+    patch = (slice(10, 20), slice(15, 25))
+    pixels = np.full((_H, _W, 3), _BASE, np.uint8)
+    pixels[patch] = 0
+    Image.fromarray(pixels, "RGB").save(scene.parent / "images/a/000001.png")
+    depth = np.full((_H, _W), 2.0, np.float32)
+    depth[patch] = 1.0
+    write_exr(gt / "depth/a/000001.exr", depth)
+    occluded = against_a()
+    assert clear["mean_abs"] == 0.0 and occluded["mean_abs"] == 0.0
+    assert clear["pixels"] - occluded["pixels"] == 12 * 12
 
 
 def test_scene_with_workers_writes_what_one_process_writes(
