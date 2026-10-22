@@ -1336,21 +1336,46 @@ def test_sampler_peek_matches_the_next_draws() -> None:
 def test__fits_on_gpu_reserves_the_working_memory() -> None:
     """Q-99 (changed, #325), Q-223: "auto" puts the cache on the GPU when it fits in half the
     free memory less the working memory the warm-up iteration left reserved, minus growth to
-    N_max, the boundary included. At B-6's figures on studio at 3M rows (#317), which Q-99's
-    first rule placed on the GPU, the 8.58 GB cache is memory-mapped."""
+    N_max, the boundary included. At B-6's figures on studio at 3M rows (#317), which the rule
+    before #325 placed on the GPU, the 8.58 GB cache is memory-mapped."""
     from openftgs.train import _fits_on_gpu
 
     gib = 2**30
     # ½·(20 − 8) − 1 = 5 GiB.
     assert _fits_on_gpu(5 * gib, free=20 * gib, reserve=8 * gib, growth=gib)
     assert not _fits_on_gpu(5 * gib + 1, free=20 * gib, reserve=8 * gib, growth=gib)
-    # Studio: free 21,834,286,592 B; reserved 11,681,136,640 less allocated 2,396,011,008 is a
-    # reserve of 9,285,125,632 B; growth 61,920,000 B. ½·12,549,160,960 − 61,920,000 =
-    # 6,212,660,480 B, under the cache's 8,584,704,000 (½·free − growth was 10,855,223,296).
+    # Studio, as M17's B-6 run recorded it (<m17-runs>/bench/B-6-studio.json, the 3M `gpu`
+    # case; Calibration data, #317): free 21,834,286,592 B; reserved 11,681,136,640 less
+    # allocated 2,396,011,008 is a reserve of 9,285,125,632 B; growth 61,920,000 B.
+    # ½·12,549,160,960 − 61,920,000 = 6,212,660,480 B, under the cache's 8,584,704,000
+    # (½·free − growth was 10,855,223,296).
     studio = {"free": 21_834_286_592, "reserve": 9_285_125_632, "growth": 61_920_000}
     assert not _fits_on_gpu(8_584_704_000, **studio)
     assert _fits_on_gpu(6_212_660_480, **studio)
     assert _fits_on_gpu(4 * 10**9, **studio)
+
+
+@pytest.mark.parametrize(("cache_gib", "placement"), [(6, "gpu"), (7, "mmap")])
+def test__choose_placement_sets_the_allocators_unused_reserve_aside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_gib: int, placement: str
+) -> None:
+    """Q-99 (changed, #325), Q-223: the trainer reads the free memory and the reserve from the
+    allocator after the first iteration. With 12 GiB free on the device, 9 GiB reserved and
+    1 GiB allocated, and no growth, the limit is ½·(12 + 8 − 8) = 6 GiB: a 6 GiB cache goes
+    to the GPU and a 7 GiB one is memory-mapped (½·free, 10 GiB, would have taken it)."""
+    gib = 2**30
+    trainer = Trainer(_no_perceptual(), _scene(tmp_path / "scene"), _init_points(), device="cpu")
+    chosen: list[str] = []
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (12 * gib, 24 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 9 * gib)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: gib)
+    monkeypatch.setattr("openftgs.train._bytes_per_row", lambda model: 0)
+    monkeypatch.setattr(FrameCache, "size_of", staticmethod(lambda dataset: cache_gib * gib))
+    monkeypatch.setattr(
+        trainer, "_open_frame_cache", lambda chosen_placement, **_: chosen.append(chosen_placement)
+    )
+    trainer._choose_placement()
+    assert chosen == [placement]
 
 
 def test_auto_placement_falls_back_when_no_cache_can_be_made(tmp_path: Path) -> None:

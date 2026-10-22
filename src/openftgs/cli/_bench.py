@@ -1468,8 +1468,8 @@ class _AutoEstimate:
         less what was reserved then, and that as a share of the ½·(free − reserve) the rule
         leaves for it; above 1, a cache at the rule's limit wouldn't have fit."""
         beyond = peak_reserved - self.reserved - self.cache - self.growth
-        margin = 0.5 * (self.free - self.reserve)
-        return {"beyond_estimate_bytes": beyond, "margin_used": beyond / margin}
+        half = 0.5 * (self.free - self.reserve)
+        return {"beyond_estimate_bytes": beyond, "margin_used": beyond / half}
 
 
 def _data_figures(

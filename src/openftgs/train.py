@@ -603,16 +603,20 @@ class Trainer:
         to N_max will add (D-51, Q-223), and is memory-mapped otherwise; a cache that can't be
         made falls back to PNGs with a warning."""
         self._placement_pending = False
-        free, _ = torch.cuda.mem_get_info(self._device)
+        unheld, _ = torch.cuda.mem_get_info(self._device)
         # Q-223: the allocator's unused reserve is the iteration's working memory (the render's
-        # and the losses' buffers at the image's size, the gradients), counted free by Q-99.
+        # and the losses' buffers at the image's size, the gradients), which Q-99's free memory
+        # counts and the rule sets aside again.
         reserve = torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(
             self._device
         )
         model = self._run.model
         growth = max(0, self._cfg.growth.n_max - model.num_gaussians) * _bytes_per_row(model)
         fits = _fits_on_gpu(
-            FrameCache.size_of(self._dataset), free=free + reserve, reserve=reserve, growth=growth
+            FrameCache.size_of(self._dataset),
+            free=unheld + reserve,
+            reserve=reserve,
+            growth=growth,
         )
         self._open_frame_cache("gpu" if fits else "mmap", automatic=True)
         self._schedule()
