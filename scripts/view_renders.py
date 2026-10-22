@@ -17,11 +17,12 @@ processes of their own, writing DIR/renders.safetensors and DIR/METRICS.json. It
 render as an 8-bit RGB PNG, clamped to [0, 1] as E16 clamps it and rounded, at its record's image
 path relative to the scene (with a .png suffix) under DIR; the PNGs are for looking at, since
 they can't reproduce the metrics (Q-137). It then deletes the float32 renders.safetensors.
-With `--compare`, it writes DIR/COMPARISON.json: per block of scene means (`entire`, and
-`dynamic` where both files have it), each metric's difference from the given METRICS.json
-(this run's minus that one; null where either value is null), the largest per-image PSNR
-difference, and as `findings` every PSNR difference above 0.01 dB and every other metric's
-difference above 0.001 (#327, Q-224). The backend is gsplat unless `--backend reference`; on a
+With `--compare`, it writes DIR/COMPARISON.json: per block of scene means (`entire` and
+`dynamic`), each metric's difference from the given METRICS.json (this run's minus that one;
+null where either value is null), per block and metric the largest per-image difference, and as
+`findings` every scene mean or image value differing by more than 0.01 dB in PSNR or 10⁻⁴ in
+any other metric, every value null on one side only, and every block, metric and image path in
+one file only (#327, Q-224). The backend is gsplat unless `--backend reference`; on a
 machine without CUDA `ftgs render` refuses gsplat rather than falling back (Q-125).
 
 Exit 0 once written; 2 for an input that can't be read or matched; a failing ftgs command's own
@@ -42,9 +43,9 @@ if TYPE_CHECKING:
     from openftgs.types import ImageRecord, SceneManifest
 
 # Q-224: larger differences from the run's METRICS.json are findings for the owner: #327 names
-# 0.01 dB for PSNR and "not small" for SSIM and LPIPS, whose values lie in [0, 1].
+# 0.01 dB for PSNR, and 10⁻⁴ puts the other metrics, whose values lie in [0, 1], on its footing.
 _PSNR_FINDING_DB = 0.01
-_UNIT_FINDING = 1e-3
+_UNIT_FINDING = 1e-4
 _BLOCKS = ("entire", "dynamic")  # fastest_10 is out of #327's scope: no M17 manifest names it
 
 
@@ -153,36 +154,75 @@ def _difference(ours: Any, theirs: Any) -> float | None:
     return None if ours is None or theirs is None else float(ours) - float(theirs)
 
 
+def _side(ours: bool) -> str:
+    return "this run's" if ours else "the given"
+
+
+def _one_sided(what: str, theirs: set[str], ours: set[str], findings: list[str]) -> None:
+    """Q-224: a finding for each name in one file only."""
+    for name in sorted(theirs ^ ours):
+        findings.append(f"{what} {name} is only in {_side(name in ours)} METRICS.json")
+
+
+def _compare_values(
+    where: str, ours: dict[str, Any], theirs: dict[str, Any], findings: list[str]
+) -> dict[str, float | None]:
+    """The differences of the metrics both sides name; Q-224's findings among them."""
+    _one_sided(f"{where} metric", set(theirs), set(ours), findings)
+    deltas: dict[str, float | None] = {}
+    for name in theirs:
+        if name not in ours:
+            continue
+        deltas[name] = delta = _difference(ours[name], theirs[name])
+        limit = _PSNR_FINDING_DB if name == "psnr" else _UNIT_FINDING
+        if delta is not None and abs(delta) > limit:
+            findings.append(f"{where} {name} differs by {delta:+.4g}")
+        elif delta is None and (ours[name] is None) != (theirs[name] is None):
+            findings.append(f"{where} {name} is null in {_side(ours[name] is None)} METRICS.json")
+    return deltas
+
+
 def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
     """#327, Q-224: this run's metrics minus the given METRICS.json's."""
     blocks: dict[str, dict[str, float | None]] = {}
-    largest: dict[str, float] = {}
+    largest: dict[str, dict[str, float]] = {}
     findings: list[str] = []
+    their_blocks, our_blocks = ({b for b in _BLOCKS if b in body} for body in (theirs, ours))
+    _one_sided("block", their_blocks, our_blocks, findings)
     for block in _BLOCKS:
         if block not in ours or block not in theirs:
             continue
         our_means, their_means = ours[block]["scene"], theirs[block]["scene"]
-        blocks[block] = {
-            name: _difference(our_means[name], their_means[name])
-            for name in their_means
-            if name in our_means
-        }
-        for name, delta in blocks[block].items():
-            limit = _PSNR_FINDING_DB if name == "psnr" else _UNIT_FINDING
-            if delta is not None and abs(delta) > limit:
-                findings.append(f"{block}: scene {name} differs by {delta:+.4g}")
+        blocks[block] = _compare_values(f"{block}: scene", our_means, their_means, findings)
+        metrics = list(dict.fromkeys([*their_means, *our_means]))  # a row's other keys aren't
+        our_images = {row["path"]: row for row in ours[block].get("images", [])}
         their_images = {row["path"]: row for row in theirs[block].get("images", [])}
-        image_psnr_deltas = [
-            delta
-            for row in ours[block].get("images", [])
-            if row["path"] in their_images
-            and (delta := _difference(row["psnr"], their_images[row["path"]]["psnr"])) is not None
-        ]
-        if image_psnr_deltas:
-            largest[block] = max(image_psnr_deltas, key=abs)
-            if abs(largest[block]) > _PSNR_FINDING_DB:
-                findings.append(f"{block}: an image's PSNR differs by {largest[block]:+.4g} dB")
-    return {"blocks": blocks, "largest_image_psnr_difference": largest, "findings": findings}
+        _one_sided(f"{block}: image", set(their_images), set(our_images), findings)
+        image_deltas: dict[str, list[float]] = {name: [] for name in metrics}
+        for path, their_row in their_images.items():
+            if path not in our_images:
+                continue
+            our_row = our_images[path]
+            row_deltas = _compare_values(
+                f"{block}: {path}",
+                {name: our_row[name] for name in metrics if name in our_row},
+                {name: their_row[name] for name in metrics if name in their_row},
+                findings,
+            )
+            for name, delta in row_deltas.items():
+                if delta is not None:
+                    image_deltas[name].append(delta)
+        largest[block] = {
+            name: max(deltas, key=abs) for name, deltas in image_deltas.items() if deltas
+        }
+    return {
+        "blocks": blocks,
+        "largest_image_difference": largest,
+        "largest_image_psnr_difference": {
+            block: values["psnr"] for block, values in largest.items() if "psnr" in values
+        },
+        "findings": findings,
+    }
 
 
 def _ftgs(*args: Path | str) -> None:

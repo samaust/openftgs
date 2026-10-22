@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """`scripts/view_renders.py`, the test-view renders of a trained model through the public CLI
-(§2.2 "Rendering at any camera and time", E16, D-84; Q-56, Q-137; #327).
+(§2.2 "Rendering at any camera and time", E16, D-84; Q-56, Q-137, Q-224; #327, #333).
 
 Added tests, not §3 rows: the request it writes is matched record for record by `ftgs eval
 --renders-dir` (Q-137's rule); its background is the model's training background (D-84); the
 whole run leaves one 8-bit PNG per test record equal to the clamped render, a METRICS.json equal
-to the run's own, and no renders file. The script runs as #327 runs it, in a process of its own,
-here on the CPU (the reference backend).
+to the run's own, and no renders file; its comparison's findings follow Q-224's bounds. The
+script runs as #327 runs it, in a process of its own, here on the CPU (the reference backend).
 """
 
 import dataclasses
@@ -200,27 +200,86 @@ def _module() -> Any:
     return module
 
 
-def _metrics(psnr: float | None, ssim1: float, dynamic_psnr: float | None) -> dict[str, Any]:
-    image = {"path": "images/cam02/000000.png", "psnr": psnr, "ssim1": ssim1}
-    return {
-        "entire": {"scene": {"psnr": psnr, "ssim1": ssim1}, "images": [image]},
-        "dynamic": {"scene": {"psnr": dynamic_psnr}, "images": []},
-    }
+def _metrics(**changes: float | None) -> dict[str, Any]:
+    """A METRICS.json body whose scene means and one image, in both blocks, hold the same
+    values; `changes` sets `<block>_<scene|image>_<metric>` to another value."""
+    base = {"psnr": 30.0, "ssim1": 0.9, "lpips_alex": 0.2}
+    body: dict[str, Any] = {}
+    for block in ("entire", "dynamic"):
+        scene = {k: changes.get(f"{block}_scene_{k}", v) for k, v in base.items()}
+        values = {k: changes.get(f"{block}_image_{k}", v) for k, v in base.items()}
+        image = {"camera": "02", "path": "images/cam02/000000.png", **values}
+        body[block] = {"scene": scene, "images": [image]}
+    return body
 
 
-def test_comparison_flags_psnr_ssim_and_skips_nulls() -> None:
-    """#327: a PSNR difference above 0.01 dB and an SSIM difference above 0.001 are findings,
-    smaller ones aren't; a null metric (METRICS.json's non-finite value, Q-63) gives a null
-    difference rather than an error; the dynamic block is compared beside the entire one."""
+def _flagged(findings: list[str]) -> list[str]:
+    return [f.split(" differs")[0] for f in findings]
+
+
+@pytest.mark.parametrize("block", ["entire", "dynamic"])
+@pytest.mark.parametrize("level", ["scene", "image"])
+def test_comparison_bounds_are_q224s(block: str, level: str) -> None:
+    """Q-224: a difference above 0.01 dB in PSNR or 10⁻⁴ in SSIM and LPIPS is a finding, per
+    scene mean and per image, in both blocks; 0.005 dB and 5·10⁻⁵ aren't. Every difference is
+    written."""
     compare = _module().compare
-    small = compare(_metrics(30.005, 0.9005, None), _metrics(30.0, 0.9, 25.0))
-    assert small["findings"] == []
-    assert small["blocks"]["entire"]["psnr"] == pytest.approx(0.005)
-    assert small["blocks"]["dynamic"] == {"psnr": None}
-    large = compare(_metrics(30.02, 0.902, 25.0), _metrics(30.0, 0.9, 25.0))
-    assert [f.split(" differs")[0] for f in large["findings"]] == [
-        "entire: scene psnr",
-        "entire: scene ssim1",
-        "entire: an image's PSNR",
+    theirs = _metrics()
+    small = {"psnr": 30.005, "ssim1": 0.9 + 5e-5, "lpips_alex": 0.2 - 5e-5}
+    large = {"psnr": 30.02, "ssim1": 0.9 + 2e-4, "lpips_alex": 0.2 - 2e-4}
+    quiet = compare(_metrics(**{f"{block}_{level}_{k}": v for k, v in small.items()}), theirs)
+    assert quiet["findings"] == []
+    loud = compare(_metrics(**{f"{block}_{level}_{k}": v for k, v in large.items()}), theirs)
+    where = f"{block}: " + ("scene" if level == "scene" else "images/cam02/000000.png")
+    assert _flagged(loud["findings"]) == [f"{where} {k}" for k in large]
+    for result, values in ((quiet, small), (loud, large)):
+        written = (
+            result["blocks"][block]
+            if level == "scene"
+            else result["largest_image_difference"][block]
+        )
+        expected = {"psnr": 30.0, "ssim1": 0.9, "lpips_alex": 0.2}
+        for k, v in values.items():
+            assert written[k] == pytest.approx(v - expected[k], abs=1e-12)
+    psnr = loud["largest_image_psnr_difference"][block]
+    assert psnr == pytest.approx(0.02 if level == "image" else 0.0, abs=1e-9)
+
+
+def test_comparison_flags_nulls_on_one_side_only() -> None:
+    """Q-224: a value null on one side and a number on the other is a finding, per scene and
+    per image, with a null difference; null on both sides is a null difference and no
+    finding."""
+    compare = _module().compare
+    both = compare(_metrics(dynamic_scene_psnr=None), _metrics(dynamic_scene_psnr=None))
+    assert both["findings"] == []
+    assert both["blocks"]["dynamic"]["psnr"] is None
+    one = compare(_metrics(dynamic_scene_psnr=None), _metrics(entire_image_ssim1=None))
+    assert one["findings"] == [
+        "entire: images/cam02/000000.png ssim1 is null in the given METRICS.json",
+        "dynamic: scene psnr is null in this run's METRICS.json",
     ]
-    assert large["largest_image_psnr_difference"]["entire"] == pytest.approx(0.02)
+    assert one["blocks"]["dynamic"]["psnr"] is None
+    assert "ssim1" not in one["largest_image_difference"]["entire"]
+
+
+def test_comparison_flags_what_one_file_holds_alone() -> None:
+    """Q-224: a block, a metric and an image path present in one file only are each a finding,
+    whichever file holds it; what both hold is still compared."""
+    compare = _module().compare
+    ours, theirs = _metrics(), _metrics()
+    del ours["dynamic"]
+    assert compare(ours, theirs)["findings"] == ["block dynamic is only in the given METRICS.json"]
+    assert compare(theirs, ours)["findings"] == ["block dynamic is only in this run's METRICS.json"]
+    ours = _metrics()
+    del ours["entire"]["scene"]["lpips_alex"]
+    del theirs["dynamic"]["images"][0]["ssim1"]
+    theirs["dynamic"]["images"].append({**theirs["dynamic"]["images"][0], "path": "b.png"})
+    result = compare(ours, theirs)
+    assert result["findings"] == [
+        "entire: scene metric lpips_alex is only in the given METRICS.json",
+        "dynamic: image b.png is only in the given METRICS.json",
+        "dynamic: images/cam02/000000.png metric ssim1 is only in this run's METRICS.json",
+    ]
+    assert result["blocks"]["entire"] == {"psnr": 0.0, "ssim1": 0.0}
+    assert result["largest_image_difference"]["entire"]["lpips_alex"] == 0.0  # both rows hold it
+    assert result["largest_image_difference"]["dynamic"] == {"psnr": 0.0, "lpips_alex": 0.0}
