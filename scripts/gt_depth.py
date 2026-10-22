@@ -392,8 +392,8 @@ def _pooled_residual(pool: _ResidualPool) -> dict[str, Any]:
 # -- Matching the scene to the ground truth -------------------------------------------------------
 
 
-def _ground_truth_frame(record: ImageRecord, cameras: dict[str, Any]) -> tuple[str, int]:
-    """Q-231: the ground-truth camera and decode index n of a test record, after checking its
+def ground_truth_frame(record: ImageRecord, cameras: dict[str, Any]) -> tuple[str, int]:
+    """Q-231: the ground-truth camera and decode index n of a record, after checking its
     camera against the ground truth's."""
     cam = record.camera
     gt = cameras.get(cam.name)
@@ -429,7 +429,7 @@ def run(checkpoint: Path, scene: Path, gt_dir: Path, *, backend: _Backend) -> di
         }
         state = load_checkpoint(checkpoint)
         records = [r for r in manifest.records if r.split == "test"]
-        frames = [_ground_truth_frame(r, cameras) for r in records]
+        frames = [ground_truth_frame(r, cameras) for r in records]
     except (OSError, ValueError, KeyError, TypeError) as err:
         raise InputError(f"{type(err).__name__}: {err}") from None
     if not records:
