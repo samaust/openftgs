@@ -1242,11 +1242,12 @@ def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
 def test__probe_reads_what_auto_reads_after_the_second_iteration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Q-225 (changed, #341), Q-189: B-6's probe reads the free memory and the reserve where
-    "auto" reads them, after its trainer's second iteration and not after its first, which may
-    autotune cuDNN and leave the allocator emptied. The allocator here holds 1 GiB allocated
-    and 1 + k GiB reserved after k iterations, with k GiB free on the device: after the second,
-    4 GiB free in all and 3 reserved; after the first it would be 2 and 2."""
+    """Q-225 (changed, #341), Q-189: when its training images have one size, B-6's probe reads
+    the free memory and the reserve where "auto" reads them, after its trainer's second
+    iteration and not after its first, which may autotune cuDNN and leave the allocator emptied.
+    The allocator here holds 1 GiB allocated and 1 + k GiB reserved after k iterations, with
+    k GiB free on the device: after the second, 4 GiB free in all and 3 reserved; after the
+    first it would be 2 and 2."""
     from openftgs.cli import _bench
     from openftgs.data import FrameCache
 
@@ -1261,8 +1262,9 @@ def test__probe_reads_what_auto_reads_after_the_second_iteration(
         steps = 0
         model = Model()
 
-        def step(self) -> None:
+        def step(self) -> SimpleNamespace:
             self.steps += 1
+            return SimpleNamespace(image_index=self.steps % 2)
 
     probe = Probe()
     monkeypatch.setattr(_bench, "_data_trainer", lambda ctx, volume, cfg, n: probe)
@@ -1271,9 +1273,63 @@ def test__probe_reads_what_auto_reads_after_the_second_iteration(
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (probe.steps * gib, 24 * gib))
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: gib)
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: (1 + probe.steps) * gib)
-    estimate = _bench._probe(cast(Any, SimpleNamespace(video=None)), cast(Any, None), 10)
+    camera = SimpleNamespace(width=32, height=24)
+    video = SimpleNamespace(records=[SimpleNamespace(camera=camera, split="train")] * 2)
+    estimate = _bench._probe(cast(Any, SimpleNamespace(video=video)), cast(Any, None), 10)
     assert probe.steps == 2
     assert (estimate.free, estimate.reserved, estimate.allocated) == (4 * gib, 3 * gib, gib)
+
+
+def test__probe_reads_what_auto_reads_once_every_image_size_has_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-232 (changed, #348), Q-189: with training images of two sizes, B-6's probe reads where
+    "auto" reads, after the iteration that follows the first at the last size to appear. Its
+    trainer trains on records 0, 1, 0, 2, 1, …, record 2 alone 40×30, so the second size first
+    comes at iteration 4 and the probe reads after iteration 5; the 64×64 test view doesn't
+    count. The allocator holds 1 GiB allocated and 1 + k GiB reserved after k iterations, with
+    k GiB free on the device: after the fifth, 10 GiB free in all and 6 reserved."""
+    from openftgs.cli import _bench
+    from openftgs.data import FrameCache
+
+    gib = 2**30
+
+    class Model:
+        PARAM_NAMES = ("means",)
+        means = torch.zeros(10, 3)
+        num_gaussians = 10
+
+    order = [0, 1, 0, 2, 1, 2, 0]
+
+    class Probe:
+        steps = 0
+        model = Model()
+
+        def step(self) -> SimpleNamespace:
+            self.steps += 1
+            return SimpleNamespace(image_index=order[self.steps - 1])
+
+    def record(width: int, height: int, split: str) -> SimpleNamespace:
+        return SimpleNamespace(camera=SimpleNamespace(width=width, height=height), split=split)
+
+    video = SimpleNamespace(
+        records=[
+            record(32, 24, "train"),
+            record(32, 24, "train"),
+            record(40, 30, "train"),
+            record(64, 64, "test"),
+        ]
+    )
+    probe = Probe()
+    monkeypatch.setattr(_bench, "_data_trainer", lambda ctx, volume, cfg, n: probe)
+    monkeypatch.setattr(_bench, "_release_cuda", lambda: None)
+    monkeypatch.setattr(FrameCache, "size_of", staticmethod(lambda dataset: gib))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (probe.steps * gib, 24 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: gib)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: (1 + probe.steps) * gib)
+    estimate = _bench._probe(cast(Any, SimpleNamespace(video=video)), cast(Any, None), 10)
+    assert probe.steps == 5
+    assert (estimate.free, estimate.reserved, estimate.allocated) == (10 * gib, 6 * gib, gib)
 
 
 def test__data_figures_share_the_data_wait_over_iterations_without_an_event() -> None:

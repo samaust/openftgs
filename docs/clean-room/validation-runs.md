@@ -55,5 +55,6 @@ The reference images themselves have flaws, seen by eye (owner, 2026-10-21): som
 | 25 | B-6 on kitchen60 at #341 | `ftgs bench data <m15-runs>/kitchen60/scene.json --out $M/bench/B-6-kitchen60-341.json` | 85be2d1 | 3 min 52 s | `margin_used` 0.043 at 1M, 0.42 at 3M; at most 0.046 % | §3.4 B-6 on kitchen60 at #341 |
 | 26 | B-6 on the CI scene's 60 frames at #341 | `ftgs bench data <m15-runs>/ci-scene/scene-60.json --out $M/bench/B-6-ci60-341.json` | 85be2d1 | 3 min 52 s | every `gpu` case runs; `bench_compare.py` ok against the stored baseline | §3.4 B-6 on the CI scene's 60-frame conversion at #341 |
 | 27 | studio default at #341 | the step 16 training with `--out $M/studio/default-341` | 85be2d1 | 80 min 17 s | no GPU out of memory, "auto" memory-mapped the cache; PSNR 23.24 dB on 0007 (dynamic 25.80), LPIPS-VGG 0.3157 (dynamic 0.1641); N reaches 3,000,000 at 13,500; GPU peak 18,866 MiB | D-51 and §1.5 on studio at #341 |
+| 28 | B-6 on kitchen60 at #348 | `ftgs bench data <m15-runs>/kitchen60/scene.json --out $M/bench/B-6-kitchen60-348.json` | edfe914 | 3 min 50 s | `margin_used` 0.043 at 1M, 0.42 at 3M, as at #341; at most 0.047 % | §3.4 B-6 on kitchen60 at #348 |
 
 Kitchen's default run reached N_max inside the growth window, so the τ_pos = 10⁻⁴ run of Q-220's first decision is replaced by one at τ_pos = 4·10⁻⁴ (Q-220 as answered).

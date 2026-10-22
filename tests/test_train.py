@@ -22,6 +22,7 @@ import torch
 from builders import (
     UNIT_TIME,
     logit_of,
+    look_at,
     model_from_rows,
     pinhole,
     random_model,
@@ -1452,7 +1453,7 @@ def test__step_chooses_the_placement_from_the_second_iterations_allocator(
         _init_points(),
         device="cpu",
     )
-    trainer._placement_wait = 2  # what "auto" sets on CUDA at construction
+    trainer._await_placement()  # what "auto" does on CUDA at construction
     unheld = {1: 20 * gib, 2: 12 * gib}
     reserved = {1: gib, 2: 9 * gib}
     chosen: list[tuple[int, str]] = []
@@ -1472,6 +1473,64 @@ def test__step_chooses_the_placement_from_the_second_iterations_allocator(
     assert chosen == [(2, "mmap")]
     trainer.step()
     assert chosen == [(2, "mmap")]
+
+
+def _two_size_scene(root: Path) -> MultiViewVideo:
+    """Two 32×24 cameras of `_scene`'s ring and a 40×30 camera, all training at frames k/30 for
+    k < 3, and a 48×36 test view, whose size "auto" doesn't wait for."""
+    cams = ring(4, radius=4.0, elevation=1.0, width_px=32, height_px=24, focal=30.0)
+    wide = look_at((0.0, -4.0, 1.0), width=40, height=30, focal=37.5, name="wide")
+    gt = random_model(24, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
+    images = [(cam, k / 30.0, "train") for k in range(3) for cam in (cams[0], cams[1], wide)]
+    test = look_at((0.0, 4.0, 1.0), width=48, height=36, focal=45.0, name="test")
+    images += [(test, k / 30.0, "test") for k in range(3)]
+    return MultiViewVideo.from_manifest(write_scene(root, gt, images))
+
+
+def _order_wide_image_fourth(trainer: Trainer, video: MultiViewVideo) -> None:
+    """Sets the first epoch of `_two_size_scene` to three 32×24 images, then a 40×30 one."""
+    train = [i for i, r in enumerate(video.records) if r.split == "train"]
+    small = [i for i in train if video.records[i].camera.width == 32]
+    wide = [i for i in train if video.records[i].camera.width == 40]
+    trainer._run.sampler.permutation = small[:3] + wide[:1] + small[3:] + wide[1:]
+
+
+def test__step_chooses_the_placement_after_every_image_size_has_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-232 (changed, #348): with "auto" pending, as on CUDA, and training images of two sizes
+    whose 40×30 size first comes at iteration 4 (three 32×24 images first), the placement is
+    chosen once, after iteration 5, from that iteration's readings. Up to iteration 4 the
+    readings would put a 7 GiB cache on the GPU (20 GiB free, ½·20 = 10 GiB); after iteration
+    5, 12 GiB are free with 9 GiB reserved and 1 allocated, a limit of ½·(12 + 8 − 8) = 6 GiB,
+    so the cache is memory-mapped."""
+    gib = 2**30
+    video = _two_size_scene(tmp_path / "scene")
+    trainer = Trainer(
+        _no_perceptual(perf=PerfConfig(frame_cache="off")), video, _init_points(), device="cpu"
+    )
+    trainer._await_placement()  # what "auto" does on CUDA at construction
+    _order_wide_image_fourth(trainer, video)
+    unheld = {i: 20 * gib for i in range(1, 5)} | {5: 12 * gib}
+    reserved = {i: gib for i in range(1, 5)} | {5: 9 * gib}
+    chosen: list[tuple[int, str]] = []
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (unheld[trainer.iteration], 0))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: reserved[trainer.iteration])
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: gib)
+    monkeypatch.setattr("openftgs.train._bytes_per_row", lambda model: 0)
+    monkeypatch.setattr(FrameCache, "size_of", staticmethod(lambda dataset: 7 * gib))
+    monkeypatch.setattr(
+        trainer,
+        "_open_frame_cache",
+        lambda placement, **_: chosen.append((trainer.iteration, placement)),
+    )
+    for _ in range(4):
+        trainer.step()
+    assert chosen == []
+    trainer.step()
+    assert chosen == [(5, "mmap")]
+    trainer.step()
+    assert chosen == [(5, "mmap")]
 
 
 def test_auto_placement_falls_back_when_no_cache_can_be_made(tmp_path: Path) -> None:
@@ -1511,6 +1570,21 @@ def test_cuda_auto_placement_waits_for_the_second_iteration(tmp_path: Path) -> N
     trainer = Trainer(_with_cache(ONE_EVENT, "auto"), video, _u21_model(video), device="cuda")
     trainer.step()
     assert trainer._frames is None
+    trainer.step()
+    assert trainer._frames is not None
+
+
+@pytest.mark.gpu
+def test_cuda_auto_placement_waits_for_every_image_size(tmp_path: Path) -> None:
+    """Q-232 (changed, #348), Q-238: on CUDA, with training images of two sizes whose 40×30
+    size first comes at iteration 4, "auto" decodes PNGs through iteration 4, which may re-tune
+    cuDNN for the new size, and opens the cache only after iteration 5."""
+    video = _two_size_scene(tmp_path / "scene")
+    trainer = Trainer(_with_cache(ONE_EVENT, "auto"), video, _u21_model(video), device="cuda")
+    _order_wide_image_fourth(trainer, video)
+    for _ in range(4):
+        trainer.step()
+        assert trainer._frames is None
     trainer.step()
     assert trainer._frames is not None
 

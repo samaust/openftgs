@@ -1391,10 +1391,6 @@ def _adam(ctx: _Context) -> _Result:
 
 _DATA_N = 1_000_000  # #232: B-1's configuration at N = 1M
 _DATA_ACTIVE = 0.2  # Q-189: as B-1's case at 1M rows (#226)
-# Q-225 (changed, #341): the probe's iterations before it reads, as many as the trainer's "auto"
-# runs before it decides (`openftgs.train._PLACEMENT_AFTER`); the first may autotune cuDNN and
-# empty the allocator.
-_PROBE_ITERATIONS = 2
 _MEMORY_N = 3_000_000  # #232, Q-99's note: peak memory at N = 3M with the cache on the GPU
 _DATA_TIMED = (121, 320)  # #232: 200 iterations under the CUDA clock, after B-1's warm-up
 _DATA_HOST = (321, 420)  # Q-189: 100 iterations under the wall clock, a diagnostic
@@ -1532,17 +1528,20 @@ def _data_trainer(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> T
 
 def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
     """Q-99, Q-189: what "auto" measures on CUDA, taken as it takes it: a trainer of B-6's
-    configuration at `n` rows runs its first two iterations on decoded PNGs, as "auto" does, and
-    the free memory, the working memory left reserved (Q-225) and growth are read when the
-    second returns (#341)."""
+    configuration at `n` rows runs on decoded PNGs until "auto" would decide, after the
+    iteration that follows the first at the last training image size to appear (the second for
+    one size; Q-225, Q-232), and the free memory, the working memory left reserved and growth
+    are read when that iteration returns (#341, #348)."""
     import torch
 
     from openftgs.data import FrameCache
+    from openftgs.train import _PlacementWait
 
     cfg = _data_config(n, "off", None)
     trainer = _data_trainer(ctx, volume, cfg, n)
-    for _ in range(_PROBE_ITERATIONS):
-        trainer.step()
+    wait = _PlacementWait(ctx.video)  # Q-232: the trainer's own count
+    while not wait.decides_after(trainer.step().image_index):
+        pass
     free, total = torch.cuda.mem_get_info()
     allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
     model = trainer.model
@@ -1647,9 +1646,10 @@ def _data(ctx: _Context) -> _Result:
         ),
         "frame_cache": "built before timing",
         "gpu": (
-            'measured where "auto" would place the cache on the GPU (Q-99, Q-225): a trainer '
-            "decoding PNGs runs two iterations first, and the free memory, the working memory "
-            "the second left reserved and growth are read after it"
+            'measured where "auto" would place the cache on the GPU (Q-99, Q-225, Q-232): a '
+            "trainer decoding PNGs runs until the iteration that follows the first at the last "
+            "training image size to appear (the second for one size), and the free memory, the "
+            "working memory that iteration left reserved and growth are read after it"
         ),
         "warmup": _DATA_TIMED[0] - 1,
         "timed": list(_DATA_TIMED),

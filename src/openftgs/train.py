@@ -282,11 +282,27 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 # perceptual network's NCHW inputs (_NCHWLPIPSLoss) at +7.2 % and +3.9 % (Calibration data).
 _AUTOTUNE = True
 
-# Q-225 (changed, #341): "auto" decides on CUDA after the trainer's second iteration. The first
-# may autotune cuDNN, whose trials return the allocator's blocks to the driver, so the reserve
-# read after it is close to nothing; from the second on the allocator keeps the working memory.
-# Q-232: the same iteration whatever the cameras' image sizes, though a new size re-tunes.
-_PLACEMENT_AFTER = 2
+
+class _PlacementWait:
+    """Q-225 (changed, #341), Q-232 (changed, #348): when "auto" decides on CUDA. An iteration
+    at an image size not yet seen in the process may autotune cuDNN, whose trials return the
+    allocator's blocks to the driver, so the reserve read after it is close to nothing. "auto"
+    therefore decides after the iteration that follows the first iteration at the last of the
+    training images' sizes to appear: after the second when they all have one size."""
+
+    def __init__(self, dataset: MultiViewVideo) -> None:
+        self._sizes = [(r.camera.width, r.camera.height) for r in dataset.records]
+        self._unseen = {
+            size for size, r in zip(self._sizes, dataset.records, strict=True) if r.split == "train"
+        }
+
+    def decides_after(self, index: int) -> bool:
+        """Records that an iteration trained on record `index`, and says whether "auto" decides
+        after it; called once an iteration, in order."""
+        if not self._unseen:
+            return True
+        self._unseen.discard(self._sizes[index])
+        return False
 
 
 @contextlib.contextmanager
@@ -565,7 +581,7 @@ class Trainer:
             self._perceptual = perceptual
         self._evaluator: Evaluator | None = None
         self._frames: Prefetcher | None = None  # D-51: training images through the frame cache
-        self._placement_wait = 0  # iterations before "auto" decides on CUDA (Q-225)
+        self._placement_wait: _PlacementWait | None = None  # "auto" pending on CUDA (Q-232)
         self._open_frame_cache(cfg.perf.frame_cache)
         # §2.4 rule 3: every training record's camera is copied to the device here, once, so a
         # training iteration's render copies no camera from the host; records share camera
@@ -603,13 +619,13 @@ class Trainer:
 
     def _open_frame_cache(self, placement: str, *, automatic: bool = False) -> None:
         """D-51, Q-99: "off" decodes PNGs; "gpu" and "mmap" open the cache now; "auto" is mmap on
-        a CPU device and, on CUDA, decided after the second iteration. A cache directory that
-        can't be made turns "auto" into "off" with a warning, and is a ValueError for an
-        explicit placement (Q-26)."""
+        a CPU device and, on CUDA, decided after the iteration that follows the first at the last
+        training image size to appear (Q-232). A cache directory that can't be made turns "auto"
+        into "off" with a warning, and is a ValueError for an explicit placement (Q-26)."""
         if placement == "off":
             return
         if placement == "auto" and self._device.type == "cuda":
-            self._placement_wait = _PLACEMENT_AFTER
+            self._await_placement()
             return
         automatic = automatic or placement == "auto"
         chosen: Literal["gpu", "mmap"] = "gpu" if placement == "gpu" else "mmap"
@@ -626,11 +642,16 @@ class Trainer:
         self._frames = Prefetcher(cache, device=self._device, depth=depth)
         weakref.finalize(self, self._frames.close)  # the reader thread ends with the trainer
 
+    def _await_placement(self) -> None:
+        """Q-232 (changed, #348): "auto" on CUDA decodes PNGs until `_PlacementWait` says it
+        decides, counting from this process's first iteration."""
+        self._placement_wait = _PlacementWait(self._dataset)
+
     def _choose_placement(self) -> None:
-        """Q-99: after the second CUDA iteration, the cache goes to GPU memory when it fits in half
-        the free memory, less the working memory that iteration left reserved, minus what growth
-        to N_max will add (D-51, Q-225), and is memory-mapped otherwise; a cache that can't be
-        made falls back to PNGs with a warning."""
+        """Q-99: once `_PlacementWait` says "auto" decides (Q-232), the cache goes to GPU memory
+        when it fits in half the free memory, less the working memory the iteration left
+        reserved, minus what growth to N_max will add (D-51, Q-225), and is memory-mapped
+        otherwise; a cache that can't be made falls back to PNGs with a warning."""
         unheld, _ = torch.cuda.mem_get_info(self._device)
         # Q-225: the allocator's unused reserve is the iteration's working memory (the render's
         # and the losses' buffers at the image's size, the gradients), which Q-99's free memory
@@ -746,10 +767,9 @@ class Trainer:
                 with stage("events"):
                     growth, relocation, pruned = self._event(entry, it)
             run.iteration = it
-            if self._placement_wait:
-                self._placement_wait -= 1
-                if not self._placement_wait:
-                    self._choose_placement()
+            if self._placement_wait is not None and self._placement_wait.decides_after(index):
+                self._placement_wait = None
+                self._choose_placement()
             with stage("log"):
                 mean_losses = self._log(terms, it)
         return StepLog(
