@@ -13,6 +13,7 @@ ground truth don't match.
 import importlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -112,9 +113,8 @@ def test_kept_psnr_with_no_pixel_flagged_is_e16s_psnr() -> None:
     assert kept_psnr(pred, gt, everything) == pytest.approx(float(psnr(pred, gt)), abs=1e-9)
     keep = torch.zeros(9, 11, dtype=torch.bool)
     keep[2:5, 3:8] = True
-    diff = pred.double().clamp(0, 1)[2:5, 3:8] - gt.double()[2:5, 3:8]
-    expected = -10.0 * math.log10(float(diff.square().mean()))
-    assert kept_psnr(pred, gt, keep) == pytest.approx(expected, abs=1e-9)
+    subset = float(psnr(pred[2:5, 3:8], gt[2:5, 3:8]))  # E16 on the kept pixels alone
+    assert kept_psnr(pred, gt, keep) == pytest.approx(subset, abs=1e-9)
     assert kept_psnr(pred, gt, torch.zeros_like(keep)) is None
     assert kept_psnr(gt, gt, keep) == math.inf
 
@@ -294,6 +294,26 @@ def test_run_reports_psnr_with_and_without_the_flagged_pixels(tmp_path: Path) ->
     overall = result["overall"]
     assert overall["frames"] == _FRAMES
     assert overall["psnr"] == pytest.approx(np.mean([f["psnr"] for f in result["frames"]]))
+
+
+def test_scene_with_workers_writes_what_one_process_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cameras split over two spawned workers give the same report and flag images as one
+    process, and the thread variables set for the workers are restored afterwards."""
+    scene, gt, _ = _flawed_scene(tmp_path)
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    module = _module()
+    one, two = tmp_path / "one", tmp_path / "two"
+    assert module.main(["scene", str(scene), str(gt), "--out", str(one)]) == 0
+    assert module.main(["scene", str(scene), str(gt), "--out", str(two), "--workers", "2"]) == 0
+    assert os.environ["OMP_NUM_THREADS"] == "2" and "MKL_NUM_THREADS" not in os.environ
+    assert json.loads((one / "REFERENCE.json").read_text()) == json.loads(
+        (two / "REFERENCE.json").read_text()
+    )
+    for n in range(_FRAMES):
+        assert np.array_equal(_flags(one, n), _flags(two, n))
 
 
 def test_scene_is_exit_2_when_the_scene_doesnt_match_the_ground_truth(

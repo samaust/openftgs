@@ -26,9 +26,10 @@ index n there and its camera checked against the ground truth's, as `gt_depth.py
    above ½, 1 and 2 times 10 levels in any channel, on all, static and dynamic pixels.
 2. **Clipping**: the share of pixels at 255 in any channel and in all three.
 3. **Flicker**: the change from frame to frame of each camera, on static pixels and inside the
-   dynamic masks apart. Static means outside both frames' masks dilated by 1 px, since the masks
-   are point-sampled and the frames box-filtered (Q-236). Static pixels still change with
-   moving shadows and indirect light, which the dynamic masks don't cover.
+   ground truth's dynamic masks apart. Static means outside both frames' masks dilated by 1 px,
+   since the masks are point-sampled and the frames box-filtered (Q-236). Static pixels still
+   change with moving shadows and indirect light, which the ground truth's dynamic masks don't
+   cover.
 
 A pixel is flagged (Q-236) when it is clipped in any channel; when its smallest difference over
 the cameras that see it exceeds 10 levels in any channel (cross-camera); or when, on static
@@ -46,7 +47,7 @@ a bit field (`FLAG_BITS`) indexed by `flags/index.json`.
 frame and averaged over frames as E16 does, its PSNR as E16 computes it, and the PSNR over the
 pixels left once those flagged in FLAGS_DIR are removed (Q-233), for each flag alone, for their
 union, and for the union at ½ and 2 times the thresholds; with the PSNR over the flagged pixels
-and their share. SSIM and LPIPS aren't reported masked.
+and their share. SSIM and LPIPS have no kept-pixel form.
 
 These are diagnostics, not pass criteria: the spec defines no metric for them. Exit 0 once
 written; 2 for an input that can't be read or matched.
@@ -419,7 +420,7 @@ def _flicker_pair(
     return regions, np.where(static, diff.max(axis=-1), np.inf)
 
 
-def _shares(mask: np.ndarray) -> float:
+def _share(mask: np.ndarray) -> float:
     return float(mask.mean())
 
 
@@ -438,7 +439,7 @@ def _camera_job(job: tuple[_View, list[_View], str | None]) -> dict[str, Any]:
         nxt = _load(view.frames[i + 1], depth=True) if i + 1 < len(view.frames) else None
         record: dict[str, Any] = {"n": frame.n, "timestamp": frame.timestamp, "test": frame.test}
         any_255, all_255 = clipped(current.image)
-        record["clipped"] = {"any": _shares(any_255), "all": _shares(all_255)}
+        record["clipped"] = {"any": _share(any_255), "all": _share(all_255)}
         record["cross"] = {}
         smallest = np.full(any_255.shape, np.inf)
         for other in others:
@@ -516,10 +517,10 @@ def _accumulate(sums: dict[str, np.ndarray], name: str, values: np.ndarray) -> N
 
 
 def _flag_shares(flags: np.ndarray) -> dict[str, Any]:
-    out: dict[str, Any] = {"clipped": _shares((flags & FLAG_BITS["clipped"]) > 0)}
+    out: dict[str, Any] = {"clipped": _share((flags & FLAG_BITS["clipped"]) > 0)}
     for kind in ("cross", "flicker"):
-        out[kind] = {str(s): _shares((flags & _bit(kind, s)) > 0) for s in _SCALES}
-    out["union"] = {str(s): _shares((flags & union_bits(s)) > 0) for s in _SCALES}
+        out[kind] = {str(s): _share((flags & _bit(kind, s)) > 0) for s in _SCALES}
+    out["union"] = {str(s): _share((flags & union_bits(s)) > 0) for s in _SCALES}
     return out
 
 
@@ -583,10 +584,20 @@ def scene_report(
     if workers > 1:
         import multiprocessing
 
-        # Each worker is one thread: the ledger's budget is the number of workers.
-        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-            os.environ[var] = "1"
-        with multiprocessing.get_context("spawn").Pool(workers) as pool:
+        # Each worker is one thread: the ledger's budget is the number of workers. Spawned
+        # workers take the environment at start, so it is restored once they are running.
+        thread_vars = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+        saved = {var: os.environ.get(var) for var in thread_vars}
+        os.environ.update(dict.fromkeys(thread_vars, "1"))
+        try:
+            pool = multiprocessing.get_context("spawn").Pool(workers)
+        finally:
+            for var, value in saved.items():
+                if value is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = value
+        with pool:
             cameras = pool.map(_camera_job, jobs, chunksize=1)
     else:
         cameras = [_camera_job(job) for job in jobs]
@@ -700,6 +711,8 @@ def run_report(
     full: list[float] = []
     frames: list[dict[str, Any]] = []
     for record in records:
+        # The index holds the scene's own timestamps, so a match is to within rounding, as
+        # Q-231 matches records to the ground truth.
         hits = [
             e
             for e in index
@@ -737,9 +750,9 @@ def run_report(
             on_flagged = _finite(kept_psnr(pred, gt, mask))
             frame[name] = {"share": share, "kept_psnr": kept, "flagged_psnr": on_flagged}
             sums[name]["share"].append(share)
-            for value_, slot in ((kept, "kept"), (on_flagged, "flagged")):
-                if value_ is not None:
-                    sums[name][slot].append(value_)
+            for figure, slot in ((kept, "kept"), (on_flagged, "flagged")):
+                if figure is not None:
+                    sums[name][slot].append(figure)
         frames.append(frame)
     overall: dict[str, Any] = {"psnr": float(np.mean(full)), "frames": len(full)}
     for name, values in sums.items():

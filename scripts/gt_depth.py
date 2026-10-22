@@ -393,7 +393,7 @@ def _pooled_residual(pool: _ResidualPool) -> dict[str, Any]:
 
 
 def ground_truth_frame(record: ImageRecord, cameras: dict[str, Any]) -> tuple[str, int]:
-    """Q-231: the ground-truth camera and decode index n of a test record, after checking its
+    """Q-231: the ground-truth camera and decode index n of a record, after checking its
     camera against the ground truth's."""
     cam = record.camera
     gt = cameras.get(cam.name)
