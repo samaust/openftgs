@@ -195,21 +195,22 @@ B-4 times the two image losses whose cost D-52 decides, LPIPS-VGG and SSIM, at 1
 | layout | `nchw` (contiguous NCHW inputs and weights); `channels_last_inputs` (channels-last inputs, NCHW weights); `channels_last_inputs_and_weights` |
 | cuDNN autotuning | off, on |
 
-`channels_last_inputs` is training's path: `LPIPSLoss` views a render's [..., H, W, 3] batch first, which is channels-last in memory, and every convolution of the network follows that layout (source log 175). So "channels-last on and off" (§3.4) is measured twice: on and off for the inputs, which training already has on, and for the weights, which it doesn't yet.
+`channels_last_inputs` was training's path until #326: a plain `LPIPSLoss` views a render's [..., H, W, 3] batch first, which is channels-last in memory, and every convolution of the network follows that layout (source log 175). So "channels-last on and off" (§3.4) is measured twice: on and off for the inputs and for the weights. Since #326 training autotunes and gives the network NCHW inputs under IEEE and TF32, and channels-last inputs under bf16 (and under TF32 with `deterministic`, which doesn't autotune) (Q-173 as changed, Q-223); the setup's `training_layout` records the autotuned layout per precision. The comparisons below keep the earlier path as their baseline, as Q-190 has it. B-4's `nchw` cases start from an NCHW tensor, so they leave out the copy the trainer makes from a render and its backward; B-1 times the whole path.
 
 **Processes.** cuDNN caches the algorithm it picked for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off and on can't be compared in one process: a later setting would run the earlier one's picks. The deviations (below) and fused-ssim run in the benchmark's process; every LPIPS case and the PyTorch SSIM path run in one child process per autotuning setting, off and then on. A child that runs out of GPU memory exits with a code of its own, its error the last line of its output, and the benchmark reports it as it would in its own process, exit 2 (Q-166 as answered); a child that fails otherwise is a traceback.
 
 **SSIM.** `losses.ssim` with training's window, σ and padding, forward (stage `loss.ssim`) and the prediction's gradient: fused-ssim in the benchmark's process, when it imports, and the PyTorch path in the child processes, in which `fused_ssim` can't be imported, so `ssim()`'s signature doesn't change (PRD #220, owner's decision). The children run it with TF32 on, as training does (D-52), one with autotuning off and one with it on; each gets the folder the benchmark imported openftgs from first on its PYTHONPATH, so every case times the same code.
 
-**Figures.** Per case, as B-3's (`{"loss", "width", "height", …}`): the first call, then the medians over 30 calls after 10 warm-up calls of the forward, the backward and the span from one's start to the other's end, and the peak allocated memory. Per size, TF32's and bf16's deviation from IEEE float32 (`{"deviation", "width", "height"}`), measured first, with the network as training runs it: the two values and their relative difference, the gradients' relative L2 difference, and their largest difference over the largest IEEE gradient element.
+**Figures.** Per case, as B-3's (`{"loss", "width", "height", …}`): the first call, then the medians over 30 calls after 10 warm-up calls of the forward, the backward and the span from one's start to the other's end, and the peak allocated memory. Per size, TF32's and bf16's deviation from IEEE float32 (`{"deviation", "width", "height"}`), measured first, with the network as training ran it until #326 (channels-last inputs, autotuning off): the two values and their relative difference, the gradients' relative L2 difference, and their largest difference over the largest IEEE gradient element.
 
 **Comparisons.** Per size, a variant's gain over its baseline, 1 − variant / baseline of the median forward plus backward (`{"comparison", "width", "height"}`), and over the sizes the smallest gain and whether it reaches 3 % (`{"comparison"}`):
 
 | Comparison | Baseline → variant | Decides |
 | --- | --- | --- |
-| `autotuning` | TF32, channels-last inputs: autotuning off → on | cuDNN autotuning in training steps (Q-173) |
+| `autotuning` | TF32, channels-last inputs: autotuning off → on | reported: cuDNN autotuning alone, which Q-173 decided off (#228) before its change |
 | `channels_last_weights` | TF32, autotuning off: channels-last inputs → inputs and weights | channels-last LPIPS weights in training (Q-173) |
 | `autotuning_and_channels_last_weights` | both together | reported |
+| `autotuning_and_nchw_inputs` | TF32: channels-last inputs, autotuning off → NCHW inputs, autotuning on | cuDNN autotuning with NCHW inputs in training steps, the combination Q-173's change adopted (#326; Q-223) |
 | `tf32` | IEEE → TF32, channels-last inputs | reported (D-52's default) |
 | `bf16` | TF32 → bf16, channels-last inputs | reported (bf16 stays opt-in, approximate) |
 | `fused_ssim` | the PyTorch path without autotuning → fused-ssim | Q-42's note: no gain sends Q-42 back to the owner |
@@ -219,6 +220,10 @@ B-4 times the two image losses whose cost D-52 decides, LPIPS-VGG and SSIM, at 1
 ## B-4's first run
 
 On kitchen's first training image (Calibration data, #228), training's LPIPS-VGG path, TF32 with channels-last inputs and NCHW weights, takes 101.6 ms at 1352×1014 (forward 54.9, backward 46.6) and 150.6 ms at 1920×1080, which matches B-1's 52.7 ms of `loss.perceptual` and 44.9 ms of `backward.losses`. Neither exact option reaches Q-173's 3 % at both sizes: autotuning gains 4.3 % and −1.0 %, channels-last weights 1.0 % and 2.9 %, so both stay off and B-1 wasn't rerun. Reported beside them: both together 6.0 % and 3.1 %, and NCHW inputs with autotuning 7.2 % and 3.9 %, combinations the rule doesn't decide, which the owner left out, for M17 (Q-173's answer); IEEE float32 is 12 % and 17 % slower than TF32, and slower with channels-last inputs than with NCHW; bf16 is 33 % and 30 % faster than TF32, its value within 2.2·10⁻³ relative and its gradient 17 to 18 % off in L2 (TF32: 3 %). fused-ssim takes 0.41 and 0.66 ms against the PyTorch path's 8.5 and 13.2 ms, about 95 % less. With autotuning, a configuration's first call takes 1 to 27 s. The run took 4 min 13 s.
+
+## B-4's second run
+
+With the trainer giving the network NCHW inputs and autotuning (Calibration data, #326), `autotuning_and_nchw_inputs` gains 6.1 % at 1352×1014 and 4.5 % at 1920×1080 over the old default, so the adopted path meets Q-173's 3 % at both sizes; autotuning alone gains 3.2 % and 0.4 %, channels-last weights 0.4 % and 0.3 %. bf16 is again faster with channels-last inputs than with NCHW, which is why it keeps them (Q-223). The adopted path's first call takes 1.9 s and its peak allocated memory reaches 13.7 GiB, autotuning's workspace. The default `ftgs train` on kitchen, B-1's measure (Q-168), took 3,380 s against M17's 3,498 s, its GPU memory peaking at 23,492 of 24,564 MiB. The run took 4 min 6 s.
 
 ## B-1's first run
 
