@@ -150,7 +150,7 @@ Everything in this section comes from each candidate's license file and its own 
 
 **Columns.** *Reads*: the inputs its documentation names. *Time, as documented*: built-in playback or sequence support. *Hook*: the documented way to attach per-primitive data and a time input and to change centers and opacity per primitive (section 2.2). *Tier*: splats, centers or both. *Architecture*: the letter of section 4 the candidate serves. *Effort*: none (works as it is, perhaps after a baking step), small (days), medium (weeks), large (months), for one engineer.
 
-**Fidelity.** No candidate documents the constants of section 2.6, so the fidelity-gaps column of the plan collapsed to "unknown from documentation" for every one and is left out of the tables; the structural gaps of section 2.6 hold for all of them. The pages did yield two concrete data: Spark draws each primitive's footprint to √8 ≈ 2.83 standard deviations with its antialiasing turned off, against the spec's opacity-aware extent capped at 3.33; and gsplat's own viewer example clamps the output to [0, 1] before display, as any player must (E7).
+**Fidelity.** No candidate documents the constants of section 2.6, so the fidelity-gaps column of the plan collapsed to "unknown from documentation" for every one and is left out of the tables; the structural gaps of section 2.6 hold for all of them. The pages did yield two concrete data: Spark draws each primitive's footprint to √8 ≈ 2.83 standard deviations, against the spec's opacity-aware extent capped at 3.33 (its advice to turn off the browser renderer's multisampling says nothing about D-6's rasterize mode); and gsplat's own viewer example clamps the output to [0, 1] before display, as any player must (E7).
 
 ### 5.1 Python and UI servers
 
