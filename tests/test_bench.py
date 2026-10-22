@@ -2096,26 +2096,20 @@ def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, A
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b7_holds_the_fps_budget_and_sets_the_threshold(render_bench: dict[str, Any]) -> None:
-    """B-7 (§3.4: ≥ 450 FPS; Q-180, Q-195): a budget entry per model for the requests at
-    every training time with the outputs on the GPU, index on and off, which never changes the
-    exit code; and T, the largest break-even over the models that have one and at least 2, or
-    None when none has."""
+def test_b7_holds_the_synthesized_models_to_no_budget_and_sets_the_threshold(
+    render_bench: dict[str, Any],
+) -> None:
+    """B-7 (§3.4, §1.5; Q-240, Q-195): the synthesized models have no floor, so no budget entry
+    (the exit code is 0 either way), and the setup reports the paper's 450 FPS as a reference
+    beside a null floor; and T, the largest break-even over the models that have one and at
+    least 2, or None when none has."""
     body = render_bench
     cases = _b7_cases(body)
-    assert len(body["budgets"]) == 2 * len(B7_MODELS)
-    for budget in body["budgets"]:
-        case = budget["case"]
-        assert (case["times"], case["outputs"]) == (3, "cuda")
-        figures = cases[(case["n"], case["active"], 3, case["index"], "cuda", None, None)]
-        assert budget == {
-            "case": case,
-            "figure": "fps",
-            "limit": 450.0,
-            "value": figures["fps"],
-            "pass": figures["fps"] >= 450.0,
-            "kind": "budget",
-        }
+    assert body["budgets"] == []
+    setup = body["setup"]
+    assert setup["reference_fps"] == 450.0
+    assert (setup["floor_fps"], setup["floor_source"]) == (None, None)
+    assert "Q-239" in setup["floor_rule"] and "budget_fps" not in setup
     found = [cases[(n, a, None, None, None, None, None)]["break_even_times"] for n, a in B7_MODELS]
     known = [k for k in found if k is not None]
     threshold = cases[(None, None, None, None, None, None, "T")]["distinct_times"]
@@ -2154,7 +2148,46 @@ def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
     assert body["setup"]["frame_dt"] == pytest.approx(0.5)
     models = {(c["case"].get("n"), c["case"].get("active")) for c in body["cases"]}
     assert models == {(32, None), (None, None)}  # the threshold case has neither
-    assert len(body["budgets"]) == 2
+    assert body["budgets"] == []  # Q-239: the scene records no floor
+    assert body["setup"]["floor_fps"] is None
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_b7_holds_the_model_given_to_its_scenes_floor(
+    tested_scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-239 (the Calibration row of 2026-10-21): on a scene whose manifest `source` has a
+    recorded floor, the model given at the recorded N gets one budget entry, on the request at
+    every training time with the index on and the outputs on the GPU, passing at or above the
+    floor; the index-off request has none. The table is patched to the test's 64-row model
+    and a 10 FPS floor; the recorded floors are the CPU test's."""
+    from openftgs.cli import _bench
+
+    shutil.copytree(tested_scene.parent, tmp_path / "kitchen-like")  # the images beside it
+    scene = tmp_path / "kitchen-like" / tested_scene.name
+    manifest = json.loads(scene.read_text(encoding="utf-8"))
+    manifest["metadata"] = {**manifest.get("metadata", {}), "source": "n3dv/kitchen"}
+    scene.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(_bench, "_B7_FLOORS", {"n3dv/kitchen": (64, 10.0)})
+    model = _given_model(tmp_path)
+    out = tmp_path / "B-7.json"
+    assert _ftgs("bench", "render", scene, "--out", out, "--model", model) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    cases = _b7_cases(body)
+    [budget] = body["budgets"]
+    on = cases[(64, None, 3, True, "cuda", None, None)]
+    assert budget == {
+        "case": {"n": 64, "active": None, "times": 3, "index": True, "outputs": "cuda"},
+        "figure": "fps",
+        "limit": 10.0,
+        "value": on["fps"],
+        "pass": on["fps"] >= 10.0,
+        "kind": "budget",
+    }
+    setup = body["setup"]
+    assert (setup["floor_fps"], setup["floor_source"]) == (10.0, "n3dv/kitchen")
+    assert setup["reference_fps"] == 450.0
 
 
 @pytest.mark.gpu
