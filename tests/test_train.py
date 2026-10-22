@@ -12,6 +12,7 @@ and U-24 state.
 import dataclasses
 import json
 import math
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -1417,7 +1418,7 @@ def test__choose_placement_sets_the_allocators_unused_reserve_aside(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_gib: int, placement: str
 ) -> None:
     """Q-99 (changed, #325), Q-225: the trainer reads the free memory and the reserve from the
-    allocator after the first iteration. With 12 GiB free on the device, 9 GiB reserved and
+    allocator when it chooses the placement. With 12 GiB free on the device, 9 GiB reserved and
     1 GiB allocated, and no growth, the limit is ½·(12 + 8 − 8) = 6 GiB: a 6 GiB cache goes
     to the GPU and a 7 GiB one is memory-mapped (½·free, 10 GiB, would have taken it)."""
     gib = 2**30
@@ -1433,6 +1434,44 @@ def test__choose_placement_sets_the_allocators_unused_reserve_aside(
     )
     trainer._choose_placement()
     assert chosen == [placement]
+
+
+def test__step_chooses_the_placement_from_the_second_iterations_allocator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-225 (changed, #341): with "auto" pending, as on CUDA, the placement is chosen once,
+    from the free memory the allocator reports after the second iteration and not after the
+    first. After the first, as when cuDNN autotuning has handed the allocator's blocks back,
+    20 GiB are free on the device and a 7 GiB cache would fit (½·20 = 10 GiB); after the second
+    12 GiB are free with 9 GiB reserved and 1 allocated, so the limit is ½·(12 + 8 − 8) = 6 GiB
+    and the cache is memory-mapped."""
+    gib = 2**30
+    trainer = Trainer(
+        _no_perceptual(perf=PerfConfig(frame_cache="off")),
+        _scene(tmp_path / "scene"),
+        _init_points(),
+        device="cpu",
+    )
+    trainer._placement_wait = 2  # what "auto" sets on CUDA at construction
+    unheld = {1: 20 * gib, 2: 12 * gib}
+    reserved = {1: gib, 2: 9 * gib}
+    chosen: list[tuple[int, str]] = []
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (unheld[trainer.iteration], 0))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: reserved[trainer.iteration])
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: gib)
+    monkeypatch.setattr("openftgs.train._bytes_per_row", lambda model: 0)
+    monkeypatch.setattr(FrameCache, "size_of", staticmethod(lambda dataset: 7 * gib))
+    monkeypatch.setattr(
+        trainer,
+        "_open_frame_cache",
+        lambda placement, **_: chosen.append((trainer.iteration, placement)),
+    )
+    trainer.step()
+    assert chosen == []
+    trainer.step()
+    assert chosen == [(2, "mmap")]
+    trainer.step()
+    assert chosen == [(2, "mmap")]
 
 
 def test_auto_placement_falls_back_when_no_cache_can_be_made(tmp_path: Path) -> None:
@@ -1464,12 +1503,29 @@ def test_prefetcher_follows_the_samplers_order(tmp_path: Path) -> None:
 
 
 @pytest.mark.gpu
-def test_cuda_auto_placement_falls_back_after_the_first_iteration(tmp_path: Path) -> None:
-    """Q-99: on CUDA "auto" decides after the first iteration; a cache directory that can't be
-    created then gives a warning and PNG decoding, not an error."""
+def test_cuda_auto_placement_waits_for_the_second_iteration(tmp_path: Path) -> None:
+    """Q-99, Q-225 (changed, #341): on CUDA "auto" decodes PNGs for the trainer's first two
+    iterations, the first of which may autotune cuDNN and empty the allocator, and opens the
+    cache only after the second, once the allocator holds the iterations' working memory."""
+    video = _scene(tmp_path / "scene", frames=U21_FRAMES)
+    trainer = Trainer(_with_cache(ONE_EVENT, "auto"), video, _u21_model(video), device="cuda")
+    trainer.step()
+    assert trainer._frames is None
+    trainer.step()
+    assert trainer._frames is not None
+
+
+@pytest.mark.gpu
+def test_cuda_auto_placement_falls_back_after_the_second_iteration(tmp_path: Path) -> None:
+    """Q-99, Q-225 (changed, #341): on CUDA "auto" decides after the second iteration; a cache
+    directory that can't be created then gives a warning and PNG decoding, not an error."""
     video = _scene(tmp_path / "scene", frames=U21_FRAMES)
     (tmp_path / "scene" / ".ftgs-cache").write_text("not a directory")
     trainer = Trainer(_with_cache(ONE_EVENT, "auto"), video, _u21_model(video), device="cuda")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trainer.step()
+    assert not [w for w in caught if "frame cache" in str(w.message)]
     with pytest.warns(UserWarning, match="frame cache"):
         trainer.step()
     assert trainer._frames is None
@@ -1483,7 +1539,7 @@ def test_u30_cuda_training_reads_from_each_placement(
 ) -> None:
     """U-30 (GPU), Q-99: training on CUDA reads its images from the cache in GPU memory, from
     the memory-mapped cache through the CUDA prefetcher, or, with "auto", from whichever the
-    free memory allows after the first iteration; the losses stay finite."""
+    free memory allows after the second iteration; the losses stay finite."""
     video = _scene(tmp_path / "scene", frames=U21_FRAMES)
     cfg = _with_cache(
         dataclasses.replace(ONE_EVENT, optim=dataclasses.replace(ONE_EVENT.optim, iterations=30)),
@@ -1500,7 +1556,7 @@ def test_u30_cuda_training_reads_from_each_placement(
 def test_u30_cuda_png_path_gives_the_first_losses_of_the_gpu_cache_bitwise(
     tmp_path: Path, placement: Literal["off", "auto"]
 ) -> None:
-    """U-30 (GPU), D-51, §2.4 rule 3: on CUDA the PNG path ("off", and "auto" until its first
+    """U-30 (GPU), D-51, §2.4 rule 3: on CUDA the PNG path ("off", and "auto" until its second
     iteration has chosen a placement) stages each decoded image in pinned memory and copies it
     without blocking. Its first iteration gives bitwise the loss terms of a first iteration
     reading the cache in GPU memory, before any update could make the runs differ (gsplat's

@@ -26,7 +26,8 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 
 import pytest
 import torch
@@ -1236,6 +1237,43 @@ def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
         "beyond_estimate_bytes": 2 * gib,
         "margin_used": 0.5,
     }
+
+
+def test__probe_reads_what_auto_reads_after_the_second_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-225 (changed, #341), Q-189: B-6's probe reads the free memory and the reserve where
+    "auto" reads them, after its trainer's second iteration and not after its first, which may
+    autotune cuDNN and leave the allocator emptied. The allocator here holds 1 GiB allocated
+    and 1 + k GiB reserved after k iterations, with k GiB free on the device: after the second,
+    4 GiB free in all and 3 reserved; after the first it would be 2 and 2."""
+    from openftgs.cli import _bench
+    from openftgs.data import FrameCache
+
+    gib = 2**30
+
+    class Model:
+        PARAM_NAMES = ("means",)
+        means = torch.zeros(10, 3)
+        num_gaussians = 10
+
+    class Probe:
+        steps = 0
+        model = Model()
+
+        def step(self) -> None:
+            self.steps += 1
+
+    probe = Probe()
+    monkeypatch.setattr(_bench, "_data_trainer", lambda ctx, volume, cfg, n: probe)
+    monkeypatch.setattr(_bench, "_release_cuda", lambda: None)
+    monkeypatch.setattr(FrameCache, "size_of", staticmethod(lambda dataset: gib))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (probe.steps * gib, 24 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: gib)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: (1 + probe.steps) * gib)
+    estimate = _bench._probe(cast(Any, SimpleNamespace(video=None)), cast(Any, None), 10)
+    assert probe.steps == 2
+    assert (estimate.free, estimate.reserved, estimate.allocated) == (4 * gib, 3 * gib, gib)
 
 
 def test__data_figures_share_the_data_wait_over_iterations_without_an_event() -> None:
