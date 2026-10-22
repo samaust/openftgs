@@ -81,7 +81,7 @@ _FLICKER_LEVELS = 2.0  # Q-236
 _SCALES = (0.5, 1.0, 2.0)  # Q-236's check: the thresholds at ½, 1 and 2 times
 _SAME_INSTANT_S = 1e-6  # Q-237: frames closer in time are the same instant
 _MATCH_S = 1e-6  # Q-231: a record's timestamp against the flag index's
-_SNAP_PX = 1e-6  # a sample this close to a pixel centre is taken at it
+_SNAP_PX = 1e-6  # Q-234: a sample this close to a pixel centre is taken at it
 _REGIONS = ("all", "static", "dynamic")
 
 FLAG_BITS: dict[str, int] = {
