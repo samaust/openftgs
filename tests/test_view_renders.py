@@ -10,6 +10,7 @@ here on the CPU (the reference backend).
 """
 
 import dataclasses
+import importlib.util
 import json
 import os
 import subprocess
@@ -154,7 +155,10 @@ def test_run_leaves_pngs_metrics_and_no_renders(tmp_path: Path) -> None:
     scene = _scene(tmp_path / "scene")
     run = _trained_run(tmp_path, scene)
     out = run / "renders"
-    done = _script("run", run / "checkpoint", scene, out, "--compare", run / "METRICS.json")
+    done = _script(
+        "run", run / "checkpoint", scene, out,
+        "--compare", run / "METRICS.json", "--backend", "reference",
+    )  # fmt: skip
     assert done.returncode == 0, done.stderr
     assert not (out / "renders.safetensors").exists()
     assert (out / "request.json").is_file()
@@ -177,7 +181,7 @@ def test_run_leaves_pngs_metrics_and_no_renders(tmp_path: Path) -> None:
                 backend="reference",
             ).image[0]
         expected = (rgb.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).numpy()
-        assert np.abs(pixels.astype(int) - expected.astype(int)).max() <= 1
+        assert np.array_equal(pixels, expected)
     ours = json.loads((out / "METRICS.json").read_text())
     theirs = json.loads((run / "METRICS.json").read_text())
     for name, value in _scene_means(theirs).items():
@@ -186,3 +190,37 @@ def test_run_leaves_pngs_metrics_and_no_renders(tmp_path: Path) -> None:
     assert comparison["findings"] == []
     assert set(comparison["blocks"]["entire"]) == set(_scene_means(theirs))
     assert all(abs(d) < 1e-6 for d in comparison["blocks"]["entire"].values())
+
+
+def _module() -> Any:
+    spec = importlib.util.spec_from_file_location("view_renders", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _metrics(psnr: float | None, ssim1: float, dynamic_psnr: float | None) -> dict[str, Any]:
+    image = {"path": "images/cam02/000000.png", "psnr": psnr, "ssim1": ssim1}
+    return {
+        "entire": {"scene": {"psnr": psnr, "ssim1": ssim1}, "images": [image]},
+        "dynamic": {"scene": {"psnr": dynamic_psnr}, "images": []},
+    }
+
+
+def test_comparison_flags_psnr_ssim_and_skips_nulls() -> None:
+    """#327: a PSNR difference above 0.01 dB and an SSIM difference above 0.001 are findings,
+    smaller ones aren't; a null metric (METRICS.json's non-finite value, Q-63) gives a null
+    difference rather than an error; the dynamic block is compared beside the entire one."""
+    compare = _module().compare
+    small = compare(_metrics(30.005, 0.9005, None), _metrics(30.0, 0.9, 25.0))
+    assert small["findings"] == []
+    assert small["blocks"]["entire"]["psnr"] == pytest.approx(0.005)
+    assert small["blocks"]["dynamic"] == {"psnr": None}
+    large = compare(_metrics(30.02, 0.902, 25.0), _metrics(30.0, 0.9, 25.0))
+    assert [f.split(" differs")[0] for f in large["findings"]] == [
+        "entire: scene psnr",
+        "entire: scene ssim1",
+        "entire: an image's PSNR",
+    ]
+    assert large["largest_image_psnr_difference"]["entire"] == pytest.approx(0.02)
