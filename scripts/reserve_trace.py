@@ -8,14 +8,16 @@ Q-225; D-51).
 A trainer of the default configuration, with only the frame cache set to "off" so that no cache
 moves the allocator, trains on SCENE.json from INIT on CUDA, cuDNN autotuning on as in training
 (§2.4 rule 2, Q-173), for N iterations (default: one epoch, one iteration per training image,
-D-26). After each iteration, as "auto" reads them when it decides, without a synchronization:
+D-26). After each iteration, once `step()` has returned, as B-6's probe reads them (Q-189), without
+a synchronization:
 
 - `free_bytes`: `torch.cuda.mem_get_info`'s free memory;
 - `reserved_bytes`, `allocated_bytes` and the reserve, reserved − allocated (Q-225);
 - `num_device_free`: `torch.cuda.memory_stats`' count of the blocks the allocator has returned to
   the driver, so far in the process;
 - whether the iteration was the first at its image size (W, H), counted over training images as
-  "auto" counts them (Q-232); with the image, its camera and N.
+  "auto" counts them (Q-232); with the image, its camera, N after the iteration
+  (`num_gaussians`) and whether it ran a growth, relocation or pruning event (`event`).
 
 The summary (`summary`) gives k, the iteration at which the last training size first appears;
 the reserve after iteration k + 1, where "auto" decides (Q-232); the steady reserve, the median
@@ -40,7 +42,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-_SETTLED = 0.9  # #350: the decision's reserve against the steady reserve
+_SETTLED = 0.9  # Q-238 (#350): the decision's reserve against the steady reserve's median
 
 
 def summary(

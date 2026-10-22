@@ -64,16 +64,20 @@ def cropped_camera(camera: Camera, crop: int) -> Camera:
 def _crop_file(source: str, target: str, width: int, height: int) -> None:
     """One PNG: copied when nothing is cropped, otherwise its top-left width × height block,
     written to a temporary sibling and renamed."""
-    Path(target).parent.mkdir(parents=True, exist_ok=True)
-    temporary = f"{target}.tmp-{os.getpid()}"
-    with Image.open(source) as image:
-        if image.size == (width, height):
-            shutil.copyfile(source, temporary)
-        else:
-            image.crop((0, 0, width, height)).save(
-                temporary, format="PNG", compress_level=_PNG_LEVEL
-            )
-    os.replace(temporary, target)
+    path = Path(target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with Image.open(source) as image:
+            if image.size == (width, height):
+                shutil.copyfile(source, temporary)
+            else:
+                image.crop((0, 0, width, height)).save(
+                    temporary, format="PNG", compress_level=_PNG_LEVEL
+                )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def crop_scene(scene: Path, out: Path, *, jobs: int = 0) -> Path:
@@ -83,7 +87,7 @@ def crop_scene(scene: Path, out: Path, *, jobs: int = 0) -> Path:
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"{out} must be absent or empty")
     root = manifest.path.parent
-    amount = crops(manifest.camera_names)
+    crop_of = crops(manifest.camera_names)
     cameras: dict[str, Camera] = {}
     records = []
     masks: list[Path | None] = []
@@ -91,7 +95,7 @@ def crop_scene(scene: Path, out: Path, *, jobs: int = 0) -> Path:
     for record, mask in zip(manifest.records, manifest.masks, strict=True):
         name = record.camera.name
         if name not in cameras:
-            cameras[name] = cropped_camera(record.camera, amount[name])
+            cameras[name] = cropped_camera(record.camera, crop_of[name])
         camera = cameras[name]
         image = out / record.image_path.relative_to(root)
         work.append((str(record.image_path), str(image), camera.width, camera.height))
