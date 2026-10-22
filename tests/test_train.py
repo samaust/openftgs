@@ -1391,7 +1391,7 @@ def test_sampler_peek_matches_the_next_draws() -> None:
 
 
 def test__fits_on_gpu_reserves_the_working_memory() -> None:
-    """Q-99 (changed, #325), Q-224: "auto" puts the cache on the GPU when it fits in half the
+    """Q-99 (changed, #325), Q-225: "auto" puts the cache on the GPU when it fits in half the
     free memory less the working memory the warm-up iteration left reserved, minus growth to
     N_max, the boundary included. At B-6's figures on studio at 3M rows (#317), which the rule
     before #325 placed on the GPU, the 8.58 GB cache is memory-mapped."""
@@ -1416,7 +1416,7 @@ def test__fits_on_gpu_reserves_the_working_memory() -> None:
 def test__choose_placement_sets_the_allocators_unused_reserve_aside(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_gib: int, placement: str
 ) -> None:
-    """Q-99 (changed, #325), Q-224: the trainer reads the free memory and the reserve from the
+    """Q-99 (changed, #325), Q-225: the trainer reads the free memory and the reserve from the
     allocator after the first iteration. With 12 GiB free on the device, 9 GiB reserved and
     1 GiB allocated, and no growth, the limit is ½·(12 + 8 − 8) = 6 GiB: a 6 GiB cache goes
     to the GPU and a 7 GiB one is memory-mapped (½·free, 10 GiB, would have taken it)."""

@@ -1195,10 +1195,10 @@ def test__data_config_is_b1s_with_the_case_placement() -> None:
 
 
 def test__auto_estimate_applies_q99s_rule_and_measures_its_margin() -> None:
-    """Q-99 (D-51), Q-224: "auto" puts the cache on the GPU when it fits in half the GPU memory
+    """Q-99 (D-51), Q-225: "auto" puts the cache on the GPU when it fits in half the GPU memory
     free after a warm-up iteration, less the working memory that iteration left reserved
     (reserved − allocated), minus what growth to N_max adds, the boundary included. Q-99's
-    note (Q-189, Q-224): what a run with the cache on the GPU then took beyond the cache, the
+    note (Q-189, Q-225): what a run with the cache on the GPU then took beyond the cache, the
     growth and that reserve, from its peak reserved memory and the memory reserved after that
     iteration, against the half the rule leaves. With the device's total, what lies outside
     this process's allocator (other processes, the CUDA context), which the free memory leaves
@@ -1357,7 +1357,7 @@ def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) ->
             continue
         # Q-99: "auto" would have placed the cache on the GPU, which then holds it.
         assert figures["cache_bytes"] <= figures["auto_limit_bytes"], case
-        reserve = figures["auto_reserved_bytes"] - figures["auto_allocated_bytes"]  # Q-224
+        reserve = figures["auto_reserved_bytes"] - figures["auto_allocated_bytes"]  # Q-225
         assert figures["auto_limit_bytes"] == pytest.approx(
             0.5 * (figures["auto_free_bytes"] - reserve) - figures["auto_growth_bytes"]
         )

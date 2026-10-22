@@ -393,7 +393,7 @@ def _bytes_per_row(model: FreeTimeGaussians) -> int:
 
 
 def _fits_on_gpu(cache: int, *, free: int, reserve: int, growth: int) -> bool:
-    """D-51, Q-99, Q-224: whether "auto" puts a cache of `cache` bytes on the GPU: it fits in
+    """D-51, Q-99, Q-225: whether "auto" puts a cache of `cache` bytes on the GPU: it fits in
     half the free memory less the working memory `reserve` held for the iterations, minus what
     growth to N_max adds."""
     return cache <= 0.5 * (free - reserve) - growth
@@ -623,11 +623,11 @@ class Trainer:
     def _choose_placement(self) -> None:
         """Q-99: after the first CUDA iteration, the cache goes to GPU memory when it fits in half
         the free memory, less the working memory that iteration left reserved, minus what growth
-        to N_max will add (D-51, Q-224), and is memory-mapped otherwise; a cache that can't be
+        to N_max will add (D-51, Q-225), and is memory-mapped otherwise; a cache that can't be
         made falls back to PNGs with a warning."""
         self._placement_pending = False
         unheld, _ = torch.cuda.mem_get_info(self._device)
-        # Q-224: the allocator's unused reserve is the iteration's working memory (the render's
+        # Q-225: the allocator's unused reserve is the iteration's working memory (the render's
         # and the losses' buffers at the image's size, the gradients), which Q-99's free memory
         # counts and the rule sets aside again.
         reserve = torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(
