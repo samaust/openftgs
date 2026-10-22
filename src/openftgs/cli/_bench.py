@@ -2171,8 +2171,19 @@ _B7_REPETITIONS = 10  # Q-194: the median of 10 requests
 # Q-194: the request sizes below F that the index's break-even is read from; then F.
 _B7_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128)
 _B7_OUTPUTS = ("cuda", "cpu")  # #231: `render_request`'s outputs on the GPU and on the CPU
-_B7_BUDGET_FPS = 450.0  # §3.4 B-7: ≥ 450 FPS on an RTX 4090 (calibrated)
+# §1.5's 450 FPS: the paper's reference target, reported in the setup, never a pass or fail
+# (Q-240); the calibrated budget is the floor table below (Q-239).
+_B7_REFERENCE_FPS = 450.0
 _B7_THRESHOLD_FLOOR = 2  # Q-195: a request at a single time never builds an index
+# Q-239: the owner's calibrated budget (Calibration row, 2026-10-21): a regression floor at
+# 90 % of each trained default model's FPS with the index on, at 1920×1080 and N = 3M, as the
+# owner gave it (measured 187.7, 220.5 and 150.9 FPS), keyed by the scene manifest's
+# `metadata.source` and the model's N.
+_B7_FLOORS: dict[str, tuple[int, float]] = {
+    "n3dv/kitchen": (3_000_000, 169.0),
+    "opencv-yaml/courtyard": (3_000_000, 198.0),
+    "selfcap/studio": (3_000_000, 136.0),
+}
 
 
 def _b7_camera(video: MultiViewVideo) -> Camera:
@@ -2226,6 +2237,32 @@ def _b7_times(video: MultiViewVideo, camera: Camera) -> tuple[list[float], str]:
     if len(taus) > len(own):  # Q-221
         return own, f"the timestamps of {camera.name}, the B-7 camera (Q-221)"
     return taus, "every distinct training timestamp (Q-194)"
+
+
+def _b7_floor(metadata: Mapping[str, Any], n: int | None) -> float | None:
+    """B-7's calibrated floor (Q-239) for the model given with `--model`: its scene's recorded
+    floor when the manifest's `metadata.source` is in the table and N is the recorded one; None
+    otherwise, and for a synthesized model (`n` None), which is held to nothing (Q-240)."""
+    source = metadata.get("source")
+    if n is None or not isinstance(source, str):
+        return None
+    recorded = _B7_FLOORS.get(source)
+    if recorded is None or recorded[0] != n:
+        return None
+    return recorded[1]
+
+
+def _b7_budget(case: Mapping[str, Any], figures: Mapping[str, Any], floor: float) -> dict[str, Any]:
+    """B-7's budget entry (Q-239; Q-166's keys, Q-180): the `fps` figure of `case` against the
+    model's calibrated floor, passing at or above it."""
+    return {
+        "case": dict(case),
+        "figure": "fps",
+        "limit": floor,
+        "value": figures["fps"],
+        "pass": figures["fps"] >= floor,
+        "kind": "budget",
+    }
 
 
 def _request_sizes(count: int) -> list[int]:
@@ -2392,7 +2429,9 @@ def _render(ctx: _Context) -> _Result:
     and with the index on and off at fewer times, on synthesized models at N = 1M and 3M with
     1 %, 5 % and 20 % of rows active, or on the model given with `--model` (D-88); per model the
     index's build time, its break-even and the share of evaluation spent rendering; then T, the
-    number of distinct times from which "auto" builds the index (Q-174, Q-194, Q-195).
+    number of distinct times from which "auto" builds the index (Q-174, Q-194, Q-195). A model
+    given is held to its scene's calibrated floor on the index-on request at the F times
+    (Q-239); the paper's 450 FPS is reported as a reference, never a pass or fail (Q-240).
     Everything goes through `render_request` and `evaluate_images`, public names only (Q-153;
     the owner's answer in Q-194)."""
     from openftgs.eval import Evaluator
@@ -2412,6 +2451,11 @@ def _render(ctx: _Context) -> _Result:
     if ctx.model is not None and ctx.model.frame_dt is not None:
         frame_dt = ctx.model.frame_dt
     split = "test" if any(r.split == "test" for r in video.records) else "train"
+    # Q-239: the calibrated floor of the model given, by the scene's source and the model's N;
+    # none for the synthesized models or an unrecorded scene (Q-240).
+    floor = _b7_floor(
+        video.manifest.metadata, None if ctx.model is None else ctx.model.model.num_gaussians
+    )
 
     def models() -> Iterator[tuple[dict[str, Any], FreeTimeGaussians]]:
         if ctx.model is not None:
@@ -2444,17 +2488,8 @@ def _render(ctx: _Context) -> _Result:
                     )
                     timed[index] = figures["request_s"]
                     cases.append({"case": case, "figures": figures})
-                    if k == count and device == "cuda":
-                        budgets.append(
-                            {
-                                "case": case,
-                                "figure": "fps",
-                                "limit": _B7_BUDGET_FPS,
-                                "value": figures["fps"],
-                                "pass": figures["fps"] >= _B7_BUDGET_FPS,
-                                "kind": "budget",
-                            }
-                        )
+                    if floor is not None and index and k == count and device == "cuda":
+                        budgets.append(_b7_budget(case, figures, floor))  # Q-239
                 if device == "cuda":
                     on_off[k] = (timed[True], timed[False])
         index_figures = _index_figures(on_off)
@@ -2492,7 +2527,15 @@ def _render(ctx: _Context) -> _Result:
         "warmup": _WARMUP,
         "repetitions": _B7_REPETITIONS,
         "clock": "wall clock, from a synchronized device to a synchronize after each request",
-        "budget_fps": _B7_BUDGET_FPS,
+        "reference_fps": _B7_REFERENCE_FPS,  # §1.5's target, no pass or fail (Q-240)
+        "floor_fps": floor,
+        "floor_source": video.manifest.metadata.get("source") if floor is not None else None,
+        "floor_rule": (
+            "Q-239 (Calibration row, 2026-10-21): 90 % of the trained default model's FPS with "
+            "the index on at 1920×1080 and the recorded N, by the scene's metadata.source and "
+            "the model's N, on the F-time request with the outputs on the GPU; none for a "
+            "synthesized model or an unrecorded scene (Q-240)"
+        ),
         "build_time": (
             "Q-194 as answered: the one-time request with the index forced on less the same "
             "request forced off, outputs on the GPU"

@@ -484,6 +484,54 @@ def test__threshold_is_the_largest_break_even_and_at_least_2() -> None:
     assert _threshold([None, None]) is None
 
 
+def test__b7_floor_is_the_calibration_rows_floor_for_the_trained_model() -> None:
+    """Q-239 (the Calibration row of 2026-10-21): B-7's budget on the model given is the floor
+    recorded for its scene, keyed by the manifest's `metadata.source` and the model's N: kitchen
+    169, courtyard 198 and studio 136 FPS at N = 3,000,000; none at another N, on a scene without
+    a recorded floor or without `source`, or for a synthesized model (Q-240)."""
+    from openftgs.cli._bench import _b7_floor
+
+    n = 3_000_000
+    assert _b7_floor({"source": "n3dv/kitchen"}, n) == 169.0
+    assert _b7_floor({"source": "opencv-yaml/courtyard", "fps": 60.0}, n) == 198.0
+    assert _b7_floor({"source": "selfcap/studio"}, n) == 136.0
+    assert _b7_floor({"source": "n3dv/kitchen"}, 1_000_000) is None  # another N
+    assert _b7_floor({"source": "n3dv/flame_steak"}, n) is None  # no recorded floor
+    assert _b7_floor({"fps": 30}, n) is None  # no source
+    assert _b7_floor({"source": "n3dv/kitchen"}, None) is None  # synthesized (Q-240)
+
+
+def test__b7_budget_holds_the_fps_at_the_floor() -> None:
+    """Q-239, Q-180: B-7's budget entry names its case and the `fps` figure, with the floor as
+    its limit and `pass` when the FPS is at least the floor; the entry has Q-166's keys and
+    nothing else, and the paper's 450 FPS is never its limit."""
+    from openftgs.cli._bench import _b7_budget
+
+    case = {"n": 3_000_000, "active": None, "times": 300, "index": True, "outputs": "cuda"}
+    at = _b7_budget(case, {"fps": 169.0, "request_s": 1.775}, 169.0)
+    assert at == {
+        "case": case,
+        "figure": "fps",
+        "limit": 169.0,
+        "value": 169.0,
+        "pass": True,
+        "kind": "budget",
+    }
+    under = _b7_budget(case, {"fps": 168.9}, 169.0)
+    assert (under["pass"], under["value"], under["limit"]) == (False, 168.9, 169.0)
+    assert set(under) == {"case", "figure", "limit", "value", "pass", "kind"}
+    assert _b7_budget(case, {"fps": 1000.0}, 136.0)["limit"] != 450.0
+
+
+def test__b7_reference_fps_is_the_papers_target_and_not_a_budget() -> None:
+    """Q-240, §1.5: the paper's 450 FPS is B-7's reference figure, reported in the setup and
+    never a budget: the module holds it as `_B7_REFERENCE_FPS` and no longer as a budget."""
+    from openftgs.cli import _bench
+
+    assert _bench._B7_REFERENCE_FPS == 450.0
+    assert not hasattr(_bench, "_B7_BUDGET_FPS")
+
+
 # BENCH.json (Q-166) and B-3, `ftgs bench slice` (§3.4, D-50; Q-13, Q-182), run once on the
 # GPU for the tests below: about half a minute, most of it compiling the slice.
 
