@@ -6,13 +6,14 @@ You are the implementer of `openftgs`, an Apache-2.0 Python package (CLI `ftgs`)
 
 ## Clean-room rules (strict)
 
-These restate spec §0, except for third-party software: the owner's license rule of 2026-10-11 below replaces §0's table of software classes until a new spec export carries it. In everything else, if these rules differ from §0, §0 wins: say so to the owner.
+These restate spec §0, except for third-party software: the owner's license rule of 2026-10-11 below replaces §0's table of software classes until a new spec export carries it, and the owner's renderer rule of 2026-10-22 below opens one code link of the project page until a new export carries that. In everything else, if these rules differ from §0, §0 wins: say so to the owner.
 
 Allowed sources:
-- The paper, arXiv 2506.05348 v2, which carries the supplementary material as Appendices A–B (local copy, if present: `docs/paper/2506.05348v2.pdf`, never committed). The project page https://zju3dv.github.io/freetimegs/ itself, but none of its code links ("Renderer", "Framework") or demos.
+- The paper, arXiv 2506.05348 v2, which carries the supplementary material as Appendices A–B (local copy, if present: `docs/paper/2506.05348v2.pdf`, never committed). The project page https://zju3dv.github.io/freetimegs/ itself, but none of its demos or code links ("Framework"), apart from the "Renderer" link under the owner rule of 2026-10-22 below.
 - Papers the paper cites, and general Gaussian-splatting literature.
 - Documentation and data files of the datasets the paper evaluates on: Neural3DV, ENeRF-Outdoor, SelfCap.
 - The openftgs-synth dataset (owner rule, 2026-10-15; #108): the owner's rendered multi-view video dataset, CC0-1.0, local at `$OPENFTGS_DATASETS/synth`. Its data files, `DATASET_CARD.md`, `ASSETS.md` and `SHA256SUMS` are allowed. Its generator is GPL-3.0-or-later, so its source code is never read and its documentation follows the copyleft rule below.
+- The renderer the project page links ("Renderer", github.com/dendenxu/fast-gaussian-rasterization, MIT) (owner rule, 2026-10-22; #352): documentation and source code, as permissive software. The code it imports keeps its own class: EasyVolcap and any rasterizer under a non-commercial license stay closed. Spec §0 ("the authors' own code"), D-6 and Appendix A #2 say otherwise until a new export carries this rule; every read is logged.
 - Third-party software, by its license (owner rule, 2026-10-11; the aim is that openftgs can be published under Apache-2.0):
   - Under a permissive license that allows commercial use (MIT, BSD, Apache-2.0, ISC, PSF, zlib and the like): documentation and source code. This covers the software the package imports or vendors (PyTorch, gsplat 1.5.3, safetensors, lpips, RoMa/`romatch` at 77f8d68, fused-ssim, NumPy, Pillow, PyYAML, SciPy), the software it replaces with its own code (OpenCV, scikit-image, torchmetrics), separate programs (COLMAP, BackgroundMattingV2) and software it doesn't import (kornia, the DINOv2 repository, decord, torchcodec). Read the project's license file before its source code; where a project bundles code under other licenses, apply this rule to each part.
   - Under a copyleft license, strong or weak (GPL, AGPL, LGPL, MPL, EPL, CDDL and the like), a non-commercial license, or no license: documentation only, never source code. Examples: ffmpeg (LGPL or GPL), hypothesis and tqdm (MPL-2.0). Using them as dependencies or programs, as §2.3 allows, is fine.
@@ -21,7 +22,7 @@ Allowed sources:
 - For software you may read only the documentation of, read the project's own documentation pages, never snippets from tools that index whole repositories: they can return source code (spec Appendix A, #36).
 
 Never allowed, whatever the license:
-- Anything from another FreeTimeGS implementation or reproduction, including the authors' own code: repositories, forks, gists, notebooks, blog code, issue threads, packages, checkpoints.
+- Anything from another FreeTimeGS implementation or reproduction, including the authors' own code, apart from the renderer the project page links (owner rule, 2026-10-22, above): repositories, forks, gists, notebooks, blog code, issue threads, packages, checkpoints.
 - EasyVolcap, in any form.
 - The source code of software under a copyleft, non-commercial or missing license.
 
