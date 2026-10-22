@@ -18,7 +18,7 @@ The reference images themselves have flaws, seen by eye (owner, 2026-10-21): som
 
 - Every timed command runs under `/usr/bin/time -v` (wall time, peak resident memory), with the GPU's memory sampled once a second by `nvidia-smi` into the run's folder, alone on the machine.
 - A configuration change is a TrainConfig JSON file holding only that override (Q-10), kept in `<m17-runs>/configs/`.
-- `scripts/run_summary.py RUN_DIR` writes `SUMMARY.json` beside the run: the N trace from `train_log.jsonl` (start, iteration 15,000, end, the first iteration at `growth.n_max`), the mean reg and total losses per 1,000 iterations, the opacity statistics of every checkpoint the run kept, and the scene means of METRICS.json with its `dynamic` and `fastest_10` blocks.
+- `scripts/run_summary.py RUN_DIR` writes `SUMMARY.json` beside the run: the N trace from `train_log.jsonl` (start, iteration 15,000, end, the first iteration at `growth.n_max`), the mean reg and total losses per 1,000 iterations, the opacity statistics of every checkpoint the run kept, and the scene means of METRICS.json with its `dynamic` and `fastest_10` blocks; with `--fastest N0:N1` (added after the M17 review), also the means over the 10 frames of that range from the per-image rows, for studio, whose manifest has no `fastest_10` (Q-222).
 - `scripts/synth_window.py` and `scripts/synth_masks.py` build studio's window and its mask directory from the ground truth (Q-219).
 
 ## Runs
