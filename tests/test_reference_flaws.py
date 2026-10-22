@@ -22,8 +22,8 @@ import numpy as np
 import pytest
 import torch
 from builders import look_at, model_from_rows, pinhole
+from exr_writer import write_exr
 from PIL import Image
-from test_gt_depth import write_exr
 
 from openftgs.config import TrainConfig, config_to_dict
 from openftgs.eval import psnr
