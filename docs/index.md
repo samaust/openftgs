@@ -12,5 +12,6 @@ installation
 quickstart
 datasets
 method
+cli
 api/index
 ```

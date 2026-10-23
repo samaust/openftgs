@@ -70,6 +70,10 @@ exclude_patterns = [
     "GLOSSARY.md",
 ]
 
+# -- Smart quotes without dashes: the CLI reference parses ftgs's help text as reStructuredText,
+# where "--window" would otherwise become an en dash and a word (#358).
+smartquotes_action = "qe"
+
 # -- MyST
 myst_enable_extensions = ["dollarmath", "amsmath", "colon_fence", "deflist"]
 
