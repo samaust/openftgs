@@ -14,5 +14,6 @@ datasets
 method
 cli
 contributing
+changelog
 api/index
 ```
