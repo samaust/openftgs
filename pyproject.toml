@@ -57,6 +57,18 @@ dev = [
     "torchmetrics",
 ]
 
+# Q-241: the documentation site's tools, a PEP 735 group, so they never enter the package's
+# metadata: `pip install . --group docs`, with torch installed first (CPU torch builds the site).
+# The floors are the releases that resolve on Python 3.11 and build the site there `-W`-clean.
+[dependency-groups]
+docs = [
+    "sphinx>=9.0.4",
+    "myst-parser>=5.1",
+    "furo>=2025.12.19",
+    "sphinx-autodoc-typehints>=3.6.1",
+    "sphinx-argparse>=0.6.1",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -90,7 +102,10 @@ skip_empty = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-extend-exclude = [".claude", "docs", "src/openftgs/_vendor/romatch"]
+# Q-241: docs/ is linted and formatted, the site's configuration docs/conf.py included, apart from
+# the spec, which is never edited and whose Markdown code blocks ruff would reformat (the build
+# output under docs/_build/ is gitignored, which ruff respects).
+extend-exclude = [".claude", "docs/spec", "src/openftgs/_vendor/romatch"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
