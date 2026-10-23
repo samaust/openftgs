@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Camera operations, the MultiViewVideo dataset with lazy image loading, scene manifests, the
-dataset converters (Neural3DV, OpenCV-style YAML, SelfCap), image resizing and undistortion, the
-YAML camera reader, the frame cache and prefetcher, and the Fastest-10 frames of the ablations.
+"""Multi-view video datasets, their cameras and images, and the converters that make them (§1.4).
+
+Camera operations, the :class:`MultiViewVideo` dataset with lazy image loading, scene manifests,
+the dataset converters (Neural3DV, OpenCV-style YAML, SelfCap), image resizing and undistortion,
+the YAML camera reader, the frame cache and prefetcher, and the Fastest-10 frames of the
+ablations.
 
 Spec: §1.4, D-51, D-61, D-69. Band: Foundation (§2.1).
 """
@@ -68,10 +71,57 @@ _MISSING_SHOWN = 5  # missing files named in the error
 
 # Q-65: the members beyond §2.1's records, time, from_manifest and load_image.
 class MultiViewVideo:
-    """The image records of a scene manifest with their time normalizer, frame interval Δt_f
-    and spatial scale S, from the training images only, and images and test-image masks loaded
-    lazily (§2.1, §1.4, E14, D-27, D-46). Built from a parsed manifest (Q-64); `from_manifest`
-    reads one."""
+    """A scene's images, cameras and timestamps, with images loaded lazily (§2.1, §1.4).
+
+    The image records of a scene manifest with their time normalizer, frame interval Δt_f and
+    spatial scale S, all three from the training images only, and the images and test-image
+    masks loaded from their files when asked for. Built from a parsed manifest (Q-64);
+    :meth:`from_manifest` reads one. The constructor checks that every image and mask file
+    exists, so a missing file fails before training starts.
+
+    Parameters
+    ----------
+    manifest
+        A scene manifest as :func:`openftgs.io.read_scene_manifest` returns it.
+
+    Attributes
+    ----------
+    manifest
+        The scene manifest the video was built from.
+    records
+        The manifest's image records, in file order, training and test images both; the
+        index of a record here is the ``index`` the loaders take.
+    time
+        The time normalizer: τ₀ and τ₁ are the smallest and largest training timestamps
+        (§1.4 "Time", E14).
+    frame_dt
+        Δt_f, the frame interval in normalized time, from the training timestamps grouped by
+        camera name (E14, D-46).
+
+    Raises
+    ------
+    ValueError
+        If an image or mask file the manifest names is missing, or the manifest has no
+        training image.
+
+    See Also
+    --------
+    FrameCache : The uint8 copy of the training images that training reads instead.
+
+    Notes
+    -----
+    E14, D-27, D-46 and Q-8 govern the time normalizer, S and Δt_f. The members beyond §2.1's
+    ``records``, ``time``, ``from_manifest`` and ``load_image`` are Q-65's.
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> from openftgs.data import MultiViewVideo
+    >>> video = MultiViewVideo.from_manifest(Path("scenes/n3dv/scene.json"))
+    >>> image = video.load_image(0)
+    >>> image.shape, image.dtype
+    (torch.Size([1014, 1352, 3]), torch.float32)
+    """
 
     records: list[ImageRecord]
     time: TimeNormalizer
@@ -104,12 +154,59 @@ class MultiViewVideo:
 
     @classmethod
     def from_manifest(cls, path: Path) -> "MultiViewVideo":
-        """The multi-view video of the ftgs-scene file at `path` (§2.2; Q-64)."""
+        """Read the ftgs-scene file at ``path`` and build its multi-view video (§2.2).
+
+        The file is parsed by :func:`openftgs.io.read_scene_manifest`, whose checks apply,
+        then the constructor's.
+
+        Parameters
+        ----------
+        path
+            The scene manifest, ``scene.json`` as a converter writes it; image paths in it
+            resolve against its folder.
+
+        Returns
+        -------
+        openftgs.data.MultiViewVideo
+            The video of every record in the file.
+
+        Raises
+        ------
+        ValueError
+            If the file isn't a valid ftgs-scene file, or a file it names is missing.
+
+        Notes
+        -----
+        Q-64: the manifest is parsed in :mod:`openftgs.io`, and this method does both steps.
+        """
         return cls(read_scene_manifest(Path(path)))
 
     def spatial_scale(self, factor: float) -> float:
-        """S of D-27 over the video's records: `spatial_scale(self.records, factor)` (Q-65,
-        Q-204)."""
+        """Compute D-27's spatial scale S over the video's records.
+
+        The same as :func:`spatial_scale` on :attr:`records`: training cameras only.
+
+        Parameters
+        ----------
+        factor
+            The multiplier of the cameras' extent, ``TrainConfig.scene_scale_factor``; finite
+            and > 0.
+
+        Returns
+        -------
+        float
+            S in world units.
+
+        Raises
+        ------
+        ValueError
+            If ``factor`` isn't a finite number > 0, or the training images have fewer than
+            two distinct camera centers.
+
+        Notes
+        -----
+        Q-65, Q-204: the dataset never sees the configuration, so the caller passes the factor.
+        """
         return spatial_scale(self.records, factor)
 
     def _checked_index(self, index: int) -> int:
@@ -118,15 +215,67 @@ class MultiViewVideo:
         return index
 
     def load_image(self, index: int) -> Tensor:
-        """Image `index` as float32 [H, W, 3] in [0, 1], on the CPU: 8-bit values divided by
-        255, alpha dropped (§1.4 "Images", D-34; Q-65)."""
+        """Load image ``index`` from its file (§1.4 "Images").
+
+        The file is decoded at every call: 8-bit RGB or RGBA, of the size of the record's
+        camera. Values are divided by 255 and the alpha channel is dropped (D-34).
+
+        Parameters
+        ----------
+        index
+            The record's position in :attr:`records`.
+
+        Returns
+        -------
+        torch.Tensor
+            The image, [H, W, 3] float32 in [0, 1], on the CPU.
+
+        Raises
+        ------
+        IndexError
+            If ``index`` is outside the records.
+        ValueError
+            If the file isn't 8 bits per channel in mode RGB or RGBA, or its size differs from
+            the camera's.
+
+        Notes
+        -----
+        Q-65: other modes are refused rather than converted. A PNG's bit depth is read from
+        its header, since Pillow opens 16-bit RGB in an 8-bit mode.
+        """
         record = self.records[self._checked_index(index)]
         pixels = _read(record.image_path, _size(record), _IMAGE_MODES)
         return torch.from_numpy(pixels[..., :3].astype(np.float32)) / 255.0
 
     def load_mask(self, index: int) -> Tensor | None:
-        """The dynamic-region mask of image `index` as float32 [H, W] in [0, 1], or None when
-        it has none: 8-bit values divided by 255, bilevel ones 0 or 1 (§2.2, Q-61, Q-65)."""
+        """Load the dynamic-region mask of image ``index``, if it has one (§2.2).
+
+        Only test images carry masks. A mask is a bilevel or 8-bit grayscale image of the
+        image's size; 8-bit values are divided by 255 and bilevel ones give 0 or 1.
+
+        Parameters
+        ----------
+        index
+            The record's position in :attr:`records`.
+
+        Returns
+        -------
+        torch.Tensor or None
+            The mask, [H, W] float32 in [0, 1], on the CPU; None when the image has no mask.
+
+        Raises
+        ------
+        IndexError
+            If ``index`` is outside the records.
+        ValueError
+            If the mask file's mode isn't bilevel or 8-bit grayscale, or its size differs
+            from the image's.
+
+        Notes
+        -----
+        Q-61: values in [0, 1], as :func:`openftgs.eval.dynamic_region` expects. Q-65: the
+        modes accepted.
+        """
         mask_path = self.manifest.masks[self._checked_index(index)]
         if mask_path is None:
             return None
@@ -137,9 +286,36 @@ class MultiViewVideo:
 
 
 def spatial_scale(records: Sequence[ImageRecord], factor: float) -> float:
-    """S of D-27: `factor` × the largest distance from a distinct training camera center to the
-    centroid of those centers (Q-65, Q-204). Test records are left out; only poses are read, so
-    the images need not exist."""
+    """Compute D-27's spatial scale S of a set of image records.
+
+    S is ``factor`` × the largest distance from a distinct training camera center to the
+    centroid of those centers, in float64. Test records are left out; only poses are read, so
+    the images need not exist.
+
+    Parameters
+    ----------
+    records
+        The image records; those of split ``"train"`` count, each distinct camera pose once,
+        in the order they first occur.
+    factor
+        The multiplier, ``TrainConfig.scene_scale_factor``; finite and > 0.
+
+    Returns
+    -------
+    float
+        S in world units.
+
+    Raises
+    ------
+    ValueError
+        If ``factor`` isn't a finite number > 0, or the training records have fewer than two
+        distinct camera centers.
+
+    Notes
+    -----
+    Q-65, Q-204: a free function, so the harness can call it on records built from cameras
+    alone. The centers are E2's −R_wᵀt_w.
+    """
     if (
         isinstance(factor, bool)
         or not isinstance(factor, numbers.Real)
@@ -164,13 +340,13 @@ def spatial_scale(records: Sequence[ImageRecord], factor: float) -> float:
 
 
 def _center(record: ImageRecord) -> tuple[float, ...]:
-    """E2's camera center −R_wᵀt_w of the record's pose, in float64."""
+    """Return E2's camera center −R_wᵀt_w of the record's pose, in float64."""
     w2c = record.camera.world_to_camera.to(torch.float64)
     return tuple((-(w2c[:3, :3].T @ w2c[:3, 3])).tolist())
 
 
 def _size(record: ImageRecord) -> tuple[int, int]:
-    """The (width, height) of the record's camera, as Pillow gives an image's size."""
+    """Return the (width, height) of the record's camera, as Pillow gives an image's size."""
     return record.camera.width, record.camera.height
 
 
@@ -179,8 +355,10 @@ _PNG_BIT_DEPTH = 24  # the IHDR chunk's bit-depth byte: after the signature, len
 
 
 def _png_bit_depth(path: Path) -> int | None:
-    """The bit depth per channel of a PNG file (its IHDR chunk), or None for other formats.
-    Pillow opens 16-bit RGB PNGs in the 8-bit mode "RGB", so the mode alone can't tell."""
+    """Return the bit depth per channel of a PNG file (its IHDR chunk), or None for others.
+
+    Pillow opens 16-bit RGB PNGs in the 8-bit mode "RGB", so the mode alone can't tell.
+    """
     with path.open("rb") as file:
         head = file.read(_PNG_BIT_DEPTH + 1)
     if len(head) <= _PNG_BIT_DEPTH or not head.startswith(_PNG_SIGNATURE):
@@ -189,8 +367,10 @@ def _png_bit_depth(path: Path) -> int | None:
 
 
 def _read(path: Path, size: tuple[int, int], modes: tuple[str, ...]) -> np.ndarray:
-    """The pixels of an image file in one of `modes`, 8 bits per channel (1 for bilevel), of
-    the given (width, height) (Q-65)."""
+    """Read an image file's pixels, in one of `modes`, 8 bits per channel (1 for bilevel).
+
+    The image must have the given (width, height) (Q-65).
+    """
     with Image.open(path) as image:
         if image.mode not in modes:
             raise ValueError(f"{path}: mode must be one of {modes}, got {image.mode!r}")
@@ -204,12 +384,35 @@ def _read(path: Path, size: tuple[int, int], modes: tuple[str, ...]) -> np.ndarr
 
 # Q-59: in data, so the converter that stores the range in the manifest (D-69) can call it.
 def fastest_frames(frames: Iterable[Tensor], *, count: int = 10) -> int:
-    """The 0-based start s of the `count` consecutive frames whose consecutive frames differ
-    most (D-69): the window [s, s + count) with the largest sum of the mean absolute
-    differences between its consecutive frames, ties going to the lowest s (Q-59).
+    """Find the ``count`` consecutive frames that change the most (D-69).
 
-    `frames` is streamed, two frames at a time; each is [H, W, 3], uint8 or floating, all of
-    one shape and dtype. The differences are taken in float64 over pixels and channels.
+    The window [s, s + count) with the largest sum of the mean absolute differences between
+    its consecutive frames, ties going to the lowest s. ``frames`` is streamed, two frames at
+    a time. The differences are taken in float64 over pixels and channels.
+
+    Parameters
+    ----------
+    frames
+        The frames in order, each [H, W, 3], uint8 on a 0–255 scale or floating on 0–1, all
+        of one shape and dtype.
+    count
+        The window's length, at least 2; 10 for the ablations' Fastest-10 frames.
+
+    Returns
+    -------
+    int
+        The 0-based start s of the window, a position in ``frames``.
+
+    Raises
+    ------
+    ValueError
+        If ``count`` isn't an int ≥ 2, there are fewer than ``count`` frames, or a frame's
+        shape or dtype differs from the first's.
+
+    Notes
+    -----
+    Q-59: the window's score, the tie rule, and this function's place in :mod:`openftgs.data`,
+    so the SelfCap converter can store the range in the manifest (D-69).
     """
     if isinstance(count, bool) or not isinstance(count, int) or count < 2:
         raise ValueError(f"count must be an int >= 2, got {count!r}")
@@ -257,7 +460,7 @@ def _matrix64(value: Any, shape: tuple[int, ...], what: str) -> np.ndarray:
 def _camera(
     K: np.ndarray, rotation: np.ndarray, translation: np.ndarray, width: int, height: int, name: str
 ) -> Camera:
-    """A Camera from float64 parts in the continuous convention, stored as float32 (§2.1)."""
+    """Build a Camera from float64 parts in the continuous convention, as float32 (§2.1)."""
     for size, what in ((width, "width"), (height, "height")):
         if isinstance(size, bool) or not isinstance(size, int | np.integer) or size < 1:
             raise ValueError(f"{what} must be an int >= 1, got {size!r}")
@@ -283,8 +486,45 @@ def _camera(
 def camera_from_opencv(
     K: Any, R: Any, T: Any, *, width: int, height: int, name: str = ""
 ) -> Camera:
-    """A camera from an OpenCV calibration (Q-84): K with pixel centres at integers gains +0.5
-    on cx and cy (§1.4), and R, T go straight into world_to_camera, x_cam = R·x + T (D-63)."""
+    """Build a camera from an OpenCV calibration (§1.4, D-63).
+
+    OpenCV puts pixel centres at integers, so K gains +0.5 on cx and cy to reach §1.4's
+    continuous convention; R and T go straight into ``world_to_camera``, x_cam = R·x + T.
+    The parts are checked in float64 and stored as float32.
+
+    Parameters
+    ----------
+    K
+        The intrinsics, 3 × 3, ``[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`` in pixels, OpenCV's
+        integer-centre convention; fx and fy > 0, no skew. Any array-like of finite numbers.
+    R
+        The world-to-camera rotation, 3 × 3, orthonormal with determinant +1.
+    T
+        The world-to-camera translation, 3 values in world units, in any shape that flattens
+        to 3.
+    width
+        The image width in pixels, ≥ 1.
+    height
+        The image height in pixels, ≥ 1.
+    name
+        The camera's name.
+
+    Returns
+    -------
+    openftgs.types.Camera
+        The camera, K and ``world_to_camera`` float32.
+
+    Raises
+    ------
+    ValueError
+        If a part has the wrong shape or a value that isn't finite, K has skew or a focal
+        length ≤ 0, R isn't a rotation, or ``width`` or ``height`` isn't an int ≥ 1.
+
+    Notes
+    -----
+    Q-84: the camera functions' signatures. Q-105: R is accepted when every entry of
+    ``RᵀR − I`` is at most 1e-5 in magnitude, and stored as read.
+    """
     K64 = _matrix64(K, (3, 3), "K").copy()
     K64[0, 2] += 0.5
     K64[1, 2] += 0.5
@@ -293,10 +533,37 @@ def camera_from_opencv(
 
 
 def camera_from_llff(pose: Any, *, name: str = "") -> Camera:
-    """A camera from a row of Neural3DV's poses_bounds.npy, or its 3×5 matrix (D-28; Q-84):
-    the camera-to-world rotation's columns point down, right and back, so the OpenCV rotation
-    is [col₁, col₀, −col₂]; then the camera centre and (H, W, focal); fx = fy = focal and
-    c = (W/2, H/2), already the image centre in the continuous convention."""
+    """Build a camera from a row of Neural3DV's ``poses_bounds.npy`` (D-28).
+
+    The 3 × 5 matrix holds the camera-to-world rotation, whose columns point down, right and
+    back, so the OpenCV rotation is [col₁, col₀, −col₂]; then the camera centre and
+    (H, W, focal). fx = fy = focal and c = (W/2, H/2), already the image centre in §1.4's
+    continuous convention.
+
+    Parameters
+    ----------
+    pose
+        A row of 17 values (the 15 of the pose, then the two depth bounds, which are ignored),
+        the 15 values of the pose, or its 3 × 5 matrix; any array-like of finite numbers.
+    name
+        The camera's name.
+
+    Returns
+    -------
+    openftgs.types.Camera
+        The camera at the pose's full resolution, K and ``world_to_camera`` float32.
+
+    Raises
+    ------
+    ValueError
+        If ``pose`` has another shape or a value that isn't finite, H or W isn't an integer,
+        or the rotation isn't one.
+
+    Notes
+    -----
+    Q-84: the camera functions' signatures. D-79: D-28's LLFF column order is unverified
+    against the real files.
+    """
     array = np.asarray(pose, dtype=np.float64)
     if array.shape == (17,):
         array = array[:15]
@@ -313,8 +580,36 @@ def camera_from_llff(pose: Any, *, name: str = "") -> Camera:
 
 
 def resized_size(width: int, height: int, ratio: float) -> tuple[int, int]:
-    """§1.4's W′ = round(W·r) and H′ = round(H·r), an exact half rounding to even as OpenCV's
-    resize by a ratio does, at least 1 (Q-89)."""
+    """Compute the size of an image resized by ``ratio`` (§1.4).
+
+    W′ = round(W·r) and H′ = round(H·r), an exact half rounding to even as OpenCV's resize by
+    a ratio does, and at least 1.
+
+    Parameters
+    ----------
+    width
+        The image width W in pixels.
+    height
+        The image height H in pixels.
+    ratio
+        The ratio r; finite and > 0.
+
+    Returns
+    -------
+    width : int
+        W′ in pixels.
+    height : int
+        H′ in pixels.
+
+    Raises
+    ------
+    ValueError
+        If ``ratio`` isn't a finite number > 0.
+
+    Notes
+    -----
+    Q-89: the rounding.
+    """
     if (
         isinstance(ratio, bool)
         or not isinstance(ratio, numbers.Real)
@@ -325,8 +620,34 @@ def resized_size(width: int, height: int, ratio: float) -> tuple[int, int]:
 
 
 def resize_camera(camera: Camera, width: int, height: int) -> Camera:
-    """The camera of the image resized to width × height: fx and cx scale by W′/W, fy and cy by
-    H′/H (§1.4, D-33); the pose is unchanged."""
+    """Return the camera of its image resized to ``width`` × ``height`` (§1.4, D-33).
+
+    fx and cx scale by W′/W, fy and cy by H′/H, in float64; the pose and the name are
+    unchanged.
+
+    Parameters
+    ----------
+    camera
+        The camera at its image's original size.
+    width
+        The new width W′ in pixels, ≥ 1.
+    height
+        The new height H′ in pixels, ≥ 1.
+
+    Returns
+    -------
+    openftgs.types.Camera
+        The camera of the resized image, K and ``world_to_camera`` float32.
+
+    Raises
+    ------
+    ValueError
+        If ``width`` or ``height`` isn't an int ≥ 1.
+
+    See Also
+    --------
+    resized_size : The size an image takes when resized by a ratio.
+    """
     K = camera.K.to(torch.float64).numpy().copy()
     K[0, [0, 2]] *= width / camera.width
     K[1, [1, 2]] *= height / camera.height
@@ -338,9 +659,12 @@ def resize_camera(camera: Camera, width: int, height: int) -> Camera:
 
 
 def _area_weights(size: int, new_size: int) -> tuple[np.ndarray, np.ndarray]:
-    """Banded weights of D-33's area averaging along one axis: output pixel j covers
-    [j·s, (j + 1)·s) of the input, s = size/new_size, each input pixel a unit square; returns
-    the first input index of each output pixel and the weights of its taps, in float64."""
+    """Compute the banded weights of D-33's area averaging along one axis.
+
+    Output pixel j covers [j·s, (j + 1)·s) of the input, s = size/new_size, each input pixel a
+    unit square; returns the first input index of each output pixel and the weights of its
+    taps, in float64.
+    """
     scale = size / new_size
     edges = np.arange(new_size + 1, dtype=np.float64) * scale
     edges[-1] = size  # exact, whatever the rounding of new_size·scale
@@ -354,10 +678,37 @@ def _area_weights(size: int, new_size: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def resize_area(image: np.ndarray, width: int, height: int) -> np.ndarray:
-    """D-33's area resizing of an [H, W] or [H, W, C] array to width × height: every output
-    pixel is the mean of the input over its footprint, input pixels being constant squares,
-    separably in float64 (Q-84). uint8 input gives uint8 output rounded half to even; floating
-    input gives float64."""
+    """Resize an image to ``width`` × ``height`` by area averaging (D-33).
+
+    Every output pixel is the mean of the input over its footprint, input pixels being
+    constant squares, computed separably in float64.
+
+    Parameters
+    ----------
+    image
+        The image, [H, W] or [H, W, C], uint8 or floating.
+    width
+        The output width in pixels, ≥ 1.
+    height
+        The output height in pixels, ≥ 1.
+
+    Returns
+    -------
+    numpy.ndarray
+        The resized image, [height, width] or [height, width, C]: uint8 rounded half to even
+        for uint8 input, float64 for floating input.
+
+    Raises
+    ------
+    ValueError
+        If ``image`` isn't 2- or 3-dimensional, its dtype is neither uint8 nor floating, or
+        ``width`` or ``height`` isn't an int ≥ 1.
+
+    Notes
+    -----
+    D-61: implemented in the package, in place of OpenCV's ``INTER_AREA``, which it matches on
+    integer factors up to rounding. Q-84: the signature.
+    """
     if image.ndim not in (2, 3):
         raise ValueError(f"image must be [H, W] or [H, W, C], got shape {image.shape}")
     for size, what in ((width, "width"), (height, "height")):
@@ -391,8 +742,10 @@ _COEFFICIENT_COUNTS = (0, 4, 5, 8, 12)
 
 
 def _coefficients(dist: Any) -> np.ndarray:
-    """The 12 coefficients k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4 of OpenCV's model,
-    zero-padded from 0, 4, 5, 8 or 12 given; the tilted model (14) is refused (D-61)."""
+    """Return the 12 coefficients of OpenCV's model, zero-padded from 0, 4, 5, 8 or 12 given.
+
+    k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4; the tilted model (14) is refused (D-61).
+    """
     values = np.asarray(dist, dtype=np.float64).reshape(-1)
     if values.size == 14:
         raise ValueError("the tilted (14-coefficient) distortion model is not supported (D-61)")
@@ -406,10 +759,40 @@ def _coefficients(dist: Any) -> np.ndarray:
 
 
 def undistortion_map(K: Any, dist: Any, width: int, height: int) -> np.ndarray:
-    """For every pixel of the undistorted width × height image, its source position (x, y) in
-    the distorted image, [H, W, 2] float64, by the steps of OpenCV's initUndistortRectifyMap
-    with R = I and the new camera matrix equal to K (D-61; Q-84). K uses OpenCV's integer
-    pixel centres, as calibration files do."""
+    """Map every pixel of the undistorted image to its source in the distorted one (D-61).
+
+    The steps of OpenCV's documented ``initUndistortRectifyMap`` with R = I and the new camera
+    matrix equal to K, in float64.
+
+    Parameters
+    ----------
+    K
+        The intrinsics, 3 × 3, in OpenCV's integer-centre convention, as calibration files
+        give them; any array-like of finite numbers.
+    dist
+        OpenCV's distortion coefficients, 0, 4, 5, 8 or 12 of them (k1, k2, p1, p2, k3, k4,
+        k5, k6, s1, s2, s3, s4, the missing ones 0), in any shape.
+    width
+        The image width W in pixels.
+    height
+        The image height H in pixels.
+
+    Returns
+    -------
+    numpy.ndarray
+        The source position (x, y) of every pixel, [H, W, 2] float64, in pixels with OpenCV's
+        integer centres.
+
+    Raises
+    ------
+    ValueError
+        If K isn't a finite 3 × 3 array, or ``dist`` has another count of coefficients (the
+        tilted model's 14 included) or one that isn't finite.
+
+    Notes
+    -----
+    Q-84: the signature.
+    """
     K64 = _matrix64(K, (3, 3), "K")
     k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4 = _coefficients(dist)
     fx, fy, cx, cy = K64[0, 0], K64[1, 1], K64[0, 2], K64[1, 2]
@@ -426,8 +809,10 @@ def undistortion_map(K: Any, dist: Any, width: int, height: int) -> np.ndarray:
 
 
 def _sample_bilinear(image: np.ndarray, positions: np.ndarray) -> np.ndarray:
-    """Bilinear samples of an [H, W] or [H, W, C] array at [h, w, 2] positions (x, y), pixel
-    centres at integers, pixels outside the image counting as 0 (D-61), in float64."""
+    """Sample an [H, W] or [H, W, C] array bilinearly at [h, w, 2] positions (x, y).
+
+    Pixel centres at integers, pixels outside the image counting as 0 (D-61), in float64.
+    """
     height, width = image.shape[:2]
     values = image.astype(np.float64)
     x, y = positions[..., 0], positions[..., 1]
@@ -446,10 +831,39 @@ def _sample_bilinear(image: np.ndarray, positions: np.ndarray) -> np.ndarray:
 
 
 def undistort_image(image: np.ndarray, K: Any, dist: Any) -> np.ndarray:
-    """The undistorted image, same size, K unchanged (D-61; Q-84): bilinear samples at
-    `undistortion_map`'s positions, zeros where the source lies outside. uint8 input gives uint8
-    output rounded half to even; floating input gives float64 (Q-90: the caller may resize the
-    float64 values before rounding). Zero coefficients return the input's values unchanged."""
+    """Undistort an image, keeping its size and K (D-61).
+
+    Bilinear samples at :func:`undistortion_map`'s positions, zeros where the source lies
+    outside the image. Zero coefficients return the input's values unchanged.
+
+    Parameters
+    ----------
+    image
+        The distorted image, [H, W] or [H, W, C], uint8 or floating.
+    K
+        The intrinsics, 3 × 3, in OpenCV's integer-centre convention; any array-like of
+        finite numbers.
+    dist
+        OpenCV's distortion coefficients, 0, 4, 5, 8 or 12 of them, in any shape.
+
+    Returns
+    -------
+    numpy.ndarray
+        The undistorted image, of the input's shape: uint8 rounded half to even for uint8
+        input, float64 for floating input.
+
+    Raises
+    ------
+    ValueError
+        If ``image`` isn't 2- or 3-dimensional or its dtype is neither uint8 nor floating, K
+        isn't a finite 3 × 3 array, or ``dist`` has another count of coefficients or one that
+        isn't finite.
+
+    Notes
+    -----
+    Q-90: the caller may resize the float64 values before rounding, so a frame that is
+    undistorted and then resized is rounded to 8 bits once. Q-84: the signature.
+    """
     if image.ndim not in (2, 3):
         raise ValueError(f"image must be [H, W] or [H, W, C], got shape {image.shape}")
     eight_bit = image.dtype == np.uint8
@@ -526,11 +940,34 @@ _OpenCVLoader.add_implicit_resolver(
 
 
 def read_opencv_yaml(path: Path) -> dict[str, Any]:
-    """The top-level mapping of a file written by OpenCV's FileStorage (D-61; Q-84, Q-91):
-    `!!opencv-matrix` entries become NumPy arrays of shape (rows, cols) or (rows, cols,
-    channels) in the dtype their `dt` names, so values equal what OpenCV reads back; other
-    values are as PyYAML reads them. A `%YAML:1.0` first line, which isn't valid YAML, is
-    dropped."""
+    """Read a YAML file written by OpenCV's FileStorage (D-61).
+
+    ``!!opencv-matrix`` entries become NumPy arrays of shape (rows, cols) or (rows, cols,
+    channels) in the dtype their ``dt`` names, so values equal what OpenCV reads back; other
+    values are as PyYAML's safe loader reads them, with OpenCV's ``.Nan`` read as NaN. A
+    ``%YAML:1.0`` first line, which isn't valid YAML, is dropped.
+
+    Parameters
+    ----------
+    path
+        The file, such as ``intri.yml`` or ``extri.yml``; UTF-8 text.
+
+    Returns
+    -------
+    dict
+        The file's top-level mapping.
+
+    Raises
+    ------
+    ValueError
+        If the file can't be read as text, isn't valid YAML, holds a malformed matrix, or its
+        top level isn't a mapping.
+
+    Notes
+    -----
+    Q-84: the signature. Q-91: the matrix constructor, written from the format OpenCV's
+    FileStorage writes.
+    """
     path = Path(path)
     try:
         text = path.read_text(encoding="utf-8")
@@ -599,7 +1036,10 @@ def _version_line(program: str, what: str) -> str:
 
 
 def _tools(ffmpeg: str, ffprobe: str | None) -> _Tools:
-    """D-80: ffprobe defaults to the one beside a path-given ffmpeg, else the one on PATH."""
+    """Find ffmpeg and ffprobe, and read ffmpeg's version (D-80).
+
+    ffprobe defaults to the one beside a path-given ffmpeg, else the one on PATH.
+    """
     resolved = _program(ffmpeg, "ffmpeg")
     if ffprobe is None:
         separators = [os.sep] + ([os.altsep] if os.altsep else [])
@@ -615,8 +1055,11 @@ def _tools(ffmpeg: str, ffprobe: str | None) -> _Tools:
 
 
 def _probe(tools: _Tools, video: Path) -> _VideoInfo:
-    """Width, height, pixel format and frame count of the first video stream (§1.4: read with
-    ffprobe from the same installation); `-count_frames` when the container states no count."""
+    """Probe the width, height, pixel format and frame count of the first video stream.
+
+    §1.4: read with ffprobe from the same installation; `-count_frames` when the container
+    states no count.
+    """
 
     def stream(extra: list[str], entries: str) -> dict[str, Any]:
         command = [
@@ -658,9 +1101,12 @@ def _decode_command(
     window: tuple[int, int] | None,
     hwaccel: str,
 ) -> list[str]:
-    """The ffmpeg command of §1.4: the first `count` frames, or with `window` = (N0, N1) the
-    decode indices N0 ≤ n < N1, as raw RGB24 on stdout (D-48). D-81: with CUDA, hardware frames
-    downloaded explicitly, so a decode that can't use CUDA fails instead of falling back."""
+    """Build the ffmpeg command of §1.4 that decodes frames as raw RGB24 on stdout (D-48).
+
+    The first `count` frames, or with `window` = (N0, N1) the decode indices N0 ≤ n < N1.
+    D-81: with CUDA, hardware frames downloaded explicitly, so a decode that can't use CUDA
+    fails instead of falling back.
+    """
     command = [tools.ffmpeg, "-v", "error"]
     filters: list[str] = []
     if hwaccel == "cuda":
@@ -702,9 +1148,11 @@ def _read_exactly(stream: IO[bytes], size: int) -> bytes:
 def _decode(
     command: list[str], info: _VideoInfo, count: int, video: Path, *, camera: str
 ) -> Generator[np.ndarray, None, None]:
-    """The frames ffmpeg writes, exactly W·H·3 bytes each (§1.4), each read as the stage
-    "convert.decode" keyed by `camera` (§3.4 B-8). Q-93: a short read, a nonzero exit or any
-    message at `-v error` is a ValueError."""
+    """Yield the frames ffmpeg writes, exactly W·H·3 bytes each (§1.4).
+
+    Each is read as the stage "convert.decode" keyed by `camera` (§3.4 B-8). Q-93: a short
+    read, a nonzero exit or any message at `-v error` is a ValueError.
+    """
     size = info.width * info.height * 3
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert process.stdout is not None and process.stderr is not None
@@ -748,10 +1196,13 @@ def _write_frame(
     K: np.ndarray | None = None,
     dist: np.ndarray | None = None,
 ) -> float:
-    """One output frame (a pool task): undistorted with K and dist in OpenCV's convention when
-    they distort, resized to `size` by area averaging with one 8-bit rounding (Q-90), and
-    written as 8-bit RGB PNG. Returns the task's wall time in seconds, which the converter
-    records as the stage "convert.encode" (§3.4 B-8): the pool's process has no clock."""
+    """Write one output frame (a pool task) and return the task's wall time in seconds.
+
+    Undistorted with K and dist in OpenCV's convention when they distort, resized to `size`
+    by area averaging with one 8-bit rounding (Q-90), and written as 8-bit RGB PNG. The
+    converter records the wall time as the stage "convert.encode" (§3.4 B-8): the pool's
+    process has no clock.
+    """
     began = time.perf_counter()
     with stage("convert.encode"):
         frame = source if isinstance(source, np.ndarray) else _read_rgb(Path(source))
@@ -773,8 +1224,10 @@ def _write_frame(
 
 
 def _read_rgb(path: Path) -> np.ndarray:
-    """An 8-bit image file as [H, W, 3] uint8 (alpha dropped; §1.4 "Images"); 16-bit PNGs are
-    refused, as `MultiViewVideo.load_image` refuses them (Q-65)."""
+    """Read an 8-bit image file as [H, W, 3] uint8 (alpha dropped; §1.4 "Images").
+
+    16-bit PNGs are refused, as `MultiViewVideo.load_image` refuses them (Q-65).
+    """
     try:
         with Image.open(path) as image:
             if image.mode not in _IMAGE_MODES:
@@ -789,8 +1242,10 @@ def _read_rgb(path: Path) -> np.ndarray:
 
 @dataclass
 class _CameraJob:
-    """One camera's frames: decoded from `video`, or read from `images`, then processed into
-    `outputs` (frame_index order)."""
+    """One camera's frames, to be processed into `outputs` (frame_index order).
+
+    Decoded from `video`, or read from `images`.
+    """
 
     name: str
     outputs: list[Path]
@@ -806,8 +1261,10 @@ class _CameraJob:
 # Q-215: the budget a process is given through the variables PyTorch reads (Q-176), so that
 # the converters' pool and the frame cache's threads stay within it; None when neither is set.
 def _thread_budget() -> int | None:
-    """The smallest positive count among OMP_NUM_THREADS and MKL_NUM_THREADS, as PyTorch takes
-    them when both are set; other values are ignored."""
+    """Return the smallest positive count among OMP_NUM_THREADS and MKL_NUM_THREADS.
+
+    As PyTorch takes them when both are set; other values are ignored.
+    """
     counts = [
         int(value)
         for value in (os.environ.get("OMP_NUM_THREADS"), os.environ.get("MKL_NUM_THREADS"))
@@ -833,8 +1290,11 @@ def _record_encoded(
 def _run_jobs(
     camera_jobs: Sequence[_CameraJob], tools: _Tools | None, *, hwaccel: str, workers: int
 ) -> dict[str, list[str]]:
-    """Decode up to `workers` cameras at once, each frame processed and written by a process
-    pool (§2.4); outputs don't depend on `workers`. Returns each camera's ffmpeg command."""
+    """Decode up to `workers` cameras at once, and return each camera's ffmpeg command.
+
+    Each frame is processed and written by a process pool (§2.4); outputs don't depend on
+    `workers`.
+    """
     commands: dict[str, list[str]] = {}
     total = sum(len(job.outputs) for job in camera_jobs)
     pool_size = max(1, min(_thread_budget() or os.cpu_count() or 1, total))  # Q-215
@@ -891,7 +1351,10 @@ def _run_jobs(
 
 
 def _prepare_out(dst: Path) -> tuple[Path, bool]:
-    """Q-88: OUT is absent or an empty directory; returns it and whether it was created."""
+    """Create OUT if needed, and return it and whether it was created.
+
+    Q-88: OUT is absent or an empty directory.
+    """
     dst = Path(dst)
     if dst.exists() and (not dst.is_dir() or any(dst.iterdir())):
         raise ValueError(f"{dst}: the output must be absent or an empty directory")
@@ -901,8 +1364,10 @@ def _prepare_out(dst: Path) -> tuple[Path, bool]:
 
 
 def _discard(out: Path, created: bool) -> None:
-    """Q-88 (owner answer): after a failure, remove everything the conversion wrote. OUT was
-    absent or empty when it started, so all of it is the conversion's own."""
+    """Remove everything the conversion wrote, after a failure (Q-88, owner answer).
+
+    OUT was absent or empty when it started, so all of it is the conversion's own.
+    """
     if created:
         shutil.rmtree(out, ignore_errors=True)
         return
@@ -957,10 +1422,64 @@ def convert_n3dv(
     jobs: int = 0,
     ffprobe: str | None = None,
 ) -> Path:
-    """Convert a Neural3DV scene (D-28, D-48, D-80; Q-88, Q-94, Q-95): `poses_bounds.npy`'s rows
-    belong to the `camXX.mp4` files in name order; the first `frames` frames of each video,
-    decoded by the user's ffmpeg, area-resized by `resize` and written as PNG; frame k at k/30 s;
-    cam00 the test view. Returns the path of OUT/scene.json."""
+    """Convert a Neural3DV scene into a scene manifest and its images (§1.4, D-48).
+
+    The rows of ``poses_bounds.npy`` belong to the ``camXX.mp4`` files in name order. The
+    first ``frames`` frames of each video are decoded by the user's ffmpeg, area-resized by
+    ``resize`` (D-33) and written as 8-bit RGB PNG under ``OUT/images/<camera>/``; frame k is
+    at k/30 s, and cam00 is the test view (D-29). Each camera's K is scaled with its frames.
+
+    Parameters
+    ----------
+    src
+        The scene's folder, holding ``poses_bounds.npy`` (one 17-value row per video) and the
+        ``camXX.mp4`` videos.
+    dst
+        OUT, the output folder: absent or empty.
+    frames
+        The frames taken from the start of each video, ≥ 1; every video must hold that many.
+    resize
+        The resizing ratio r, finite and > 0; 0.5 is the protocol's.
+    ffmpeg
+        The ffmpeg program, 5.1 or later: a name looked up on PATH, or a path.
+    hwaccel
+        ``"cuda"`` decodes on the GPU and fails rather than fall back to the CPU (D-81);
+        ``"none"`` decodes on the CPU.
+    jobs
+        The cameras decoded at once; 0 means one per four cores. The output doesn't depend
+        on it.
+    ffprobe
+        The ffprobe program; None means the one beside ``ffmpeg`` when ``ffmpeg`` is a path,
+        else the one on PATH (D-80).
+
+    Returns
+    -------
+    pathlib.Path
+        The path of ``OUT/scene.json``, the scene manifest.
+
+    Raises
+    ------
+    ValueError
+        If an argument is out of range, ``dst`` isn't absent or empty, ``poses_bounds.npy``
+        is missing or doesn't hold one row per video, a video's size differs from its row's or
+        it holds too few frames, or ffmpeg or ffprobe is missing or fails. What the conversion
+        wrote is removed first.
+
+    Notes
+    -----
+    D-28: the camera conventions and the LLFF pose layout; D-80: ``ffprobe``. Q-88: the
+    output folder, and its cleanup after a failure; Q-94: the manifest's metadata, the
+    near and far bounds included; Q-95: the videos and their pose rows; Q-169: ``src`` is
+    made absolute, so the ffmpeg commands recorded in the metadata mean the same from any
+    directory.
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> from openftgs.data import convert_n3dv
+    >>> convert_n3dv(Path("n3dv/scene"), Path("scenes/n3dv"))
+    PosixPath('scenes/n3dv/scene.json')
+    """
     # Q-169: absolute, so the recorded commands mean the same from any directory; normalized
     # lexically, with a symlinked folder kept under the name it was given.
     src = Path(os.path.abspath(src))
@@ -1040,7 +1559,7 @@ _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 
 
 def _rodrigues(vector: np.ndarray) -> np.ndarray:
-    """The rotation matrix of a Rodrigues vector, in float64."""
+    """Return the rotation matrix of a Rodrigues vector, in float64."""
     theta = float(np.linalg.norm(vector))
     if theta == 0.0:
         return np.eye(3)
@@ -1065,9 +1584,11 @@ class _Calibrated:
 
 
 def _calibration(intri_path: Path, extri_path: Path) -> list[_Calibrated]:
-    """The cameras of intri.yml and extri.yml (D-61, D-63; Q-96): `names`, K_, D_ or dist_,
-    optional W_ and H_, an optional ccm_ that must be the identity, Rot_ and/or R_ (agreeing
-    within 1e-6 when both), T_."""
+    """Read the cameras of intri.yml and extri.yml (D-61, D-63; Q-96).
+
+    `names`, K_, D_ or dist_, optional W_ and H_, an optional ccm_ that must be the identity,
+    Rot_ and/or R_ (agreeing within 1e-6 when both), T_.
+    """
     for path in (intri_path, extri_path):
         if not path.is_file():
             raise ValueError(f"{path}: calibration file not found")
@@ -1149,11 +1670,76 @@ def convert_opencv_yaml(
     ffprobe: str | None = None,
     test_camera: str | None = None,
 ) -> Path:
-    """Convert a dataset with OpenCV-style YAML calibrations, such as ENeRF-Outdoor (§1.4,
-    D-61, D-63, D-80; Q-96): intri.yml and extri.yml in SRC, frames from `images/<camera>/`
-    (the first `frames` files by name) or `videos/<camera>.mp4`; frames undistorted with the
-    file's K, K shifted by +0.5, frames and K resized; frame k at k/fps s; `test_camera` the
-    test view. Returns the path of OUT/scene.json."""
+    """Convert a dataset with OpenCV-style YAML calibrations, such as ENeRF-Outdoor (§1.4).
+
+    The cameras come from ``intri.yml`` and ``extri.yml`` in ``src``, and each camera's frames
+    from ``images/<camera>/`` (the first ``frames`` files by name, PNG or JPEG) or else from
+    ``videos/<camera>.mp4``, decoded by the user's ffmpeg. Frames are undistorted with the
+    file's K and distortion (D-61), K is shifted by +0.5 to §1.4's continuous convention, and
+    frames and K are resized by ``resize`` (D-33). Frames are written as 8-bit RGB PNG under
+    ``OUT/images/<camera>/``; frame k is at k/fps s.
+
+    Parameters
+    ----------
+    src
+        The dataset's folder: ``intri.yml`` with ``names``, ``K_<c>``, ``D_<c>`` or
+        ``dist_<c>``, optional ``W_<c>`` and ``H_<c>`` and an optional identity ``ccm_<c>``;
+        ``extri.yml`` with ``Rot_<c>`` or ``R_<c>`` (Rodrigues) or both, and ``T_<c>``; and
+        the frames.
+    dst
+        OUT, the output folder: absent or empty.
+    fps
+        The frame rate, finite and > 0; 60 for ENeRF-Outdoor.
+    frames
+        The frames taken from the start of each camera, ≥ 1; every camera must have that many.
+    resize
+        The resizing ratio r, finite and > 0.
+    ffmpeg
+        The ffmpeg program, 5.1 or later: a name looked up on PATH, or a path. Used only for
+        cameras whose frames come from a video.
+    hwaccel
+        ``"cuda"`` decodes on the GPU and fails rather than fall back to the CPU (D-81);
+        ``"none"`` decodes on the CPU.
+    jobs
+        The cameras decoded at once; 0 means one per four cores. The output doesn't depend
+        on it.
+    ffprobe
+        The ffprobe program; None means the one beside ``ffmpeg`` when ``ffmpeg`` is a path,
+        else the one on PATH (D-80).
+    test_camera
+        The name of the test view; None means every image is a training image (D-29, D-80).
+
+    Returns
+    -------
+    pathlib.Path
+        The path of ``OUT/scene.json``, the scene manifest.
+
+    Raises
+    ------
+    ValueError
+        If an argument is out of range, ``test_camera`` isn't a calibrated camera, ``dst``
+        isn't absent or empty, a calibration file is missing or malformed (a rotation that
+        isn't one, ``Rot_<c>`` and ``R_<c>`` differing by more than 1e-6, a ccm that isn't the
+        identity), a camera has no frames, too few, or frames whose size differs from each
+        other or from ``W_<c>`` and ``H_<c>``, or ffmpeg or ffprobe is missing or fails. What
+        the conversion wrote is removed first.
+
+    Notes
+    -----
+    D-63: the calibration's conventions and checks; D-80: ``ffprobe`` and ``test_camera``.
+    Q-96: the input layout and the order of undistortion, shift and resizing; Q-88: the
+    output folder; Q-90: one 8-bit rounding after undistortion and resizing; Q-169: ``src`` is
+    made absolute. D-79: ENeRF-Outdoor's file layout is unverified against the real files.
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> from openftgs.data import convert_opencv_yaml
+    >>> convert_opencv_yaml(
+    ...     Path("enerf_outdoor/scene"), Path("scenes/outdoor"), fps=60, frames=300, resize=1.0
+    ... )
+    PosixPath('scenes/outdoor/scene.json')
+    """
     src = Path(os.path.abspath(src))  # Q-169, as in convert_n3dv
     if (
         isinstance(fps, bool)
@@ -1265,8 +1851,10 @@ _FASTEST = 10  # D-69
 
 
 class _HashingReader:
-    """A binary reader that hashes every byte it passes on (Q-86: the archive's SHA-256 is of
-    the bytes as downloaded, read once)."""
+    """A binary reader that hashes every byte it passes on.
+
+    Q-86: the archive's SHA-256 is of the bytes as downloaded, read once.
+    """
 
     def __init__(self, file: IO[bytes]) -> None:
         self._file = file
@@ -1283,8 +1871,11 @@ class _HashingReader:
 
 
 def _safe_member(member: tarfile.TarInfo) -> tuple[str, ...] | None:
-    """A member's path parts, or None for anything but a regular file at a relative path
-    without `..` (Q-86: archives are untrusted data)."""
+    """Return a member's path parts, or None unless it is a safe regular file.
+
+    None for anything but a regular file at a relative path without `..` (Q-86: archives
+    are untrusted data).
+    """
     parts = tuple(Path(member.name).parts)
     if not member.isreg() or not parts or Path(member.name).is_absolute() or ".." in parts:
         return None
@@ -1294,10 +1885,13 @@ def _safe_member(member: tarfile.TarInfo) -> tuple[str, ...] | None:
 def _extract_archive(
     archive: Path, work: Path, *, videos: bool, calibration: bool
 ) -> tuple[str, list[str]]:
-    """Stream `archive` once: extract `*/videos/*.mp4` into work/videos and
-    `*/optimized/{intri.yml, extri.yml, sync.json}` into work/optimized, hash every byte, and
-    return the SHA-256 and the warnings (Q-86). A gzip CRC failure after every member came out
-    whole is a warning; one that cuts a member short is an error."""
+    """Stream `archive` once, extract what the converter needs, and return its SHA-256.
+
+    Extract `*/videos/*.mp4` into work/videos and `*/optimized/{intri.yml, extri.yml,
+    sync.json}` into work/optimized, hash every byte, and return the SHA-256 and the warnings
+    (Q-86). A gzip CRC failure after every member came out whole is a warning; one that cuts a
+    member short is an error.
+    """
     if not archive.is_file():
         raise ValueError(
             f"{archive}: archive not found (Q-86: SRC holds the archives as downloaded)"
@@ -1351,7 +1945,7 @@ def _extract_archive(
 
 
 def _sync_offsets(path: Path, names: Sequence[str]) -> dict[str, float]:
-    """sync.json: an object of camera name → offset in seconds (D-59, Q-101)."""
+    """Read sync.json, an object of camera name → offset in seconds (D-59, Q-101)."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as err:
@@ -1387,7 +1981,7 @@ def _colmap_version(colmap: str) -> tuple[str, str]:
 
 
 def _quaternion(rotation: np.ndarray) -> np.ndarray:
-    """(w, x, y, z) of a rotation matrix, w ≥ 0 (COLMAP's images.txt order, QW first)."""
+    """Return (w, x, y, z) of a rotation matrix, w ≥ 0 (COLMAP's images.txt order, QW first)."""
     m = rotation
     trace = m[0, 0] + m[1, 1] + m[2, 2]
     candidates = [
@@ -1428,8 +2022,11 @@ def _quaternion(rotation: np.ndarray) -> np.ndarray:
 def _read_colmap_text(
     folder: Path,
 ) -> tuple[dict[int, tuple[int, int, np.ndarray]], dict[str, int]]:
-    """PINHOLE cameras (id → (W, H, [fx, fy, cx, cy])) and image name → camera id of a text
-    model (COLMAP's documented format)."""
+    """Read the PINHOLE cameras and the images' camera ids of a COLMAP text model.
+
+    Cameras as id → (W, H, [fx, fy, cx, cy]) and image name → camera id, in COLMAP's
+    documented format.
+    """
     cameras: dict[int, tuple[int, int, np.ndarray]] = {}
     try:
         camera_text = (folder / "cameras.txt").read_text()
@@ -1463,10 +2060,13 @@ def _colmap_undistort(
     frames: dict[str, list[Path]],
     sizes: dict[str, tuple[int, int]],
 ) -> tuple[dict[str, tuple[int, int, np.ndarray]], list[list[str]], Path]:
-    """D-60, Q-97: COLMAP's image_undistorter with blank_pixels 0 on a text model of FULL_OPENCV
-    cameras (cx, cy + 0.5 for COLMAP's pixel centres), its binary output converted to text; the
-    read-back PINHOLE camera of each camera (W, H, [fx, fy, cx, cy]) in the continuous
-    convention, unshifted; and the folder of undistorted images."""
+    """Undistort the frames with COLMAP's image_undistorter (D-60, Q-97).
+
+    Run with blank_pixels 0 on a text model of FULL_OPENCV cameras (cx, cy + 0.5 for COLMAP's
+    pixel centres), its binary output converted to text; return the read-back PINHOLE camera
+    of each camera (W, H, [fx, fy, cx, cy]) in the continuous convention, unshifted, the
+    commands, and the folder of undistorted images.
+    """
     model, output, text = (
         work / "colmap" / "sparse_in",
         work / "colmap" / "undistorted",
@@ -1536,8 +2136,11 @@ def _colmap_undistort(
 
 
 def _masks(folder: Path, indices: Sequence[int]) -> tuple[dict[int, Path], dict[str, Any]]:
-    """D-64, Q-87: DIR/<n:06d>.png per test image and DIR/masks.json; a missing mask is
-    refused (§1.4: one mask per test image; Q-104)."""
+    """Find the mask of every test image in DIR and read DIR/masks.json (D-64, Q-87).
+
+    DIR/<n:06d>.png per test image and DIR/masks.json; a missing mask is refused (§1.4: one
+    mask per test image; Q-104).
+    """
     sidecar = folder / "masks.json"
     try:
         info = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -1595,12 +2198,91 @@ def convert_selfcap(
     ffprobe: str | None = None,
     resize: float | None = None,
 ) -> Path:
-    """Convert a SelfCap scene (§1.4, D-59, D-60, D-63, D-64, D-80; Q-86, Q-87, Q-97, Q-101): SRC
-    holds the archives as downloaded; dance1 … bike2 take window and test camera from the
-    card's table, other names need both. `resize` sets the ratio; None takes the table's, or
-    0.5 for other names (D-80). Frames N0 ≤ n < N1 of every camera, undistorted by
-    COLMAP (or the package with undistort='internal'), area-resized, with τ = n/60 minus the
-    camera's sync offset. Returns the path of OUT/scene.json."""
+    """Convert a SelfCap scene into a scene manifest and its images (§1.4, D-59, D-60).
+
+    ``src`` holds the archives as downloaded; each archive used is streamed once and its
+    SHA-256 recorded. The frames N0 ≤ n < N1 of every camera's video, by 0-based decode index,
+    are decoded by the user's ffmpeg, undistorted by COLMAP (or by the package with
+    ``undistort="internal"``), area-resized (D-33) and written as 8-bit RGB PNG under
+    ``OUT/images/<camera>/``. A frame's timestamp is τ = n/60 s minus its camera's sync
+    offset. For dance1, the manifest also records the Fastest-10 frames (D-69).
+
+    Parameters
+    ----------
+    src
+        The folder of the archives: ``<sequence>-release.tar.gz`` (``hair-release`` for
+        dance1 and dance2, ``corgi-release``, ``bike-release``; ``<scene>-release`` for another
+        scene name), and ``hair-calib.tar.gz`` for the hair scenes unless ``calib`` is given.
+    dst
+        OUT, the output folder: absent or empty.
+    scene
+        The scene: dance1, dance2, corgi1, corgi2, bike1 or bike2 from the dataset card's
+        table, or another name, which then needs ``window`` and ``test_camera``.
+    window
+        (N0, N1), the decode indices taken, 0 ≤ N0 < N1; None means the table's.
+    test_camera
+        The test view's four-digit camera name; None means the table's.
+    undistort
+        ``"colmap"`` runs the user's COLMAP, the protocol's way (D-60); ``"internal"`` uses
+        the package's own undistortion, which isn't protocol-exact.
+    colmap
+        The COLMAP program: a name looked up on PATH, or a path.
+    use_sync
+        Whether the offsets of ``optimized/sync.json`` are subtracted, when the calibration
+        has the file (D-59).
+    masks
+        A folder of dynamic-region masks, ``<n:06d>.png`` per test image and ``masks.json``
+        naming their source (D-64); None means no masks, and the dynamic-region metrics are
+        skipped.
+    calib
+        A calibration folder holding ``intri.yml``, ``extri.yml`` and optionally
+        ``sync.json``, directly or under ``optimized/``; None means the one D-63 names.
+    ffmpeg
+        The ffmpeg program, 5.1 or later: a name looked up on PATH, or a path.
+    hwaccel
+        ``"cuda"`` decodes on the GPU and fails rather than fall back to the CPU (D-81);
+        ``"none"`` decodes on the CPU.
+    jobs
+        The cameras decoded at once; 0 means one per four cores. The output doesn't depend
+        on it.
+    ffprobe
+        The ffprobe program; None means the one beside ``ffmpeg`` when ``ffmpeg`` is a path,
+        else the one on PATH (D-80).
+    resize
+        The resizing ratio, finite and > 0; None means the table's, or 0.5, the protocol's
+        ratio for 4K video, for other names (D-80).
+
+    Returns
+    -------
+    pathlib.Path
+        The path of ``OUT/scene.json``, the scene manifest.
+
+    Raises
+    ------
+    ValueError
+        If an argument is out of range, a scene outside the table lacks ``window`` or
+        ``test_camera``, ``dst`` isn't absent or empty, an archive is missing or unreadable, the
+        calibration or ``sync.json`` is missing or fails D-63's checks, a video is missing or
+        shorter than the window, a mask is missing or malformed, ffmpeg, ffprobe or COLMAP is
+        missing or fails, or ffmpeg reports any error while decoding. What the conversion
+        wrote is removed first.
+
+    Notes
+    -----
+    D-63: the calibration's source and checks; D-64: the masks; D-80: ``ffprobe`` and
+    ``resize``. Q-86: the archives, read as untrusted data; a gzip CRC failure after every
+    needed member came out whole is a warning in the manifest's metadata. Q-87: the masks'
+    layout; Q-88: the output folder; Q-93: decoding errors; Q-97: other scene names, the
+    COLMAP input and its read-back; Q-101: ``sync.json``. D-79: D-59's reading of the sync
+    offsets is unverified against the real files.
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> from openftgs.data import convert_selfcap
+    >>> convert_selfcap(Path("selfcap"), Path("scenes/dance1"), scene="dance1")
+    PosixPath('scenes/dance1/scene.json')
+    """
     src = Path(src)
     if undistort not in ("colmap", "internal"):
         raise ValueError(f"undistort must be 'colmap' or 'internal', got {undistort!r}")
@@ -1799,7 +2481,7 @@ _CACHE_PLACEMENTS = ("gpu", "mmap")
 
 
 def _cache_groups(dataset: "MultiViewVideo") -> list[tuple[str, list[int]]]:
-    """The training records grouped by camera name, in order of first appearance (Q-98)."""
+    """Group the training records by camera name, in order of first appearance (Q-98)."""
     groups: dict[str, list[int]] = {}
     for index, record in enumerate(dataset.records):
         if record.split == "train":
@@ -1830,11 +2512,32 @@ def _cache_file_valid(path: Path, metadata: dict[str, str], shape: tuple[int, ..
 
 
 class FrameCache:
-    """The uint8 copy of every training image (D-51; Q-84, Q-98): one safetensors file per
-    camera beside the scene manifest, keyed by its SHA-256, held in GPU memory ("gpu") or
-    memory-mapped and read one frame at a time ("mmap"). `open` builds it when missing or
-    stale. Instances come from `FrameCache.open` only: the constructor takes internal
-    structures and may change without notice (Q-84)."""
+    """The uint8 copy of every training image, so training decodes no PNG (D-51).
+
+    One safetensors file per camera beside the scene manifest, keyed by the manifest's
+    SHA-256, held in GPU memory (``"gpu"``) or memory-mapped and read one frame at a time
+    (``"mmap"``). :meth:`open` builds it when missing or stale. PNG stays the interface: the
+    cache holds the same 8-bit values :meth:`MultiViewVideo.load_image` decodes.
+
+    Instances come from :meth:`FrameCache.open` only: the constructor takes internal
+    structures and may change without notice (Q-84).
+
+    Attributes
+    ----------
+    directory
+        The folder of the cache's files.
+    placement
+        Where the frames are held, ``"gpu"`` or ``"mmap"``.
+
+    See Also
+    --------
+    Prefetcher : Reads the cache's frames ahead, in the order training takes them.
+
+    Notes
+    -----
+    Q-84: the class's members. Q-98: the cache's location, file layout and validity: a file
+    is rebuilt when its metadata or shape doesn't match the manifest's training images.
+    """
 
     def __init__(
         self,
@@ -1852,12 +2555,36 @@ class FrameCache:
 
     @staticmethod
     def default_directory(manifest: SceneManifest) -> Path:
-        """`<manifest dir>/.ftgs-cache/<manifest sha256>` (Q-98)."""
+        """Return the cache's default folder for a scene manifest (Q-98).
+
+        Parameters
+        ----------
+        manifest
+            The scene manifest.
+
+        Returns
+        -------
+        pathlib.Path
+            ``<manifest dir>/.ftgs-cache/<manifest sha256>``.
+        """
         return manifest.path.parent / ".ftgs-cache" / manifest.sha256
 
     @staticmethod
     def size_of(dataset: "MultiViewVideo") -> int:
-        """The bytes of the training images as uint8, the cache's payload."""
+        """Compute the bytes of a dataset's training images as uint8, the cache's payload.
+
+        Only the cameras' sizes are read, so the cache need not exist.
+
+        Parameters
+        ----------
+        dataset
+            The multi-view video.
+
+        Returns
+        -------
+        int
+            W·H·3 summed over the training images, in bytes.
+        """
         return sum(
             r.camera.width * r.camera.height * 3 for r in dataset.records if r.split == "train"
         )
@@ -1866,9 +2593,38 @@ class FrameCache:
     def build(
         cls, dataset: "MultiViewVideo", *, directory: Path | None = None, jobs: int = 0
     ) -> Path:
-        """Write the cache's files, keeping the valid ones, and return its directory. PNGs are
-        decoded by `jobs` threads (0: the thread budget when one is set, else one per CPU;
-        Q-215)."""
+        """Write the cache's files, keeping the valid ones, and return its folder (D-51).
+
+        Each camera's training images are decoded from their PNGs and written as one
+        safetensors file, through a temporary file that replaces the old one; a file whose
+        metadata and shape already match is kept.
+
+        Parameters
+        ----------
+        dataset
+            The multi-view video whose training images are cached.
+        directory
+            The cache's folder; None means :meth:`default_directory` of the dataset's
+            manifest. It is created if missing.
+        jobs
+            The threads that decode PNGs; 0 means the thread budget of ``OMP_NUM_THREADS`` and
+            ``MKL_NUM_THREADS`` when one is set, else one per CPU.
+
+        Returns
+        -------
+        pathlib.Path
+            The cache's folder.
+
+        Raises
+        ------
+        ValueError
+            If a training image can't be read as 8-bit RGB of its camera's size, or one
+            camera's training images differ in size.
+
+        Notes
+        -----
+        Q-98: the files and their validity. Q-215: the default thread count.
+        """
         directory = (
             Path(directory) if directory is not None else cls.default_directory(dataset.manifest)
         )
@@ -1913,8 +2669,36 @@ class FrameCache:
         device: str | torch.device = "cpu",
         directory: Path | None = None,
     ) -> "FrameCache":
-        """The cache of `dataset`, built first when missing or stale; "gpu" loads every camera's
-        frames onto `device`, "mmap" keeps the files memory-mapped (D-51, Q-98)."""
+        """Open the frame cache of a dataset, building it first when missing or stale (D-51).
+
+        Parameters
+        ----------
+        dataset
+            The multi-view video whose training images are cached.
+        placement
+            ``"gpu"`` loads every camera's frames onto ``device``; ``"mmap"`` keeps the files
+            memory-mapped and reads one frame at a time.
+        device
+            Where ``"gpu"`` puts the frames; ignored by ``"mmap"``.
+        directory
+            The cache's folder; None means :meth:`default_directory` of the dataset's
+            manifest.
+
+        Returns
+        -------
+        openftgs.data.FrameCache
+            The open cache.
+
+        Raises
+        ------
+        ValueError
+            If ``placement`` is neither ``"gpu"`` nor ``"mmap"``, or the cache can't be built
+            (see :meth:`build`).
+
+        Notes
+        -----
+        Q-98: the files; Q-99: how training chooses the placement.
+        """
         if placement not in _CACHE_PLACEMENTS:
             raise ValueError(f"placement must be one of {_CACHE_PLACEMENTS}, got {placement!r}")
         directory = cls.build(dataset, directory=directory)
@@ -1935,12 +2719,28 @@ class FrameCache:
 
     @property
     def nbytes(self) -> int:
-        """The size of the cache's files."""
+        """The size of the cache's files on disk, in bytes."""
         return sum(p.stat().st_size for p in self.directory.glob("*.safetensors"))
 
     def frame(self, index: int) -> Tensor:
-        """Training image `index` as uint8 [H, W, 3]: a view in GPU memory, or read from the
-        memory-mapped file onto the CPU."""
+        """Return training image ``index`` from the cache.
+
+        Parameters
+        ----------
+        index
+            The record's position in :attr:`MultiViewVideo.records`; a training image.
+
+        Returns
+        -------
+        torch.Tensor
+            The image, [H, W, 3] uint8 on 0–255: a view in GPU memory for ``"gpu"``, or read
+            from the memory-mapped file onto the CPU for ``"mmap"``.
+
+        Raises
+        ------
+        IndexError
+            If ``index`` isn't a training image of the cache.
+        """
         if index not in self._where:
             raise IndexError(f"record {index} is not a training image of this cache")
         k, row = self._where[index]
@@ -1952,11 +2752,33 @@ class FrameCache:
 
 
 class Prefetcher:
-    """Images in a known order, read ahead (D-51; Q-84, Q-99): `schedule` gives the upcoming
-    training record indices, `take` returns one as float32 [H, W, 3] in [0, 1] on `device`,
-    bitwise equal to `MultiViewVideo.load_image`. On CUDA a thread copies frames through a ring
-    of pinned buffers on a side stream, and the current stream waits on each copy's event; on the
-    CPU the thread reads ahead; `depth` 0 reads each image when it is taken."""
+    """Reads a frame cache's images ahead, in the order training takes them (D-51).
+
+    :meth:`schedule` gives the upcoming training record indices, and :meth:`take` returns
+    one as float32 [H, W, 3] in [0, 1] on ``device``, bitwise equal to
+    :meth:`MultiViewVideo.load_image`. On CUDA a thread copies frames through a ring of pinned
+    buffers on a side stream, and the current stream waits on each copy's event; on the CPU
+    the thread reads ahead.
+
+    Parameters
+    ----------
+    cache
+        The open frame cache the images come from.
+    device
+        Where :meth:`take` returns the images; ``"cuda"`` means the current CUDA device.
+    depth
+        The images read ahead, ≥ 0; 0 reads each image when it is taken, with no thread.
+
+    Raises
+    ------
+    ValueError
+        If ``depth`` isn't an int ≥ 0.
+
+    Notes
+    -----
+    Q-84: the class's members; Q-99: how the prefetcher meets the sampler. §2.4 rule 3: the
+    training thread never waits on the host for a copy.
+    """
 
     def __init__(
         self, cache: FrameCache, *, device: str | torch.device = "cpu", depth: int = 8
@@ -1985,7 +2807,17 @@ class Prefetcher:
         self._misses = 0
 
     def schedule(self, indices: Sequence[int]) -> None:
-        """The upcoming record indices, in the order they will be taken."""
+        """Set the record indices that will be taken next, in order.
+
+        Images already read ahead are kept when the new schedule starts with them, and
+        dropped otherwise.
+
+        Parameters
+        ----------
+        indices
+            The upcoming training record indices, positions in
+            :attr:`MultiViewVideo.records`, in the order :meth:`take` will be called.
+        """
         upcoming = list(indices)
         pending = [index for index, _ in self._pending]
         if upcoming[: len(pending)] == pending:
@@ -1996,8 +2828,27 @@ class Prefetcher:
         self._fill()
 
     def take(self, index: int) -> Tensor:
-        """Record `index`'s image as float32 [H, W, 3] on the device, ready on the current
-        stream; read directly when it isn't next in the schedule."""
+        """Return a record's image on the device, ready on the current stream.
+
+        An image that isn't next in the schedule is read directly, and the rest of the
+        schedule is dropped.
+
+        Parameters
+        ----------
+        index
+            The training record's position in :attr:`MultiViewVideo.records`.
+
+        Returns
+        -------
+        torch.Tensor
+            The image, [H, W, 3] float32 in [0, 1] on the prefetcher's device, bitwise equal
+            to :meth:`MultiViewVideo.load_image`.
+
+        Raises
+        ------
+        IndexError
+            If ``index`` isn't a training image of the cache.
+        """
         if self._pending and self._pending[0][0] == index:
             _, future = self._pending.popleft()
             item = future.result()
@@ -2011,6 +2862,7 @@ class Prefetcher:
         return image
 
     def close(self) -> None:
+        """Drop the images read ahead and stop the reading thread, waiting for it."""
         self._drop()
         if self._executor is not None:
             self._executor.shutdown(wait=True)
@@ -2028,8 +2880,11 @@ class Prefetcher:
             self._release(future.result())
 
     def _buffer(self, shape: tuple[int, ...]) -> Tensor:
-        """A buffer of the worker's ring, called on the worker thread only: waiting there for
-        the buffer's last copy keeps the wait off the training thread (§2.4 rule 3)."""
+        """Return a buffer of the worker's ring, called on the worker thread only.
+
+        Waiting there for the buffer's last copy keeps the wait off the training thread (§2.4
+        rule 3).
+        """
         with self._lock:
             free = self._free.get(shape)
             entry = free.pop() if free else None
@@ -2047,13 +2902,15 @@ class Prefetcher:
                 self._free.setdefault(tuple(buffer.shape), []).append((buffer, event))
 
     def _load(self, index: int, *, ring: bool) -> tuple[Tensor, Any, Tensor | None]:
-        """Record `index`'s frame on the device, copied through a pinned buffer on the side
-        stream. `ring`: the worker's own ring of buffers, reused after waiting on their last
+        """Load record `index`'s frame on the device, through a pinned buffer on the side stream.
+
+        `ring`: the worker's own ring of buffers, reused after waiting on their last
         copy. Otherwise, on the training thread (`depth` 0, or a frame read out of order), a
         fresh block of PyTorch's caching pinned allocator, dropped after the copy: the copy
         records its event on the block, which the allocator reuses only once that event has
         completed, checked without waiting, so the training thread never waits on the host
-        for an earlier copy (§2.4 rule 3). The bytes copied are the same either way."""
+        for an earlier copy (§2.4 rule 3). The bytes copied are the same either way.
+        """
         frame = self._cache.frame(index)
         if frame.device == self._device or not self._cuda:
             return frame, None, None
