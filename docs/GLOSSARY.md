@@ -698,6 +698,10 @@ _Avoid_: golden file, reference run (a run, not its stored result), snapshot
 A pass criterion or budget marked "calibrated" in the spec: set once from analytic expectations or the first reference run, then frozen; the first measured values go to the Calibration data table of questions.md, and changing it needs a logged reason. §3.2, §3.4
 _Avoid_: tuned threshold, empirical limit, magic number
 
+**Regression floor**:
+B-7's calibrated budget on a trained model: the rendering speed it must keep, set at 90 % of what its scene's default model measured with the temporal index on at 1920×1080 and the recorded primitive count, on the card that measured it, and judged on that request alone; a model of another scene, count or card has none and is read against the reference outcome. §3.4 B-7, Q-239, Q-240
+_Avoid_: budget FPS, minimum FPS, target FPS (the reference outcome is the paper's figure), pass mark
+
 **Exact optimization**:
 A performance change that alters results only through floating-point rounding, on by default once a benchmark shows a gain. §2.4, D-49
 _Avoid_: lossless, safe path, free speed-up

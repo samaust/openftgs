@@ -4,7 +4,7 @@ codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (D-88), B-1
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
 D-50, Q-13), B-4 (`bench losses`; D-52, Q-173, Q-190), B-5 (`bench adam`; D-53, Q-188),
 B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), B-7 (`bench render`; D-55, Q-174, Q-194,
-Q-195), B-8 (`bench init` and `bench convert`; D-48,
+Q-195, Q-239, Q-240), B-8 (`bench init` and `bench convert`; D-48,
 D-56, D-81, Q-169, Q-192, Q-193), the seeded model synthesizer of the benchmark
 setups (Q-168), and the exit codes of a run cut short (Q-166 as answered, Q-199).
 
@@ -482,6 +482,65 @@ def test__threshold_is_the_largest_break_even_and_at_least_2() -> None:
     assert _threshold([4, None, 8]) == 8
     assert _threshold([1, None, 1]) == 2
     assert _threshold([None, None]) is None
+
+
+def test__b7_floor_is_the_calibration_rows_floor_for_the_trained_model() -> None:
+    """Q-239 (the Calibration row of 2026-10-21): B-7's budget on the model given is the floor
+    recorded for its scene, keyed by the manifest's `metadata.source`, the model's N and the
+    card the floors were measured on: kitchen 169, courtyard 198 and studio 136 FPS at
+    N = 3,000,000 on an RTX 4090 (the card the Calibration rows name; its device string as the
+    stored baselines' environment block records it); none at another N, on a scene without a
+    recorded floor or without `source`, or on another card (Q-240)."""
+    from openftgs.cli._bench import _b7_floor
+
+    n, gpu = 3_000_000, "NVIDIA GeForce RTX 4090"
+    assert _b7_floor("n3dv/kitchen", n, gpu) == 169.0
+    assert _b7_floor("opencv-yaml/courtyard", n, gpu) == 198.0
+    assert _b7_floor("selfcap/studio", n, gpu) == 136.0
+    assert _b7_floor("n3dv/kitchen", 1_000_000, gpu) is None  # another N
+    assert _b7_floor("n3dv/flame_steak", n, gpu) is None  # no recorded floor
+    assert _b7_floor(None, n, gpu) is None  # a manifest without `source`
+    assert _b7_floor("n3dv/kitchen", n, "NVIDIA GeForce RTX 3090") is None  # another card
+
+
+def test__budget_at_least_passes_at_or_above_the_limit() -> None:
+    """Q-239, Q-180: a budget held from below, as B-7's floor is, passes when the figure is at
+    least the limit, where the other budgets pass at most at it; the entry keeps Q-166's keys."""
+    from openftgs.cli._bench import _budget
+
+    case = {"n": 3_000_000, "active": None, "times": 300, "index": True, "outputs": "cuda"}
+    at = _budget(case, {"fps": 169.0, "request_s": 1.775}, "fps", 169.0, "budget", at_least=True)
+    assert at == {
+        "case": case,
+        "figure": "fps",
+        "limit": 169.0,
+        "value": 169.0,
+        "pass": True,
+        "kind": "budget",
+    }
+    under = _budget(case, {"fps": 168.9}, "fps", 169.0, "budget", at_least=True)
+    assert (under["pass"], under["value"]) == (False, 168.9)
+    assert _budget(case, {"fps": 169.0}, "fps", 169.0, "budget")["pass"] is True  # at most
+    assert _budget(case, {"fps": 169.1}, "fps", 169.0, "budget")["pass"] is False
+
+
+def test__b7_floor_and_budget_hold_each_m17_model_to_its_floor() -> None:
+    """#351's criterion (Q-239, Q-240): for each trained M17 model at N = 3,000,000 on the
+    RTX 4090, the budget entry carries its scene's floor, 169, 198 or 136 FPS (the Calibration
+    row of 2026-10-21), passing at it and failing just under it; the paper's 450 FPS (§1.5) is
+    the reference figure, never one of those limits."""
+    from openftgs.cli._bench import _B7_REFERENCE_FPS, _b7_floor, _budget
+
+    gpu = "NVIDIA GeForce RTX 4090"
+    floors = {"n3dv/kitchen": 169.0, "opencv-yaml/courtyard": 198.0, "selfcap/studio": 136.0}
+    case = {"n": 3_000_000, "active": None, "times": 300, "index": True, "outputs": "cuda"}
+    for source, expected in floors.items():
+        floor = _b7_floor(source, 3_000_000, gpu)
+        assert floor == expected
+        passing = _budget(case, {"fps": expected}, "fps", floor, "budget", at_least=True)
+        failing = _budget(case, {"fps": expected - 0.1}, "fps", floor, "budget", at_least=True)
+        assert (passing["limit"], passing["pass"], failing["pass"]) == (expected, True, False)
+    assert _B7_REFERENCE_FPS == 450.0 and 450.0 not in floors.values()
 
 
 # BENCH.json (Q-166) and B-3, `ftgs bench slice` (§3.4, D-50; Q-13, Q-182), run once on the
@@ -2048,26 +2107,20 @@ def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, A
 
 @pytest.mark.gpu
 @pytest.mark.weights
-def test_b7_holds_the_fps_budget_and_sets_the_threshold(render_bench: dict[str, Any]) -> None:
-    """B-7 (§3.4: ≥ 450 FPS; Q-180, Q-195): a budget entry per model for the requests at
-    every training time with the outputs on the GPU, index on and off, which never changes the
-    exit code; and T, the largest break-even over the models that have one and at least 2, or
-    None when none has."""
+def test_b7_holds_the_synthesized_models_to_no_budget_and_sets_the_threshold(
+    render_bench: dict[str, Any],
+) -> None:
+    """B-7 (§3.4, §1.5; Q-240, Q-195): the synthesized models have no floor, so no budget entry
+    (the exit code is 0 either way), and the setup reports the paper's 450 FPS as a reference
+    beside a null floor; and T, the largest break-even over the models that have one and at
+    least 2, or None when none has."""
     body = render_bench
     cases = _b7_cases(body)
-    assert len(body["budgets"]) == 2 * len(B7_MODELS)
-    for budget in body["budgets"]:
-        case = budget["case"]
-        assert (case["times"], case["outputs"]) == (3, "cuda")
-        figures = cases[(case["n"], case["active"], 3, case["index"], "cuda", None, None)]
-        assert budget == {
-            "case": case,
-            "figure": "fps",
-            "limit": 450.0,
-            "value": figures["fps"],
-            "pass": figures["fps"] >= 450.0,
-            "kind": "budget",
-        }
+    assert body["budgets"] == []
+    setup = body["setup"]
+    assert setup["reference_fps"] == 450.0
+    assert (setup["floor_fps"], setup["floor_source"]) == (None, None)
+    assert "Q-239" in setup["floor_rule"] and "budget_fps" not in setup
     found = [cases[(n, a, None, None, None, None, None)]["break_even_times"] for n, a in B7_MODELS]
     known = [k for k in found if k is not None]
     threshold = cases[(None, None, None, None, None, None, "T")]["distinct_times"]
@@ -2106,7 +2159,47 @@ def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
     assert body["setup"]["frame_dt"] == pytest.approx(0.5)
     models = {(c["case"].get("n"), c["case"].get("active")) for c in body["cases"]}
     assert models == {(32, None), (None, None)}  # the threshold case has neither
-    assert len(body["budgets"]) == 2
+    assert body["budgets"] == []  # Q-239: the scene records no floor
+    assert body["setup"]["floor_fps"] is None
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test__b7_floors_wire_one_budget_entry_on_the_index_on_request(
+    tested_scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring of Q-239's floor through `ftgs bench render`, a private test: with the floor
+    table patched to the test's 64-row model, a 10 FPS floor and this machine's card, a scene
+    whose manifest `source` is in the table gives the model given one budget entry, on the
+    request at every training time with the index on and the outputs on the GPU, passing at or
+    above the floor; the index-off request has none. The recorded floors are the CPU test's."""
+    from openftgs.cli import _bench
+
+    shutil.copytree(tested_scene.parent, tmp_path / "kitchen-like")  # the images beside it
+    scene = tmp_path / "kitchen-like" / tested_scene.name
+    manifest = json.loads(scene.read_text(encoding="utf-8"))
+    manifest["metadata"] = {**manifest.get("metadata", {}), "source": "n3dv/kitchen"}
+    scene.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(_bench, "_B7_FLOORS", {"n3dv/kitchen": (64, 10.0)})
+    monkeypatch.setattr(_bench, "_B7_FLOORS_GPU", torch.cuda.get_device_name())
+    model = _given_model(tmp_path)
+    out = tmp_path / "B-7.json"
+    assert _ftgs("bench", "render", scene, "--out", out, "--model", model) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    cases = _b7_cases(body)
+    [budget] = body["budgets"]
+    on = cases[(64, None, 3, True, "cuda", None, None)]
+    assert budget == {
+        "case": {"n": 64, "active": None, "times": 3, "index": True, "outputs": "cuda"},
+        "figure": "fps",
+        "limit": 10.0,
+        "value": on["fps"],
+        "pass": on["fps"] >= 10.0,
+        "kind": "budget",
+    }
+    setup = body["setup"]
+    assert (setup["floor_fps"], setup["floor_source"]) == (10.0, "n3dv/kitchen")
+    assert setup["reference_fps"] == 450.0
 
 
 @pytest.mark.gpu

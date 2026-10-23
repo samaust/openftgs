@@ -4,9 +4,9 @@ BENCH.json.
 
 Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55, D-56, D-81,
 D-88 (`--model`). Q-166 (BENCH.json and the exit codes), Q-199 (a numerical failure in a
-run), Q-168 (the setups), Q-178 and Q-189
-(B-6), Q-174 (the index threshold T that B-7 sets), Q-194 and Q-195 (B-7), Q-169, Q-192
-and Q-193 (B-8). docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
+run), Q-168 (the setups), Q-178 and Q-189 (B-6), Q-174 (the index threshold T that B-7 sets),
+Q-194, Q-195, Q-239 and Q-240 (B-7), Q-169, Q-192 and Q-193 (B-8).
+docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
 that runs it, and whether it needs CUDA and takes `--model`. The framework checks the scene and
@@ -1675,16 +1675,22 @@ def _budget(
     kind: str,
     *,
     strict: bool = False,
+    at_least: bool = False,
 ) -> dict[str, Any]:
     """A budget entry of BENCH.json (Q-166, Q-180) for one figure of one case: it passes at
-    most at `limit`, or, `strict`, only under it (B-6's "< 1%")."""
+    most at `limit`, or, `strict`, only under it (B-6's "< 1%"), or, `at_least`, at or above
+    it (B-7's floor, Q-239)."""
     value = figures[figure]
+    if at_least:
+        passed = value >= limit
+    else:
+        passed = value < limit if strict else value <= limit
     return {
         "case": case,
         "figure": figure,
         "limit": limit,
         "value": value,
-        "pass": value < limit if strict else value <= limit,
+        "pass": passed,
         "kind": kind,
     }
 
@@ -2171,8 +2177,20 @@ _B7_REPETITIONS = 10  # Q-194: the median of 10 requests
 # Q-194: the request sizes below F that the index's break-even is read from; then F.
 _B7_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128)
 _B7_OUTPUTS = ("cuda", "cpu")  # #231: `render_request`'s outputs on the GPU and on the CPU
-_B7_BUDGET_FPS = 450.0  # §3.4 B-7: ≥ 450 FPS on an RTX 4090 (calibrated)
+# §1.5's 450 FPS: the paper's reference outcome, reported in the setup, never a pass or fail
+# (Q-240); the calibrated budget is the floor table below (Q-239).
+_B7_REFERENCE_FPS = 450.0
 _B7_THRESHOLD_FLOOR = 2  # Q-195: a request at a single time never builds an index
+# Q-239: the owner's calibrated budget (Calibration row, 2026-10-21): a regression floor at
+# 90 % of each trained default model's FPS with the index on, at 1920×1080 and N = 3M, as the
+# owner gave it (measured 187.7, 220.5 and 150.9 FPS), keyed by the scene manifest's
+# `metadata.source` and the model's N, on the card they were measured on.
+_B7_FLOORS: dict[str, tuple[int, float]] = {
+    "n3dv/kitchen": (3_000_000, 169.0),
+    "opencv-yaml/courtyard": (3_000_000, 198.0),
+    "selfcap/studio": (3_000_000, 136.0),
+}
+_B7_FLOORS_GPU = "NVIDIA GeForce RTX 4090"  # Q-239: another card gets the reference figure only
 
 
 def _b7_camera(video: MultiViewVideo) -> Camera:
@@ -2226,6 +2244,19 @@ def _b7_times(video: MultiViewVideo, camera: Camera) -> tuple[list[float], str]:
     if len(taus) > len(own):  # Q-221
         return own, f"the timestamps of {camera.name}, the B-7 camera (Q-221)"
     return taus, "every distinct training timestamp (Q-194)"
+
+
+def _b7_floor(source: object, n: int, gpu: str) -> float | None:
+    """B-7's calibrated floor (Q-239) for the model given with `--model`, of N rows, on the
+    scene whose manifest `metadata.source` is `source`, timed on the card `gpu`: the recorded
+    floor when the source is in the table, N is the recorded one and the card is the one the
+    floors were measured on; None otherwise, the model then held to nothing (Q-240)."""
+    if gpu != _B7_FLOORS_GPU or not isinstance(source, str):
+        return None
+    recorded = _B7_FLOORS.get(source)
+    if recorded is None or recorded[0] != n:
+        return None
+    return recorded[1]
 
 
 def _request_sizes(count: int) -> list[int]:
@@ -2392,9 +2423,13 @@ def _render(ctx: _Context) -> _Result:
     and with the index on and off at fewer times, on synthesized models at N = 1M and 3M with
     1 %, 5 % and 20 % of rows active, or on the model given with `--model` (D-88); per model the
     index's build time, its break-even and the share of evaluation spent rendering; then T, the
-    number of distinct times from which "auto" builds the index (Q-174, Q-194, Q-195).
+    number of distinct times from which "auto" builds the index (Q-174, Q-194, Q-195). A model
+    given is held to its scene's calibrated floor on the index-on request at the F times
+    (Q-239); the paper's 450 FPS is reported as a reference, never a pass or fail (Q-240).
     Everything goes through `render_request` and `evaluate_images`, public names only (Q-153;
     the owner's answer in Q-194)."""
+    import torch
+
     from openftgs.eval import Evaluator
 
     video = ctx.video
@@ -2412,6 +2447,14 @@ def _render(ctx: _Context) -> _Result:
     if ctx.model is not None and ctx.model.frame_dt is not None:
         frame_dt = ctx.model.frame_dt
     split = "test" if any(r.split == "test" for r in video.records) else "train"
+    # Q-239: the calibrated floor of the model given, by the scene's source, the model's N and
+    # the card; none for the synthesized models or an unrecorded scene (Q-240).
+    source = video.manifest.metadata.get("source")
+    floor = (
+        None
+        if ctx.model is None
+        else _b7_floor(source, ctx.model.model.num_gaussians, torch.cuda.get_device_name())
+    )
 
     def models() -> Iterator[tuple[dict[str, Any], FreeTimeGaussians]]:
         if ctx.model is not None:
@@ -2444,16 +2487,9 @@ def _render(ctx: _Context) -> _Result:
                     )
                     timed[index] = figures["request_s"]
                     cases.append({"case": case, "figures": figures})
-                    if k == count and device == "cuda":
-                        budgets.append(
-                            {
-                                "case": case,
-                                "figure": "fps",
-                                "limit": _B7_BUDGET_FPS,
-                                "value": figures["fps"],
-                                "pass": figures["fps"] >= _B7_BUDGET_FPS,
-                                "kind": "budget",
-                            }
+                    if floor is not None and index and k == count and device == "cuda":
+                        budgets.append(  # Q-239
+                            _budget(case, figures, "fps", floor, "budget", at_least=True)
                         )
                 if device == "cuda":
                     on_off[k] = (timed[True], timed[False])
@@ -2492,7 +2528,16 @@ def _render(ctx: _Context) -> _Result:
         "warmup": _WARMUP,
         "repetitions": _B7_REPETITIONS,
         "clock": "wall clock, from a synchronized device to a synchronize after each request",
-        "budget_fps": _B7_BUDGET_FPS,
+        "reference_fps": _B7_REFERENCE_FPS,  # §1.5's target, no pass or fail (Q-240)
+        "floor_fps": floor,
+        "floor_source": source if floor is not None else None,
+        "floor_rule": (
+            "Q-239 (Calibration row, 2026-10-21): 90 % of the trained default model's FPS with "
+            "the index on at 1920×1080 and the recorded N, measured on an RTX 4090, by the "
+            "scene's metadata.source, the model's N and the card, on the F-time request with "
+            "the outputs on the GPU; none for a synthesized model, an unrecorded scene or "
+            "another card (Q-240)"
+        ),
         "build_time": (
             "Q-194 as answered: the one-time request with the index forced on less the same "
             "request forced off, outputs on the GPU"
