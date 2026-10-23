@@ -103,11 +103,30 @@ class _Benchmark:
 def add_parser(commands: Any) -> None:
     """The `bench` command and its options, on the `ftgs` subparsers `commands`."""
     p = commands.add_parser("bench", help="performance benchmarks (§3.4)")
-    p.add_argument("benchmark", choices=tuple(_BENCHMARKS))
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--out", type=Path, required=True, metavar="BENCH.json")
+    # Q-242: the help text, from §2.1's CLI block and the paragraph after it.
+    p.add_argument(
+        "benchmark",
+        choices=tuple(_BENCHMARKS),
+        help="the benchmark: train-step (B-1), raster (B-2), slice (B-3), losses (B-4), "
+        "adam (B-5), data (B-6), render (B-7), init or convert (B-8); all but convert need a "
+        "CUDA device",
+    )
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="BENCH.json",
+        help="the results file to write; exit 0 once the benchmark ran, whatever its budgets",
+    )
     # D-88: train-step and render only.
-    p.add_argument("--model", type=Path, metavar="MODEL")
+    p.add_argument(
+        "--model",
+        type=Path,
+        metavar="MODEL",
+        help="train-step and render only: the model to time, a checkpoint directory or an "
+        "FTGS-IF file (default: seeded synthesized models placed in the scene)",
+    )
     p.set_defaults(run=run)
 
 
