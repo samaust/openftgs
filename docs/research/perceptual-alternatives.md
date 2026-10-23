@@ -291,6 +291,7 @@ the median over 16 renders: frame 0 of the first eight training cameras (cam01 t
 - **Verdicts,** per configuration and metric: "equivalent" when TOST passes after Holm; "better" when the favourable Welch test passes after Holm; "inconclusive" otherwise. Beside every verdict: the mean difference, its Welch 95 % confidence interval, and the seeds a side that `k_for_power` gives for 80 % power at the margin. A configuration clearly below A shows in its interval, though no test of "worse" is declared.
 - **Also reported:** the same tests at L3's margins, ±0.25 dB PSNR and ±0.005 SSIM₁.
 - **The caveat:** three seeds a side give little power. Wherever a test fails to conclude, the document says so, with the seeds it would have needed.
+- **Added after A's first seed, before any candidate result** (2026-10-23, the owner's decision at A's gate, #374): a secondary analysis on PSNR outside #329's flagged pixels, `REFERENCE_PSNR.json`'s `overall.union.kept_psnr` (Q-233): cam00's PSNR over the pixels that none of the three flags (clipped, cross-camera, flicker) marks at its default threshold. It gets the same tests (TOST at the owner's ±0.1 dB and L3's ±0.25 dB, the favourable Welch test) in Holm families of its own; the declared tests stay primary. The reason: A at seed 0 gave 27.32 dB against run 20's 29.75 dB with matching training traces, and the gap lies in a strip of cam00 the training cameras barely cover, mostly inside the clipped flags (section 6).
 
 ### 5.8 The metric study
 
