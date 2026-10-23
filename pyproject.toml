@@ -118,7 +118,26 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+# Q-243: pydocstyle's D rules under the NumPy convention, plus D417, which the convention leaves
+# out and which must be selected by its full code: once a docstring has a Parameters section,
+# every parameter is documented there. The documentation site's conf.py stays linted.
+select = ["E", "F", "W", "I", "UP", "B", "D", "D417"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+# Q-243: the tests, by the owner's call; they aren't public API and the site doesn't render them.
+"tests/**" = ["D"]
+# Q-243: the package's private modules, the CLI's among them, are not public API and the site
+# doesn't render them. `[!_]` keeps `__init__.py` and `__main__.py` linted.
+"src/openftgs/_[!_]*.py" = ["D"]
+"src/openftgs/cli/_[!_]*.py" = ["D"]
+# Q-5, Q-243: the harness is a separate distribution, ftgs-harness, that this release doesn't
+# publish and the site doesn't document.
+"harness/**" = ["D"]
+# Q-243: the maintainer scripts are tools run from the repository, not packaged or documented.
+"scripts/**" = ["D"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["openftgs", "ftgs_harness"]
