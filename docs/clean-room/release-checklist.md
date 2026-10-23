@@ -16,11 +16,11 @@ The environments were built fresh under `.scratch/prd-355-release/` (gitignored)
 | --- | --- | --- | --- | --- |
 | `venv-ci-314` (CI's) | 3.14.8 | 2.14.1+cpu | 63 | Passed (exit 0) |
 | `venv-ci-311` (CI's) | 3.11.17 | 2.14.1+cpu | 63 | Passed (exit 0) |
-| `venv-cuda-314` (CUDA) | 3.14.8 | 2.14.1 (cu130) | 82 | **Failed (exit 1)**: 16 rows need the owner's sign-off |
+| `venv-cuda-314` (CUDA) | 3.14.8 | 2.14.1 (cu130) | 82 | Failed (exit 1): 16 rows needed the owner's sign-off; passed after it (below) |
 
 In all three, gsplat 1.5.3 (`UNKNOWN`) matched its existing sign-off, and no row is GPL, AGPL or non-commercial. The two CI environments differ only in versions (numpy 2.5.2 and 2.4.6, scipy 1.18.1 and 1.17.1, contourpy, tifffile); the CUDA environment adds cuda-bindings 13.4.4 and cuda-pathfinder 1.8.4 (both Apache-2.0, which pass), triton 3.8.0 (MIT) and the 16 rows below, and resolves newer numpy (2.5.4) and Pillow (13.0.0) than the PyTorch CPU index serves.
 
-**Needing the owner's sign-off** (CUDA environment only; none is signed off yet). None comes from openftgs's own requirements: torch's Linux wheel requires them (its `Requires-Dist`, `platform_system == "Linux"`), the user installs them with torch, and openftgs never redistributes them. The last column is the license notice the wheel itself ships (Libraries bundled in dependency wheels, below).
+**Needing the owner's sign-off** (CUDA environment only; signed off on 2026-10-23, below). None comes from openftgs's own requirements: torch's Linux wheel requires them (its `Requires-Dist`, `platform_system == "Linux"`), the user installs them with torch, and openftgs never redistributes them. The last column is the license notice the wheel itself ships (Libraries bundled in dependency wheels, below).
 
 | Package | Version | Reported license | Why it is installed | The wheel's notice |
 | --- | --- | --- | --- | --- |
@@ -41,7 +41,15 @@ In all three, gsplat 1.5.3 (`UNKNOWN`) matched its existing sign-off, and no row
 | nvidia-nccl-cu13 | 2.30.7 | `LicenseRef-NVIDIA-Proprietary` | torch directly (`==2.30.7`) | BSD-3-Clause (NVIDIA) |
 | nvidia-nvshmem-cu13 | 3.4.5 | `LicenseRef-NVIDIA-Proprietary` | torch directly (`==3.4.5`) | CUDA Toolkit EULA |
 
-Each sign-off becomes an entry of `scripts/license_signoff.json` keyed on the package, the version (exact, or a pattern the owner chooses) and the reported license string above, after which the CUDA scan is rerun here. Sign-offs: awaiting the owner (2026-10-22).
+**Sign-off, 2026-10-23.** The owner, in the build session, on the 16 rows above: "Yes." Each is an entry of `scripts/license_signoff.json` keyed on the package, its exact version and the reported license string above, with the wheel's notice as `actual`, the reason "Installed by torch's Linux CUDA 13.0 wheel, not by openftgs; installed by the user and never redistributed (Q-4)", source-log row T366.9 as its source, and the date 2026-10-23. A change of version or license string voids it.
+
+**Rerun after the sign-offs**, on 2026-10-23, from `ticket-366-license-scan` with `prd-355-release` at 908cdf1 merged in and the 16 entries added, in the same environments (whose packages are unchanged: the merge changed no dependency, and the licenses job still installs `.[dev,init]` and `harness[lpips]`); the system's Python 3.14 is now 3.14.9, which the 3.14 environments run on:
+
+| Environment | Python | Distributions | Result |
+| --- | --- | --- | --- |
+| `venv-ci-314` | 3.14.9 | 63 | Passed (exit 0); gsplat signed off; the 16 new entries reported as stale, a warning only, since CI's CPU torch installs no NVIDIA wheel |
+| `venv-ci-311` | 3.11.17 | 63 | Passed (exit 0); as `venv-ci-314` |
+| `venv-cuda-314` | 3.14.9 | 82 | **Passed (exit 0)**: gsplat and the 16 rows signed off, nothing stale (Q-4's detecting test) |
 
 ## Libraries bundled in dependency wheels
 
@@ -60,28 +68,28 @@ The notices were then read, each distribution's own LICENSE first (source-log ro
 | Distribution (declared license) | Bundled libraries | Their license, and where it is stated | Outcome |
 | --- | --- | --- | --- |
 | numpy 2.5.2, 2.4.6, 2.5.4 (`BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0`) | `numpy.libs/`: libscipy_openblas64_ | OpenBLAS, BSD-3-Clause, with LAPACK inside it, BSD-3-Clause-Open-MPI (numpy's LICENSE.txt) | Pass |
-| | libgfortran | GCC runtime library, GPL-3.0-or-later WITH GCC-exception-3.1 (numpy's LICENSE.txt) | **Sign-off** (runtime exception) |
-| | libquadmath | LGPL-2.1-or-later (numpy's LICENSE.txt) | **Sign-off** (LGPL) |
+| | libgfortran | GCC runtime library, GPL-3.0-or-later WITH GCC-exception-3.1 (numpy's LICENSE.txt) | **Signed off** (runtime exception; 2026-10-23) |
+| | libquadmath | LGPL-2.1-or-later (numpy's LICENSE.txt) | **Signed off** (LGPL; 2026-10-23) |
 | scipy 1.18.1, 1.17.1 (`BSD License`) | `scipy.libs/`: libscipy_openblas | OpenBLAS and LAPACK, as numpy's (scipy's LICENSE.txt) | Pass |
-| | libgfortran (two copies) | GPL-3.0-or-later WITH GCC-exception-3.1 (scipy's LICENSE.txt) | **Sign-off** (runtime exception) |
-| | libquadmath (two copies) | LGPL-2.1-or-later (scipy's LICENSE.txt) | **Sign-off** (LGPL) |
-| opencv-python-headless 5.0.0.93 (`Apache Software License`; the packaging's LICENSE.txt is MIT) | `opencv_python_headless.libs/`: libavcodec, libavformat, libavutil, libswresample, libswscale | FFmpeg, LGPL-2.1 (LICENSE-3RD-PARTY.txt) | **Sign-off** (LGPL) |
-| | libgfortran | No section in opencv's notice; GPL-3.0-or-later WITH GCC-exception-3.1 by numpy's notice for the same library | **Sign-off** (runtime exception) |
-| | libquadmath | No section in opencv's notice; LGPL-2.1-or-later by numpy's notice | **Sign-off** (LGPL) |
+| | libgfortran (two copies) | GPL-3.0-or-later WITH GCC-exception-3.1 (scipy's LICENSE.txt) | **Signed off** (runtime exception; 2026-10-23) |
+| | libquadmath (two copies) | LGPL-2.1-or-later (scipy's LICENSE.txt) | **Signed off** (LGPL; 2026-10-23) |
+| opencv-python-headless 5.0.0.93 (`Apache Software License`; the packaging's LICENSE.txt is MIT) | `opencv_python_headless.libs/`: libavcodec, libavformat, libavutil, libswresample, libswscale | FFmpeg, LGPL-2.1 (LICENSE-3RD-PARTY.txt) | **Signed off** (LGPL; 2026-10-23) |
+| | libgfortran | No section in opencv's notice; GPL-3.0-or-later WITH GCC-exception-3.1 by numpy's notice for the same library | **Signed off** (runtime exception; 2026-10-23) |
+| | libquadmath | No section in opencv's notice; LGPL-2.1-or-later by numpy's notice | **Signed off** (LGPL; 2026-10-23) |
 | | libopenblasp | No section in opencv's notice; OpenBLAS, BSD-3-Clause, by numpy's notice | Pass |
 | | libvpx, libaom, libavif, libpng16 | BSD-3-Clause, BSD-2-Clause, BSD-2-Clause and the libpng license (LICENSE-3RD-PARTY.txt) | Pass |
-| | libdrm | No notice in any installed wheel | **Owner's call** (unknown) |
+| | libdrm | No notice in any installed wheel; libdrm's own release 2.4.134 ships no license file, and its README states no license (source-log row T366.11) | **Open**: its license is not yet established (below) |
 | pillow 12.3.0, 13.0.0 (`MIT-CMU`) | `pillow.libs/`: libavif, libbrotlicommon, libbrotlidec, libfreetype, libharfbuzz, libjpeg, liblcms2, liblzma, libopenjp2, libpng16, libsharpyuv, libtiff, libwebp, libwebpdemux, libwebpmux, libXau, libxcb, libzstd | Each has a section in Pillow's LICENSE (libsharpyuv under libwebp's), all permissive: MIT or MIT-style (brotli, HarfBuzz's "Old MIT", Little CMS, libXau, libxcb), BSD (libavif, libwebp, OpenJPEG, zstd), the IJG terms (libjpeg), the libpng license, the libtiff license; FreeType is offered under the FreeType License or GPL-2.0, and the FreeType License is taken; liblzma is in the public domain | Pass |
 | torch 2.14.1+cpu, 2.14.1 (`Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT`) | `torch/lib/`: libtorch, libtorch_cpu, libtorch_python, libtorch_global_deps, libc10, libshm, and test libraries (CPU build); plus libtorch_cuda, libtorch_cuda_linalg, libtorch_nvshmem, libc10_cuda, libcaffe2_nvrtc (CUDA build) | torch's own builds, under torch's LICENSE | Pass |
-| | libgomp.so.1 | No notice in torch's wheel. GCC's OpenMP runtime, by its `GOMP_1.0` to `GOMP_5.0` symbol versions and its "gcc 8.5.0" build note; GCC licenses it GPL-3.0-or-later WITH GCC-exception-3.1, as numpy's notice states for its sibling libgfortran | **Sign-off** (runtime exception) |
+| | libgomp.so.1 | No notice in torch's wheel. GCC's OpenMP runtime, by its `GOMP_1.0` to `GOMP_5.0` symbol versions and its "gcc 8.5.0" build note; GCC licenses it GPL-3.0-or-later WITH GCC-exception-3.1, as numpy's notice states for its sibling libgfortran | **Signed off** (runtime exception; 2026-10-23) |
 | torchvision 0.29.1+cpu, 0.29.1 (`BSD`) | `torchvision.libs/`: libjpeg, libpng16, libsharpyuv, libwebp, libz | torchvision's wheel ships only its own BSD-3-Clause LICENSE; libjpeg-turbo, libpng, libwebp (with libsharpyuv) and zlib are permissive by Pillow's sections for the same libraries | Pass |
-| | libcudart, libnvjpeg (CUDA build only) | No notice in torchvision's wheel. NVIDIA's CUDA runtime and nvJPEG: both are listed in Attachment A of the CUDA Toolkit EULA (the notice of nvidia-cuda-runtime) as distributable portions | **Owner's call** (proprietary, inside a BSD wheel) |
-| triton 3.8.0 (`MIT`; CUDA environment) | `triton/backends/nvidia/lib/cupti/` and `cupti-blackwell/`: libcupti, libnvperf_host, libnvperf_target, libpcsamplingutil, libcheckpoint | No notice in triton's wheel, whose only notice is its MIT LICENSE. NVIDIA's CUPTI: listed in Attachment A of the CUDA Toolkit EULA as distributable | **Owner's call** (proprietary, inside an MIT wheel) |
+| | libcudart, libnvjpeg (CUDA build only) | No notice in torchvision's wheel. NVIDIA's CUDA runtime and nvJPEG: both are listed in Attachment A of the CUDA Toolkit EULA (the notice of nvidia-cuda-runtime) as distributable portions | **Signed off** (proprietary, inside a BSD wheel; 2026-10-23) |
+| triton 3.8.0 (`MIT`; CUDA environment) | `triton/backends/nvidia/lib/cupti/` and `cupti-blackwell/`: libcupti, libnvperf_host, libnvperf_target, libpcsamplingutil, libcheckpoint | No notice in triton's wheel, whose only notice is its MIT LICENSE. NVIDIA's CUPTI: listed in Attachment A of the CUDA Toolkit EULA as distributable | **Signed off** (proprietary, inside an MIT wheel; 2026-10-23) |
 | The 15 NVIDIA runtime wheels (CUDA environment) | `nvidia/cu13/lib/`, `nvidia/cudnn/lib/`, `nvidia/cusparselt/lib/`, `nvidia/nccl/lib/`, `nvidia/nvshmem/lib/`: the wheels' own libraries | Their own notices (License scan, above) | Covered by the license scan's sign-offs |
 
 **Unrecognised layouts**, resolved by hand: `torchvision/_C_stable.so` and `torchvision/image_stable.so` are torchvision's own operator libraries, and `triton/_C/libtriton.so`, `triton/_C/libproton.so`, `triton/plugins/libMLIRDialectPlugin.so`, `triton/plugins/libTritonPluginsTestLib.so` and `triton/instrumentation/libGPUInstrumentationTestLib.so` are triton's own, under each project's license; the classifier leaves them unrecognised because they don't carry CPython's extension suffixes. Outside the shared-library inventory, triton also ships NVIDIA's executables `ptxas`, `ptxas-blackwell`, `cuobjdump` and `nvdisasm` under `triton/backends/nvidia/bin/`.
 
-**Needing the owner's sign-off** (LGPL, and GPL with a runtime exception; the ticket's rule). openftgs bundles none of them: they arrive with the user's install of numpy, scipy, opencv-python-headless (`[dev]` only, the test oracle) and torch.
+**Signed off by the owner** (LGPL, and GPL with a runtime exception; the ticket's rule). openftgs bundles none of them: they arrive with the user's install of numpy, scipy, opencv-python-headless (`[dev]` only, the test oracle) and torch.
 
 | Library | License | Bundled by (versions) | Environments |
 | --- | --- | --- | --- |
@@ -90,9 +98,11 @@ The notices were then read, each distribution's own LICENSE first (source-log ro
 | libgfortran | GPL-3.0-or-later WITH GCC-exception-3.1 | numpy, scipy, opencv-python-headless (versions as above) | all three |
 | libgomp | GPL-3.0-or-later WITH GCC-exception-3.1 | torch 2.14.1+cpu and 2.14.1 | all three |
 
-**For the owner's decision** (not in the ticket's sign-off rule, but proprietary or unknown, which Q-4 sends to a sign-off when it is a distribution's declared license): NVIDIA's libcudart and libnvjpeg inside torchvision 0.29.1's CUDA wheel; NVIDIA's CUPTI inside triton 3.8.0; libdrm inside opencv-python-headless 5.0.0.93, for which no installed wheel ships a notice.
+**Put to the owner as well** (not in the ticket's sign-off rule, but proprietary or unknown, which Q-4 sends to a sign-off when it is a distribution's declared license): NVIDIA's libcudart and libnvjpeg inside torchvision 0.29.1's CUDA wheel; NVIDIA's CUPTI inside triton 3.8.0; libdrm inside opencv-python-headless 5.0.0.93, for which no installed wheel ships a notice.
 
-Sign-offs: awaiting the owner (2026-10-22).
+**Sign-off, 2026-10-23.** The owner, in the build session, on the four libraries of the table above: "Yes." On the three items put to them: "(a) for the NVIDIA ones and (c) for libdrm", that is, NVIDIA's libcudart and libnvjpeg in torchvision's CUDA wheel and NVIDIA's CUPTI in triton are signed off like the proprietary rows of the license scan, and libdrm's license is to be read on its own project first, passing with no sign-off if it is permissive.
+
+**libdrm, 2026-10-23: open.** Its project's GitLab (`gitlab.freedesktop.org/mesa/drm`) refused the automated request, so its release tarball `https://dri.freedesktop.org/libdrm/libdrm-2.4.134.tar.xz`, the newest, was downloaded into the session's scratchpad and its file names listed: it has no LICENSE, COPYING or other license file. Its `README.rst`, the only top-level documentation, states no license. Nothing else of it was opened, since its license is stated only inside its source files and build files, which the clean-room rules don't open for a project whose license isn't established (source-log row T366.11). The owner decides how it is established.
 
 ## The vendored RoMa
 
@@ -165,7 +175,7 @@ NOTICE also names RoMa's commit, 77f8d68803526dcddfd9b7a46bc76125bdc25f15, as `V
 
 **Never redistributed.** openftgs's wheel and sdist hold no weight file: no `.pth`, `.pt`, `.ckpt`, `.bin` or `.safetensors` in either (the listings of "No dataset material" below). The weights reach a user's machine only from the projects' own hosts, at run time, or with the lpips wheel from PyPI.
 
-**For the owner's attention (no sign-off asked).** Only the AlexNet and VGG16 trunks have no affirmative grant: torchvision's statement is a disclaimer that leaves their terms to their training data. The release notes' account of the weights' terms should say so.
+**For the owner's attention (no sign-off asked).** Only the AlexNet and VGG16 trunks have no affirmative grant: torchvision's statement is a disclaimer that leaves their terms to their training data. The release notes' account of the weights' terms should say so. The owner's decision, 2026-10-23: no sign-off for LPIPS ("Don't sign off LPIPS. I want to find a better alternative."); a replacement is being researched in PRD #373.
 
 ## No dataset material
 
