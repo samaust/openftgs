@@ -149,8 +149,10 @@ def _no_source_buttons_on_stubs(
     context: dict[str, Any],
     doctree: object,
 ) -> None:
-    """Drop the view and edit buttons from the generated API pages, whose sources (the stubs
-    autosummary writes under api/generated/) aren't in the repository."""
+    """Drop the view and edit buttons from the generated API pages.
+
+    Their sources, the stubs autosummary writes under api/generated/, aren't in the repository.
+    """
     if pagename.startswith("api/generated/"):
         context["theme_top_of_page_buttons"] = []
 
