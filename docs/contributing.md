@@ -48,7 +48,8 @@ docstring (Q-243); the API pages render them.
 - `Raises` where the code raises for user input; `Notes` for the other spec citations;
   `Examples` on the entry points users call directly. Examples are shown, not run.
 - Tensors and arrays state their shape, dtype and range or units, as `[N, 3] float32`. Config
-  fields name their provenance tag. A dataclass documents its fields under `Attributes`.
+  fields name their provenance tag. A class's docstring documents its constructor's parameters
+  under `Parameters`, and a dataclass its fields there too, so each shows with its type.
 - Cross-references use full dotted paths across modules (``:func:`~openftgs.render.render` ``);
   code in text takes double backticks. A module constant gets an attribute docstring on the line
   after its assignment.
