@@ -120,6 +120,7 @@ nitpick_ignore: list[tuple[str, str]] = []
 
 extlinks = {
     "repo": (f"{_REPOSITORY}/blob/{_REF}/%s", "%s"),
+    "repotree": (f"{_REPOSITORY}/tree/{_REF}/%s", "%s"),  # a folder of the repository (#358)
     "issue": (f"{_REPOSITORY}/issues/%s", "#%s"),
 }
 
