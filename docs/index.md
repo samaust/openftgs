@@ -9,6 +9,7 @@ the command line `ftgs`. Its source is on GitHub, at
 :maxdepth: 2
 
 installation
+quickstart
 method
 api/index
 ```
