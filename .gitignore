@@ -30,3 +30,7 @@ htmlcov/
 /runs/
 /data/
 /datasets/
+
+# The documentation site's build output and the API stubs autosummary generates (Q-241)
+/docs/_build/
+/docs/api/generated/

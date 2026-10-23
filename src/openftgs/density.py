@@ -106,12 +106,12 @@ class GradStats:
 
     @property
     def g_sum(self) -> Tensor:
-        """[N] float32: the sum of NDC-scaled 2D-mean gradient norms (E10, D-12). Read-only."""
+        """[N] float32, the sum of NDC-scaled 2D-mean gradient norms (E10, D-12). Read-only."""
         return self._g_sum
 
     @property
     def count(self) -> Tensor:
-        """[N] int32: the number of visible camera–primitive pairs summed into g_sum (Q-49)."""
+        """[N] int32, the number of visible camera–primitive pairs summed into g_sum (Q-49)."""
         return self._count
 
     # Q-49: visible in unpacked mode, gaussian_ids in packed mode; no host synchronization.
