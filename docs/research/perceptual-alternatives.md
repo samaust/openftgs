@@ -1,6 +1,6 @@
 # Perceptual loss and metric: alternatives to LPIPS with licensed weights
 
-A research document, written from 2026-10-23 on PRD #373 (which absorbed issue #372), on replacing LPIPS in openftgs's two uses of it, the training loss and the evaluation metric, with something whose pretrained weights carry an explicit permissive grant from their publisher, or on keeping LPIPS. This version holds phase 1, the desk survey (sections 1 to 4), and a draft of phase 2, the test plan (section 5), for the owner's checkpoint 1. Sections 6 to 9 (results, recommendation, what adopting it would change, sources) follow the tests. The document proposes no code and changes no spec item: adopting a replacement is a spec change the owner makes (E7, E16, D-9, D-29, D-68 and §2.1's `perc_net`), followed by its own implementation issue.
+A research document, written from 2026-10-23 on PRD #373 (which absorbed issue #372), on replacing LPIPS in openftgs's two uses of it, the training loss and the evaluation metric, with something whose pretrained weights carry an explicit permissive grant from their publisher, or on keeping LPIPS. This version holds phase 1, the desk survey (sections 1 to 4), and the test plan of PRD #374 (section 5), which replaced #373's phases 2 and 3 after the owner's checkpoint 1. Section 6, the results, follows the tests; sections 7 to 9 (the recommendation, what adopting it would change, the sources) are #373's phase 4. The document proposes no code and changes no spec item: adopting a replacement is a spec change the owner makes (E7, E16, D-9, D-29, D-68 and §2.1's `perc_net`), followed by its own implementation issue.
 
 **Owner decisions behind the work** (2026-10-23, in session; PRD #373):
 
@@ -62,7 +62,7 @@ One table, split by family, with the same columns throughout. Each cell's source
 
 **Whether explicitly licensed originals exist.** Yes, for both architectures: Oxford's Visual Geometry Group releases the original VGG16 and VGG19 (Caffe and MatConvNet files) under Creative Commons Attribution 4.0, with attribution by citing the technical report (T373.7), and Keras's porter states that Keras's VGG16 weights are a port of exactly that release (T373.20). Caffe's BVLC AlexNet, a replication of the original grouped AlexNet, is stated by its publisher to be released for use without restriction, with no named license (T373.15). Neither is the trunk LPIPS was calibrated on.
 
-**Whether LPIPS's linear layers stay valid on such a trunk.** No. lpips builds its trunks with torchvision's constructors and `pretrained=True` (T373.16), so its v0.1 linear layers were learned on torchvision's own weights; they are one non-negative weight per channel of each tapped layer, on channel-normalized features (T373.13), and an independently trained trunk orders and scales its channels arbitrarily, so the weights mean nothing on it (T373.82). The Caffe files also expect BGR images in 0–255 with the mean subtracted, where lpips's scaling layer produces torchvision's standardization (T373.17, T373.82). Two ways remain: use the licensed trunk **uncalibrated**, which the LPIPS paper measured at 67.0 % 2AFC for VGG and 68.9 % for AlexNet on torchvision's trunks, against 69.2 % and 69.8 % calibrated (T373.13), or **recalibrate** the linear layers on BAPPS, whose terms lpips's README does not state (T373.11), which would make openftgs the publisher of new weights. How far an uncalibrated score moves from LPIPS cannot be stated from documents: it is a different distance on a different scale, and 3c measures its agreement instead.
+**Whether LPIPS's linear layers stay valid on such a trunk.** No. lpips builds its trunks with torchvision's constructors and `pretrained=True` (T373.16), so its v0.1 linear layers were learned on torchvision's own weights; they are one non-negative weight per channel of each tapped layer, on channel-normalized features (T373.13), and an independently trained trunk orders and scales its channels arbitrarily, so the weights mean nothing on it (T373.82). The Caffe files also expect BGR images in 0–255 with the mean subtracted, where lpips's scaling layer produces torchvision's standardization (T373.17, T373.82). Two ways remain: use the licensed trunk **uncalibrated**, which the LPIPS paper measured at 67.0 % 2AFC for VGG and 68.9 % for AlexNet on torchvision's trunks, against 69.2 % and 69.8 % calibrated (T373.13), or **recalibrate** the linear layers on BAPPS, whose terms lpips's README does not state (T373.11), which would make openftgs the publisher of new weights. How far an uncalibrated score moves from LPIPS cannot be stated from documents: it is a different distance on a different scale, and the metric study (section 5.8) measures its agreement instead.
 
 | Candidate | Code license | Weights: publisher's statement | Training data | Differentiable | Parameters; cost | Human alignment | New dependency | Maintenance | Fit to `LPIPSLoss` | Bar; fit |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -82,10 +82,10 @@ None of these has learned weights, so all clear the bar; NLPD's few constants we
 | Candidate | Code license | Weights | Training data | Differentiable | Parameters; cost | Human alignment | New dependency | Maintenance | Fit to `LPIPSLoss` | Bar; fit |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | L1 + D-SSIM only (λ_perc = 0) | openftgs | none | none | yes | 0; saves the 92.5 / 138.8 ms | the 3DGS and 3DGS-MCMC recipe (T373.66, T373.67); E7 without its [P] term | none | openftgs's own | no network: `LossConfig.lambda_perc = 0` | passes; **run B** (a candidate, not a module) |
-| MS-SSIM | piq Apache-2.0 (T373.24), torchmetrics Apache-2.0 (§2.3), or openftgs's own on `losses.ssim` | none | none | yes | 0; est. 11 / 18 ms on the PyTorch path (1.3× its SSIM, T373.84) | SRCC 0.80 / 0.80 / 0.55 (T373.26); BAPPS 61.2 traditional, 79.3 CNN (T373.74); as a loss about MAE, with blur and per-channel colour shifts (T373.27) | none if written on `losses.ssim` | own code, or piq (last released 2023-07, T373.70) | fits; negative contrast terms under fractional exponents can give NaN gradients (a 3a check) | passes; reserve (it overlaps E7's D-SSIM) |
+| MS-SSIM | piq Apache-2.0 (T373.24), torchmetrics Apache-2.0 (§2.3), or openftgs's own on `losses.ssim` | none | none | yes | 0; est. 11 / 18 ms on the PyTorch path (1.3× its SSIM, T373.84) | SRCC 0.80 / 0.80 / 0.55 (T373.26); BAPPS 61.2 traditional, 79.3 CNN (T373.74); as a loss about MAE, with blur and per-channel colour shifts (T373.27) | none if written on `losses.ssim` | own code, or piq (last released 2023-07, T373.70) | fits; negative contrast terms under fractional exponents can give NaN gradients (a candidate check, section 5.4) | passes; reserve (it overlaps E7's D-SSIM) |
 | GMSD, MS-GMSD | piq (T373.24) | none | none | yes | 0; est. < 20 / < 30 ms | SRCC 0.80 / 0.85 / 0.58 and 0.81 / 0.85 / 0.59 (T373.26); as a loss: ringing, discards luminance (T373.27) | piq or own | piq last released 2023-07 (T373.70) | grayscale | passes; fails fit as a loss |
 | MDSI | piq | none | none | yes | 0; est. < 20 / < 30 ms | SRCC 0.89 / 0.89 / 0.59 (T373.26); not in Ding's study; gradient-based like GMSD | piq or own | as piq | fits | passes; metric reserve |
-| HaarPSI | piq | none | none | yes | 0; est. < 20 / < 30 ms | SRCC 0.87 / 0.89 / 0.59 (T373.26); not in Ding's study; no BAPPS figure found | piq or own | as piq | fits | passes; metric reserve, computed in 3c |
+| HaarPSI | piq | none | none | yes | 0; est. < 20 / < 30 ms | SRCC 0.87 / 0.89 / 0.59 (T373.26); not in Ding's study; no BAPPS figure found | piq or own | as piq | fits | passes; metric reserve, computed in the metric study |
 | FSIM (FSIMc) | piq | none | none | yes | 0; est. 20–60 / 30–90 ms | SRCC 0.80 / 0.83 / 0.59 (T373.26); BAPPS FSIMc 63.8 (T373.13); as a loss: ringing, unstable (T373.27) | piq or own | as piq | fits | passes; fails fit as a loss |
 | VSI | piq | none | none | yes | 0; est. 20–60 / 30–90 ms | SRCC 0.90 / 0.88 / 0.54 (T373.26); as a loss: ringing, unstable (T373.27) | piq or own | as piq | fits | passes; fails fit as a loss |
 | VIF (VIFp) | piq | none | none | yes | 0; est. 20–60 / 30–90 ms | SRCC 0.61 / 0.65 / 0.50 (T373.26); as a loss: over-enhanced contrast (T373.27) | piq or own | as piq | fits | passes; fails fit |
@@ -144,9 +144,11 @@ Why the 17 fail, in short: torchvision's or timm's ImageNet weights, which their
 
 ### 3.6 How the costs were estimated
 
-Costs not measured are arithmetic (T373.84): a convolutional trunk's multiply-adds at 224² (the publisher's figure) scaled by the pixel count (×27.32 to 1352×1014, ×41.33 to 1920×1080) and divided by VGG16's convolutional 15.4 G, times LPIPS-VGG's measured 92.5 / 138.8 ms; a ViT's linear layers at about its parameter count per token and its attention at 2·n²·d per block, with n = ⌊H/p⌋·⌊W/p⌋ (6,912 tokens for ViT-S/14 at 1344×1008, 10,549 at 1918×1078). Kernel efficiency differs (depthwise convolutions and float32 attention run below the dense convolutions' throughput), so the estimates rank candidates; 3a measures the finalists as B-4 measures LPIPS.
+Costs not measured are arithmetic (T373.84): a convolutional trunk's multiply-adds at 224² (the publisher's figure) scaled by the pixel count (×27.32 to 1352×1014, ×41.33 to 1920×1080) and divided by VGG16's convolutional 15.4 G, times LPIPS-VGG's measured 92.5 / 138.8 ms; a ViT's linear layers at about its parameter count per token and its attention at 2·n²·d per block, with n = ⌊H/p⌋·⌊W/p⌋ (6,912 tokens for ViT-S/14 at 1344×1008, 10,549 at 1918×1078). Kernel efficiency differs (depthwise convolutions and float32 attention run below the dense convolutions' throughput), so the estimates rank candidates; the candidate checks (section 5.4) measure them as B-4 measures LPIPS.
 
 ## 4. The finalists
+
+The finalists below were proposed for checkpoint 1. The owner's decisions there (section 5.1) replaced them: PRD #374 runs every candidate that passed in full, so this section records the survey's ranking, not the run list.
 
 ### 4.1 For the loss
 
@@ -157,12 +159,12 @@ Costs not measured are arithmetic (T373.84): a convolutional trunk's multiply-ad
    - *Cost:* the same convolutions as LPIPS-VGG, so ≈ 92.5 / 138.8 ms; per-iteration cost equal to the baseline's.
    - *Human alignment:* the uncalibrated VGG distance scored 67.0 % on BAPPS 2AFC on torchvision's sibling trunk, against 69.2 % calibrated (T373.13); untested on Oxford's trunk; VGG features are the classic perceptual loss, which lpips's README calls closer to it than AlexNet when optimizing (T373.11).
    - *Why:* the smallest change from E7's term: same architecture, layers and cost, a publisher's grant on the weights, and no calibration data.
-   - *Open:* which file to convert (the Caffe model, MatConvNet's `.mat`, which SciPy reads only if it is not MAT 7.3, or Keras's HDF5 port) is settled in 3a; the converted weights cannot ship in the wheel (§2.3's note), so a user's first run would download Oxford's file and convert it.
+   - *Open:* which file to convert (the Caffe model, MatConvNet's `.mat`, which SciPy reads only if it is not MAT 7.3, or Keras's HDF5 port) is settled by the candidate checks (section 5.4); the converted weights cannot ship in the wheel (§2.3's note), so a user's first run would download Oxford's file and convert it.
 2. **DINOv2-S: an uncalibrated distance on DINOv2 ViT-S/14 features.**
-   - *What:* patch tokens of four evenly spaced blocks (for example 3, 6, 9 and 12), channel-normalized, squared differences averaged as in LPIPS, on the image cropped to a multiple of 14 and standardized as DINOv2 expects. **Default: half resolution** (the render and the target downsampled by 2 before the trunk, about 676×507, cropped to 672×504), since full resolution fails the cost criterion by the estimate below and kitchen's default run already peaks at 23.5 GB of the card's 24; full resolution replaces it only if 3a measures it no slower than LPIPS-VGG and within the memory headroom. L1 and D-SSIM keep the full-resolution detail either way.
+   - *What:* patch tokens of four evenly spaced blocks (for example 3, 6, 9 and 12), channel-normalized, squared differences averaged as in LPIPS, on the image cropped to a multiple of 14 and standardized as DINOv2 expects. **Default: half resolution** (the render and the target downsampled by 2 before the trunk, about 676×507, cropped to 672×504), since full resolution fails the cost criterion by the estimate below and kitchen's default run already peaks at 23.5 GB of the card's 24; full resolution replaces it only if the candidate checks measure it no slower than LPIPS-VGG and within the memory headroom. L1 and D-SSIM keep the full-resolution detail either way.
    - *Code license:* the vendored DINOv2 layers, Apache-2.0 (D-65), and openftgs's distance.
    - *Weights' publisher statement:* Meta, DINOv2 code and weights under Apache-2.0: https://github.com/facebookresearch/dinov2 (README, "License") (T373.34); file `dinov2_vits14_pretrain.pth` on `dl.fbaipublicfiles.com`.
-   - *Cost:* est. 1.4× / 2× LPIPS-VGG at full resolution, about 0.15× at half resolution (section 3.6): it meets "no higher than LPIPS-VGG" only at reduced resolution unless 3a measures better.
+   - *Cost:* est. 1.4× / 2× LPIPS-VGG at full resolution, about 0.15× at half resolution (section 3.6): it meets "no higher than LPIPS-VGG" only at reduced resolution unless the candidate checks measure better.
    - *Human alignment:* training-free DINOv2 ViT-B features score SRCC 0.722 on TID2013 and 0.573 on PIPAL, below DINO v1's 0.786 and 0.637 (T373.73); no BAPPS figure; self-supervised features generally track human judgments (T373.13).
    - *Why:* the only modern trunk with an explicit grant on its weights that is already in the dependency tree, with no new package.
 3. **ꟻLIP (LDR) as a loss, the weight-free reserve.**
@@ -181,13 +183,13 @@ Run B, λ_perc = 0, is itself the weight-free answer for the loss: the 3DGS reci
 2. **LASI.** Weight-free, so nothing to license, and on BAPPS level with uncalibrated LPIPS and well above MS-SSIM (73.8 / 81.4 / 70.2 against 73.3 / 83.1 / 71.7 and 61.2 / 79.3 / 64.6 on the traditional, CNN and super-resolution subsets) (T373.74). Its reference code is unlicensed JAX (T373.75), so openftgs would write it from the paper; cost of the MS-SSIM class per its authors, to be measured.
 3. **ꟻLIP (LDR).** Weight-free, BSD-3-Clause (T373.28), designed for rendered images against ground truth and validated by its authors on that task (T373.32), with error maps that serve the owner's visual comparison; no standard-benchmark figures, so it is weaker on the first metric criterion.
 
-The metric study (3c) also computes, at little cost, HaarPSI and MDSI (the best TID2013 and KADID-10k figures in piq's table, T373.26), MS-SSIM, DINOv2-S, and LPIPS-Alex and -VGG as measurements, so that the ranking of section 5 does not rest on the finalists alone.
+The metric study also computes, at little cost, HaarPSI and MDSI (the best TID2013 and KADID-10k figures in piq's table, T373.26), MS-SSIM, DINOv2-S, and LPIPS-Alex and -VGG as measurements, so that the ranking of section 5 does not rest on the finalists alone.
 
 ### 4.3 What a finalist would add to §2.3
 
 Owner decisions, listed for adoption, not for the tests (the tests install into a scratch venv only):
 
-- **VGG16-CC and AlexNet-CC:** no Python package if Oxford's MatConvNet file reads with SciPy (already core); otherwise h5py (BSD-3-Clause) for Keras's HDF5 port, or protobuf (BSD-3-Clause) with Caffe's BSD-2 `caffe.proto` for the Caffe files. Either way, a run-time download from Oxford's or Caffe's host (availability to check in 3a), a conversion step, a cache, and an attribution line for CC BY 4.0 in the documentation and NOTICE.
+- **VGG16-CC and AlexNet-CC:** no Python package if Oxford's MatConvNet file reads with SciPy (already core); otherwise h5py (BSD-3-Clause) for Keras's HDF5 port, or protobuf (BSD-3-Clause) with Caffe's BSD-2 `caffe.proto` for the Caffe files. Either way, a run-time download from Oxford's or Caffe's host (availability checked with the candidate checks), a conversion step, a cache, and an attribution line for CC BY 4.0 in the documentation and NOTICE.
 - **DINOv2-S:** none: the vendored builders and Meta's weights host, as RoMa's DINOv2 ViT-L/14 already uses.
 - **ꟻLIP:** `flip-evaluator` (BSD-3-Clause; no cp314 wheel seen, T373.71) does not carry the PyTorch loss; vendoring the repository's BSD-3 PyTorch file (as D-65 vendors RoMa) or writing it from the paper adds no package.
 - **LASI:** none (openftgs's own code).
@@ -195,70 +197,158 @@ Owner decisions, listed for adoption, not for the tests (the tests install into 
 
 If both uses leave LPIPS, §2.3's lpips row and its torchvision dependency go from the core, and torchmetrics' LPIPS oracle (U-23) with them.
 
-## 5. The test plan (draft for checkpoint 1)
+## 5. The test plan (PRD #374)
 
-Nothing in this section has run. It follows PRD #373's phases 2 and 3; the owner confirms or edits the finalists and the criteria before any GPU time is spent.
+PRD #374, opened on 2026-10-23 after the owner's checkpoint 1, replaces PRD #373's phases 2 and 3 (the test plan and the tests); the draft that stood here for checkpoint 1 is superseded. This section is the plan as declared before any result: it was committed while run A's first seed was still training, before anything had been computed on a render. Section 6 reports what ran against it, and any departure from it.
 
-### 5.1 Setup, held fixed
+### 5.1 The owner's decisions at checkpoint 1 (2026-10-23)
 
-- **Code:** `main` at the research commit (7e70ed7 or the branch's base when the runs start), openftgs installed editable from this worktree into a scratch venv, `.scratch/perceptual/venv-perc-314` (Python 3.14, the CUDA build of PyTorch the shared `.venv` pins); candidate packages (piq, the ꟻLIP loss file, a converter's dependency) only there, each license read first; the shared `.venv` untouched.
-- **Data:** kitchen, M15's conversion at `<m15-runs>/kitchen` (20 cameras × 300 frames at 1352×1014, cam00 held out), its frame cache built beforehand, M17's init points `<m17-runs>/kitchen/init.safetensors`, the default configuration, seed 0 (Q-220).
-- **Runs** under `/home/auss/datasets/openftgs-m18-perceptual/<run>/`, outside the repository; logs with the command, commit, `uptime`, `/usr/bin/time -v` and GPU samples, as M17's.
-- **Prototype code** in `.scratch/perceptual/` (not committed): `candidates.py` (the candidate modules), `checks.py` (3a), `calibrate.py`, `train_with.py` (the seam below), `metric_study.py`, `sheet.py`. The document will record every command, the patch point and the versions.
-- **The seam** (approved with the plan): `train_with.py --loss NAME --lambda λ` replaces `openftgs.train._perceptual_network` with a factory returning a class whose constructor takes `net`, sets `_backbone = net` (so `total_loss`'s check passes for `perc_net = "vgg"`), freezes its parameters, stays in evaluation mode, and whose `forward(pred, gt, *, map_inputs=True)` meets `LPIPSLoss`'s contract; it then runs the trainer as `ftgs train` does, with `LossConfig.lambda_perc` set to λ by a configuration file. It catches a candidate's effect on a real run; it misses what a production implementation would add (precision modes, channels-last, caching).
+1. **The original trunks meet the bar:** Oxford's VGG16 (CC BY 4.0, with attribution) and BVLC's AlexNet ("unrestricted use").
+2. **A repository-wide license counts as the publisher's grant for DINO v1 only.** ConvNeXt v1, Kaiming He's ResNet-50 and the original SqueezeNet stay out.
+3. **Seven measures stay out of the loss runs:** GMSD and MS-GMSD, FSIM, VSI, VIF, NLPD, CW-SSIM and MS-SSIM. They are still computed as metrics.
+4. **DINOv3 and a VGG16 recalibrated on BAPPS stay out.**
+5. **Every loss candidate gets full runs at three seeds,** not a short-run screen or three finalists: section 4's finalists rest on indirect evidence, so every candidate that passed is tested in full, except those excluded for a reason of their own.
+6. **Disk space is limited:** each run's large files are deleted as soon as its results are kept (section 5.10).
+7. **The plan is its own PRD,** #374, related to #373. Phase 4 of #373 (sections 7 to 9 and the recommendation) stays there.
 
-### 5.2 3a. The candidates on their own
+Excluded, with their reasons: OpenCLIP and SigLIP (semantic models built for 224×224 images, unfit for a full-resolution loss or metric); the seven of decision 3, as losses; DINOv3 and a recalibrated VGG16 (decision 4); ConvNeXt v1, ResNet-50 and the original SqueezeNet (decision 2); the 17 candidates that failed the bar (section 3.5). Left to the owner's veto: MDSI and HaarPSI are gradient-based, like the measures Ding et al. found to cause ringing as losses, though Ding did not test these two (T373.27); DINO v1 ViT-S/8 is left out by the cost rule (section 3.6).
 
-- **Sanity,** on kitchen's ground-truth frame 0 of cams 01, 05, 10 and 15 at full resolution: Gaussian noise σ ∈ {1, 2, 4, 8, 16}/255; Gaussian blur σ ∈ {0.5, 1, 2, 4} px; JPEG at quality {90, 70, 50, 30, 10} (Pillow); sub-pixel shifts of {0.25, 0.5, 1} px by bilinear resampling. Each candidate must give 0 (within 10⁻⁶ of its scale) on identical images, grow monotonically along each family, and have finite gradients with respect to the prediction, including at the identity and on a prediction with values above 1 (E7's unclamped Î). Symmetry is recorded, not required (ꟻLIP's HDR form is asymmetric).
-- **Timing,** as B-4 times LPIPS (Q-190): the forward on both images plus the prediction's backward, the median of 30 calls after the first call and 10 warm-ups, in the training path's precision (TF32, autotuning as adopted), at 1352×1014 and 1920×1080, with the machine to itself (`.claude/skills/implement-without-subagents/scripts/machine.py run --exclusive`, as B-4's second run), LPIPS-VGG measured in the same session as the reference; also peak allocated memory.
-- **Conversion** (VGG16-CC, AlexNet-CC): download Oxford's and BVLC's files, record their size and SHA-256, convert, and check the converted VGG16's ImageNet top-1 on a handful of validation images is sane (a smoke check, not a benchmark).
+### 5.2 Setup, held fixed
 
-### 5.3 λ calibration
+- **Code:** branch `docs-perceptual-alternatives` at dfb5076, whose `src/` is `main`'s 7e70ed7. Since validation run 20 (f6047c1, #326), `src/` has changed only in where the frame cache's "auto" places the frames (#325's follow-ups #341 and #348) and in the benchmarks (#351), not in the training arithmetic.
+- **Environment:** a scratch venv, `.scratch/perceptual/venv-perc-314` in this worktree, made with uv from the shared `.venv`'s frozen pins (Python 3.14.9, torch 2.14.1+cu130, torchvision 0.29.1, lpips 0.1.4, gsplat 1.5.3, fused-ssim at a7c48d6, every pin identical), with openftgs editable from the worktree. The candidates' packages go only there, each license read first. The shared `.venv` is fingerprinted (its files' paths, sizes and modification times) before and after.
+- **Data:** kitchen, M15's conversion at `<m15-runs>/kitchen` with its frame cache (20 cameras × 300 frames at 1352×1014, cam00 held out), M17's init points `<m17-runs>/kitchen/init.safetensors`, the default configuration, seeds 0, 1 and 2. All read only, fingerprinted likewise before and after.
+- **Run folders:** `/home/auss/datasets/openftgs-m18-perceptual/`, outside the repository: `runs/<config>-s<seed>/` while a run is live, `kept/<config>-s<seed>/` for what stays, `kept/common/` for the fixed inputs (the test request, the crop windows, the checks, the calibration), `weights/` for the downloaded and converted weights.
+- **Prototype code,** not committed, archived under `kept/code/` at the end: `common.py`, `configs.py`, `make_common.py` (the test request and the crop windows), `train_with.py` (the seam), `pipeline.py` (one run's stages), `candidates.py` (the loss and metric modules), `converters.py` (the Caffe weights), `checks.py`, `calibrate.py`, `metric_runner.py`, `crops.py`, `verify.py`, `study.py` (the statistics and the metric study) and `sheet.py` (the blind comparison). Each run's `candidate.json` records the code's SHA-256.
+- **The seam,** approved with #373's plan: `train_with.py` replaces `openftgs.train._perceptual_network` with a factory returning the candidate's class, then calls `openftgs.cli.main(["train", …])`, so each run is `ftgs train`'s own. The class takes `net`, sets `_backbone = net`, freezes its parameters, stays in evaluation mode, and meets `LPIPSLoss`'s `forward(pred, gt, *, map_inputs=True)` on `[..., H, W, 3]` floats, Î unclamped (Q-41). Every run's `config.json` therefore says `perc_net: vgg`; the `candidate.json` beside it names the real candidate, its λ, its resolution, its seed, the commit and the code's digest. A and B run without the seam, B with the configuration file `{"loss": {"lambda_perc": 0.0}}`. The trainer's channels-last conversion of the perceptual network (`_CHANNELS_LAST_WEIGHTS`, Q-173) is off at this commit, so no candidate meets it and the ViTs need no check for it. Under the seam each candidate runs with the training path's flags: TF32 convolutions, IEEE float32 matrix products, cuDNN autotuning (D-52, Q-73, Q-173).
 
-λ_perc = 0.01 was tuned for LPIPS. For each loss finalist c, λ_c = 0.01 · median_i ‖∇_Î LPIPS-VGG(Î_i, I_i)‖₂ / ‖∇_Î L_c(Î_i, I_i)‖₂ over 8 training images (frame 0 of the first 8 training cameras), with Î_i rendered from two models: M17's trained kitchen model at #326 (row 20's checkpoint, `<m17-runs>/kitchen/default-326`) and the initialization (iteration 1). The trained-model value is used, since most of training is near convergence; both values and their spread are recorded, and if they differ by more than a factor of 2 the owner is told before the runs.
+### 5.3 The loss configurations: 13 × seeds 0, 1 and 2, so 39 full runs
 
-### 5.4 3b. The training runs
-
-| Run | Loss | λ_perc | Estimated wall time |
+| Run | Candidate | Weights and source | Resolution of the trunk |
 | --- | --- | --- | --- |
-| A | LPIPS-VGG (the baseline) | 0.01 | 57 min (rows 2 and 20 of the validation runs: 58 min 18 s and 56 min 20 s) |
-| B | L1 + D-SSIM only | 0 | about 15–20 min: the perceptual loss is 82 % of a grown iteration (B-1), so the rest is about 21 ms of 118 |
-| C | VGG16-CC | λ_C from 5.3 | about 57 min (the same convolutions) |
-| D | DINOv2-S, at half resolution by default (section 4.1) | λ_D from 5.3, calibrated at the resolution the run uses | about 25 min at half resolution; 60–90 min if 3a clears full resolution (est.) |
-| E (optional) | the better of C and D | λ at 3× or ⅓× its calibrated value, on the side the owner picks | as C or D |
-| F (optional) | ꟻLIP | λ_F from 5.3 | about 20–25 min (est.) |
+| A | LPIPS-VGG, the reference | torchvision's VGG16 (the current loss) | full |
+| B | λ_perc = 0: L1 + D-SSIM only | none | — |
+| C1 | VGG16-CC: LPIPS's distance uncalibrated, five layers, equal channel weights | Oxford's VGG16, CC BY 4.0 | full |
+| C2 | AlexNet-CC, the same distance | BVLC's AlexNet, unrestricted use | full |
+| C3 | A-DISTS on Oxford's VGG16, own code from the paper | Oxford's VGG16 | full, shorter side as its paper fixes |
+| D1 | DINOv2 ViT-S/14, a distance over four blocks | Meta, Apache-2.0 (vendored layers, D-65) | half; full only if the checks fit it |
+| D2 | DINOv2 ViT-B/14 | Meta, Apache-2.0 | half |
+| D3 | DINO v1 ViT-S/16 | Meta, Apache-2.0 repository grant (decision 2) | full if the checks fit it, else half |
+| D4 | DINO v1 ViT-B/16 | as D3 | half |
+| F1 | ꟻLIP (LDR) | NVIDIA, BSD-3-Clause; no weights | full |
+| F2 | LASI, own code from the paper | no weights | full |
+| F3 | MDSI | piq, Apache-2.0; no weights | full |
+| F4 | HaarPSI | piq, Apache-2.0; no weights | full |
 
-Each run is `ftgs train $K/scene.json --init $M/kitchen/init.safetensors --out $R/<run>` (A, and B with a configuration file `{"loss": {"lambda_perc": 0.0}}`), or `train_with.py` with the same arguments (C to F); then `ftgs render` on the held-out request (cam00 × 300 frames) and `ftgs eval`. Recorded per run: command, commit, configuration, seed, wall time, peak GPU memory, the N trace, PSNR, SSIM₁, SSIM₂, LPIPS-Alex and LPIPS-VGG (measurements only, for continuity with M17), and every candidate metric of 3c.
+How each is built:
 
-**Acceptance of the baseline:** A must reproduce row 20's kitchen numbers (PSNR 29.75 dB, LPIPS-Alex 0.1850) within the recorded run-to-run spread (0.05 dB, rows 2 and 5); if the code since #326 has moved them, that is reported before the finalists are judged.
+- **C1, VGG16-CC.** Oxford's VGG16 release, converted once to PyTorch. The image, RGB with Î unclamped, is mapped to the release's convention (BGR, times 255, minus the per-channel mean it documents); features after relu1_2, relu2_2, relu3_3, relu4_3 and relu5_3; each feature vector normalized to unit length over channels (ε = 10⁻¹⁰, as lpips); squared differences summed over channels, averaged over space, summed over the five layers. This is lpips's `lpips=False` distance (T373.17) on Oxford's weights.
+- **C2, AlexNet-CC.** The same distance on BVLC's AlexNet, after relu1 to relu5 (before the response normalization and pooling), with the per-channel mean of the release's mean image.
+- **C3, A-DISTS.** Written from its paper (T373.65) on Oxford's VGG16, the input resized so that its shorter side is 256, as the paper fixes.
+- **D1 to D4.** The patch tokens after blocks 3, 6, 9 and 12 of the twelve, each token's vector normalized to unit length, squared differences summed over channels and averaged over tokens, summed over the four blocks; the image standardized with ImageNet's mean and standard deviation, downsampled by 2 (bilinear, antialiased) at half resolution, centre-cropped to a multiple of the patch size, the position embeddings interpolated by the model's own code. DINOv2 through the vendored layers (D-65, T373.33). DINO v1 through the same builder if DINO's weights load into it strictly; otherwise through DINO's Apache-2.0 `vision_transformer.py`, adapted with its attribution.
+- **F1, ꟻLIP.** NVIDIA's `LDRFLIPLoss`, the repository's BSD-3-Clause PyTorch file copied in with its header, at its default pixels per degree.
+- **F2, LASI.** Written from its paper (T373.74); its unlicensed JAX code is never read.
+- **F3, F4.** piq's MDSI (a distance) and 1 − HaarPSI (a similarity), at piq's defaults with a data range of 1.
 
-### 5.5 3c. The metric study and the owner's comparison
+The from-paper implementations (LASI, A-DISTS, and NLPD and CW-SSIM as metrics) are validated by the sanity checks only and are labelled "own implementation, not validated against published figures" wherever their numbers appear. Validating them against TID2013, KADID-10k or BAPPS would mean downloading datasets outside CLAUDE.md's allowed sources; if one of them wins, that validation becomes a precondition of adopting it.
 
-- **Agreement:** every candidate metric (VGG16-CC, AlexNet-CC, LASI, ꟻLIP, HaarPSI, MDSI, MS-SSIM, DINOv2-S, and LPIPS-Alex and -VGG as references) on the 300 test renders of every run: the per-run mean and ranking, and the per-image Spearman correlation with PSNR, SSIM₁ and LPIPS-VGG, pooled over runs and within each run.
-- **Comparison sheet:** the same frames (a static, a moving and the fastest-motion frame of cam00) and three crops per frame from every run, side by side with the ground truth, as PNGs under the run directory, so the owner's eye is the human judgment and the conclusion does not rest on LPIPS.
+### 5.4 The candidate checks
 
-### 5.6 Proposed decision criteria
+Before any candidate trains, each of C1 to F4 is checked on its own:
 
-For the owner to accept or change at checkpoint 1.
+- **Sanity,** on kitchen's ground-truth frame 0 of cam01, cam05, cam10 and cam15 at 1352×1014, under four families of distortion: Gaussian noise of σ ∈ {1, 2, 4, 8, 16}/255 (seeded, clipped to [0, 1]); Gaussian blur of σ ∈ {0.5, 1, 2, 4} px; JPEG at quality 90, 70, 50, 30 and 10 (Pillow 12.3.0); sub-pixel shifts of 0.25, 0.5 and 1 px (bilinear, edges replicated). A candidate passes when:
+  1. on identical images it gives 0, or at most 10⁻⁶ of its value at the strongest noise;
+  2. its mean over the four images increases at every step of every family;
+  3. its gradient with respect to the prediction is finite at the identity, at every distortion, and on a prediction with a 256×256 patch raised by 0.3, above 1 where the image is bright (E7's unclamped Î).
 
-- **A loss** is acceptable when, against A: PSNR at least A's minus 0.1 dB; SSIM₁ at least A's minus 0.002; visibly no worse in the owner's side-by-side crops; per-iteration cost no higher than LPIPS-VGG's (3a's timing).
-- **A metric** is acceptable when: its published human alignment is at least comparable to LPIPS's (BAPPS 2AFC within about 2 points of LPIPS-VGG's 69.2, or SRCC on TID2013 and KADID-10k at least LPIPS-VGG's in the same source); it orders the runs as the owner's visual ranking and PSNR and SSIM do; and its weights clear the bar.
-- A single run per configuration resolves differences above the 0.05 dB seed spread only; a difference within it is reported as no difference.
+  Symmetry is recorded, not required.
+- **Cost,** by B-4's method (§3.4, Q-190): the forward on both images plus the prediction's backward, the median of 30 calls after the first call and 10 warm-ups, at 1352×1014 and 1920×1080, under the training path's flags (section 5.2). LPIPS-VGG on the trainer's adopted path (NCHW inputs, TF32, autotuning) is timed in the same process as the reference. The machine runs nothing else (`machine.py run --exclusive --wait`, with `uptime` recorded).
+- **Memory,** on top of the trained kitchen model: run 20's model (N = 3,000,000) on the GPU with its gradients and its Adam moments allocated, one training view at 1352×1014 rendered with gsplat, then L1, SSIM, the candidate and the backward; torch's peak allocated memory, for each candidate and for LPIPS-VGG in the same process.
+- **Drops,** as the PRD sets them: a candidate is dropped when it fails a sanity check, when its cost at 1352×1014 (kitchen's training size, the size every run trains at) exceeds LPIPS-VGG's, or when it doesn't fit even at half resolution. "Fits" means a peak at most 800 MiB above LPIPS-VGG's: run 20 left 1,072 MiB of the card's 24,564 free at its peak of 23,492 MiB, less a quarter for fragmentation. D1 and D3 run at full resolution when full resolution passes both the cost and the memory rule, else at half; D2 and D4 at half. The cost at 1920×1080 is recorded for an adoption decision, not used to drop. A dropped candidate's numbers are recorded in section 6.
 
-### 5.7 GPU hours
+### 5.5 λ calibration
 
-| Part | Estimate |
-| --- | --- |
-| 3a checks and timings (with conversions) | 0.5 h |
-| λ calibration | 0.2 h |
-| A, B, C, D | 1.0 + 0.3 + 1.0 + 0.4 h (D at half resolution; 1.0–1.5 h at full) |
-| Render and eval of each run (4 × about 10 min) | 0.7 h |
-| 3c metric study and sheet | 0.3 h |
-| **Core total** | **about 4.5 h (5 to 5.5 h with D at full resolution)** |
-| Optional E and F | + 0.5 to 1.0 h and + 0.5 h (with their render and eval), **about 5.5 to 7 h in all** |
+λ_perc = 0.01 was tuned for LPIPS. For each candidate c,
 
-The PRD's estimate of about an hour per run holds for A and C; B, F and a half-resolution D are much shorter.
+λ_c = 0.01 · median ‖∇_Î LPIPS-VGG(Î, I)‖₂ / ‖∇_Î L_c(Î, I)‖₂,
 
-## 6. to 9.
+the median over 16 renders: frame 0 of the first eight training cameras (cam01 to cam08) at 1352×1014, rendered from run 20's trained model and from the initialization (the model the trainer builds from `init.safetensors` before its first step). Each candidate is calibrated at its configuration's resolution, its resizing inside the gradient, under the training path's flags. Both models' medians are recorded; a factor above 2 between them is reported in the interim report.
 
-Results, recommendation, what adopting it would change, and the sources: after the tests.
+### 5.6 The runs
+
+- **Per run,** the pipeline's stages: train the default 30,000 iterations, writing only the final checkpoint; `ftgs render` of the test request (cam00 × 300 frames); `ftgs eval --renders-dir` on those renders, so the reference metrics score the very renders the candidates score (the trainer's own end-of-run METRICS.json is kept too); `scripts/run_summary.py`; `scripts/reference_flaws.py run` (REFERENCE_PSNR.json); every metric of section 5.8 per image; the crop bank (section 5.9); the kept files; the check; the deletion (section 5.10). Each step is logged as M17's were: the command, the commit, `uptime`, `/usr/bin/time -v`, the GPU's memory sampled once a second, and torch's allocator peaks.
+- **Order:** by seed. Every configuration at seed 0 first, A first of all; then seed 1; then seed 2.
+- **A's gate:** A at seed 0 must reproduce validation run 20, PSNR on cam00 within 0.05 dB of 29.752 dB (the recorded run-to-run spread, validation runs 2 and 5). If it doesn't, the owner hears before any other run.
+- **The interim report,** after seed 0: the table of every configuration's metrics and the crop sheet go to the owner. It doesn't stop the runs; the owner may drop a configuration from seeds 1 and 2.
+
+### 5.7 The statistics, declared before any result
+
+- **The values:** per run, the scene means over cam00's 300 test images in `ftgs eval`'s METRICS.json (E16, D-67): PSNR and SSIM₁ are tested; SSIM₂, LPIPS-Alex and LPIPS-VGG are reported as measurements.
+- **The comparisons:** every configuration other than A against A, on PSNR and on SSIM₁, each with its three per-seed values against A's three.
+- **"No worse than LPIPS-VGG":** TOST, two one-sided Welch tests (the harness's `tost_p`), at the owner's margins, ±0.1 dB PSNR and ±0.002 SSIM₁.
+- **"Better":** Welch's test in the favourable direction, the configuration above A: the harness's two-sided `welch_p` halved when the difference is favourable, 1 minus that otherwise.
+- **Correction:** Holm, one family per test and margin, across every compared configuration and both metrics (m = 2 × the configurations compared, 24 if none is dropped), as the harness's L3 corrects (§3.3); α = 0.05.
+- **Verdicts,** per configuration and metric: "equivalent" when TOST passes after Holm; "better" when the favourable Welch test passes after Holm; "inconclusive" otherwise. Beside every verdict: the mean difference, its Welch 95 % confidence interval, and the seeds a side that `k_for_power` gives for 80 % power at the margin. A configuration clearly below A shows in its interval, though no test of "worse" is declared.
+- **Also reported:** the same tests at L3's margins, ±0.25 dB PSNR and ±0.005 SSIM₁.
+- **The caveat:** three seeds a side give little power. Wherever a test fails to conclude, the document says so, with the seeds it would have needed.
+
+### 5.8 The metric study
+
+Every metric candidate runs on every run's 300 test renders, clamped to [0, 1] (D-67), against the converted frames, per image; a run's value is the mean over its images. The candidates: VGG16-CC, AlexNet-CC, A-DISTS (on Oxford's VGG16), DINOv2-S and -B, DINO v1-S and -B, ꟻLIP, LASI, MDSI, HaarPSI, MS-SSIM, GMSD, MS-GMSD, FSIM, VSI, VIF, NLPD and CW-SSIM; for reference, PSNR, SSIM₁, SSIM₂, LPIPS-Alex and LPIPS-VGG, from `ftgs eval`, as measurements only.
+
+**The input conventions,** fixed before anything is computed:
+
+| Metric | Implementation | Input | Resolution | Parameters | Better |
+| --- | --- | --- | --- | --- | --- |
+| PSNR, SSIM₁, SSIM₂, LPIPS-Alex, LPIPS-VGG | `ftgs eval` | RGB in [0, 1]; LPIPS mapped to [−1, 1] (D-68) | full | the spec's (E16) | PSNR, SSIM higher; LPIPS lower |
+| VGG16-CC | own, Oxford's VGG16 | RGB in [0, 1], mapped to the release's BGR, 0–255, mean subtracted | full | five layers, unit-normalized, equal weights | lower |
+| AlexNet-CC | own, BVLC's AlexNet | as VGG16-CC | full | relu1 to relu5 | lower |
+| A-DISTS | own from its paper, Oxford's VGG16 | as its paper | shorter side 256 | the paper's | lower |
+| DINOv2-S, DINOv2-B, DINO-S, DINO-B | own distance, the publisher's weights | RGB standardized with ImageNet's mean and deviation | the loss configuration's (section 5.4) | four blocks | lower |
+| ꟻLIP | NVIDIA's PyTorch file | sRGB in [0, 1] | full | the default pixels per degree | lower |
+| LASI | own from its paper | as its paper | full | the paper's neighbourhood and decay | lower |
+| MDSI | piq | RGB in [0, 1], data range 1 | piq's own size-dependent downsampling | piq's defaults | lower |
+| HaarPSI | piq | as MDSI | as MDSI | piq's defaults | higher |
+| MS-SSIM | piq | as MDSI | full | 11-tap Gaussian, σ 1.5, five scales, the published weights | higher |
+| GMSD, MS-GMSD | piq | as MDSI (piq takes the luminance) | as MDSI | piq's defaults | lower |
+| FSIM | piq, chromatic | as MDSI | as MDSI | piq's defaults | higher |
+| VSI | piq | as MDSI | as MDSI | piq's defaults | higher |
+| VIF | piq's VIFp | as MDSI (luminance) | full | piq's defaults | higher |
+| NLPD | own from its paper | as its paper | full | the paper's constants | lower |
+| CW-SSIM | own from its paper | luminance in [0, 1] | full | the paper's | higher |
+
+**Agreement with PSNR and SSIM:** per image, Spearman's ρ of each metric with PSNR and with SSIM₁, pooled over every run and as the median within runs; across runs, Spearman's ρ and Kendall's τ between each metric's run means and PSNR's and SSIM₁'s. Signs are turned so that a positive value means agreement.
+
+**The owner's blind comparison:**
+
+- **The crops' values:** every metric on every kept crop, the 8-bit crop against the ground truth's.
+- **The pairs:** for each crop window and each pair of runs of different configurations at the same seed, the disagreement d = min(k, M − k)/M, where k of the M candidate metrics prefer the first run's crop. Triplets are taken greedily by d, ties in a seeded random order, at most one per window, and each configuration in at most 13 triplets (2 × 80/13, rounded up): 80 triplets.
+- **The sheet:** one numbered PNG per triplet, 01 to 80: a candidate crop, the ground truth in the middle, the other candidate crop. Which side holds which run is drawn with a fixed seed; the key stays in `kept/blind/key.json`, unseen by the owner until the answers are in.
+- **The answer:** one string of 80 characters, `L` or `R` for the crop closer to the ground truth, `=` for no preference.
+- **The results:** each metric's agreement with the owner's choices, ties left out, with its Clopper–Pearson 95 % interval, beside its rank correlations with PSNR and SSIM. The same choices judge the losses: each configuration's share of the triplets it won, with its interval, beside PSNR and SSIM.
+
+### 5.9 The crop bank
+
+`kept/common/crop-windows.json`, made from the ground truth alone before the first run (`make_common.py`): 30 frames of cam00 (5, 15, …, 295) and four 256×256 windows in each, on a 32-pixel grid: the two of most temporal change |I_t − I_{t−1}|, where reconstructions of a dynamic scene differ, then the two of most gradient energy, none overlapping; 120 windows. Each run's crops are cut from its renders clamped to [0, 1] (D-67) and written as 8-bit PNG; the same windows of the ground truth are cut once.
+
+### 5.10 The disk rule
+
+- **Where:** everything under `/home/auss/datasets/openftgs-m18-perceptual/`. Read only, never written or deleted: the kitchen scene and its frame cache, kitchen's init points, run 20, the dataset, and every other folder.
+- **Per run, in this order:** train, writing only the final checkpoint; evaluate; render; compute every metric per image; cut the crop bank; write the kept files (`config.json`, `candidate.json`, the two METRICS.json, `SUMMARY.json`, `REFERENCE_PSNR.json`, `train_log.jsonl`, the per-image table, the crop bank, the logs with the command, commit, wall time and GPU memory); check that every kept file exists and parses, that the per-image table has every metric of every image and is finite, and that every crop decodes. Only then are that run's checkpoint and renders deleted, each path checked to lie inside the run's own folder first.
+- **If a check fails,** nothing is deleted: the run stops and is reported.
+- **Sizes:** about 2.2 GB of checkpoint and 6.6 GB of float32 renders per run while it is live; about 20 to 30 MB kept per run; the venv and the weights about 10 GB.
+- **The trade-off:** no trained model is kept. A later check that needs one retrains its run, 15 to 60 minutes.
+
+### 5.11 Budget
+
+- **GPU:** about 28 hours: the checks 1 h, the calibration 0.5 h, the 39 runs about 22.5 h plus about 3.5 h to evaluate, render and score them, the metric study 1.5 h. PRD #355's #370 and step 7 wait for it.
+- **Disk:** about 9 GB at a time while a run is live, about 12 GB kept with the venv and the weights.
+- **The owner's time:** the interim report, the blind comparison (about 45 minutes), and #373's checkpoint 2.
+
+## 6. Results
+
+After the tests.
+
+## 7. to 9.
+
+The recommendation, what adopting it would change, and the sources: #373's phase 4, after the results.
