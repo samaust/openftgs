@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FreeTimeGaussians: the nine stored tensors, their activations and at_time(); initialization
-from init points (steps 7–9), the exchange model in both directions, and E5.
+"""FreeTimeGaussians: the nine stored tensors, their activations and at_time().
+
+Also initialization from init points (§1.3 steps 7–9), the exchange model in both directions, and
+E5's rotation and covariance.
 
 Spec: §1.1, §1.3 Initialization, §2.2 ftgs-if, E5, E14. Band: Core model (§2.1).
 """
@@ -40,7 +42,25 @@ _KNN_CHUNK = 1 << 24  # distances held at once by the 3-NN search (rows × point
 
 # E5 (Q-20): public so the render backends and the split of E17 share one definition.
 def rotation_matrix(quats: Tensor) -> Tensor:
-    """R(q/‖q‖) of E5 for quaternions (w, x, y, z): ``[..., 4]`` → ``[..., 3, 3]``."""
+    """Compute the rotation matrices R(q/‖q‖) of quaternions in (w, x, y, z) order (E5).
+
+    The quaternions are normalized first, so their length doesn't matter.
+
+    Parameters
+    ----------
+    quats
+        Quaternions q, ``[..., 4]`` floating point, in the order (w, x, y, z), of any nonzero
+        norm.
+
+    Returns
+    -------
+    torch.Tensor
+        The rotation matrices, ``[..., 3, 3]``, in the dtype of ``quats``.
+
+    Notes
+    -----
+    Q-20: public, so that the render backends and the split of E17 share one definition.
+    """
     q = quats / torch.linalg.vector_norm(quats, dim=-1, keepdim=True)
     w, x, y, z = q.unbind(-1)
     return torch.stack(
@@ -60,7 +80,27 @@ def rotation_matrix(quats: Tensor) -> Tensor:
 
 
 def covariance(quats: Tensor, scales: Tensor) -> Tensor:
-    """Σ = R(q)·S·Sᵀ·R(q)ᵀ with S = diag(a) (E5): ``[..., 4]``, ``[..., 3]`` → ``[..., 3, 3]``."""
+    """Compute the covariances Σ = R(q)·S·Sᵀ·R(q)ᵀ with S = diag(a) (E5).
+
+    R is :func:`rotation_matrix` of the normalized quaternions.
+
+    Parameters
+    ----------
+    quats
+        Quaternions q, ``[..., 4]`` floating point, in the order (w, x, y, z), of any nonzero
+        norm.
+    scales
+        The activated scales a = exp(â), ``[..., 3]``, in world units.
+
+    Returns
+    -------
+    torch.Tensor
+        The covariances, ``[..., 3, 3]``, symmetric, in world units squared.
+
+    Notes
+    -----
+    Q-20: public, so that the render backends and the split of E17 share one definition.
+    """
     rs = rotation_matrix(quats) * scales[..., None, :]  # R·diag(a)
     return rs @ rs.transpose(-1, -2)
 
@@ -68,8 +108,36 @@ def covariance(quats: Tensor, scales: Tensor) -> Tensor:
 # Q-20: the return type of at_time, the temporal slice (Q-12) plus the SH coefficients.
 @dataclass(frozen=True)
 class GaussiansAtTime:
-    """The per-time arrays of §1.1 at one time, with the slice's base opacity, E8 terms and
-    culling mask (Q-12, Q-20)."""
+    """The per-time arrays of §1.1 at one time, with the slice's opacity, E8 terms and cull mask.
+
+    :meth:`FreeTimeGaussians.at_time` returns it: the fields of
+    :class:`~openftgs.motion.TemporalSlice` plus the SH coefficients. N is the number of
+    primitives, and every tensor is float32 on the model's device.
+
+    Parameters
+    ----------
+    means_t
+        The moved positions μx(t), ``[N, 3]``, in world units (E1).
+    opacities_t
+        The effective opacities σ_eff = σ·σt, ``[N]``, in [0, 1] (E3).
+    quats_n
+        The unit quaternions q/‖q‖, ``[N, 4]``, in the order (w, x, y, z).
+    scales
+        The scales exp(â), ``[N, 3]``, in world units.
+    sh
+        The SH coefficients concat(``sh0``, ``shN``), ``[N, (L′ + 1)², 3]``, cut to the requested
+        degree L′.
+    opacities
+        The base opacities σ = sigmoid(ô), ``[N]``, in [0, 1].
+    reg_terms
+        The per-row terms σ·sg[σt] of E8, ``[N]``.
+    passes_cull
+        ``[N]`` bool, True where σ_eff ≥ 1/255, the rows that survive the opacity cull (D-32).
+
+    Notes
+    -----
+    Q-12 defines the slice's fields, and Q-20 this type.
+    """
 
     means_t: Tensor  # [N, 3] μx(t), E1
     opacities_t: Tensor  # [N] σ_eff = σ·σt, E3
@@ -87,17 +155,18 @@ def _fail(reason: str) -> NoReturn:
 
 
 def _check_sh_degree(sh_degree: object, allowed: tuple[int, ...] = _SH_DEGREES) -> int:
-    """An int (not a bool) among `allowed` (D-3)."""
+    """Return ``sh_degree`` if it is an int (not a bool) among `allowed` (D-3)."""
     if isinstance(sh_degree, bool) or not isinstance(sh_degree, int) or sh_degree not in allowed:
         _fail(f"sh_degree must be one of {allowed}, got {sh_degree!r}")
     return sh_degree
 
 
 def _knn_mean_distance(positions: Tensor, k: int, floor: float) -> Tensor:
-    """Mean distance from each point to its min(k, n − 1) nearest others, floored (D-25, Q-21).
+    """Average each point's distance to its min(k, n − 1) nearest others, floored (D-25, Q-21).
 
     Brute force in float64 by chunks of rows, with differences rather than the matrix-product
-    form, so points far from the origin keep their precision. A lone point gets the floor."""
+    form, so points far from the origin keep their precision. A lone point gets the floor.
+    """
     n = int(positions.shape[0])
     if n < 2:
         return torch.full((n,), floor, dtype=torch.float64, device=positions.device)
@@ -115,8 +184,10 @@ def _knn_mean_distance(positions: Tensor, k: int, floor: float) -> Tensor:
 
 
 def _canonical_sign(quats: Tensor) -> Tensor:
-    """Q-24: the sign that makes the first nonzero component positive: w ≥ 0, and where w = 0
-    the next nonzero component decides."""
+    """Flip each quaternion's sign so that its first nonzero component is positive (Q-24).
+
+    So w ≥ 0, and where w = 0 the next nonzero component decides.
+    """
     first = torch.argmax((quats != 0).to(torch.int8), dim=-1, keepdim=True)
     lead = torch.gather(quats, -1, first)
     # + 0.0 turns the −0.0 that a sign flip makes of zero components into +0.0.
@@ -131,7 +202,70 @@ def _producer() -> str:
 
 
 class FreeTimeGaussians(torch.nn.Module):
-    """The nine stored tensors of §1.1, registered as parameters under their own names."""
+    """The nine stored tensors of §1.1, registered as parameters under their own names.
+
+    A :class:`torch.nn.Module` whose parameters are the stored forms of §1.1: ``means``,
+    ``times``, ``log_durations``, ``velocities``, ``log_scales``, ``quats``, ``opacity_logits``,
+    ``sh0`` and ``shN``. :meth:`at_time` gives the per-time arrays a renderer consumes, and
+    :meth:`physical` the activated values. The constructor copies the caller's tensors, so the
+    parameters get their own storage, and checks §1.1's validity rules. The public attributes
+    ``sh_degree``, ``time`` and ``time_unit`` hold the constructor's arguments (Q-20).
+
+    Parameters
+    ----------
+    params
+        The nine stored tensors by name (:attr:`PARAM_NAMES`), each float32, finite and on one
+        device, with N rows: ``means`` ``[N, 3]`` in world units; ``times`` ``[N]`` in
+        normalized time; ``log_durations`` ``[N]``, log s with s in normalized time;
+        ``velocities`` ``[N, 3]`` in world units per unit of normalized time; ``log_scales``
+        ``[N, 3]``, log a; ``quats`` ``[N, 4]`` in the order (w, x, y, z), each of norm above
+        1e-8; ``opacity_logits`` ``[N]``, logit σ; ``sh0`` ``[N, 1, 3]``; ``shN``
+        ``[N, (L + 1)² − 1, 3]``. With a single timestamp (τ₀ = τ₁), ``times`` and
+        ``velocities`` must be 0 (D-71).
+    sh_degree
+        The SH degree L, 0, 1, 2 or 3 (D-3).
+    time
+        The time normalization of the training timestamps (E14).
+    time_unit
+        The unit of raw time τ, as the scene manifest names it; "s" by default (Q-17).
+
+    Raises
+    ------
+    ValueError
+        If ``params`` doesn't hold exactly the nine names, a tensor breaks §1.1's validity
+        rules (its shape, float32, one device, finite values, quaternion norms, D-71's
+        single-timestamp rule), or ``sh_degree`` is not an int among 0 to 3.
+
+    Notes
+    -----
+    §2.1 fixes the signature; Q-17 adds ``time_unit``. Every rejection is a plain ValueError
+    (Q-26). A model starts with :attr:`slice_impl` "auto" (Q-66).
+
+    Examples
+    --------
+    Build a model of four primitives at SH degree 3 and slice it at normalized time 0.5:
+
+    >>> import torch
+    >>> from openftgs.model import FreeTimeGaussians
+    >>> from openftgs.types import TimeNormalizer
+    >>> n = 4
+    >>> params = {
+    ...     "means": torch.randn(n, 3),
+    ...     "times": torch.linspace(0.0, 1.0, n),
+    ...     "log_durations": torch.full((n,), -2.0),
+    ...     "velocities": torch.zeros(n, 3),
+    ...     "log_scales": torch.full((n, 3), -3.0),
+    ...     "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(n, 1),
+    ...     "opacity_logits": torch.zeros(n),
+    ...     "sh0": torch.zeros(n, 1, 3),
+    ...     "shN": torch.zeros(n, 15, 3),
+    ... }
+    >>> model = FreeTimeGaussians(params, sh_degree=3, time=TimeNormalizer(0.0, 10.0))
+    >>> model.num_gaussians
+    4
+    >>> model.at_time(0.5).means_t.shape
+    torch.Size([4, 3])
+    """
 
     PARAM_NAMES = (
         "means",
@@ -144,6 +278,8 @@ class FreeTimeGaussians(torch.nn.Module):
         "sh0",
         "shN",
     )
+    """The names of the nine stored tensors of §1.1, in order; checkpoints and the optimizer use
+    them."""
 
     means: torch.nn.Parameter
     times: torch.nn.Parameter
@@ -183,10 +319,57 @@ class FreeTimeGaussians(torch.nn.Module):
         sh_degree: int = 3,  # Q-16
         n_max: int | None = None,  # Q-16
     ) -> "FreeTimeGaussians":
-        """Initialization steps 7–9 of §1.3 for points from roma_init or supplied through the
-        public interface: at most F·B points in total (D-24), defaults for missing velocities,
-        durations and frame ids (D-23, D-21, D-47), per-frame 3-NN scales (D-25) and the fixed
-        initial values of step 9 (D-5). `frame_dt` is Δt_f (E14)."""
+        """Initialize a model from init points by steps 7–9 of §1.3 (§1.3 Initialization).
+
+        The points come from ``roma_init`` or are supplied through the public interface. At most
+        F·B points are kept in total, a seeded uniform subset in file order, with F frames of
+        the sequence (1 for a single timestamp) and B = ``cfg.points_per_frame``. Missing
+        velocities become 0, missing durations Δt_f, and missing frame ids the nearest slot
+        k·Δt_f. Scales are isotropic: the log of the mean distance to the ``cfg.scale_knn``
+        nearest neighbours in the same frame (3 by default), floored at ``cfg.scale_floor``.
+        Every primitive starts with opacity ``cfg.init_opacity``, the identity rotation,
+        ``sh0`` from its color and ``shN`` = 0.
+
+        Parameters
+        ----------
+        points
+            The initial points: positions ``[N, 3]`` float32 in world units, colors ``[N, 3]``
+            float32 in [0, 1], timestamps ``[N]`` float64 in raw τ and, optionally, velocities
+            in world units per unit of τ, durations in raw τ units and frame ids.
+        time
+            The time normalization of the training timestamps (E14).
+        cfg
+            The initialization settings: B, the opacity, the neighbour count and the scale
+            floor.
+        frame_dt
+            Δt_f, the frame interval in normalized time (E14), finite and positive; it gives F
+            and the missing durations.
+        generator
+            The generator that draws the subset when N exceeds F·B; it isn't used otherwise.
+        sh_degree
+            The SH degree L, 0, 1, 2 or 3 (D-3); 3 by default.
+        n_max
+            N_max, the largest number of primitives; None skips the F·B check.
+
+        Returns
+        -------
+        openftgs.model.FreeTimeGaussians
+            The model, with at most F·B primitives, on the device of ``points.positions``.
+
+        Raises
+        ------
+        ValueError
+            If ``points`` breaks ftgs-init's rules, ``sh_degree`` is not an int among 0 to 3,
+            ``frame_dt`` is not finite and positive, or F·B exceeds ``n_max``.
+
+        Notes
+        -----
+        D-24 and D-74: the cap F·B; D-23, D-21 and D-47: the defaults for velocities,
+        durations and frame ids; D-25: the scales; D-5: step 9's values; D-71: velocities are 0
+        with a single timestamp. Q-16 adds ``sh_degree`` and ``n_max``; Q-21 fixes F, the
+        nearest slot and the subset; Q-22 the validation of the points; Q-27 the unit
+        conversions (E14).
+        """
         validate_init_points(points)  # Q-22
         sh_degree = _check_sh_degree(sh_degree)
         if not (math.isfinite(frame_dt) and frame_dt > 0.0):
@@ -264,8 +447,36 @@ class FreeTimeGaussians(torch.nn.Module):
 
     @classmethod
     def from_exchange(cls, exchange: ExchangeModel, *, device: str = "cuda") -> "FreeTimeGaussians":
-        """A model from exchange-model contents (§2.2 ftgs-if): validated (Q-22), converted to
-        the stored forms in float64, the opacity clamped before the logit."""
+        """Build a model from exchange-model contents (§2.2 ftgs-if).
+
+        The contents are validated, then converted to the stored forms in float64: time centers
+        and durations to normalized time, velocities per unit of normalized time, the logs of
+        durations and scales, the rotations normalized, and the opacity clamped to
+        [1e-7, 1 − 1e-7] before its logit. The model keeps the exchange model's SH degree, time
+        span and time unit.
+
+        Parameters
+        ----------
+        exchange
+            The exchange model, physical values in raw time units.
+        device
+            The device of the parameters; "cuda" by default.
+
+        Returns
+        -------
+        openftgs.model.FreeTimeGaussians
+            The model, its parameters float32 on ``device``.
+
+        Raises
+        ------
+        ValueError
+            If ``exchange`` breaks ftgs-if's rules, or its values break §1.1's validity rules.
+
+        Notes
+        -----
+        Q-22 and Q-24: the validation and the rotations; Q-27: E14's conversions; Q-9: time
+        centers outside the training span are accepted without a warning; Q-17: the time unit.
+        """
         validate_exchange(exchange)
         arrays = exchange.arrays
         time = TimeNormalizer(exchange.tau0, exchange.tau1)
@@ -297,8 +508,34 @@ class FreeTimeGaussians(torch.nn.Module):
 
     @classmethod
     def load(cls, path: Path, *, device: str = "cuda") -> "FreeTimeGaussians":
-        """A model from a checkpoint directory or a ftgs-if file (§2.1). A checkpoint above its
-        stored configuration's N_max is rejected by `io.load_checkpoint` (§1.1; Q-25)."""
+        """Load a model from a checkpoint directory or an ftgs-if file (§2.1).
+
+        A directory is read as an ftgs-checkpoint, with the SH degree of its stored
+        configuration; any other path as an ftgs-if file (§2.2).
+
+        Parameters
+        ----------
+        path
+            A checkpoint directory or an ftgs-if file.
+        device
+            The device of the parameters; "cuda" by default.
+
+        Returns
+        -------
+        openftgs.model.FreeTimeGaussians
+            The model, its parameters float32 on ``device``.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint or file can't be read or breaks its format's rules, or the
+            checkpoint holds more primitives than its stored configuration's N_max (§1.1).
+
+        Notes
+        -----
+        Q-25: :func:`openftgs.io.load_checkpoint` rejects a checkpoint above its N_max. Q-26:
+        the CLI reports this ValueError as invalid input.
+        """
         path = Path(path)
         if not path.is_dir():
             return cls.from_exchange(read_exchange(path), device=device)
@@ -311,8 +548,27 @@ class FreeTimeGaussians(torch.nn.Module):
         )
 
     def physical(self) -> dict[str, Tensor]:
-        """Physical values in raw time units under the ftgs-if keys (§2.2; Q-20): exactly the
-        arrays to_exchange writes, detached."""
+        """Return the activated values in raw time units under the ftgs-if keys (§2.2).
+
+        They are exactly the arrays :meth:`to_exchange` writes, detached, on the model's
+        device.
+
+        Returns
+        -------
+        dict of str to torch.Tensor
+            ``position`` ``[N, 3]`` float32, μx in world units; ``time_center`` ``[N]``
+            float64, τ₀ + μt·T_τ in raw τ; ``duration`` ``[N]`` float64, s·T_τ in raw τ units;
+            ``velocity`` ``[N, 3]`` float32, v/T_τ in world units per unit of τ; ``scale``
+            ``[N, 3]`` float32, exp(â); ``rotation`` ``[N, 4]`` float32, the unit quaternion
+            (w, x, y, z) with its first nonzero component positive; ``opacity`` ``[N]``
+            float32, sigmoid(ô) computed in float64 and clamped to [1e-7, 1 − 1e-7]; ``sh``
+            ``[N, (L + 1)², 3]`` float32. With a single timestamp, durations and velocities use
+            a time unit of 1 instead of T_τ (D-70).
+
+        Notes
+        -----
+        Q-20 names the keys; Q-24 fixes the rotations' sign; Q-27: E14's conversions.
+        """
         time = self.time
         f64 = torch.float64
         with torch.no_grad():
@@ -331,7 +587,18 @@ class FreeTimeGaussians(torch.nn.Module):
             }
 
     def to_exchange(self) -> ExchangeModel:
-        """The exchange model of §2.2 ftgs-if: physical values in raw time units."""
+        """Return the exchange model of §2.2 ftgs-if, physical values in raw time units.
+
+        Returns
+        -------
+        openftgs.types.ExchangeModel
+            The arrays of :meth:`physical`, with the model's SH degree, τ₀, τ₁ and time unit,
+            and the producer "openftgs" followed by the installed version.
+
+        Notes
+        -----
+        The exchange model's background is left at its default, black (D-34, D-84).
+        """
         return ExchangeModel(
             arrays=self.physical(),
             sh_degree=self.sh_degree,
@@ -342,20 +609,36 @@ class FreeTimeGaussians(torch.nn.Module):
         )
 
     def _set_params(self, params: Mapping[str, Tensor]) -> None:
-        """Check the §1.1 validity rules, then register the nine tensors as parameters, sharing
-        their storage."""
+        """Check the §1.1 validity rules, then register the nine tensors as parameters.
+
+        The parameters share the tensors' storage.
+        """
         self._check_params(params)
         for name in self.PARAM_NAMES:
             setattr(self, name, torch.nn.Parameter(params[name].detach()))
 
     # Q-55: public, so that a writer that works in place (relocation) can check §1.1's rules.
     def validate(self) -> None:
-        """Check the §1.1 validity rules on the current parameters; ValueError if one fails.
-        Reads values, so it synchronizes on a GPU (events allow it, §2.4 rule 3)."""
+        """Check the §1.1 validity rules on the current parameters (§1.1).
+
+        The rules are the constructor's: the nine tensors' shapes, float32, one device, finite
+        values, quaternion norms above 1e-8, and zero times and velocities with a single
+        timestamp (D-71). It reads values, so it synchronizes on a GPU (events allow it, §2.4
+        rule 3).
+
+        Raises
+        ------
+        ValueError
+            If a rule fails.
+
+        Notes
+        -----
+        Q-55: public, so that a writer that works in place (relocation) can check §1.1's rules.
+        """
         self._check_params({name: getattr(self, name).detach() for name in self.PARAM_NAMES})
 
     def _check_params(self, params: Mapping[str, Tensor]) -> None:
-        """The §1.1 validity rules, shared by the constructor, resize_ and validate (Q-55)."""
+        """Check the §1.1 validity rules, shared by the constructor, resize_ and validate (Q-55)."""
         if set(params) != set(self.PARAM_NAMES):
             _fail(f"params must hold exactly {self.PARAM_NAMES}, got {sorted(params)}")
         n = int(params["means"].shape[0]) if params["means"].dim() == 2 else -1
@@ -394,7 +677,22 @@ class FreeTimeGaussians(torch.nn.Module):
     # Q-66 (owner answer): public, so the trainer can set PerfConfig.slice_impl on any model.
     @property
     def slice_impl(self) -> _SliceImpl:
-        """The temporal-slice implementation `at_time` runs (D-50, Q-13): "auto" by default."""
+        """The temporal-slice implementation that at_time runs, "auto" by default (D-50).
+
+        One of ``PerfConfig.slice_impl``'s values, "auto", "eager", "compiled" and "cuda", with
+        the meanings of :func:`openftgs.motion.temporal_slice`; the trainer sets it from the
+        configuration.
+
+        Raises
+        ------
+        ValueError
+            On setting a value outside those four.
+
+        Notes
+        -----
+        Q-13: what each value does; Q-66: a public attribute, so the trainer can set it on any
+        model.
+        """
         return self._slice_impl
 
     @slice_impl.setter
@@ -405,11 +703,43 @@ class FreeTimeGaussians(torch.nn.Module):
 
     @property
     def num_gaussians(self) -> int:
+        """The number of primitives N, the rows of every stored tensor (§2.1).
+
+        It changes only through :meth:`resize_`.
+        """
         return int(self.means.shape[0])
 
     def at_time(self, t: float, *, sh_degree: int | None = None) -> GaussiansAtTime:
-        """The per-time arrays at normalized time t (§1.1), with SH cut to `sh_degree` bands
-        (default: the model's degree; Q-20)."""
+        """Compute the per-time arrays at normalized time t (§1.1).
+
+        The positions and opacities come from :func:`openftgs.motion.temporal_slice`, run with
+        :attr:`slice_impl`; the SH coefficients are cut to ``sh_degree`` bands. Outside [0, 1]
+        the motion extrapolates linearly (E1).
+
+        Parameters
+        ----------
+        t
+            The normalized time.
+        sh_degree
+            The SH degree L′ to keep, an int from 0 to the model's degree L; None, the
+            default, keeps L.
+
+        Returns
+        -------
+        openftgs.model.GaussiansAtTime
+            The per-time arrays, float32 on the model's device, differentiable with respect to
+            the parameters.
+
+        Raises
+        ------
+        ValueError
+            If ``sh_degree`` is not an int from 0 to L.
+
+        Notes
+        -----
+        Q-20 adds ``sh_degree`` and the return type; D-50 and Q-66: the slice's
+        implementation.
+        """
         degree = self.sh_degree if sh_degree is None else sh_degree
         degree = _check_sh_degree(degree, tuple(range(self.sh_degree + 1)))
         # §3.4: the slice's stages wrap the call, never the compiled function's body (D-50).
@@ -442,9 +772,32 @@ class FreeTimeGaussians(torch.nn.Module):
     def resize_(
         self, *, keep: Tensor | None = None, append: Mapping[str, Tensor] | None = None
     ) -> None:
-        """Keep the rows the bool mask `keep` [N] selects, in their old order, then append the
-        rows of `append` last (§1.3 Growth step 4; Q-23). The result is revalidated; on error
-        the model is unchanged."""
+        """Keep the rows a bool mask selects, in their order, then append new rows last (§1.3).
+
+        This is step 4 of §1.3 Growth. The result is revalidated against §1.1's rules; on error
+        the model is unchanged. The nine parameters are replaced by new
+        ``torch.nn.Parameter`` objects, so an optimizer over them must be resized too.
+
+        Parameters
+        ----------
+        keep
+            A bool mask ``[N]`` on the model's device, True for the rows to keep; None keeps
+            every row.
+        append
+            The rows to append, under exactly the nine names, each with the trailing shape,
+            dtype and device of its stored tensor (``[M, 3]`` float32 for ``means``, and so on);
+            None appends nothing.
+
+        Raises
+        ------
+        ValueError
+            If ``keep`` or ``append`` breaks these rules, or the result breaks §1.1's rules.
+
+        Notes
+        -----
+        Q-23: ``keep`` is a mask only, so it can't reorder rows, and nothing is moved between
+        devices silently.
+        """
         # Q-23: keep is a bool mask [N], so it can't reorder rows; append matches shape, dtype
         # and device; nothing is moved between devices silently.
         n = self.num_gaussians
