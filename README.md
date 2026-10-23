@@ -1,10 +1,12 @@
 # openftgs
 
-[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml) [![Coverage](docs/coverage.svg)](#tests)
+[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml) [![Coverage](docs/coverage.svg)](#tests) [![Documentation](https://app.readthedocs.org/projects/openftgs/badge/)](https://openftgs.readthedocs.io)
 
 openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors.
 
 Python package `openftgs`, under the Apache-2.0 license, with the command-line tool `ftgs`.
+
+The documentation is at [openftgs.readthedocs.io](https://openftgs.readthedocs.io): installation, a quickstart, the datasets, the method, the command line and the API reference.
 
 **Status: pre-alpha.** The library and its command line are built through milestone M14; the performance work, the differential harness and the validation runs follow (`docs/clean-room/milestones.md`).
 
@@ -71,7 +73,7 @@ OPENFTGS_ALLOW_DOWNLOADS=1 pytest -m weights      # tests that download pretrain
 python scripts/license_scan.py                    # GPL, AGPL, non-commercial fail; others need a sign-off in scripts/license_signoff.json
 ```
 
-The coverage badge is the CPU and GPU suites' total on a machine with a CUDA device, the dataset and weights tests left out. `python scripts/coverage_local.py` runs both suites, writes `htmlcov/` and `coverage.xml`, and rewrites `docs/coverage.svg` when both pass; commit the SVG to update the badge (Q-217). CI's `test` job reports the CPU suite's coverage in its summary (Q-216).
+The coverage badge is the CPU and GPU suites' total on a machine with a CUDA device, the dataset and weights tests left out. `python scripts/coverage_local.py` runs both suites, writes `htmlcov/` and `coverage.xml`, and rewrites `docs/coverage.svg` when both pass; commit the SVG to update the badge (Q-217). CI's `test` job runs the CPU suite on Python 3.14 and on 3.11, the oldest Python openftgs supports (Q-1), and reports its coverage in its summary (Q-216).
 
 The license scan passes in CI's environment (CPU torch). With CUDA torch it also lists the NVIDIA runtime wheels, which stay unapproved until they are signed off for the release (milestone M18).
 

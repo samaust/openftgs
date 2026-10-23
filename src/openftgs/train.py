@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Trainer: the iteration loop, the sampler, the schedules, and the evaluation and checkpoint
-hooks.
+"""The training loop of §1.3, with its sampler, schedules, and evaluation and checkpoint hooks.
+
+Trainer: the iteration loop, the sampler, the schedules, and the evaluation and checkpoint hooks.
 
 Spec: §1.3, §2.2 (Full checkpoint), §2.4 rule 3, D-26, D-45. Band: Orchestration (§2.1).
 """
@@ -58,7 +59,7 @@ __all__ = ["Callback", "CalendarEntry", "StepLog", "Trainer", "calendar_entry"] 
 
 
 def _check_int(value: object, low: int, high: int | None, what: str) -> int:
-    """An int (not a bool) in [low, high], or at least low when high is None."""
+    """Check for an int (not a bool) in [low, high], or at least low when high is None."""
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
@@ -76,6 +77,22 @@ def _check_int(value: object, low: int, high: int | None, what: str) -> int:
 # Q-71: what the calendar holds for one iteration.
 @dataclass(frozen=True)
 class CalendarEntry:
+    """What the calendar holds for one iteration (§1.3 Iteration calendar; Q-71).
+
+    Parameters
+    ----------
+    sh_degree
+        L_active, the SH degree active at the iteration (E13).
+    grow
+        Whether the iteration ends with a growth event (D-18).
+    relocate
+        Whether it ends with a relocation event (D-17).
+    prune
+        Whether it ends with the ablation's pruning (§1.3 Count-control modes).
+    reset_opacity
+        Whether it ends with the ablation's opacity reset (§1.3 Count-control modes).
+    """
+
     sh_degree: int  # L_active (E13)
     grow: bool  # a growth event (D-18)
     relocate: bool  # a relocation event (D-17)
@@ -84,13 +101,44 @@ class CalendarEntry:
 
     @property
     def event(self) -> bool:
-        """An event whose gradient statistics are reset afterwards (§1.3 step 7, D-45)."""
+        """Whether the iteration has an event, after which the gradient statistics are reset.
+
+        A growth, relocation or pruning event (§1.3 step 7, D-45); the ablation's opacity reset
+        alone is not one.
+        """
         return self.grow or self.relocate or self.prune
 
 
 def calendar_entry(cfg: TrainConfig, it: int) -> CalendarEntry:
-    """The calendar of `cfg` at iteration `it` (§1.3 step 7 and Iteration calendar, E13): the
-    active SH degree and the events, every window and period read from the configuration."""
+    """Return the calendar of ``cfg`` at iteration ``it`` (§1.3 Iteration calendar).
+
+    The active SH degree and the events of §1.3 step 7, every window and period read from the
+    configuration; growth events share the relocation period (§2.1).
+
+    Parameters
+    ----------
+    cfg
+        The run's configuration.
+    it
+        The iteration, 1 to ``cfg.optim.iterations`` (D-41).
+
+    Returns
+    -------
+    openftgs.train.CalendarEntry
+        The SH degree active at ``it`` and the events that end it.
+
+    Raises
+    ------
+    ValueError
+        If ``it`` isn't an int from 1 to ``cfg.optim.iterations``.
+
+    Notes
+    -----
+    E13: the SH degree is ``min((it - 1) // cfg.optim.sh_interval, cfg.sh_degree)``. Q-71: the
+    ablation (``cfg.reloc.prune_opacity`` set) prunes every relocation period and resets the
+    opacities every :data:`~openftgs.density.OPACITY_RESET_EVERY` iterations (Q-67), both
+    inside the growth window only.
+    """
     _check_int(it, 1, cfg.optim.iterations, "it")  # D-41
     growth, reloc = cfg.growth, cfg.reloc
     on_period = it % reloc.every == 0  # growth events share the relocation period (§2.1)
@@ -111,6 +159,40 @@ def calendar_entry(cfg: TrainConfig, it: int) -> CalendarEntry:
 
 @dataclass(frozen=True)
 class StepLog:
+    """What one training iteration reports (Q-69).
+
+    Parameters
+    ----------
+    iteration
+        The iteration just completed.
+    image_index
+        The trained image's index into the dataset's records.
+    timestamp
+        The image's raw time τ.
+    t
+        Its normalized time (E14).
+    sh_degree
+        L_active, the SH degree the iteration rendered with (E13).
+    rates
+        The learning rates of this iteration, by tensor name (E12, E13).
+    losses
+        :func:`~openftgs.losses.total_loss`'s terms, detached 0-d tensors on the device, not
+        read (D-77).
+    num_gaussians
+        N after the iteration.
+    growth
+        The growth event's report, or None without one.
+    relocation
+        The relocation event's report, or None without one.
+    pruned
+        The number of primitives the ablation's pruning removed, or None without pruning.
+    opacity_reset
+        Whether the ablation's opacity reset ran.
+    mean_losses
+        Each term's mean over the iterations since the last read, read when the iteration is a
+        multiple of ``PerfConfig.log_every`` (§2.4 rule 3); None otherwise.
+    """
+
     iteration: int  # the iteration just completed
     image_index: int  # into the dataset's records
     timestamp: float  # the image's raw τ
@@ -129,13 +211,17 @@ class StepLog:
 
 
 Callback = Callable[["Trainer", StepLog], bool | None]  # Q-69: True stops train()
+"""A function :meth:`Trainer.train` calls after each step, with the trainer and its log (Q-69).
+
+A callback that returns True stops training after that step; False or None lets it go on.
+"""
 
 
 # Generators and the sampler (D-26; Q-72).
 
 
 def _seeded(seed: int, role: str) -> torch.Generator:
-    """A CPU generator for one role, seeded from TrainConfig.seed (Q-72)."""
+    """Return a CPU generator for one role, seeded from TrainConfig.seed (Q-72)."""
     digest = hashlib.sha256(f"openftgs/{role}/{seed}".encode()).digest()
     return torch.Generator().manual_seed(int.from_bytes(digest[:8], "little"))
 
@@ -152,8 +238,11 @@ def _restored_generator(state: object, role: str) -> torch.Generator:
 
 
 class _Sampler:
-    """D-26: the seeded permutation of the training images, redrawn each epoch, as dataset
-    record indices; the next permutation is drawn when the current one runs out (Q-72)."""
+    """The seeded permutation of the training images, redrawn each epoch (D-26).
+
+    As dataset record indices; the next permutation is drawn when the current one runs out
+    (Q-72).
+    """
 
     def __init__(
         self,
@@ -191,9 +280,11 @@ class _Sampler:
         return index
 
     def peek(self, count: int) -> list[int]:
-        """Up to `count` upcoming indices: the rest of this permutation and the next epoch's,
-        drawn on a copy of the generator's state, so the stream doesn't move (Q-72 note 3,
-        Q-99)."""
+        """Return up to `count` upcoming indices, without moving the stream (Q-72 note 3, Q-99).
+
+        The rest of this permutation and the next epoch's, drawn on a copy of the generator's
+        state, so the stream doesn't move.
+        """
         upcoming = self.permutation[self.cursor : self.cursor + count]
         if len(upcoming) < count:
             clone = torch.Generator()
@@ -207,8 +298,10 @@ class _Sampler:
 
 
 def _global_rng() -> dict[str, Any]:
-    """The global generators, recorded for code outside the trainer (Q-72); CUDA states only
-    when CUDA is already initialized, so a CPU run never initializes it."""
+    """Record the global generators, for code outside the trainer (Q-72).
+
+    CUDA states only when CUDA is already initialized, so a CPU run never initializes it.
+    """
     cuda: dict[str, Tensor] = {}
     if torch.cuda.is_initialized():  # type: ignore[no-untyped-call]
         cuda = {str(i): state for i, state in enumerate(torch.cuda.get_rng_state_all())}
@@ -232,9 +325,12 @@ def _global_rng() -> dict[str, Any]:
 
 
 def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
-    """Q-72: the recorded global generator states, checked on throwaway generators so that a
-    malformed state is a ValueError before anything changes, and the function that restores
-    them: CUDA states only when CUDA is initialized, for recorded devices that exist."""
+    """Check the recorded global generator states, and return their restorer (Q-72).
+
+    The states are checked on throwaway generators so that a malformed state is a ValueError
+    before anything changes, and the function returned restores them: CUDA states only when
+    CUDA is initialized, for recorded devices that exist.
+    """
     try:
         cpu = rng["torch_cpu"]
         torch.Generator().set_state(cpu)
@@ -284,11 +380,14 @@ _AUTOTUNE = True
 
 
 class _PlacementWait:
-    """Q-225 (changed, #341), Q-232 (changed, #348): when "auto" decides on CUDA. An iteration
-    at an image size not yet seen in the process may autotune cuDNN, whose trials return the
-    allocator's blocks to the driver, so the reserve read after it is close to nothing. "auto"
-    therefore decides after the iteration that follows the first iteration at the last of the
-    training images' sizes to appear: after the second when they all have one size."""
+    """When "auto" decides on CUDA (Q-225 changed, #341; Q-232 changed, #348).
+
+    An iteration at an image size not yet seen in the process may autotune cuDNN, whose trials
+    return the allocator's blocks to the driver, so the reserve read after it is close to
+    nothing. "auto" therefore decides after the iteration that follows the first iteration at
+    the last of the training images' sizes to appear: after the second when they all have one
+    size.
+    """
 
     def __init__(self, dataset: MultiViewVideo) -> None:
         self._sizes = [(r.camera.width, r.camera.height) for r in dataset.records]
@@ -297,8 +396,10 @@ class _PlacementWait:
         }
 
     def decides_after(self, index: int) -> bool:
-        """Records that an iteration trained on record `index`, and says whether "auto" decides
-        after it; called once an iteration, in order."""
+        """Record an iteration on record `index`, and say whether "auto" decides after it.
+
+        Called once an iteration, in order.
+        """
         if not self._unseen:
             return True
         self._unseen.discard(self._sizes[index])
@@ -307,8 +408,10 @@ class _PlacementWait:
 
 @contextlib.contextmanager
 def _perf_flags(perf: PerfConfig) -> Iterator[None]:
-    """Q-73: PerfConfig's process-global flags for one training iteration, restored
-    afterwards."""
+    """Set PerfConfig's process-global flags for one training iteration (Q-73).
+
+    They are restored afterwards.
+    """
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
     algorithms = (
@@ -345,9 +448,11 @@ _CHANNELS_LAST_WEIGHTS = False
 # Q-173 (changed, #326), Q-223: B-4 measured NCHW inputs the fastest layout in IEEE float32, and
 # in TF32 with autotuning; slower in TF32 without it and in bfloat16, which keep the plain view.
 class _NCHWLPIPSLoss(LPIPSLoss):
-    """LPIPS with its two images copied so that the network gets them as contiguous NCHW
-    tensors: the trainer's network under `perc_precision` "ieee", and "tf32" with autotuning.
-    The copy is exact (§2.4 rule 2); the evaluator's networks stay plain."""
+    """LPIPS whose network gets its two images as contiguous NCHW tensors, by a copy.
+
+    The trainer's network under `perc_precision` "ieee", and "tf32" with autotuning. The copy
+    is exact (§2.4 rule 2); the evaluator's networks stay plain.
+    """
 
     def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
         # [..., H, W, 3] in memory whose batch-first view, `LPIPSLoss`'s, is contiguous NCHW
@@ -357,9 +462,11 @@ class _NCHWLPIPSLoss(LPIPSLoss):
 
 # Q-172: autocast is local to the perceptual network, which only the trainer builds this way.
 class _Bf16LPIPSLoss(LPIPSLoss):
-    """D-52's approximate option, `perc_precision = "bf16"`: LPIPS with its network run under
-    bfloat16 autocast on the images' device, returning float32. The evaluator's networks stay
-    float32 (#228)."""
+    """LPIPS with its network run under bfloat16 autocast, returning float32 (D-52).
+
+    D-52's approximate option, `perc_precision = "bf16"`, autocast on the images' device. The
+    evaluator's networks stay float32 (#228).
+    """
 
     def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
         # Q-191: on the CPU too; the network's own reductions as autocast leaves them.
@@ -369,8 +476,11 @@ class _Bf16LPIPSLoss(LPIPSLoss):
 
 
 def _perceptual_network(perf: PerfConfig) -> type[LPIPSLoss]:
-    """The trainer's perceptual network for `perf`: bf16's (Q-172), NCHW inputs where B-4
-    measured them faster (Q-223), else plain `LPIPSLoss` with its channels-last view."""
+    """Return the trainer's perceptual network for `perf`.
+
+    bf16's (Q-172), NCHW inputs where B-4 measured them faster (Q-223), else plain `LPIPSLoss`
+    with its channels-last view.
+    """
     if perf.perc_precision == "bf16":
         return _Bf16LPIPSLoss
     autotuned = _AUTOTUNE and not perf.deterministic
@@ -380,9 +490,11 @@ def _perceptual_network(perf: PerfConfig) -> type[LPIPSLoss]:
 
 
 def _check_ablation(cfg: TrainConfig) -> None:
-    """Q-71: the "w/o periodic relocation" ablation turns relocation off (§1.3 Count-control
-    modes), so a pruning opacity with relocation on, a mode the spec doesn't define, is
-    refused rather than run."""
+    """Refuse a pruning opacity with relocation on, a mode the spec doesn't define (Q-71).
+
+    The "w/o periodic relocation" ablation turns relocation off (§1.3 Count-control modes), so
+    that mode is refused rather than run.
+    """
     if cfg.reloc.enabled and cfg.reloc.prune_opacity is not None:
         raise ValueError(
             "reloc.prune_opacity selects the ablation, which turns relocation off: set "
@@ -391,7 +503,7 @@ def _check_ablation(cfg: TrainConfig) -> None:
 
 
 def _check_perf(perf: PerfConfig) -> None:
-    """Q-73: an option that isn't built fails at construction rather than being ignored."""
+    """Fail at construction on an option that isn't built, rather than ignore it (Q-73)."""
     if perf.images_per_step != 1:
         # Q-177 (owner's answer): multi-GPU training is deferred.
         raise NotImplementedError(
@@ -407,30 +519,36 @@ def _check_perf(perf: PerfConfig) -> None:
 
 
 def _bytes_per_row(model: FreeTimeGaussians) -> int:
-    """Q-99: the bytes a primitive row takes during training: its floats in the nine stored
-    tensors (§1.1) for the parameter, its gradient and Adam's two moments, plus the gradient
-    statistics' two floats, all float32."""
+    """Return the bytes a primitive row takes during training (Q-99).
+
+    Its floats in the nine stored tensors (§1.1) for the parameter, its gradient and Adam's two
+    moments, plus the gradient statistics' two floats, all float32.
+    """
     floats = sum(tensor[0].numel() for tensor in _stored_tensors(model).values())
     return 4 * (4 * floats + 2)
 
 
 def _fits_on_gpu(cache: int, *, free: int, reserve: int, growth: int) -> bool:
-    """D-51, Q-99, Q-225: whether "auto" puts a cache of `cache` bytes on the GPU: it fits in
-    half the free memory less the working memory `reserve` held for the iterations, minus what
-    growth to N_max adds."""
+    """Say whether "auto" puts a cache of `cache` bytes on the GPU (D-51, Q-99, Q-225).
+
+    It does when it fits in half the free memory less the working memory `reserve` held for the
+    iterations, minus what growth to N_max adds.
+    """
     return cache <= 0.5 * (free - reserve) - growth
 
 
 def _stored_tensors(model: FreeTimeGaussians) -> dict[str, Tensor]:
-    """The model's nine stored tensors (§1.1), by name."""
+    """Return the model's nine stored tensors (§1.1), by name."""
     return {name: getattr(model, name) for name in FreeTimeGaussians.PARAM_NAMES}
 
 
 def _copy_of(model: FreeTimeGaussians) -> FreeTimeGaussians:
-    """Q-69 (owner answer, #97): a copy of a passed model, made as the model copies the tensors
-    it is given, so the caller's object is never modified or moved; it keeps the model's SH
-    degree, time normalizer and time unit (Q-17). Q-76: the constructor checks §1.1, so a model
-    that breaks the validity rules is refused here."""
+    """Copy a passed model, as the model copies the tensors it is given (Q-69, #97).
+
+    The caller's object is never modified or moved; the copy keeps the model's SH degree, time
+    normalizer and time unit (Q-17). Q-76: the constructor checks §1.1, so a model that breaks
+    the validity rules is refused here.
+    """
     return FreeTimeGaussians(
         _stored_tensors(model),
         sh_degree=model.sh_degree,
@@ -440,7 +558,7 @@ def _copy_of(model: FreeTimeGaussians) -> FreeTimeGaussians:
 
 
 def _cpu(tree: Any) -> Any:
-    """A copy of a tree of dicts with every tensor detached and cloned to the CPU."""
+    """Copy a tree of dicts with every tensor detached and cloned to the CPU."""
     if isinstance(tree, Tensor):
         return tree.detach().to("cpu", copy=True)
     if isinstance(tree, Mapping):
@@ -464,9 +582,61 @@ class _Run:
 
 
 class Trainer:
-    """The training loop of §1.3 on a multi-view video: one image per training iteration, the
-    events of the calendar, and the trainer state a checkpoint holds (§2.2). The seed is
-    `cfg.seed`; the device selects the backend: gsplat on CUDA, the reference elsewhere (Q-69)."""
+    """The training loop of §1.3 on a multi-view video.
+
+    One image per training iteration, the events of the calendar, and the trainer state a
+    checkpoint holds (§2.2). The seed is ``cfg.seed``; the device selects the backend: gsplat
+    on CUDA, the reference elsewhere (Q-69).
+
+    Parameters
+    ----------
+    cfg
+        The run's configuration; its seed seeds the initialization, the sampler and the
+        events' draws (D-26; Q-72).
+    dataset
+        The scene to train on; its training images are sampled, one per iteration.
+    init
+        The initial points the model is initialized from (§1.3 Initialization), or a model to
+        train a copy of. A model must have ``cfg.sh_degree``, the dataset's time normalizer and
+        time unit, and at most N_max primitives.
+    device
+        The device to train on: gsplat renders on a CUDA device, the reference renderer on any
+        other.
+
+    Raises
+    ------
+    ValueError
+        If a model passed as ``init`` doesn't fit the run, ``init`` is neither initial points
+        nor a model, the configuration sets ``reloc.prune_opacity`` with relocation on (Q-71),
+        or an explicitly placed frame cache can't be made (D-51).
+    NotImplementedError
+        If ``cfg.perf`` asks for an option that isn't built: ``images_per_step`` above 1
+        (D-54), or ``slice_impl`` "cuda" (D-50).
+
+    Notes
+    -----
+    Initial points become a model as §1.3 steps 7 to 9 say (D-24, D-74; Q-16), with the run's
+    own initialization generator. A model passed in is copied, never modified or moved (Q-69).
+    The spatial scale S comes from the dataset and ``cfg.scene_scale_factor`` (D-27).
+
+    Examples
+    --------
+    Train on a converted scene, evaluate the test images and save a checkpoint:
+
+    >>> from pathlib import Path
+    >>> from openftgs.config import TrainConfig
+    >>> from openftgs.data import MultiViewVideo
+    >>> from openftgs.io import read_init_points, save_checkpoint
+    >>> from openftgs.train import Trainer
+    >>> video = MultiViewVideo.from_manifest(Path("scene/scene.json"))
+    >>> points = read_init_points(Path("init.safetensors"), time_unit=video.manifest.time_unit)
+    >>> trainer = Trainer(TrainConfig(seed=0), video, points, device="cuda")
+    >>> trainer.train(until=1_000)
+    >>> trainer.iteration
+    1000
+    >>> metrics = trainer.evaluate("test", out_dir=Path("run"))
+    >>> save_checkpoint(trainer.state_dict(), Path("run/checkpoint"))
+    """
 
     def __init__(
         self,
@@ -532,11 +702,42 @@ class Trainer:
         force: bool = False,
         perf: PerfConfig | None = None,
     ) -> "Trainer":
-        """Resume the run saved in a ftgs-checkpoint directory (io.load_checkpoint, then
-        load_state_dict). A checkpoint of another scene manifest is refused unless forced; a
-        forced resume keeps the run's τ₀, τ₁, S and Δt_f (§2.2; Q-70). Given `perf`, the run
-        continues with those performance settings, which may differ from the checkpoint's only
-        in the fields that change no number (Q-134, Q-153); else with the checkpoint's."""
+        """Resume the run saved in a ftgs-checkpoint directory (§2.2).
+
+        The checkpoint is read with :func:`~openftgs.io.load_checkpoint`, then
+        :meth:`load_state_dict` continues its run. A checkpoint of another scene manifest is
+        refused unless forced; a forced resume keeps the run's τ₀, τ₁, S and Δt_f (Q-70).
+
+        Parameters
+        ----------
+        directory
+            The checkpoint directory.
+        dataset
+            The scene the run trains on.
+        device
+            The device to train on, as for the constructor.
+        force
+            Resume even when the checkpoint was made from another scene manifest (Q-70).
+        perf
+            The performance settings the run continues with, which may differ from the
+            checkpoint's only in the fields that change no number (Q-134, Q-153); None keeps
+            the checkpoint's.
+
+        Returns
+        -------
+        openftgs.train.Trainer
+            A trainer at the checkpoint's iteration, ready to continue its run.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint can't be read, was made from another scene manifest and ``force``
+            is False, or holds a state that doesn't fit the dataset (:meth:`load_state_dict`),
+            or if ``perf`` differs from the checkpoint's where it must match.
+        NotImplementedError
+            If the performance settings ask for an option that isn't built, as for the
+            constructor.
+        """
         state = load_checkpoint(Path(directory))
         if state.scene_sha256 != dataset.manifest.sha256 and not force:
             raise ValueError(
@@ -618,10 +819,13 @@ class Trainer:
         self._schedule()  # Q-99: a restored sampler gets its own queue
 
     def _open_frame_cache(self, placement: str, *, automatic: bool = False) -> None:
-        """D-51, Q-99: "off" decodes PNGs; "gpu" and "mmap" open the cache now; "auto" is mmap on
-        a CPU device and, on CUDA, decided after the iteration that follows the first at the last
-        training image size to appear (Q-232). A cache directory that can't be made turns "auto"
-        into "off" with a warning, and is a ValueError for an explicit placement (Q-26)."""
+        """Open the frame cache at `placement` (D-51, Q-99).
+
+        "off" decodes PNGs; "gpu" and "mmap" open the cache now; "auto" is mmap on a CPU device
+        and, on CUDA, decided after the iteration that follows the first at the last training
+        image size to appear (Q-232). A cache directory that can't be made turns "auto" into
+        "off" with a warning, and is a ValueError for an explicit placement (Q-26).
+        """
         if placement == "off":
             return
         if placement == "auto" and self._device.type == "cuda":
@@ -643,15 +847,20 @@ class Trainer:
         weakref.finalize(self, self._frames.close)  # the reader thread ends with the trainer
 
     def _await_placement(self) -> None:
-        """Q-232 (changed, #348): "auto" on CUDA decodes PNGs until `_PlacementWait` says it
-        decides, counting from this process's first iteration."""
+        """Decode PNGs until `_PlacementWait` says "auto" decides on CUDA (Q-232, #348).
+
+        Counting from this process's first iteration.
+        """
         self._placement_wait = _PlacementWait(self._dataset)
 
     def _choose_placement(self) -> None:
-        """Q-99: once `_PlacementWait` says "auto" decides (Q-232), the cache goes to GPU memory
-        when it fits in half the free memory, less the working memory the iteration left
-        reserved, minus what growth to N_max will add (D-51, Q-225), and is memory-mapped
-        otherwise; a cache that can't be made falls back to PNGs with a warning."""
+        """Place the frame cache once `_PlacementWait` says "auto" decides (Q-99, Q-232).
+
+        The cache goes to GPU memory when it fits in half the free memory, less the working
+        memory the iteration left reserved, minus what growth to N_max will add (D-51, Q-225),
+        and is memory-mapped otherwise; a cache that can't be made falls back to PNGs with a
+        warning.
+        """
         unheld, _ = torch.cuda.mem_get_info(self._device)
         # Q-225: the allocator's unused reserve is the iteration's working memory (the render's
         # and the losses' buffers at the image's size, the gradients), which Q-99's free memory
@@ -675,8 +884,11 @@ class Trainer:
             self._frames.schedule(self._run.sampler.peek(self._cfg.perf.prefetch))
 
     def _image(self, index: int) -> Tensor:
-        """Training image `index` on the device: from the frame cache when there is one, bitwise
-        what `MultiViewVideo.load_image` decodes (D-51)."""
+        """Return training image `index` on the device (D-51).
+
+        From the frame cache when there is one, bitwise what `MultiViewVideo.load_image`
+        decodes.
+        """
         if self._frames is None:
             image = self._dataset.load_image(index)
             if self._device.type != "cuda":
@@ -694,18 +906,48 @@ class Trainer:
     # Q-69 (owner answer, #97): read-only; load_state_dict replaces the model it returns.
     @property
     def model(self) -> FreeTimeGaussians:
-        """The model the trainer is training: the same object across training iterations and
-        events, which resize it in place; `load_state_dict` and `from_checkpoint` replace it with
-        the model of the loaded state."""
+        """The model the trainer is training (Q-69).
+
+        The same object across training iterations and events, which resize it in place;
+        :meth:`load_state_dict` and :meth:`from_checkpoint` replace it with the model of the
+        loaded state.
+        """
         return self._run.model
 
     @property
     def iteration(self) -> int:
-        """Completed optimizer steps."""
+        """The number of completed optimizer steps (§2.1).
+
+        0 for a new run; each :meth:`step` adds one, up to ``cfg.optim.iterations``.
+        """
         return self._run.iteration
 
     def step(self) -> StepLog:
-        """One training iteration (§1.3 steps 1–7) at it = iteration + 1."""
+        """Run one training iteration (§1.3 steps 1–7) at it = iteration + 1.
+
+        The sampler's next training image is rendered at its normalized time with the active
+        SH degree; E9's loss is backpropagated, the gradient statistics updated (E10, D-12) and
+        one Adam step taken at this iteration's learning rates; then the calendar's event runs.
+
+        Returns
+        -------
+        openftgs.train.StepLog
+            What the iteration did.
+
+        Raises
+        ------
+        ValueError
+            If the run is complete, at ``cfg.optim.iterations``.
+        FloatingPointError
+            If training diverged: a model that fails §1.1's validity rules, gradient statistics
+            that aren't finite, or a mean loss that isn't finite (Q-69).
+
+        Notes
+        -----
+        The images come in the sampler's order (D-26; Q-72), and the events in D-45's order.
+        Divergence is checked only where the run reads values from the device: before an event,
+        and every ``cfg.perf.log_every`` iterations, when the loss terms are read (§2.4 rule 3).
+        """
         run, cfg = self._run, self._cfg
         it = run.iteration + 1
         if it > cfg.optim.iterations:
@@ -789,8 +1031,11 @@ class Trainer:
         )
 
     def _check_valid(self, it: int) -> None:
-        """Q-69: a model that fails §1.1's validity rules, or non-finite gradient statistics,
-        mean the run diverged. Reads values, so it runs only where the run synchronizes."""
+        """Raise FloatingPointError if the run diverged (Q-69).
+
+        A model that fails §1.1's validity rules, or non-finite gradient statistics, mean the
+        run diverged. Reads values, so it runs only where the run synchronizes.
+        """
         try:
             self._run.model.validate()
         except ValueError as err:
@@ -803,8 +1048,11 @@ class Trainer:
     def _event(
         self, entry: CalendarEntry, it: int
     ) -> tuple[GrowthReport | None, RelocationReport | None, int | None]:
-        """§1.3 step 7 in its order (D-45; Q-71): growth, relocation, the ablation's pruning
-        and opacity reset, then the statistics reset, which relocation does itself (Q-51)."""
+        """Run §1.3 step 7 in its order (D-45; Q-71).
+
+        Growth, relocation, the ablation's pruning and opacity reset, then the statistics reset,
+        which relocation does itself (Q-51).
+        """
         if not (entry.event or entry.reset_opacity):
             return None, None, None
         run, cfg = self._run, self._cfg
@@ -840,8 +1088,11 @@ class Trainer:
         return growth, relocation, pruned
 
     def _log(self, terms: Mapping[str, Tensor], it: int) -> dict[str, float] | None:
-        """§2.4 rule 3: loss terms add up on the device and are read every log_every
-        iterations, with the validity check; a non-finite mean means divergence (Q-69)."""
+        """Add the loss terms up on the device, and read them every log_every iterations.
+
+        §2.4 rule 3: they are read with the validity check; a non-finite mean means divergence
+        (Q-69).
+        """
         for name, value in terms.items():
             self._window[name] = value if name not in self._window else self._window[name] + value
         self._window_count += 1
@@ -855,8 +1106,26 @@ class Trainer:
         return means
 
     def train(self, until: int | None = None, callbacks: Sequence[Callback] = ()) -> None:
-        """Step until `until` (default T_it), calling every callback after each step; a
-        callback that returns True stops training after that step (Q-69)."""
+        """Step until iteration ``until``, calling every callback after each step (Q-69).
+
+        A callback that returns True stops training after that step.
+
+        Parameters
+        ----------
+        until
+            The iteration to stop at, from the current iteration to T_it; None, the default,
+            trains to T_it, ``cfg.optim.iterations``.
+        callbacks
+            Called in order after each step, with the trainer and the step's
+            :class:`StepLog`.
+
+        Raises
+        ------
+        ValueError
+            If ``until`` isn't an int from the current iteration to T_it.
+        FloatingPointError
+            If training diverged (:meth:`step`).
+        """
         iterations = self._cfg.optim.iterations
         target = iterations if until is None else until
         _check_int(target, self._run.iteration, iterations, "until")
@@ -870,10 +1139,40 @@ class Trainer:
 
     # Q-74: the returned keys and what out_dir receives.
     def evaluate(self, split: str = "test", *, out_dir: Path | None = None) -> dict[str, float]:
-        """The E16 metrics of a data split's images: the scene means of the entire images, and
-        under "dynamic/<name>" those of the dynamic regions when there are any. With `out_dir`,
-        METRICS.json is written there (Q-63, Q-74). A render that isn't finite raises
-        FloatingPointError from evaluate_images, before anything is written (Q-129, Q-147)."""
+        """Compute the E16 metrics of a data split's images (Q-74).
+
+        The scene means of the entire images, and under ``"dynamic/<name>"`` those of the
+        dynamic regions when there are any. With ``out_dir``, METRICS.json is written there
+        (Q-63). The model renders with the trainer's backend and the configuration's
+        background.
+
+        Parameters
+        ----------
+        split
+            The data split whose images are evaluated.
+        out_dir
+            The directory METRICS.json is written to, made when missing; None writes nothing.
+
+        Returns
+        -------
+        dict of str to float
+            Each metric's scene mean, by its name in :data:`~openftgs.eval.METRIC_NAMES`, and
+            under ``"dynamic/<name>"`` the dynamic regions' means when any image has a usable
+            one.
+
+        Raises
+        ------
+        ValueError
+            If the split holds no images.
+        FloatingPointError
+            If a render isn't finite, raised by :func:`~openftgs.eval.evaluate_images` before
+            anything is written (Q-129, Q-147).
+
+        Notes
+        -----
+        METRICS.json is written by :func:`~openftgs.eval.write_metrics` (Q-136), with the
+        trainer's iteration and no model path.
+        """
         if self._evaluator is None:
             self._evaluator = Evaluator(device=self._device)
         images = evaluate_images(
@@ -902,7 +1201,18 @@ class Trainer:
     # -- state ----------------------------------------------------------------------------------
 
     def state_dict(self) -> TrainerState:
-        """The trainer state of §2.2's checkpoint, with every tensor a CPU copy (Q-69, Q-72)."""
+        """Return the trainer state of §2.2's checkpoint, every tensor a CPU copy (Q-69, Q-72).
+
+        :func:`~openftgs.io.save_checkpoint` writes it, and :meth:`load_state_dict` continues
+        the run it holds.
+
+        Returns
+        -------
+        openftgs.types.TrainerState
+            The iteration, the configuration, τ₀ and τ₁, S and Δt_f, the model's stored
+            tensors, the optimizer's and gradient statistics' states, the generator states, the
+            sampler's position, the scene manifest's SHA-256 and the time unit.
+        """
         run = self._run
         return TrainerState(
             iteration=run.iteration,
@@ -926,10 +1236,35 @@ class Trainer:
         )
 
     def load_state_dict(self, state: TrainerState) -> None:
-        """Continue the run `state` holds: its configuration must be this trainer's, apart from
-        the performance settings that change no number, for which the trainer keeps its own
-        (Q-134, Q-153); its τ₀, τ₁, S and Δt_f are adopted. Everything is built before anything
-        is replaced, so a rejected state leaves the trainer as it was (Q-69, Q-72)."""
+        """Continue the run ``state`` holds (§2.2; Q-69, Q-72).
+
+        Its configuration must be this trainer's, apart from the performance settings that
+        change no number, for which the trainer keeps its own (Q-134, Q-153); its τ₀, τ₁, S and
+        Δt_f are adopted. Everything is built before anything is replaced, so a rejected state
+        leaves the trainer as it was.
+
+        Parameters
+        ----------
+        state
+            A trainer state, from :meth:`state_dict` or :func:`~openftgs.io.load_checkpoint`.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the state's configuration differs from the trainer's where it must match, its
+            time unit isn't the dataset's, its iteration is out of range, its N exceeds N_max,
+            or its tensors, optimizer state, statistics, sampler or generator states are
+            malformed.
+
+        Notes
+        -----
+        The global generators (Python's, NumPy's and PyTorch's) are restored last, CUDA's only
+        when CUDA is initialized (Q-72); the trainer's model is replaced (:attr:`model`).
+        """
         cfg = self._cfg
         conflicts = resume_conflicts(config_from_dict(state.config), cfg)
         if conflicts:
