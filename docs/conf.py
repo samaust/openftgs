@@ -70,6 +70,10 @@ exclude_patterns = [
     "GLOSSARY.md",
 ]
 
+# -- Smart quotes without dashes: the CLI reference parses ftgs's help text as reStructuredText,
+# where "--window" would otherwise become an en dash and a word (#358).
+smartquotes_action = "qe"
+
 # -- MyST
 myst_enable_extensions = ["dollarmath", "amsmath", "colon_fence", "deflist"]
 
@@ -116,6 +120,7 @@ nitpick_ignore: list[tuple[str, str]] = []
 
 extlinks = {
     "repo": (f"{_REPOSITORY}/blob/{_REF}/%s", "%s"),
+    "repotree": (f"{_REPOSITORY}/tree/{_REF}/%s", "%s"),  # a folder of the repository (#358)
     "issue": (f"{_REPOSITORY}/issues/%s", "#%s"),
 }
 
