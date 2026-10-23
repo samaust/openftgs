@@ -99,7 +99,8 @@ masks and background images. The project's validation runs used three scenes:
 - **Layout:** SRC is a folder of the archives as downloaded. The converter reads only each
   archive's videos and its calibration, `optimized/intri.yml` and `optimized/extri.yml`, with
   `optimized/sync.json`'s per-camera offsets when the archive has one (D-63). The dance scenes'
-  calibration comes from the separately published hair-calib archive (`--calib DIR`).
+  calibration comes from the separately published hair-calib archive, and `--calib DIR`
+  overrides either source.
 - **Convert:**
 
   ```bash
