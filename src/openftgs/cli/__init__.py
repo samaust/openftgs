@@ -912,30 +912,114 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
+    # Q-242: the help text, written from §2.1's CLI block, the paragraph after it and the module
+    # docs; it changes no default, type, choice or requirement. A literal percent sign is "%%".
     p = commands.add_parser("convert", help="convert a dataset into a scene manifest")
-    p.add_argument("kind", choices=tuple(_CONVERT_OPTIONS))
-    p.add_argument("src", type=Path, metavar="SRC")
-    p.add_argument("out", type=Path, metavar="OUT")
-    p.add_argument("--scene", metavar="NAME")
-    p.add_argument("--fps", type=float, metavar="F")
-    p.add_argument("--frames", type=int, metavar="N")
-    p.add_argument("--resize", type=float, metavar="R")
-    p.add_argument("--ffmpeg", metavar="PATH")
-    p.add_argument("--ffprobe", metavar="PATH")
-    p.add_argument("--hwaccel", choices=("none", "cuda"))
-    p.add_argument("--jobs", type=int, metavar="J")
-    p.add_argument("--test-camera", dest="test_camera", metavar="NAME")
-    p.add_argument("--window", type=_pair, metavar="N0:N1")
-    p.add_argument("--undistort", choices=("colmap", "internal"))
-    p.add_argument("--colmap", metavar="PATH")
-    p.add_argument("--no-sync", dest="use_sync", action="store_const", const=False)
-    p.add_argument("--masks", type=Path, metavar="DIR")
-    p.add_argument("--calib", type=Path, metavar="DIR")
+    p.add_argument(
+        "kind",
+        choices=tuple(_CONVERT_OPTIONS),
+        help="the converter: n3dv (Neural3DV), opencv-yaml (OpenCV-style YAML calibrations, "
+        "such as ENeRF-Outdoor) or selfcap (SelfCap's archives)",
+    )
+    p.add_argument("src", type=Path, metavar="SRC", help="the dataset's scene folder")
+    p.add_argument(
+        "out",
+        type=Path,
+        metavar="OUT",
+        help="the output folder, absent or empty; it receives the frames and OUT/scene.json, "
+        "whose path is printed",
+    )
+    p.add_argument(
+        "--scene",
+        metavar="NAME",
+        help="selfcap, required: the scene; a scene outside the dataset card's table needs "
+        "--window and --test-camera",
+    )
+    p.add_argument("--fps", type=float, metavar="F", help="opencv-yaml, required: frame rate")
+    p.add_argument(
+        "--frames",
+        type=int,
+        metavar="N",
+        help="n3dv and opencv-yaml: the first N frames of each camera (n3dv: 300 by default; "
+        "required for opencv-yaml)",
+    )
+    p.add_argument(
+        "--resize",
+        type=float,
+        metavar="R",
+        help="the resize ratio of frames and intrinsics (n3dv: 0.5 by default; required for "
+        "opencv-yaml; selfcap: the card's ratio, or 0.5 for other scenes)",
+    )
+    p.add_argument("--ffmpeg", metavar="PATH", help="the ffmpeg program (default: on PATH)")
+    p.add_argument(
+        "--ffprobe",
+        metavar="PATH",
+        help="the ffprobe program (default: beside a given --ffmpeg, else on PATH)",
+    )
+    p.add_argument(
+        "--hwaccel",
+        choices=("none", "cuda"),
+        help="ffmpeg's video decoding: none (the default) or cuda, which forces hardware frames",
+    )
+    p.add_argument(
+        "--jobs",
+        type=int,
+        metavar="J",
+        help="cameras decoded at once (0, the default: one per four cores); outputs don't "
+        "depend on it",
+    )
+    p.add_argument(
+        "--test-camera",
+        dest="test_camera",
+        metavar="NAME",
+        help="opencv-yaml and selfcap: the test view (opencv-yaml: none by default, so every "
+        "image trains; selfcap: the card's)",
+    )
+    p.add_argument(
+        "--window",
+        type=_pair,
+        metavar="N0:N1",
+        help="selfcap: frames N0 <= n < N1 of every camera (default: the card's)",
+    )
+    p.add_argument(
+        "--undistort",
+        choices=("colmap", "internal"),
+        help="selfcap: undistort with COLMAP (the default) or with the package's own code",
+    )
+    p.add_argument(
+        "--colmap", metavar="PATH", help="selfcap: the COLMAP program (default: on PATH)"
+    )
+    p.add_argument(
+        "--no-sync",
+        dest="use_sync",
+        action="store_const",
+        const=False,
+        help="selfcap: ignore the cameras' sync offsets, so frame n is at n/60 s",
+    )
+    p.add_argument(
+        "--masks",
+        type=Path,
+        metavar="DIR",
+        help="selfcap: one mask per test image, DIR/<n:06d>.png, with DIR/masks.json giving "
+        "their source",
+    )
+    p.add_argument(
+        "--calib",
+        type=Path,
+        metavar="DIR",
+        help="selfcap: a calibration folder that overrides the archives' calibration",
+    )
     p.set_defaults(run=_convert)
 
     p = commands.add_parser("cache", help="build the frame cache of a scene")
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--placement", choices=("auto", "gpu", "mmap"), default="auto")
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "--placement",
+        choices=("auto", "gpu", "mmap"),
+        default="auto",
+        help="auto (the default) only builds the cache; gpu or mmap also opens it in that "
+        "placement, which shows that it fits",
+    )
     p.set_defaults(run=_cache)
 
     p = commands.add_parser(
@@ -944,48 +1028,161 @@ def _parser() -> argparse.ArgumentParser:
         description="Initial points for training. D-24's check of F·B against N_max happens "
         "when `ftgs train` builds the model, where it is exit code 2 (Q-128).",
     )
-    p.add_argument("method", choices=("roma",))
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("out", type=Path, metavar="OUT.safetensors")
-    p.add_argument("--stride", type=int, metavar="K")
-    p.add_argument("--points-per-frame", dest="points_per_frame", type=int, metavar="B")
-    p.add_argument("--seed", type=int, metavar="S")
-    p.add_argument("--model", choices=("roma_outdoor", "tiny_roma_v1_outdoor"))
-    p.add_argument("--no-upsample", dest="no_upsample", action="store_true")
+    p.add_argument("method", choices=("roma",), help="the method: roma (needs a CUDA device)")
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "out", type=Path, metavar="OUT.safetensors", help="the initial points file to write"
+    )
+    p.add_argument(
+        "--stride",
+        type=int,
+        metavar="K",
+        help="init frames at every K-th frame of the sequence (default: 1, every frame)",
+    )
+    p.add_argument(
+        "--points-per-frame",
+        dest="points_per_frame",
+        type=int,
+        metavar="B",
+        help="the point budget B per frame of the sequence; an init frame keeps at most K·B "
+        "(default: 1000)",
+    )
+    p.add_argument("--seed", type=int, metavar="S", help="the random seed (default: 0)")
+    p.add_argument(
+        "--model",
+        choices=("roma_outdoor", "tiny_roma_v1_outdoor"),
+        help="RoMa's model (default: roma_outdoor)",
+    )
+    p.add_argument(
+        "--no-upsample",
+        dest="no_upsample",
+        action="store_true",
+        help="match at RoMa's coarse resolution only",
+    )
     p.set_defaults(run=_init)
 
     p = commands.add_parser("train", help="train a model")
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--init", type=Path, required=True, metavar="INIT.safetensors")
-    p.add_argument("--out", type=Path, required=True, metavar="RUN_DIR")
-    p.add_argument("--config", type=Path, metavar="CFG.json")
-    p.add_argument("--seed", type=int, metavar="S")
-    p.add_argument("--resume", type=Path, metavar="CKPT_DIR")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--checkpoint-every", type=int, default=0, metavar="N")  # D-83
-    p.add_argument("--keep-checkpoints", type=int, default=1, metavar="K")  # D-83
-    p.add_argument("--profile", type=_pair, metavar="START:COUNT")
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "--init",
+        type=Path,
+        required=True,
+        metavar="INIT.safetensors",
+        help="the initial points, from ftgs init",
+    )
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="RUN_DIR",
+        help="the run directory, absent or empty for a new run; it receives config.json, "
+        "train_log.jsonl, the checkpoints and, when the scene has a test split, METRICS.json",
+    )
+    p.add_argument(
+        "--config",
+        type=Path,
+        metavar="CFG.json",
+        help="a TrainConfig as JSON (default: TrainConfig's defaults)",
+    )
+    p.add_argument("--seed", type=int, metavar="S", help="the seed, replacing the configuration's")
+    p.add_argument(
+        "--resume",
+        type=Path,
+        metavar="CKPT_DIR",
+        help="continue from a checkpoint, on its own configuration",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="with --resume: resume despite a changed scene manifest",
+    )
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also save a checkpoint after every N-th iteration (0, the default, saves only at "
+        "the end and on SIGINT or SIGTERM)",
+    )  # D-83
+    p.add_argument(
+        "--keep-checkpoints",
+        type=int,
+        default=1,
+        metavar="K",
+        help="keep the K latest saves: RUN_DIR/checkpoint and RUN_DIR/checkpoint-<iteration> "
+        "(default: 1)",
+    )  # D-83
+    p.add_argument(
+        "--profile",
+        type=_pair,
+        metavar="START:COUNT",
+        help="write a torch.profiler trace of COUNT iterations from START to "
+        "RUN_DIR/profile/trace.json",
+    )
     p.set_defaults(run=_train)
 
     p = commands.add_parser("render", help="answer a render request")
-    p.add_argument("model", type=Path, metavar="MODEL")
-    p.add_argument("--request", type=Path, required=True, metavar="REQUEST.json")
-    p.add_argument("--out", type=Path, required=True, metavar="RENDERS.safetensors")
-    p.add_argument("--backend", choices=("gsplat", "reference"), default="gsplat")
+    p.add_argument(
+        "model", type=Path, metavar="MODEL", help="a checkpoint directory or an FTGS-IF file"
+    )
+    p.add_argument(
+        "--request", type=Path, required=True, metavar="REQUEST.json", help="the render request"
+    )
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="RENDERS.safetensors",
+        help="the renders file to write",
+    )
+    p.add_argument(
+        "--backend",
+        choices=("gsplat", "reference"),
+        default="gsplat",
+        help="gsplat (the default, needs a CUDA device) or reference, which renders on the CPU",
+    )
     p.set_defaults(run=_render)
 
     p = commands.add_parser("eval", help="evaluate a model on a scene")
-    p.add_argument("model", type=Path, metavar="MODEL")
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--split", choices=("test", "train"), default="test")  # Q-143
-    p.add_argument("--out", type=Path, required=True, metavar="METRICS.json")
-    p.add_argument("--renders-dir", dest="renders_dir", type=Path, metavar="DIR")
+    p.add_argument(
+        "model", type=Path, metavar="MODEL", help="a checkpoint directory or an FTGS-IF file"
+    )
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "--split",
+        choices=("test", "train"),
+        default="test",
+        help="the split to evaluate (default: test)",
+    )  # Q-143
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="METRICS.json",
+        help="the metrics file to write, per image and per scene",
+    )
+    p.add_argument(
+        "--renders-dir",
+        dest="renders_dir",
+        type=Path,
+        metavar="DIR",
+        help="score the renders in DIR (request.json and renders.safetensors) instead of "
+        "rendering the model",
+    )
     p.set_defaults(run=_eval)
 
     p = commands.add_parser("export", help="export a checkpoint as an exchange model")
-    p.add_argument("checkpoint", type=Path, metavar="CKPT_DIR")
-    p.add_argument("--format", choices=("ftgs-if",), required=True)
-    p.add_argument("--out", type=Path, required=True, metavar="MODEL.safetensors")
+    p.add_argument("checkpoint", type=Path, metavar="CKPT_DIR", help="the checkpoint directory")
+    p.add_argument(
+        "--format", choices=("ftgs-if",), required=True, help="the exchange format: ftgs-if"
+    )
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="MODEL.safetensors",
+        help="the exchange model file to write",
+    )
     p.set_defaults(run=_export)
 
     from openftgs.cli import _bench  # the package is loaded by now; the module imports from it
