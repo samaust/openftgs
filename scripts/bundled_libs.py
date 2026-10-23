@@ -149,7 +149,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--wheel", type=Path, action="append", help="a wheel file to inventory")
     parser.add_argument("--json", action="store_true", help="print the entries as JSON")
-    parser.add_argument("--all", action="store_true", help="also list distributions without")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="also list distributions with no bundled or unrecognised library",
+    )
     args = parser.parse_args(argv)
     entries = [_wheel(w) for w in args.wheel] if args.wheel else list(_installed())
     entries.sort(key=lambda e: e.name.lower())
