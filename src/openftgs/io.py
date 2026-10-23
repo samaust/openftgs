@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reading and writing full checkpoints (TrainerState), FTGS-IF exchange files (ExchangeModel),
-ftgs-init files (InitPoints), render requests (RenderRequest) and their renders (Renders), scene
-manifests (SceneManifest), and PLY files for viewers, with the validators of the exchange and
-init formats. Plain data in and out: this module imports neither openftgs.model nor
-openftgs.train.
+"""Readers and writers of the stable file formats of §2.2, and PLY files for viewers.
+
+Full checkpoints (:class:`~openftgs.types.TrainerState`), FTGS-IF exchange files
+(:class:`~openftgs.types.ExchangeModel`), ftgs-init files (:class:`~openftgs.types.InitPoints`),
+render requests (:class:`~openftgs.types.RenderRequest`) and their renders
+(:class:`~openftgs.types.Renders`), scene manifests (:class:`~openftgs.types.SceneManifest`), and
+PLY files for viewers, with the validators of the exchange and init formats. Plain data in and
+out: this module imports neither openftgs.model nor openftgs.train.
+
+Tensors live in safetensors files and all other state in JSON, so no file is ever unpickled.
+Every file carries ``format`` and ``version``; readers reject a major version other than 1 and
+ignore unknown optional keys (§2.2). Every rejection of a file's contents is a plain
+:class:`ValueError` (Q-26).
 
 Spec: §2.2, D-30, D-34, D-73, D-83; Q-64, Q-152. Band: Foundation (§2.1).
 """
@@ -72,7 +80,7 @@ def _fail(where: str, reason: str) -> NoReturn:
 
 
 def _check_header(meta: Mapping[str, object], fmt: str, where: str) -> None:
-    """§2.2: `format` must match and the major part of `version` must be 1."""
+    """Check the header: `format` must match and the major part of `version` must be 1 (§2.2)."""
     if meta.get("format") != fmt:
         _fail(where, f"format must be {fmt!r}, got {meta.get('format')!r}")
     version = meta.get("version")
@@ -114,10 +122,12 @@ def _write_safetensors(tensors: Mapping[str, Tensor], path: Path, meta: Mapping[
 def _replace_with_safetensors(
     tensors: Mapping[str, Tensor], path: Path, meta: Mapping[str, str]
 ) -> None:
-    """Q-126 (as answered, #179): write a single-file output to a temporary sibling, named as
-    Q-25's `.<name>.tmp-<pid>`, and rename it over `path`, so a write that fails partway leaves
-    the old file, or no file, and no temporary. A symlink at `path` becomes a regular file
-    (Q-146)."""
+    """Write a single-file output through a temporary sibling renamed over `path` (Q-126).
+
+    Q-126 (as answered, #179): the temporary sibling is named as Q-25's `.<name>.tmp-<pid>`, so
+    a write that fails partway leaves the old file, or no file, and no temporary. A symlink at
+    `path` becomes a regular file (Q-146).
+    """
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
         _write_safetensors(tensors, temporary, meta)
@@ -135,7 +145,10 @@ def _check_tensor(
     *,
     required: bool = True,
 ) -> Tensor | None:
-    """The tensor `name` with exactly `dtype` and `shape` (None matches any size), all finite."""
+    """Return the tensor `name`, checked for exactly `dtype` and `shape` and finite values.
+
+    None in `shape` matches any size.
+    """
     value = tensors.get(name)
     if value is None:
         if required:
@@ -159,8 +172,21 @@ _INIT = "ftgs-init"
 
 # Q-22: the ftgs-init validator, shared by the reader, the writer and the model.
 def validate_init_points(points: InitPoints) -> None:
-    """§2.2 ftgs-init validation (Q-22): the table's dtypes and shapes, N ≥ 1, all values finite,
-    colors within [0, 1], durations positive. Raises ValueError (Q-26)."""
+    """Check init points against the rules of §2.2's ``ftgs-init`` format (Q-22).
+
+    The rules: the table's dtypes and shapes, N ≥ 1, all values finite, colors within [0, 1]
+    and durations positive. The reader, the writer and the model share this check.
+
+    Parameters
+    ----------
+    points
+        The points to check.
+
+    Raises
+    ------
+    ValueError
+        If the points break a rule, which the message names (Q-26).
+    """
     where = "ftgs-init"
     positions = points.positions
     if not isinstance(positions, Tensor) or positions.dim() != 2:
@@ -200,9 +226,39 @@ def write_init_points(
     producer: str,
     metadata: Mapping[str, str] | None = None,  # Q-107
 ) -> None:
-    """Write a ftgs-init v1 file (§2.2; Q-22), validating first. `metadata` adds string keys
-    and values beside §2.2's own, such as `roma_init`'s provenance (Q-107); a reserved key or a
-    key or value that isn't a string raises ValueError."""
+    """Write init points as a ``ftgs-init`` v1 file (§2.2; Q-22).
+
+    The points are validated first (:func:`validate_init_points`). The file is written to a
+    temporary sibling and renamed over ``path``, so a write that fails leaves the old file, or
+    none (Q-126).
+
+    Parameters
+    ----------
+    points
+        The points to write.
+    path
+        The file to write; replaced if it exists.
+    time_unit
+        The unit of the points' raw times, recorded as the ``time_unit`` metadata.
+    producer
+        The software that made the points, recorded as the ``producer`` metadata.
+    metadata
+        More string keys and values to record beside §2.2's own, such as ``roma_init``'s
+        provenance (Q-107), or None. The keys ``format``, ``version``, ``time_unit`` and
+        ``producer`` are reserved.
+
+    Raises
+    ------
+    ValueError
+        If the points are invalid, or ``metadata`` holds a reserved or non-string key or value.
+    OSError
+        If the file can't be written.
+
+    Examples
+    --------
+    >>> from openftgs.io import write_init_points
+    >>> write_init_points(points, Path("init.safetensors"), time_unit="s", producer="my-tool")
+    """
     validate_init_points(points)
     extra = dict(metadata or {})
     for key, value in extra.items():
@@ -227,8 +283,37 @@ def write_init_points(
 
 
 def read_init_points(path: Path, *, time_unit: str | None = None) -> InitPoints:
-    """Read and validate a ftgs-init file (§2.2; Q-22). With `time_unit`, a file in another
-    unit is rejected."""
+    """Read and validate a ``ftgs-init`` file (§2.2; Q-22).
+
+    The optional tensors and the ``producer`` metadata may be absent; ``time_unit`` must be
+    there.
+
+    Parameters
+    ----------
+    path
+        The file to read.
+    time_unit
+        The time unit the file must record, or None to accept any.
+
+    Returns
+    -------
+    openftgs.types.InitPoints
+        The points, on the CPU.
+
+    Raises
+    ------
+    ValueError
+        If the file isn't a readable safetensors file or a ``ftgs-init`` file of major version
+        1, lacks ``time_unit`` or a required tensor, records another unit than ``time_unit``,
+        or holds invalid points (:func:`validate_init_points`).
+
+    Examples
+    --------
+    >>> from openftgs.io import read_init_points
+    >>> points = read_init_points(Path("init.safetensors"), time_unit="s")
+    >>> points.positions.shape
+    torch.Size([300000, 3])
+    """
     tensors, meta = _read_safetensors(Path(path))
     _check_header(meta, _INIT, str(path))
     if "time_unit" not in meta:  # §2.2 ftgs-init metadata
@@ -281,8 +366,36 @@ _RENDER_CONVENTIONS = {
 
 
 def render_conventions(*, background: Sequence[float] = (0.0, 0.0, 0.0)) -> dict[str, Any]:
-    """A fresh copy of ftgs-if's `render_conventions` block (§2.2, D-73; Q-24, Q-35, Q-204) with
-    `background`, three numbers in [0, 1] (D-84), black by default (D-34)."""
+    """Return a fresh copy of the ``render_conventions`` block of ``ftgs-if`` (§2.2, D-73).
+
+    The block describes the producer's renderer to importers and to the harness: E6's
+    constants, the pixel-center offset, the background the model was trained against, the
+    Jacobian clamp margin, the screen-extent rule and its cap, and the rasterize mode. Readers
+    use only its background (D-84).
+
+    Parameters
+    ----------
+    background
+        The RGB background the model was trained against, three numbers in [0, 1] (D-84);
+        black by default (D-34).
+
+    Returns
+    -------
+    dict
+        The block, with the keys ``alpha_max``, ``eps2d``, ``near``, ``far``, ``alpha_skip``,
+        ``transmittance_stop``, ``pixel_center_offset``, ``background`` (a list of three
+        floats), ``jacobian_clamp_margin``, ``screen_extent_rule``, ``screen_extent_max`` and
+        ``rasterize_mode``.
+
+    Raises
+    ------
+    ValueError
+        If ``background`` isn't three numbers in [0, 1].
+
+    Notes
+    -----
+    The keys and values follow Q-24, Q-35 and Q-204.
+    """
     if (
         isinstance(background, str)
         or not isinstance(background, Sequence)
@@ -300,10 +413,25 @@ def render_conventions(*, background: Sequence[float] = (0.0, 0.0, 0.0)) -> dict
 
 # Q-22, Q-24: the ftgs-if validator, shared by the reader, the writer and the model.
 def validate_exchange(model: ExchangeModel) -> None:
-    """§2.2 ftgs-if validation (Q-22, Q-24): the table's keys, dtypes and shapes, N ≥ 1, all
-    values finite, opacity in (0, 1), durations and scales positive, rotations of norm > 1e-8,
-    sh_degree in {0, 1, 2, 3}, finite τ₀ ≤ τ₁, a background of three numbers in [0, 1] (D-84).
-    Raises ValueError (Q-26)."""
+    """Check an exchange model against the rules of §2.2's ``ftgs-if`` format (Q-22, Q-24).
+
+    The rules: the table's keys, dtypes and shapes, N ≥ 1, all values finite, opacity in
+    (0, 1), durations and scales positive, rotations of norm > 1e-8, ``sh_degree`` in
+    {0, 1, 2, 3}, finite τ₀ ≤ τ₁, a background of three numbers in [0, 1] (D-84), and, with a
+    single timestamp (τ₀ = τ₁), every time center τ₀ and every velocity 0 (D-71). Rotations
+    need not be unit quaternions here; only :func:`write_exchange` asks for that. The reader,
+    the writer and the model share this check.
+
+    Parameters
+    ----------
+    model
+        The model to check.
+
+    Raises
+    ------
+    ValueError
+        If the model breaks a rule, which the message names (Q-26).
+    """
     where = "ftgs-if"
     degree = model.sh_degree
     if isinstance(degree, bool) or not isinstance(degree, int) or degree not in _SH_DEGREES:
@@ -359,8 +487,11 @@ def validate_exchange(model: ExchangeModel) -> None:
 
 
 def _check_canonical_rotation(rotation: Tensor, where: str) -> None:
-    """§2.2 ftgs-if: unit quaternions with w ≥ 0; Q-24: where w = 0, the first nonzero component
-    is positive. Checked on write only; readers accept any rotation of norm > 1e-8."""
+    """Check that rotations are canonical unit quaternions (§2.2 ftgs-if; Q-24).
+
+    §2.2 ftgs-if: unit quaternions with w ≥ 0; Q-24: where w = 0, the first nonzero component
+    is positive. Checked on write only; readers accept any rotation of norm > 1e-8.
+    """
     norm = torch.linalg.vector_norm(rotation.to(torch.float64), dim=-1)
     if not bool(((norm - 1.0).abs() <= _UNIT_TOLERANCE).all()):
         _fail(where, "rotation must hold unit quaternions")
@@ -373,8 +504,34 @@ _IF_KEYS = ("position", "time_center", "duration", "velocity", "scale", "rotatio
 
 
 def write_exchange(model: ExchangeModel, path: Path) -> None:
-    """Write a ftgs-if v1 file (§2.2), validating first (Q-22). Writing is stricter than
-    reading: rotations must be unit quaternions with the canonical sign (Q-24)."""
+    """Write an exchange model as a ``ftgs-if`` v1 file (§2.2).
+
+    The model is validated first (:func:`validate_exchange`; Q-22), and writing is stricter
+    than reading: rotations must be unit quaternions, within 1e-6, with the canonical sign:
+    w ≥ 0 and, where w = 0, the first nonzero component positive (Q-24). The metadata records the
+    SH degree, the time unit, τ₀, τ₁, the producer and the :func:`render_conventions` block
+    with the model's background (D-84). The file is written to a temporary sibling and renamed
+    over ``path`` (Q-126).
+
+    Parameters
+    ----------
+    model
+        The model to write.
+    path
+        The file to write; replaced if it exists.
+
+    Raises
+    ------
+    ValueError
+        If the model is invalid, or its rotations aren't canonical unit quaternions.
+    OSError
+        If the file can't be written.
+
+    Examples
+    --------
+    >>> from openftgs.io import write_exchange
+    >>> write_exchange(model.to_exchange(), Path("model.safetensors"))
+    """
     validate_exchange(model)
     _check_canonical_rotation(model.arrays["rotation"], f"ftgs-if {path}")
     meta = {
@@ -395,8 +552,11 @@ def write_exchange(model: ExchangeModel, path: Path) -> None:
 
 
 def _recorded_background(meta: Mapping[str, str], where: str) -> tuple[float, float, float]:
-    """D-84: render_conventions' background, black when the block or the entry is absent; its
-    range is validate_exchange's to check."""
+    """Return the background render_conventions records, black when absent (D-84).
+
+    D-84: render_conventions' background, black when the block or the entry is absent; its
+    range is validate_exchange's to check.
+    """
     if "render_conventions" not in meta:
         return (0.0, 0.0, 0.0)
     try:
@@ -418,10 +578,38 @@ def _recorded_background(meta: Mapping[str, str], where: str) -> tuple[float, fl
 
 
 def read_exchange(path: Path) -> ExchangeModel:
-    """Read and validate a ftgs-if file (§2.2; Q-22). Unknown keys are ignored, and so are the
-    entries of render_conventions other than `background` (Q-24), which is returned: black
-    when the block or the entry is absent, a ValueError when it isn't three numbers in [0, 1]
-    or the block isn't a JSON object (D-84, Q-157)."""
+    """Read and validate a ``ftgs-if`` file (§2.2; Q-22).
+
+    Unknown keys are ignored, and so are the entries of ``render_conventions`` other than
+    ``background`` (Q-24), which is returned as the model's background: black when the block
+    or the entry is absent (D-84). A missing ``producer`` reads as an empty string.
+
+    Parameters
+    ----------
+    path
+        The file to read.
+
+    Returns
+    -------
+    openftgs.types.ExchangeModel
+        The model, its tensors on the CPU.
+
+    Raises
+    ------
+    ValueError
+        If the file isn't a readable safetensors file or a ``ftgs-if`` file of major version
+        1; if it lacks ``sh_degree``, ``tau0``, ``tau1`` or ``time_unit``, or they aren't
+        numbers; if ``render_conventions`` isn't a JSON object or its background isn't three
+        numbers in [0, 1] (D-84, Q-157); or if the model is invalid
+        (:func:`validate_exchange`).
+
+    Examples
+    --------
+    >>> from openftgs.io import read_exchange
+    >>> exchange = read_exchange(Path("model.safetensors"))
+    >>> exchange.sh_degree, exchange.time_unit
+    (3, 's')
+    """
     tensors, meta = _read_safetensors(Path(path))
     where = str(path)
     _check_header(meta, _IF, where)
@@ -481,8 +669,11 @@ _SEP = "/"  # Q-25: separator of the key paths under which nested tensors are st
 def _split_tensors(
     tree: Mapping[str, Any], where: str, prefix: str = ""
 ) -> tuple[dict[str, Tensor], dict[str, Any]]:
-    """Q-25: every tensor in a tree of dicts goes to a flat map under its `/`-joined key path;
-    the rest stays in a JSON-ready tree. Tensors inside lists are refused."""
+    """Split a tree of dicts into its tensors and a JSON-ready rest (Q-25).
+
+    Q-25: every tensor in a tree of dicts goes to a flat map under its `/`-joined key path;
+    the rest stays in a JSON-ready tree. Tensors inside lists are refused.
+    """
     tensors: dict[str, Tensor] = {}
     rest: dict[str, Any] = {}
     for key, value in tree.items():
@@ -502,7 +693,7 @@ def _split_tensors(
 
 
 def _check_json(value: Any, where: str) -> None:
-    """A JSON value with finite numbers and string keys; tensors are refused here."""
+    """Check for a JSON value with finite numbers and string keys; tensors are refused here."""
     if value is None or isinstance(value, bool | int | str):
         return
     if isinstance(value, float):
@@ -523,7 +714,7 @@ def _check_json(value: Any, where: str) -> None:
 
 
 def _merge_tensors(tree: dict[str, Any], tensors: Mapping[str, Tensor], where: str) -> None:
-    """The inverse of _split_tensors: put each tensor back at its key path."""
+    """Put each tensor back at its key path, the inverse of _split_tensors."""
     for path, value in tensors.items():
         *parents, leaf = path.split(_SEP)
         node = tree
@@ -558,7 +749,7 @@ def _mtime(path: Path) -> float:
 
 
 def _checkpoint_manifest(directory: Path) -> dict[str, Any] | None:
-    """The manifest of a checkpoint directory, or None for anything else."""
+    """Return the manifest of a checkpoint directory, or None for anything else."""
     try:
         manifest = json.loads((directory / _MANIFEST).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -571,8 +762,10 @@ def _is_checkpoint(directory: Path) -> bool:
 
 
 def _recover_set_aside(directory: Path) -> None:
-    """Q-25: recover from a save killed between its two renames, then sweep leftovers. The
-    newest set-aside checkpoint is the one a killed save left last."""
+    """Recover from a save killed between its two renames, then sweep leftovers (Q-25).
+
+    The newest set-aside checkpoint is the one a killed save left last.
+    """
     aside = sorted(directory.parent.glob(f".{directory.name}.old-*"), key=_mtime)
     if not directory.exists() and aside and _is_checkpoint(aside[-1]):
         aside.pop().rename(directory)
@@ -581,14 +774,50 @@ def _recover_set_aside(directory: Path) -> None:
 
 
 def save_checkpoint(state: TrainerState, directory: Path) -> Path:
-    """Write `state` as a ftgs-checkpoint v1 directory (§2.2; Q-17, Q-25) and return its path.
+    """Write a trainer state as a ``ftgs-checkpoint`` v1 directory (§2.2; Q-25).
 
-    The files are written into a temporary sibling directory that then replaces `directory`, so
-    a reader sees either the old checkpoint or the new one. An existing directory is replaced
+    The files are written into a temporary sibling directory that then replaces ``directory``,
+    so a reader sees either the old checkpoint or the new one. An existing directory is replaced
     only if it is a checkpoint or empty. POSIX can't swap two directories in one rename: a kill
     between the two renames leaves the old checkpoint set aside beside the target, and the next
     save of the same target restores it before replacing it (Q-25). Concurrent saves to one
-    target are not supported."""
+    target are not supported.
+
+    Parameters
+    ----------
+    state
+        The state to save, as ``Trainer.state_dict`` returns it: ``params`` holding exactly the
+        nine stored tensors of §1.1, float32; ``stats`` holding only [N] tensors; tensors in
+        ``optim`` and ``rng`` at any depth of nested dicts, under keys without ``/``; JSON
+        values with finite numbers elsewhere.
+    directory
+        The checkpoint directory to write.
+
+    Returns
+    -------
+    pathlib.Path
+        ``directory``.
+
+    Raises
+    ------
+    ValueError
+        If ``state`` breaks one of these rules, or ``directory`` exists and is neither a
+        checkpoint nor an empty directory.
+    OSError
+        If a file can't be written.
+
+    Notes
+    -----
+    The manifest records the iteration, the configuration, τ₀, τ₁, S, Δt_f, the SH degree and
+    seed, the scene manifest's SHA-256 and time unit (Q-17), the versions of openftgs, torch,
+    gsplat and CUDA, and the SHA-256 of every other file.
+
+    Examples
+    --------
+    >>> from openftgs.io import save_checkpoint
+    >>> save_checkpoint(trainer.state_dict(), Path("run/checkpoint"))
+    PosixPath('run/checkpoint')
+    """
     directory = Path(directory)
     where = f"checkpoint {directory}"
     if set(state.params) != set(_PARAM_NAMES):
@@ -669,14 +898,14 @@ _EARLIER_NAME = re.compile(r"checkpoint-(0|[1-9][0-9]*)")
 
 
 def _iteration_of(directory: Path) -> int | None:
-    """The iteration a checkpoint's manifest records, or None for anything else (Q-150)."""
+    """Return the iteration a checkpoint's manifest records, or None for anything else (Q-150)."""
     manifest = _checkpoint_manifest(directory)
     iteration = None if manifest is None else manifest.get("iteration")
     return iteration if isinstance(iteration, int) and not isinstance(iteration, bool) else None
 
 
 def _earlier_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
-    """Q-150: every RUN_DIR/checkpoint-<n> that is a checkpoint, with n, ordered by n."""
+    """List every RUN_DIR/checkpoint-<n> that is a checkpoint, with n, ordered by n (Q-150)."""
     found: list[tuple[int, Path]] = []
     for path in run_dir.glob("checkpoint-*"):
         match = _EARLIER_NAME.fullmatch(path.name)
@@ -686,7 +915,7 @@ def _earlier_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
 
 
 def _counts_as_kept(path: Path) -> bool:
-    """Q-150: a checkpoint-<n> entry is a kept checkpoint when it is a checkpoint directory."""
+    """Tell whether a checkpoint-<n> entry is a kept checkpoint: a checkpoint directory (Q-150)."""
     return path.is_dir() and _is_checkpoint(path)
 
 
@@ -697,14 +926,45 @@ def _check_keep(keep: int) -> None:
 
 # D-83, Q-152: the saves of ftgs train, rotated through the run directory.
 def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) -> Path:
-    """Save `state` as RUN_DIR/checkpoint with `save_checkpoint`, keeping the `keep` latest
-    saves of the run directory, one per iteration (D-83): the previous latest is renamed
-    RUN_DIR/checkpoint-<its iteration> when `keep` > 1, and the oldest beyond `keep` are removed
-    once the new save is in place (Q-151). Kept checkpoints of the saved iteration or later, the
-    continuation a resume from an earlier one abandoned, are not kept: RUN_DIR/checkpoint is
-    replaced in place, the others removed first (Q-149). Only checkpoints are counted or
-    removed, and a rename onto anything else is refused with ValueError (Q-150, Q-25). A save
-    that fails puts the previous latest back. Returns RUN_DIR/checkpoint."""
+    """Save a trainer state into a run directory, keeping its latest saves (D-83; Q-152).
+
+    The state is saved as ``RUN_DIR/checkpoint`` with :func:`save_checkpoint`, keeping the
+    ``keep`` latest saves of the run directory, one per iteration: the previous latest is
+    renamed ``RUN_DIR/checkpoint-<its iteration>`` when ``keep`` > 1, and the oldest beyond
+    ``keep`` are removed once the new save is in place (Q-151). Kept checkpoints of the saved
+    iteration or later, the continuation a resume from an earlier one abandoned, are not kept:
+    ``RUN_DIR/checkpoint`` is replaced in place, the others removed first (Q-149). Only
+    checkpoints are counted or removed (Q-150, Q-25). A save that fails puts the previous
+    latest back.
+
+    Parameters
+    ----------
+    state
+        The state to save, as for :func:`save_checkpoint`.
+    run_dir
+        The run directory.
+    keep
+        How many saves to keep, the latest included, ≥ 1.
+
+    Returns
+    -------
+    pathlib.Path
+        ``RUN_DIR/checkpoint``.
+
+    Raises
+    ------
+    ValueError
+        If ``keep`` isn't an integer ≥ 1, the rename would land on a ``checkpoint-<n>`` that
+        isn't a checkpoint (Q-150, Q-25), or :func:`save_checkpoint` refuses the state.
+    OSError
+        If a file can't be written.
+
+    Examples
+    --------
+    >>> from openftgs.io import save_run_checkpoint
+    >>> save_run_checkpoint(trainer.state_dict(), Path("run"), keep=3)
+    PosixPath('run/checkpoint')
+    """
     _check_keep(keep)
     run_dir = Path(run_dir)
     latest = run_dir / _LATEST
@@ -736,9 +996,25 @@ def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) ->
 
 # Q-163: ftgs train's check before training (Q-150 as answered).
 def check_run_checkpoints(run_dir: Path, *, keep: int = 1) -> None:
-    """Raise ValueError naming the first RUN_DIR/checkpoint-<n>, by n, that isn't a checkpoint
-    (Q-150) when `keep` > 1, since a save of `save_run_checkpoint` with that `keep` would refuse
-    to rename onto it. Only each manifest's format is read, and nothing changes."""
+    """Check that the saves of a run directory can rotate, before training (Q-163).
+
+    With ``keep`` > 1, a save of :func:`save_run_checkpoint` with that ``keep`` would refuse to
+    rename onto a ``RUN_DIR/checkpoint-<n>`` that isn't a checkpoint (Q-150), so ``ftgs train``
+    checks for one first. Only each manifest's format is read, and nothing changes.
+
+    Parameters
+    ----------
+    run_dir
+        The run directory.
+    keep
+        How many saves the run will keep, ≥ 1; with 1 there is nothing to check.
+
+    Raises
+    ------
+    ValueError
+        If ``keep`` isn't an integer ≥ 1, or, with ``keep`` > 1, naming the first
+        ``RUN_DIR/checkpoint-<n>``, by n, that isn't a checkpoint.
+    """
     _check_keep(keep)
     if keep == 1:
         return
@@ -753,8 +1029,36 @@ def check_run_checkpoints(run_dir: Path, *, keep: int = 1) -> None:
 
 
 def load_checkpoint(directory: Path) -> TrainerState:
-    """Read a ftgs-checkpoint directory (§2.2; Q-25), checking its format, major version, file
-    set and every SHA-256 first. Tensors are returned on the CPU."""
+    """Read a ``ftgs-checkpoint`` directory (§2.2; Q-25).
+
+    The manifest's format and major version, the file set and every file's SHA-256 are checked
+    before anything else is read; files the manifest doesn't list are ignored. The stored
+    configuration must be valid (Q-10, Q-11), and N must not exceed its ``n_max`` (§1.1).
+
+    Parameters
+    ----------
+    directory
+        The checkpoint directory.
+
+    Returns
+    -------
+    openftgs.types.TrainerState
+        The state, its tensors on the CPU.
+
+    Raises
+    ------
+    ValueError
+        If the manifest can't be read or isn't a ``ftgs-checkpoint`` manifest of major version
+        1, a file is missing or doesn't match its SHA-256, a file's contents are malformed, the
+        configuration is invalid, or N exceeds N_max.
+
+    Examples
+    --------
+    >>> from openftgs.io import load_checkpoint
+    >>> state = load_checkpoint(Path("run/checkpoint"))
+    >>> state.iteration
+    30000
+    """
     directory = Path(directory)
     where = f"checkpoint {directory}"
     try:
@@ -883,8 +1187,10 @@ def _parse_camera(value: Any, name: str, where: str) -> Camera:
 
 
 def _check_json_header(raw: Mapping[str, Any], fmt: str, where: str) -> None:
-    """§2.2 for the JSON formats: `format`, and a `version` of major 1 written as a JSON int or
-    a "major.minor" string (Q-56)."""
+    """Check the header of a JSON format: `format`, and a `version` of major 1 (§2.2; Q-56).
+
+    The version is written as a JSON int or a "major.minor" string (Q-56).
+    """
     version = raw.get("version")
     if isinstance(version, bool) or not isinstance(version, int | str):
         _fail(where, f"version must be an int or a string, got {version!r}")
@@ -910,8 +1216,38 @@ def _parse_item(value: Any, where: str) -> RenderItem:
 
 
 def read_render_request(path: Path) -> RenderRequest:
-    """Read and validate a ftgs-render-request file (§2.2; Q-56). `background` defaults to
-    black (D-34) and `sh_degree` to null, the model's degree; unknown keys are ignored."""
+    """Read and validate a ``ftgs-render-request`` file (§2.2; Q-56).
+
+    ``background`` defaults to black (D-34) and ``sh_degree`` to null, the model's full
+    degree; unknown keys are ignored. Each item's camera is checked: positive integer width
+    and height, K with fx, fy > 0 and no skew, and a world-to-camera matrix whose last row is
+    (0, 0, 0, 1) and whose rotation is orthonormal, within 1e-5, with determinant +1.
+
+    Parameters
+    ----------
+    path
+        The JSON file to read.
+
+    Returns
+    -------
+    openftgs.types.RenderRequest
+        The request, its items in file order, each camera named after its item's id.
+
+    Raises
+    ------
+    ValueError
+        If the file isn't readable JSON or a ``ftgs-render-request`` file of major version 1;
+        if ``time_unit`` isn't a non-empty string, the background isn't three numbers in
+        [0, 1] or ``sh_degree`` isn't null or 0 to 3; or if ``items`` is empty, an item id is
+        empty or repeated, a timestamp isn't a finite number or a camera breaks a rule.
+
+    Examples
+    --------
+    >>> from openftgs.io import read_render_request
+    >>> request = read_render_request(Path("request.json"))
+    >>> [item.id for item in request.items]
+    ['r0000', 'r0001']
+    """
     where = f"render request {path}"
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -967,9 +1303,40 @@ def _check_renders(rgb: Mapping[str, Tensor], alpha: Mapping[str, Tensor], where
 
 
 def write_renders(renders: Renders, path: Path, *, producer: str, request_sha256: str) -> None:
-    """Write a ftgs-renders v1 file (§2.2; Q-56): `rgb/<id>` [H, W, 3] and `alpha/<id>`
-    [H, W, 1], float32, rgb not clamped to 1, with the producer and the SHA-256 of the request
-    file's bytes, as 64 lowercase hex digits, as metadata."""
+    """Write renders as a ``ftgs-renders`` v1 file (§2.2; Q-56).
+
+    Each item's colors are stored as ``rgb/<id>``, [H, W, 3] float32, not clamped to 1, and
+    its opacity as ``alpha/<id>``, [H, W, 1] float32; the metadata records the producer and
+    the request's SHA-256. The file is written to a temporary sibling and renamed over
+    ``path`` (Q-126).
+
+    Parameters
+    ----------
+    renders
+        The renders: at least one non-empty id, each in both maps, with the dtypes and shapes
+        above and finite values.
+    path
+        The file to write; replaced if it exists.
+    producer
+        The software that made the renders.
+    request_sha256
+        The SHA-256 of the request file's bytes, as 64 lowercase hex digits.
+
+    Raises
+    ------
+    ValueError
+        If ``request_sha256`` isn't such a digest, or the renders break a rule.
+    OSError
+        If the file can't be written.
+
+    Examples
+    --------
+    >>> import hashlib
+    >>> from openftgs.io import write_renders
+    >>> digest = hashlib.sha256(Path("request.json").read_bytes()).hexdigest()
+    >>> write_renders(renders, Path("renders.safetensors"), producer="my-tool",
+    ...               request_sha256=digest)
+    """
     where = f"renders {path}"
     if not isinstance(request_sha256, str) or not _SHA256_PATTERN.fullmatch(request_sha256):
         _fail(where, f"request_sha256 must be a SHA-256 hex digest, got {request_sha256!r}")
@@ -986,10 +1353,38 @@ def write_renders(renders: Renders, path: Path, *, producer: str, request_sha256
 
 
 def read_renders(path: Path, *, request_sha256: str | None = None) -> Renders:
-    """Read and validate a ftgs-renders file (§2.2; Q-56). With `request_sha256`, a file
-    recorded for another request is rejected. Tensors other than rgb/… and alpha/… are
-    ignored. The file keeps no item order, so the ids come back sorted: match them to the
-    request by id."""
+    """Read and validate a ``ftgs-renders`` file (§2.2; Q-56).
+
+    Tensors other than ``rgb/…`` and ``alpha/…`` are ignored. The file keeps no item order, so
+    the ids come back sorted: match them to the request by id.
+
+    Parameters
+    ----------
+    path
+        The file to read.
+    request_sha256
+        The SHA-256 of the request the renders must answer, as 64 lowercase hex digits, or
+        None to accept any.
+
+    Returns
+    -------
+    openftgs.types.Renders
+        The renders, sorted by id, on the CPU.
+
+    Raises
+    ------
+    ValueError
+        If the file isn't a readable safetensors file or a ``ftgs-renders`` file of major
+        version 1, was made for another request than ``request_sha256``, or its renders are
+        empty, unpaired, of the wrong dtype or shape, or not finite.
+
+    Examples
+    --------
+    >>> from openftgs.io import read_renders
+    >>> renders = read_renders(Path("renders.safetensors"), request_sha256=digest)
+    >>> renders.rgb["r0000"].shape
+    torch.Size([480, 640, 3])
+    """
     tensors, meta = _read_safetensors(Path(path))
     where = f"renders {path}"
     _check_header(meta, _RENDERS, where)
@@ -1024,11 +1419,39 @@ def _relative_path(value: Any, what: str, where: str) -> Path:
 
 
 def read_scene_manifest(path: Path) -> SceneManifest:
-    """Read and validate a ftgs-scene file (§2.2; Q-64): the image records in file order, with
-    paths resolved against the manifest's directory, the test images' masks, the metadata, the
-    time unit, the SHA-256 of the file's bytes as read and the camera names in the key order of
-    the `cameras` object (Q-108). Cameras are checked as a render
-    request's (Q-56); unknown keys are ignored. Whether the files exist is not checked here."""
+    """Read and validate a ``ftgs-scene`` file (§2.2; Q-64).
+
+    The result holds the image records in file order, with paths resolved against the
+    manifest's directory, the test images' masks, the metadata, the time unit, the SHA-256 of
+    the file's bytes as read and the camera names in the key order of the ``cameras`` object
+    (Q-108). An image that overrides ``K`` or ``world_to_camera`` gets a camera of its own.
+    Cameras are checked as a render request's (Q-56), and must be pinhole cameras; unknown keys
+    are ignored. Whether the files exist is not checked here.
+
+    Parameters
+    ----------
+    path
+        The manifest file to read.
+
+    Returns
+    -------
+    openftgs.types.SceneManifest
+        The parsed manifest.
+
+    Raises
+    ------
+    ValueError
+        If the file isn't readable JSON or a ``ftgs-scene`` file of major version 1; if a
+        camera, an image entry, a path, a split or the metadata breaks §2.2's rules (absolute
+        paths and masks on training images are refused); or if there is no training image.
+
+    Examples
+    --------
+    >>> from openftgs.io import read_scene_manifest
+    >>> scene = read_scene_manifest(Path("scene/scene.json"))
+    >>> scene.camera_names[:2], len(scene.records)
+    (('cam00', 'cam01'), 6000)
+    """
     path = Path(path)
     where = f"scene manifest {path}"
     try:
@@ -1102,7 +1525,7 @@ def read_scene_manifest(path: Path) -> SceneManifest:
 
 
 def _float32_json(value: Tensor) -> list[Any]:
-    """Q-84: each value as the shortest decimal that reads back to the same float32."""
+    """Convert each value to the shortest decimal that reads back to the same float32 (Q-84)."""
     array = value.detach().to("cpu", torch.float32).numpy()
     return [[float(str(x)) for x in row] for row in array]
 
@@ -1118,7 +1541,7 @@ def _camera_entry(camera: Camera) -> dict[str, Any]:
 
 
 def _manifest_path(path: Path, root: Path, what: str, where: str) -> str:
-    """§2.2: paths are written relative to the manifest, in POSIX form."""
+    """Return `path` relative to the manifest, in POSIX form (§2.2)."""
     try:
         relative = Path(os.path.relpath(Path(path).absolute(), root.absolute()))
     except ValueError:  # another drive on Windows
@@ -1136,12 +1559,50 @@ def write_scene_manifest(
     masks: Sequence[Path | None] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> SceneManifest:
-    """Write a ftgs-scene v1 file (§2.2; Q-64, Q-84) and return it as `read_scene_manifest`
-    reads it back. One camera entry per camera name comes from that name's first record; a
-    later record whose K or world-to-camera differs gets a per-image override. Camera values are
-    written as the shortest decimals that read back to the same float32 values, so the reader
-    rebuilds each camera bitwise. Image and mask paths must lie under the manifest's directory.
-    The file is written to a temporary sibling, validated by reading it back, then renamed."""
+    """Write image records as a ``ftgs-scene`` v1 file (§2.2; Q-64, Q-84).
+
+    One camera entry per camera name comes from that name's first record; a later record whose
+    K or world-to-camera differs gets a per-image override. Camera values are written as the
+    shortest decimals that read back to the same float32 values, so the reader rebuilds each
+    camera bitwise. Image and mask paths must lie under the manifest's directory and are
+    written relative to it. The file is written to a temporary sibling, validated by reading it
+    back, then renamed over ``path``.
+
+    Parameters
+    ----------
+    path
+        The manifest file to write; replaced if it exists.
+    records
+        The image records, in the order to write them; at least one for training.
+    time_unit
+        The unit of the records' raw times.
+    masks
+        Each record's mask, aligned with ``records``: a path for a test image, else None; or
+        None for no masks at all.
+    metadata
+        The manifest's ``metadata`` object, JSON values only, or None for an empty one.
+
+    Returns
+    -------
+    openftgs.types.SceneManifest
+        The manifest as :func:`read_scene_manifest` reads it back.
+
+    Raises
+    ------
+    ValueError
+        If ``masks`` doesn't align with ``records``, a camera name changes size, a path lies
+        outside the manifest's directory, the metadata isn't JSON, or the written file fails
+        :func:`read_scene_manifest`'s checks.
+    OSError
+        If the file can't be written.
+
+    Examples
+    --------
+    >>> from openftgs.io import read_scene_manifest, write_scene_manifest
+    >>> scene = read_scene_manifest(Path("scene/scene.json"))
+    >>> train = [r for r in scene.records if r.split == "train"]
+    >>> subset = write_scene_manifest(Path("scene/train.json"), train, time_unit=scene.time_unit)
+    """
     path = Path(path)
     where = f"scene manifest {path}"
     root = path.parent
@@ -1208,10 +1669,42 @@ _OPACITY_EPS = 1e-7
 def write_ply(
     path: Path, *, means: Tensor, scales: Tensor, quats: Tensor, opacities: Tensor, sh: Tensor
 ) -> None:
-    """Write per-time arrays as a static 3DGS-viewer PLY (Q-18): binary little-endian float32
-    properties x y z, nx ny nz (zero), f_dc_0..2, f_rest_* (channel-major), opacity as a logit,
-    scale_0..2 as logs, rot_0..3. Inputs are physical values: scales > 0, opacities in [0, 1]
-    (clamped to [1e-7, 1 − 1e-7] before the logit), quaternions (w, x, y, z)."""
+    """Write per-time arrays as a static PLY for 3DGS viewers (Q-18).
+
+    A snapshot of the model at one time, export-only and never read back. The file is binary
+    little-endian with the float32 properties ``x y z``, ``nx ny nz`` (zero),
+    ``f_dc_0..2``, ``f_rest_*`` (channel-major), ``opacity`` as a logit, ``scale_0..2`` as
+    logs and ``rot_0..3``.
+
+    Parameters
+    ----------
+    path
+        The PLY file to write; replaced if it exists.
+    means
+        Positions at the chosen time, [N, 3], in world units.
+    scales
+        Scales, [N, 3], in world units, > 0.
+    quats
+        Rotations as quaternions (w, x, y, z), [N, 4].
+    opacities
+        Opacities, [N], in [0, 1]; clamped to [1e-7, 1 − 1e-7] before the logit.
+    sh
+        SH coefficients, [N, K, 3], K ≥ 1, the first the DC term.
+
+    Raises
+    ------
+    ValueError
+        If a shape doesn't match, a value isn't finite, or a scale isn't positive.
+    OSError
+        If the file can't be written.
+
+    Examples
+    --------
+    >>> from openftgs.io import write_ply
+    >>> g = model.at_time(0.5)
+    >>> write_ply(Path("t050.ply"), means=g.means_t, scales=g.scales, quats=g.quats_n,
+    ...           opacities=g.opacities_t, sh=g.sh)
+    """
     where = f"ply {path}"
     n = int(means.shape[0]) if means.dim() == 2 else -1
     k = int(sh.shape[1]) if sh.dim() == 3 else -1
