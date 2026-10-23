@@ -85,7 +85,80 @@ NOTICE also names RoMa's commit, 77f8d68803526dcddfd9b7a46bc76125bdc25f15, as `V
 
 ## No dataset material
 
-To be written by #367.
+§2.3 notes: datasets are never bundled; SelfCap is licensed for non-commercial research only, and nothing derived from it enters the repository, the wheels or CI; Neural3DV is CC-BY-NC-4.0 (D-79). CLAUDE.md: `docs/paper/` and datasets are never committed. Checked on 2026-10-22 by ticket #367 on commit 7e1faf0 of `prd-355-release`, with git 2.43.0, in the tracked tree, the whole history, and a freshly built sdist and wheel. Every search root is inside the repository, out of `.venv` and `.scratch`; helper scripts and outputs went to the session's scratchpad, written `<s>` below.
+
+### The tracked tree
+
+253 tracked files (`git ls-files`).
+
+**By name.** `git ls-files | grep -i -E '<media and data extensions>|<dataset and scene names>|docs/paper|(^|/)(data|datasets|runs)/'`, with the extensions `mp4 avi mov mkv webm png jpg jpeg bmp tif tiff exr npy npz ply tar gz tgz zip 7z pth pt ckpt bin h5 pdf yml yaml safetensors svg`, the names `poses_bounds intri extri sync.json selfcap n3dv neural enerf corgi hair yoga bike dance coffee spinach beef salmon steak actor`. Hits, each accounted for:
+
+| Hit | What it is |
+| --- | --- |
+| `.github/workflows/ci.yml`, `gpu-bench.yml` | CI workflows |
+| `docs/coverage.svg` | the coverage badge (Q-217) |
+| `docs/modules/data/*.md` (4) | module docs of `openftgs.data` |
+| `tests/synthetic/data/s{1,2,3,4,6}_gt.safetensors`, `seeds.json` | the S-n fixtures (below) |
+
+No `docs/paper/`, `data/`, `datasets/` or `runs/` path, and no image, video, NumPy, point-cloud, archive or checkpoint file.
+
+**By content.** The only binary files are the five S-n fixtures: every other tracked file is UTF-8 text without a NUL byte (the history check below applies the same test to every blob). The largest tracked files are `docs/clean-room/questions.md` (587,931 bytes), the spec, the source log and source and test modules. `git grep -I -i -c -E 'selfcap|neural.?3d.?v|n3dv|enerf|coffee_martini|cook_spinach|cut_roasted_beef|flame_salmon|flame_steak|sear_steak|hair-calib|yoga-calib|corgi'` names the datasets in 37 files, every hit a name or prose, not data:
+
+- the spec and `docs/spec/README.md`, CLAUDE.md, `docs/clean-room/` (questions, source log, milestones, validation runs), `docs/GLOSSARY.md`, `docs/modules/`, `docs/research/animated-playback.md`, `docs/agents/clean-room.md`, `.claude/skills/tdd/mocking.md` and `README.md`: the owner's and the project's prose;
+- `src/openftgs/data.py`, `eval.py`, `cli/__init__.py` and `cli/_bench.py`: the converters and their names, written from §1.4 and the datasets' documentation (D-28, D-59 to D-64); `_bench.py`'s `selfcap/studio` and `n3dv/kitchen` are openftgs-synth scenes (CC0-1.0, Q-239);
+- `scripts/ci_scene.py`, `crop_scene.py`, `synth_masks.py` and `synth_window.py`: the CI's procedural scene, sized after Neural3DV's setup (§3.4), and tools for converted openftgs-synth scenes;
+- the tests: scene names as strings (`n3dv/flame_steak` in `test_eval.py` and `test_io.py`), and mini-archives and calibration files in the datasets' layouts that `tests/builders.py` and the tests generate in pytest's `tmp_path`, with invented values (`SELFCAP_OFFSETS = {"0000": 0.004, "0001": -0.0125, "0002": 0.02}`; `test_data_images.py`'s hand-written `intri.yml` with round numbers, and the 2160 × 3840 image size the spec's prose gives). C-1 to C-5 in `tests/test_converter_checks.py` read the datasets only from `$OPENFTGS_DATASETS` when the raw downloads are there, and skip otherwise (Q-7, Q-100, D-79).
+
+`git grep -n -E '%YAML|opencv-matrix'` finds OpenCV-style YAML only in `data.py`'s reader, its module doc and `test_data_images.py`'s generated files.
+
+**The benchmark baselines** (`benchmarks/baselines/nvidia-geforce-rtx-4090/*.json`, 6 files) are BENCH.json timing records of the CI's procedural scene (`scripts/ci_scene.py`), with no image data (Q-196).
+
+### The whole history
+
+Every ref (`git for-each-ref`: 36 local branches, `main` and the worktrees' branches among them, and 2 remote-tracking refs), 1,325 commits (`git rev-list --all`):
+
+```
+git rev-list --all --objects > <s>/objects.txt                       # 9,098 objects
+git cat-file --batch-check='%(objectname) %(objecttype) %(objectsize) %(rest)' < <s>/objects.txt > <s>/sizes.txt   # 2,706 blobs
+awk '$2=="blob"{print $1}' <s>/sizes.txt > <s>/blobs.txt
+git cat-file --batch < <s>/blobs.txt > <s>/blobs.bin                  # the 2,706 blobs, read by the two scripts below
+git log --all --name-only --format= | sort -u                         # every path ever committed
+git log --all --oneline -- docs/paper                                 # empty
+git log --all --oneline -- 'data/*' 'datasets/*' 'runs/*'             # empty
+```
+
+The two scripts (run with `/usr/bin/python3 -I`, Python 3.12.3) walk `blobs.bin` record by record, a header line `<oid> blob <size>` and then `size` bytes, and name each blob by its path in `sizes.txt`:
+
+```python
+binary = b"\0" in body or not _decodes_as_utf8(body)                 # the first: binary blobs
+hits = Counter(path[oid] for oid, body in blobs if re.search(pattern, body, re.I))   # the second, per pattern
+```
+
+- **Paths.** 273 paths were ever committed. The name search of the tracked tree, run on them, adds only the retired S-5 fixture `tests/synthetic/data/s5_gt.safetensors` (removed by e9c33df, #216) and the skills' `agents/openai.yaml` files (agent configuration, removed by 237c8b3). `docs/paper/`, `data/`, `datasets/` and `runs/` were never committed.
+- **Binary blobs.** A script that reads `blobs.bin` and flags every blob holding a NUL byte or not decoding as UTF-8 finds 6 binary blobs and 2,700 text blobs. The six are the S-n fixtures: `s1_gt` (1,116 bytes), `s2_gt` (1,712), `s3_gt` (2,056), `s4_gt` (21,224), `s6_gt` (3,072) and the retired `s5_gt` (169,776). Every blob above 50 KB is a version of a text file (questions, source log, glossary, spec, module docs, source and test modules) or `s5_gt`.
+- **Data signatures.** A second script, a case-insensitive regular-expression search of every blob, finds no PNG (`\x89PNG`), NumPy (`\x93NUMPY`), MP4 (`ftyp(isom|mp4)`), PLY (`ply\nformat`) or `base64,` content. `%YAML` and `opencv-matrix` occur only in versions of `questions.md`, `source-log.md`, the spec, `docs/modules/data/images-and-cameras.md`, `data.py` and `test_data_images.py`; `poses_bounds` only as a name, in the same kinds of files and the converter tests.
+
+### The sdist and the wheel
+
+Built through `uvx`, as Q-241 says, from the worktree into the scratchpad, never the repository's `dist/`. The project has no MANIFEST.in, so, before building, empty placeholder files were put at the ignored paths that hold the paper and data in a working checkout, `docs/paper/placeholder.pdf`, `data/placeholder.txt`, `datasets/placeholder.txt` and `runs/placeholder.txt`, beside the worktree's untracked RoMa clone (`.scratch/`); they were removed after the build, with the build's `src/openftgs.egg-info`.
+
+```
+uvx --from build pyproject-build --installer uv --outdir <s>/t367-build <worktree>
+```
+
+uv 0.11.32, build 1.6.1, setuptools 84.2.1 in the isolated build environments (source log row T367.9). Built: `openftgs-0.1.0.dev0.tar.gz` (563,382 bytes, SHA-256 0f175d34a7860c1ec211ba92cd4059a7de9ea7b4b45e3ee418e3537b8a828e2d) and, from it, `openftgs-0.1.0.dev0-py3-none-any.whl` (276,732 bytes, SHA-256 ac53bb18ad9c4cdf94671f77d3b6971853873cb0b8ab20f0b1a16d125fbfad7d). Listed with `tar tzf` and `python -m zipfile -l`, and compared with `git ls-files`:
+
+- **sdist**, 109 files: `LICENSE`, `NOTICE`, `README.md`, `pyproject.toml`, the package under `src/openftgs/` (the vendored RoMa's license files and `VENDOR.json` included), and setuptools' default `tests/test*.py` (42 test modules, without `conftest.py`, `builders.py`, `tests/synthetic/` or `tests/harness/`). Every file is a tracked file except setuptools' generated `PKG-INFO`, `setup.cfg` and `src/openftgs.egg-info/*` (6).
+- **wheel**, 62 files: the package under `openftgs/`, the vendored RoMa's license files and `VENDOR.json` included, and the 7 files of the `.dist-info`, with `licenses/LICENSE` and `licenses/NOTICE`. Its 55 package files are the sdist's 55 files under `src/openftgs/`, each a tracked file.
+- **Neither** holds a placeholder, a `docs/` path, a `data/`, `datasets/` or `runs/` path, a `__pycache__` or `.pyc` file, any file with the media, data, archive, checkpoint or YAML extensions of the name search, or a file named after a dataset or scene. The dataset names inside them are those of the tracked files they copy (the converters and the test modules, above).
+
+### The S-n fixtures' provenance
+
+The only data files in the repository and its history. `tests/synthetic/data/s1_gt.safetensors`, `s2_gt`, `s3_gt`, `s4_gt` and `s6_gt` are ftgs-if exchange models (§2.2; 1, 8, 12, 240 and 24 Gaussians, SH degree 0) of §3.2's synthetic scenes, written by `tests/synthetic/make_ground_truth.py` with `openftgs.io.write_exchange` from the seeds in `tests/synthetic/data/seeds.json` and `synthetic_scenes.py`'s generators; their metadata's producer is "openftgs tests (M11 ground truth)", or M13 for `s4_gt`. `test_committed_ground_truth_reproduces_from_its_seeds` (`tests/synthetic/test_synthetic_recovery.py`) checks that the committed files are what the seeds give, and passed on this commit. SHA-256: s1 39ece2ad…, s2 8b4927ec…, s3 bfef9f4b…, s4 888a5770…, s6 fb0efad4…, seeds.json 2063ebb8…. They derive from no dataset. The other S-n scenes are generated at test time: S-7 and S-8 from S-2's ground truth and their seeds, S-5, S-9 and S-11 by the analytic ray caster (`tests/synthetic/raycast.py`) from their seeds, S-10 from a tiny scene built in the test; the retired `s5_gt` was a generated exchange model like the others.
+
+### The spec's observations of SelfCap's calibration files
+
+The spec records what the owner saw in SelfCap's files: §1.4's SelfCap protocol ("Camera files, checked on hair-calib and yoga-calib and on the corgi listing", the sync.json offset ranges, the calibration source, the point clouds' numbering, the corgi archive's CRC failure), D-59, D-63 and D-64, and Appendix A rows 30, 31 and 38. They are the owner's text, not data: file and key names, matrix shapes, image sizes, value ranges and agreement bounds (offsets from −0.046 to +0.026 s, Rot against Rodrigues(R) to 3·10⁻⁸, cosines ≥ 0.64), counts and dates, written as prose. Beyond the few values that prose quotes (the 2160 × 3840 size, k3 = 0, hair's t\_ = 0, n\_ = 1 and f\_ = 20, the ranges and bounds), the checks above found no calibration matrix, frame, mask or point cloud of SelfCap in the repository, its history or the built packages. `questions.md`, the module docs and the tests repeat that prose, or build files in that layout with invented values (above). The owner's copies of hair-calib and yoga-calib, and the corgi listing, were never committed.
 
 ## Source-log audit
 
