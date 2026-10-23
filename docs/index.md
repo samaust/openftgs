@@ -13,5 +13,6 @@ quickstart
 datasets
 method
 cli
+contributing
 api/index
 ```
