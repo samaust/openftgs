@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ftgs command line: convert, cache, init, train, render, eval, export and bench.
-
-Spec: §2.1 (CLI block and exit codes), §2.2, §3.4, D-62. Band: Interface (§2.1).
+"""The ``ftgs`` command line of §2.1: convert, cache, init, train, render, eval, export, bench.
 
 Each command parses its options and calls the library; heavy imports happen inside the
-commands, so `ftgs --help` stays fast and `ftgs train` can set environment variables before
-CUDA starts. The exit codes are §2.1's: 0 success, 2 invalid input or environment, 3 a
-numerical failure (Q-142); `ftgs train` stopped by a signal exits with 128 plus its number
-(Q-133). Any other exception is a bug and keeps its traceback (Q-26). `ftgs bench` and its
-benchmarks are in the private module `_bench` (Q-166 to Q-168).
+commands, so ``ftgs --help`` stays fast and ``ftgs train`` can set environment variables
+before CUDA starts. The module's one public name is ``main``, which the ``ftgs`` console
+script and ``python -m openftgs.cli`` run.
+
+Notes
+-----
+Spec: §2.1 (CLI block and exit codes), §2.2, §3.4, D-62. Band: Interface (§2.1).
+
+The exit codes are §2.1's: 0 success, 2 invalid input or environment, 3 a numerical failure
+(Q-142); ``ftgs train`` stopped by a signal exits with 128 plus its number (Q-133). Any other
+exception is a bug and keeps its traceback (Q-26). ``ftgs bench`` and its benchmarks are in
+the private module ``_bench`` (Q-166 to Q-168).
 """
 
 from __future__ import annotations
@@ -57,8 +62,11 @@ def _fail(message: str, code: int = _INPUT) -> NoReturn:
 
 @contextlib.contextmanager
 def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
-    """Q-26, Q-142: a ValueError (and the listed types) of a call that reads or checks user
-    input is exit code 2; anywhere else it stays a bug with its traceback."""
+    """Turn a ValueError, or one of the listed types, into exit code 2.
+
+    Q-26, Q-142: for a call that reads or checks user input; anywhere else a ValueError stays
+    a bug with its traceback.
+    """
     caught: tuple[type[Exception], ...] = (ValueError, *also)
     try:
         yield
@@ -68,8 +76,10 @@ def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _environment(what: str) -> Iterator[None]:
-    """Q-142: an OSError of a run-time download (the LPIPS weights, §2.3 notes) is an
-    environment error, exit code 2."""
+    """Turn an OSError of a run-time download into exit code 2.
+
+    Q-142: an environment error, as for the LPIPS weights (§2.3 notes).
+    """
     try:
         yield
     except OSError as error:
@@ -78,9 +88,11 @@ def _environment(what: str) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _output(what: str) -> Iterator[None]:
-    """Q-142 (as answered): an OSError while writing a user-chosen output, or making its
-    directory, is exit code 2; the atomic writes leave the old file or checkpoint (Q-25,
-    Q-126)."""
+    """Turn an OSError while writing a user-chosen output into exit code 2.
+
+    Q-142 (as answered): making the output's directory included; the atomic writes leave the
+    old file or checkpoint (Q-25, Q-126).
+    """
     try:
         yield
     except OSError as error:
@@ -95,7 +107,7 @@ def _producer() -> str:
 
 
 def _device() -> str:
-    """Q-125: CUDA when PyTorch sees a device, else the CPU."""
+    """Return CUDA when PyTorch sees a device, else the CPU (Q-125)."""
     import torch
 
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,9 +118,12 @@ def _backend(device: str) -> Literal["gsplat", "reference"]:
 
 
 def _shard_devices(device: str) -> list[str] | None:
-    """D-54, Q-175, Q-186: on CUDA with two or more visible CUDA devices, which
+    """Return the devices to shard over, or None to run unsharded.
+
+    D-54, Q-175, Q-186: on CUDA with two or more visible CUDA devices, which
     `CUDA_VISIBLE_DEVICES` restricts, every one of them, one shard each; None with one, or on
-    the CPU, which renders unsharded with no copy of the model."""
+    the CPU, which renders unsharded with no copy of the model.
+    """
     import torch
 
     if device != "cuda":
@@ -120,7 +135,7 @@ def _shard_devices(device: str) -> list[str] | None:
 
 
 def _empty_or_absent(path: Path, what: str) -> None:
-    """Q-126: a directory output must be absent or an empty directory."""
+    """Refuse a directory output that is neither absent nor an empty directory (Q-126)."""
     if path.exists() and (not path.is_dir() or any(path.iterdir())):
         _fail(f"{what} {path} must be absent or an empty directory")
 
@@ -144,7 +159,7 @@ def _sha256(path: Path) -> str:
 
 
 def _pair(text: str) -> tuple[int, int]:
-    """`A:B` with two integers (`--window N0:N1`, `--profile START:COUNT`)."""
+    """Parse `A:B` with two integers (`--window N0:N1`, `--profile START:COUNT`)."""
     parts = text.split(":")
     try:
         if len(parts) != 2:
@@ -299,7 +314,7 @@ def _init(args: argparse.Namespace) -> int:
 
 
 def _read_config(path: Path | None, seed: int | None) -> TrainConfig:
-    """§2.1: --config is a JSON TrainConfig (Q-10); --seed replaces its seed."""
+    """Read --config, a JSON TrainConfig (§2.1, Q-10), with --seed replacing its seed."""
     from openftgs.config import config_from_dict
 
     with _as_input_error(f"configuration {path}", OSError):
@@ -314,9 +329,12 @@ def _read_config(path: Path | None, seed: int | None) -> TrainConfig:
 
 
 def _check_resume_dir(run_dir: Path, cfg: TrainConfig) -> None:
-    """Q-134: a resumed run writes into an absent or empty directory, or into the run directory
-    of its own configuration: its config.json differs at most in the performance settings a
-    resume may change (Q-134 as answered, Q-153)."""
+    """Refuse a resumed run's directory unless it is absent, empty or the run's own (Q-134).
+
+    A resumed run writes into an absent or empty directory, or into the run directory of its
+    own configuration: its config.json differs at most in the performance settings a resume
+    may change (Q-134 as answered, Q-153).
+    """
     from openftgs.config import config_from_dict, resume_conflicts
 
     if not run_dir.exists() or (run_dir.is_dir() and not any(run_dir.iterdir())):
@@ -331,7 +349,7 @@ def _check_resume_dir(run_dir: Path, cfg: TrainConfig) -> None:
 
 
 def _check_masks(video: MultiViewVideo, split: str) -> None:
-    """Q-135 (#83): a split's masks are all there or none are."""
+    """Refuse a split whose masks aren't all there or all absent (Q-135, #83)."""
     indices = [i for i, r in enumerate(video.records) if r.split == split]
     absent = [i for i in indices if video.manifest.masks[i] is None]
     if absent and len(absent) < len(indices):
@@ -344,8 +362,10 @@ def _check_masks(video: MultiViewVideo, split: str) -> None:
 
 
 class _Signals:
-    """§2.2, Q-133: SIGINT and SIGTERM during training are recorded, and the trainer stops
-    after the current iteration; the old handlers come back afterwards."""
+    """The record of SIGINT and SIGTERM during training (§2.2, Q-133).
+
+    The trainer stops after the current iteration; the old handlers come back afterwards.
+    """
 
     def __init__(self) -> None:
         self.received: int | None = None
@@ -365,8 +385,11 @@ class _Signals:
 
 
 class _Profile:
-    """§3.4: a torch.profiler trace of iterations START … START + COUNT − 1, in which every
-    stage of an iteration is a named range; the stages' NVTX ranges run with or without it."""
+    """A torch.profiler trace of iterations START … START + COUNT − 1 (§3.4).
+
+    Every stage of an iteration is a named range in it; the stages' NVTX ranges run with or
+    without it.
+    """
 
     def __init__(self, start: int, count: int, path: Path, device: str) -> None:
         import torch.profiler
@@ -388,8 +411,10 @@ class _Profile:
             set_profiling(True)  # §3.4: the trace carries the stage names
 
     def step_done(self, iteration: int) -> None:
-        """After iteration `iteration`: start before the window's first, finish after its
-        last."""
+        """Start before the window's first iteration, and finish after its last.
+
+        Called after iteration `iteration`.
+        """
         self.begin_if_due(iteration)
         if iteration == self._last:
             self.finish()
@@ -492,9 +517,12 @@ def _train(args: argparse.Namespace) -> int:
     log_failure: _Failure | None = None  # Q-159 (as answered): reported once the checkpoint is safe
 
     def save() -> None:
-        """D-83: every save, periodic, final, on a signal or after a train_log.jsonl that
-        can't be written (Q-159 as answered), checks the state first (Q-133) and rotates the run
-        directory's kept checkpoints."""
+        """Save a checkpoint, the state checked first, and rotate the kept ones (D-83).
+
+        Every save, periodic, final, on a signal or after a train_log.jsonl that can't be
+        written (Q-159 as answered), checks the state first (Q-133) and rotates the run
+        directory's kept checkpoints.
+        """
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
         # Q-159: no further save is attempted; Q-150 (as answered): a rotation refused onto an
@@ -506,8 +534,11 @@ def _train(args: argparse.Namespace) -> int:
             save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
 
     def end_profile(stage: Callable[[], None], *, failed: bool) -> None:
-        """Q-144: write the trace; Q-142: a trace that can't be written is exit 2, reported
-        after the checkpoint is saved; Q-160: after a training failure, only a warning."""
+        """Write the trace, holding back a failure to write it (Q-144).
+
+        Q-142: a trace that can't be written is exit 2, reported after the checkpoint is
+        saved; Q-160: after a training failure, only a warning.
+        """
         nonlocal trace_failure
         try:
             with _output(f"the profile trace {profile.path if profile else ''}"):
@@ -606,8 +637,11 @@ def _train(args: argparse.Namespace) -> int:
 
 
 def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
-    """Q-133: the trainer checks for divergence at log reads and events (Q-69), so a model that
-    turned non-finite since then is caught here, and a diverged state is never saved."""
+    """Refuse a model or statistics that aren't finite, as exit code 3 (Q-133).
+
+    The trainer checks for divergence at log reads and events (Q-69), so a model that turned
+    non-finite since then is caught here, and a diverged state is never saved.
+    """
     import torch
 
     try:
@@ -619,8 +653,11 @@ def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
 
 
 def _out_of_memory(completed: int, run_dir: Path, resumed: Path | None) -> str:
-    """Q-142 (as answered): what an out-of-memory failure in training lost, and the way on:
-    `completed` is the trainer's iteration, the step in progress being lost."""
+    """Describe what an out-of-memory failure in training lost, and the way on.
+
+    Q-142 (as answered): `completed` is the trainer's iteration, the step in progress being
+    lost.
+    """
     latest = run_dir / "checkpoint"
     if latest.is_dir():
         where = f"resume from {latest}"
@@ -656,12 +693,14 @@ def _model_sha256(path: Path) -> str:
 
 
 def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
-    """MODEL of §2.1: a checkpoint directory or an FTGS-IF file; with `hashed`, also the SHA-256
-    that names it (Q-136), taken before and after reading, so that it names the bytes read: a
-    model that changed meanwhile, as a periodic save (D-83) changes RUN_DIR/checkpoint, is
-    exit 2 (Q-154). So is a model whose second hash can't be taken, and a read that fails while
-    the hash changes, as when a save tears the read; a read that fails with the hash unchanged
-    keeps the reader's error (Q-154 as answered)."""
+    """Read MODEL of §2.1, a checkpoint directory or an FTGS-IF file.
+
+    With `hashed`, also the SHA-256 that names it (Q-136), taken before and after reading, so
+    that it names the bytes read: a model that changed meanwhile, as a periodic save (D-83)
+    changes RUN_DIR/checkpoint, is exit 2 (Q-154). So is a model whose second hash can't be
+    taken, and a read that fails while the hash changes, as when a save tears the read; a read
+    that fails with the hash unchanged keeps the reader's error (Q-154 as answered).
+    """
     changed_message = f"model {path} changed while it was read; evaluate it again"
     with _as_input_error(f"model {path}", OSError):  # Q-142, Q-154
         try:  # a mistyped checkpoint directory isn't an unreadable FTGS-IF file
@@ -684,7 +723,10 @@ def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
 
 
 def _model_sha256_or_none(path: Path) -> str | None:
-    """Q-154 (as answered): None when the model is gone or unreadable, as within a save."""
+    """Return the model's SHA-256, or None when it is gone or unreadable (Q-154).
+
+    Q-154 (as answered): gone or unreadable as within a save.
+    """
     try:
         return _model_sha256(path)
     except OSError:
@@ -736,7 +778,7 @@ def _render(args: argparse.Namespace) -> int:
 def _render_loaded(
     loaded: _Loaded, request_path: Path, out: Path, backend: str, device: str
 ) -> int:
-    """`ftgs render`'s body once MODEL is read: also `ftgs-adapter render`'s (Q-202)."""
+    """Run `ftgs render`'s body once MODEL is read; also `ftgs-adapter render`'s (Q-202)."""
     import torch
 
     from openftgs.io import read_render_request, write_renders
@@ -779,8 +821,10 @@ def _render_loaded(
 def _match_renders(
     video: MultiViewVideo, split: str, directory: Path
 ) -> tuple[dict[int, Any], dict[str, str]]:
-    """Q-137: each record of the split matched to exactly one item of DIR's request, by its
-    timestamp, image size and camera, and that item's render."""
+    """Match each record of the split to exactly one item of DIR's request (Q-137).
+
+    The match is by timestamp, image size and camera; each record gets that item's render.
+    """
     import torch
     from safetensors import safe_open
 
@@ -890,7 +934,7 @@ def _export(args: argparse.Namespace) -> int:
 
 
 def _export_loaded(loaded: _Loaded, out: Path) -> int:
-    """`ftgs export`'s body once the model is read: also `ftgs-adapter export`'s (Q-202)."""
+    """Run `ftgs export`'s body once the model is read; also `ftgs-adapter export`'s (Q-202)."""
     from openftgs.io import write_exchange
 
     # D-84: the file records the background the run was trained against.
@@ -1193,9 +1237,12 @@ def _parser() -> argparse.ArgumentParser:
 
 # Q-176 (as answered, #274): the cores of the affinity set, which PyTorch's own default follows.
 def _physical_cores() -> int:
-    """The distinct (package, core) pairs, in Linux's CPU topology, of the CPUs this process may
+    """Count the physical cores of the CPUs this process may run on (Q-176).
+
+    The distinct (package, core) pairs, in Linux's CPU topology, of the CPUs this process may
     run on; the number of those CPUs where the topology can't be read, and the logical CPUs
-    where Python has no `os.sched_getaffinity` (macOS, Windows)."""
+    where Python has no `os.sched_getaffinity` (macOS, Windows).
+    """
     if not hasattr(os, "sched_getaffinity"):
         return os.cpu_count() or 1
     cpus = os.sched_getaffinity(0)
@@ -1223,7 +1270,43 @@ def _set_intra_op_threads() -> None:
 
 # Q-124: the module's one public name; the ftgs console script and `python -m openftgs.cli`.
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run `ftgs` with `argv` (the process's arguments by default) and return its exit code."""
+    """Run ``ftgs`` with ``argv`` and return its exit code (§2.1).
+
+    Parse the arguments with the parser of §2.1's CLI block, set PyTorch's intra-op threads to
+    the physical cores, unless ``OMP_NUM_THREADS`` or ``MKL_NUM_THREADS`` is set, then run the
+    command and map its failures to §2.1's exit codes. ``--help`` and a usage error run no
+    command and change nothing.
+
+    Parameters
+    ----------
+    argv
+        The arguments after the program's name, as ``["train", "scene.json", "--init",
+        "init.safetensors", "--out", "run"]``; None, the default, reads the process's
+        arguments, ``sys.argv[1:]``.
+
+    Returns
+    -------
+    int
+        The exit code: 0 success (``--help`` included), 2 invalid input or environment (a
+        usage error included), 3 a numerical failure, and 128 plus the signal's number when
+        SIGINT or SIGTERM stops ``ftgs train`` after it saved its checkpoint.
+
+    Notes
+    -----
+    Q-124: the module's one public name, run by the ``ftgs`` console script and by
+    ``python -m openftgs.cli``. A failure the CLI reports is one line on stderr,
+    ``ftgs <command>: error: <message>``, followed by a warning line for each failure that
+    came after it (Q-159); any other exception is a bug and keeps its traceback (Q-26,
+    Q-142). Signals: Q-133. Threads: §2.4, Q-176.
+
+    Examples
+    --------
+    Train on a converted scene from Python, as ``ftgs train`` would:
+
+    >>> from openftgs.cli import main
+    >>> main(["train", "scene/scene.json", "--init", "init.safetensors", "--out", "run"])
+    0
+    """
     parser = _parser()
     try:
         args = parser.parse_args(argv)
