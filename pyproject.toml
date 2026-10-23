@@ -32,6 +32,11 @@ ftgs = "openftgs.cli:main"
 # Q-202: the adapter of the differential harness (§3.3).
 ftgs-adapter = "openftgs.cli._adapter:main"
 
+# Q-244: the project URLs. The documentation site is built by Read the Docs (.readthedocs.yaml,
+# Q-241).
+[project.urls]
+Documentation = "https://openftgs.readthedocs.io"
+
 [project.optional-dependencies]
 # §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. D-85: fused-local-corr, RoMa's optional
 # speed-up, isn't listed, on any Python; it is built from source against the installed torch

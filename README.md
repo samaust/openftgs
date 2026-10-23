@@ -1,10 +1,12 @@
 # openftgs
 
-[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml) [![Coverage](docs/coverage.svg)](#tests)
+[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml) [![Coverage](docs/coverage.svg)](#tests) [![Documentation](https://app.readthedocs.org/projects/openftgs/badge/)](https://openftgs.readthedocs.io)
 
 openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors.
 
 Python package `openftgs`, under the Apache-2.0 license, with the command-line tool `ftgs`.
+
+The documentation is at [openftgs.readthedocs.io](https://openftgs.readthedocs.io): installation, a quickstart, the datasets, the method, the command line and the API reference.
 
 **Status: pre-alpha.** The library and its command line are built through milestone M14; the performance work, the differential harness and the validation runs follow (`docs/clean-room/milestones.md`).
 
