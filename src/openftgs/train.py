@@ -694,7 +694,7 @@ class Trainer:
     # Q-69 (owner answer, #97): read-only; load_state_dict replaces the model it returns.
     @property
     def model(self) -> FreeTimeGaussians:
-        """The model the trainer is training: the same object across training iterations and
+        """The model the trainer is training; the same object across training iterations and
         events, which resize it in place; `load_state_dict` and `from_checkpoint` replace it with
         the model of the loaded state."""
         return self._run.model

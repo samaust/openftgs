@@ -43,7 +43,7 @@ def _batch_first(image: Tensor) -> Tensor:
 
 
 def l1_loss(pred: Tensor, gt: Tensor) -> Tensor:
-    """L_img = mean |Î − I| over the batch, pixels and channels (E7, D-7)."""
+    """L_img = mean ``|Î − I|`` over the batch, pixels and channels (E7, D-7)."""
     _check_pair(pred, gt)
     return (pred - gt).abs().mean()
 
