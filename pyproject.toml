@@ -102,10 +102,20 @@ skip_empty = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-# Q-241: docs/ is linted and formatted, the site's configuration docs/conf.py included, apart from
-# the spec, which is never edited and whose Markdown code blocks ruff would reformat (the build
-# output under docs/_build/ is gitignored, which ruff respects).
-extend-exclude = [".claude", "docs/spec", "src/openftgs/_vendor/romatch"]
+# Q-241: the documentation site's sources under docs/ (conf.py and the pages) are linted and
+# formatted. The records and notes beside them are not, since ruff would reformat the Python
+# blocks of their Markdown: the spec (never edited), the clean-room records, the agent and module
+# docs, the research notes and the glossary. docs/_build/ is gitignored, which ruff respects.
+extend-exclude = [
+    ".claude",
+    "docs/agents",
+    "docs/clean-room",
+    "docs/modules",
+    "docs/research",
+    "docs/spec",
+    "docs/GLOSSARY.md",
+    "src/openftgs/_vendor/romatch",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
