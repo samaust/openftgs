@@ -607,8 +607,12 @@ The agent or person writing openftgs from the spec under the clean-room rules, i
 _Avoid_: developer, Claude, assistant, contributor
 
 **Spec revision**:
-The numbered version of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", exported to `docs/spec/openftgs-spec.md` with its SHA-256 (revision 549b at present: revision 549, amended twice in the repository in the owner's name, as 549a and 549b); changes arrive as a new export that replaces the file in one commit. docs/spec/README.md
+The numbered version of the owner's document "FreeTimeGS — Clean-Room Specification & Architecture", exported to `docs/spec/openftgs-spec.md` with its SHA-256 (revision 549n at present: revision 549, amended fourteen times in the repository in the owner's name, as 549a to 549n); changes arrive as a new export that replaces the file in one commit. docs/spec/README.md
 _Avoid_: spec version, draft, edition, the spec's git history
+
+**License sign-off**:
+The owner's recorded approval of a dependency whose declared license the release-time license scan can't pass on its own (LGPL, proprietary or unknown), tied to the package's version and its reported license string so that a change of either voids it; GPL, AGPL and non-commercial licenses can't be signed off. §2.3 notes, Q-4
+_Avoid_: whitelist, allowlist, waiver, exception (reserved for a license's own exception clause, such as a runtime exception)
 
 **Provenance tag**:
 The marker on every spec rule saying who fixed it and whether the implementer may change it: [P], [P→3DGS], [L: source] or [D-n]. §0
@@ -739,3 +743,7 @@ _Avoid_: provenance label (one word from the spec's provenance tag), triage labe
 **Out-of-scope record**:
 The closed GitHub issues labelled `out-of-scope`, one canonical issue per rejected feature request, each with a decision comment citing the spec item that bounds the scope; later requests for the same concept are closed as its duplicates. docs/agents/issue-tracker.md
 _Avoid_: out-of-scope folder, `.out-of-scope/`, rejection log, wontfix list
+
+**Release checklist**:
+M18's record of the release-time checks that §2.3's notes and D-79 call for: the license scan and its sign-offs, the libraries bundled in dependency wheels, the vendored license files, the pretrained weights' terms, the absence of dataset material, and the source-log audit. docs/clean-room/milestones.md (M18)
+_Avoid_: release notes (the user-facing summary on the changelog page), audit (one of its checks), release log
