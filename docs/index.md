@@ -8,6 +8,7 @@ the command line `ftgs`. Its source is on GitHub, at
 ```{toctree}
 :maxdepth: 2
 
+installation
 method
 api/index
 ```
