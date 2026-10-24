@@ -348,7 +348,70 @@ Every metric candidate runs on every run's 300 test renders, clamped to [0, 1] (
 
 ## 6. Results
 
-After the tests.
+Everything below was measured on the RTX 4090 at ba243ec and after (the code's `src/` unchanged throughout), in the scratch venv of section 5.2, with the prototype code archived under `kept/code/`. The from-paper implementations (LASI, NLPD, CW-SSIM) are labelled "own implementation, not validated against published figures" wherever their numbers appear.
+
+### 6.1 What changed from the plan
+
+- **C3, A-DISTS, dropped before any run:** its paper prints neither the five fitted weights and biases of its texture probability (eq. 7) nor its constant *c*, fitted on hand-labelled patches that aren't public; no code repository exists (T373.64, T373.95). It leaves the loss runs and the metric study (gap recorded on #374).
+- **A's gate failed; the owner accepted A at seed 0 as the reference** (section 6.2), and asked for a secondary analysis on the kept-pixel PSNR, declared before any candidate result (section 5.7; 5ad93c7).
+- **Two rulings on the checks** (the owner, 2026-10-23, in session): the shift family is judged by 0.5 px and 1 px each scoring above 0.25 px, the step where blur and displacement grow together, since LPIPS-VGG itself scores the exact 1 px shift below the bilinear 0.5 px one; and ꟻLIP's and HaarPSI's values at the identity (a stabilizer constant and float32 rounding) pass, departures from the 10⁻⁶ threshold section 5.4 declared.
+- **LASI's prototype was fixed during the checks:** under the training path's flags its windowed sums ran in TF32 and cuDNN's autotuning picked FFT convolutions, which broke Ā's positive definiteness; it now computes in IEEE float32 without autotuning whatever the caller's flags, and its first sanity numbers were discarded (the run had imported the old code).
+- **Dropped by the checks:** F2 (LASI) and F3 (MDSI); D1 and D3 run at half resolution (section 6.4). The loss runs are therefore 10 configurations at three seeds, 30 runs: A, B, C1, C2, D1 to D4, F1 and F4.
+
+### 6.2 A's gate
+
+| Run | Code | PSNR on cam00 | Kept-pixel PSNR | SSIM₁ | LPIPS-Alex |
+| --- | --- | --- | --- | --- | --- |
+| Validation run 2, seed 0 | 30e4885 | 27.33 | 29.57 | | |
+| Validation run 5, seed 1 | 30b82be | 27.28 | 29.79 | | 0.1894 |
+| Validation run 20, seed 0 | f6047c1 (#326) | 29.75 | 30.88 | 0.8768 | 0.1850 |
+| A, seed 0 | ba243ec | 27.32 | 29.66 | 0.8755 | 0.1915 |
+
+- **Training matches:** A-s0's and run 20's `train_log.jsonl` agree to about 0.1 % at every logged iteration (total loss 0.03342 for both at iteration 30,000); their N differs from iteration 500 on (337,078 against 337,072), GPU nondeterminism at the same seed.
+- **The evaluation hasn't changed:** `ftgs eval` at ba243ec re-scores run 20's own checkpoint at 29.752 dB, its recorded value.
+- **Where the gap lies:** run 20 leads by 2.44 dB on average, on 283 of the 300 frames by more than 1 dB; on 10 frames, nearly all of A-s0's extra squared error lies in the right-edge strip of cam00's upper half, a blown-out wall the training cameras barely cover, where every model leaves dark smears and run 20's are faint. Inside #329's clipped flags A-s0 scores 21.7 dB, run 20 27.3 dB.
+- **Reading:** three of four default kitchen runs land at 27.28 to 27.33 dB and run 20 is the outlier; cam00's PSNR carries a run-to-run component of about 2.4 dB from that strip; on the kept pixels run 20 still leads the others by 1.1 to 1.3 dB. The owner accepted A-s0 as reproducing the default (#374, 2026-10-23).
+
+### 6.3 The converted trunks
+
+`converters.py` read both `.caffemodel` files with its own wire-format reader (T373.89): Oxford's VGG16 in the legacy `layers` format, 13 convolutions and three fully connected layers; BVLC's AlexNet, 5 convolutions with the grouped conv2, conv4 and conv5 (48 and 192 input channels). As a smoke check of the channel order and the mean, both classified three kitchen frames (a 224 or 227 centre crop of the shorter side at 256) beside torchvision's own trunks: Oxford's VGG16 gives "dining table" first on all three (0.66, 0.55, 0.75), as torchvision's VGG16 does on two; BVLC's AlexNet agrees with torchvision's AlexNet on the first frame ("dining table", then "pool table") and, like it, spreads its probability on the other two (`kept/common/smoke-trunks.txt`).
+
+### 6.4 The candidate checks
+
+Sanity on four ground-truth frames (cam01, cam05, cam10, cam15 at 1352×1014); cost by B-4's method with the machine to itself, LPIPS-VGG on the trainer's path in the same process (94.0 ms both times it was timed); memory as torch's peak allocation of one training step on run 20's model (N = 3,000,000, its Adam moments resident, 1.43 GiB), LPIPS-VGG's 16.07 GiB the reference.
+
+| Candidate | Sanity | ms at 1352×1014 | ms at 1920×1080 | Peak memory, GiB | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| LPIPS-VGG (reference) | fails the 0.5 → 1 px shift step | 94.0 | 140.7 | 16.07 | the reference |
+| VGG16-CC (C1) | passes | 92.9 | 138.8 | 10.71 | runs, full resolution |
+| AlexNet-CC (C2) | passes under the shift ruling (fails the 0.5 → 1 px step) | 8.3 | 14.2 | 14.81 | runs, full resolution |
+| DINOv2-S/14 (D1), full | passes | 275.3 | 551.4 | 3.93 | fails the cost rule |
+| DINOv2-S/14 (D1), half | passes | 31.1 | 45.4 | 3.54 | runs, half resolution |
+| DINOv2-B/14 (D2), half | passes | 61.9 | 105.2 | 3.78 | runs, half resolution |
+| DINO-S/16 (D3), full | passes | 153.0 | 326.1 | 3.64 | fails the cost rule |
+| DINO-S/16 (D3), half | passes | 17.1 | 34.4 | 3.53 | runs, half resolution |
+| DINO-B/16 (D4), half | passes | 36.6 | 69.4 | 3.77 | runs, half resolution |
+| ꟻLIP (F1) | passes under the identity ruling (3.2·10⁻⁷ at the identity, 2.4·10⁻⁶ of its strongest-noise value) | 11.6 | 17.3 | 3.54 | runs |
+| LASI (F2), own implementation | fails: blur peaks at σ = 1 px then falls (0.635, 0.629, 0.615), the 1 px shift scores below 0.25 px (0.101 against 0.291) | 1,379.5 | 1,991.4 | 19.33 | dropped (sanity, cost and memory) |
+| MDSI (F3) | fails: non-finite gradients at the identity and under every distortion | 2.4 | 2.7 | 3.45 | dropped |
+| HaarPSI (F4) | passes under the identity ruling (up to 2.5·10⁻⁵ of its scale in float32, 10⁻¹⁵ in float64) | 2.5 | 2.9 | 3.45 | runs |
+
+The peaks include cuDNN autotuning's trial workspaces, which is why LPIPS-VGG's and AlexNet-CC's exceed VGG16-CC's; every candidate but LASI stays below LPIPS-VGG's. The per-candidate files are `kept/common/checks/{sanity,timing}-<candidate>.json` and `memory.json`, with `uptime` beside each timing (load averages 0.3 and 1.7, the second just after run B's end, nothing else on the machine).
+
+### 6.5 λ calibration
+
+| Configuration | λ | Median ratio, trained model | Median ratio, initialization | Their quotient |
+| --- | --- | --- | --- | --- |
+| C1, VGG16-CC | 0.00164 | 0.136 | 0.206 | 0.66 |
+| C2, AlexNet-CC | 0.00408 | 0.309 | 0.518 | 0.60 |
+| D1, DINOv2-S/14, half | 0.00185 | 0.353 | 0.103 | **3.44** |
+| D2, DINOv2-B/14, half | 0.00204 | 0.219 | 0.199 | 1.10 |
+| D3, DINO-S/16, half | 0.00358 | 0.497 | 0.262 | 1.90 |
+| D4, DINO-B/16, half | 0.00484 | 0.490 | 0.475 | 1.03 |
+| F1, ꟻLIP | 0.415 | 10.27 | 75.05 | **0.14** |
+| F4, HaarPSI | 0.0617 | 2.33 | 10.08 | **0.23** |
+
+λ is 0.01 times the median over all 16 renders, as declared. D1, F1 and F4 differ by more than a factor of 2 between the trained model and the initialization; the declared rule reports this, and the runs use the pooled median (`kept/common/calibration.json` holds every ratio).
 
 ## 7. to 9.
 
