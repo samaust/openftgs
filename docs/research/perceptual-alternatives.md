@@ -1,6 +1,6 @@
 # Perceptual loss and metric: alternatives to LPIPS with licensed weights
 
-A research document, written from 2026-10-23 on PRD #373 (which absorbed issue #372), on replacing LPIPS in openftgs's two uses of it, the training loss and the evaluation metric, with something whose pretrained weights carry an explicit permissive grant from their publisher, or on keeping LPIPS. This version holds phase 1, the desk survey (sections 1 to 4), and the test plan of PRD #374 (section 5), which replaced #373's phases 2 and 3 after the owner's checkpoint 1. Section 6, the results, follows the tests; sections 7 to 9 (the recommendation, what adopting it would change, the sources) are #373's phase 4. The document proposes no code and changes no spec item: adopting a replacement is a spec change the owner makes (E7, E16, D-9, D-29, D-68 and §2.1's `perc_net`), followed by its own implementation issue.
+A research document, written from 2026-10-23 on PRD #373 (which absorbed issue #372), on replacing LPIPS in openftgs's two uses of it, the training loss and the evaluation metric, with something whose pretrained weights carry an explicit permissive grant from their publisher, or on keeping LPIPS. This version holds phase 1, the desk survey (sections 1 to 4), the test plan of PRD #374 (section 5), which replaced #373's phases 2 and 3 after the owner's checkpoint 1, and its results (section 6); sections 7 to 9 (the recommendation, what adopting it would change, the sources) are #373's phase 4. The document proposes no code and changes no spec item: adopting a replacement is a spec change the owner makes (E7, E16, D-9, D-29, D-68 and §2.1's `perc_net`), followed by its own implementation issue.
 
 **Owner decisions behind the work** (2026-10-23, in session; PRD #373):
 
@@ -412,6 +412,157 @@ The peaks include cuDNN autotuning's trial workspaces, which is why LPIPS-VGG's 
 | F4, HaarPSI | 0.0617 | 2.33 | 10.08 | **0.23** |
 
 λ is 0.01 times the median over all 16 renders, as declared. D1, F1 and F4 differ by more than a factor of 2 between the trained model and the initialization; the declared rule reports this, and the runs use the pooled median (`kept/common/calibration.json` holds every ratio).
+
+### 6.6 The runs
+
+All 30 runs completed the 30,000 iterations; every one reached N = 3,000,000, between iterations 2,100 (F1) and 3,800, and kept its files, passed the check of section 5.10, and had its checkpoint and renders deleted. Means ± sample standard deviation over seeds 0, 1 and 2; training time is the wall clock of `ftgs train`; "torch peak" the allocator's peak during training, "GPU peak" the largest value `nvidia-smi` sampled, which the frame cache's "auto" placement fills to near the card's 24,564 MiB in every run.
+
+| Configuration | λ | PSNR per seed (0, 1, 2) | PSNR | Kept-pixel PSNR | SSIM₁ | LPIPS-Alex | LPIPS-VGG | Training, min | torch peak, GiB | GPU peak, MiB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A, LPIPS-VGG | 0.01 | 27.32, 26.53, 28.70 | 27.52 ± 1.10 | 29.72 ± 0.52 | 0.8750 ± 0.0005 | 0.1896 ± 0.0018 | 0.2423 ± 0.0010 | 56.9 | 13.96 | 23318 |
+| B, λ = 0 | 0 | 28.30, 25.43, 27.85 | 27.20 ± 1.54 | 29.62 ± 1.48 | 0.8748 ± 0.0023 | 0.2012 ± 0.0032 | 0.2737 ± 0.0018 | 9.6 | 5.51 | 23661 |
+| C1, VGG16-CC | 0.00164 | 27.70, 28.09, 29.05 | 28.28 ± 0.70 | 30.41 ± 0.63 | 0.8763 ± 0.0001 | 0.1864 ± 0.0008 | 0.2534 ± 0.0003 | 55.6 | 13.95 | 23853 |
+| C2, AlexNet-CC | 0.00408 | 26.88, 26.80, 28.27 | 27.31 ± 0.83 | 29.33 ± 0.58 | 0.8722 ± 0.0006 | 0.1806 ± 0.0002 | 0.2675 ± 0.0000 | 13.9 | 12.70 | 23433 |
+| D1, DINOv2-S/14 ½ | 0.00185 | 28.60, 26.85, 28.48 | 27.97 ± 0.98 | 29.25 ± 0.94 | 0.8774 ± 0.0010 | 0.1913 ± 0.0023 | 0.2648 ± 0.0026 | 25.3 | 5.60 | 22873 |
+| D2, DINOv2-B/14 ½ | 0.00204 | 28.52, 26.48, 26.90 | 27.30 ± 1.08 | 29.13 ± 1.29 | 0.8769 ± 0.0016 | 0.1925 ± 0.0029 | 0.2642 ± 0.0026 | 40.9 | 5.84 | 24016 |
+| D3, DINO-S/16 ½ | 0.00358 | 26.50, 27.28, 27.65 | 27.14 ± 0.59 | 29.31 ± 0.45 | 0.8756 ± 0.0000 | 0.1911 ± 0.0009 | 0.2660 ± 0.0003 | 18.3 | 5.60 | 23875 |
+| D4, DINO-B/16 ½ | 0.00484 | 28.97, 29.35, 28.27 | 28.86 ± 0.55 | 30.84 ± 0.16 | 0.8770 ± 0.0001 | 0.1896 ± 0.0012 | 0.2655 ± 0.0010 | 28.7 | 5.83 | 23635 |
+| F1, ꟻLIP | 0.415 | 28.38, 27.01, 26.58 | 27.32 ± 0.94 | 29.48 ± 0.60 | 0.8777 ± 0.0011 | 0.1946 ± 0.0017 | 0.2710 ± 0.0010 | 15.7 | 5.52 | 23940 |
+| F4, HaarPSI | 0.0617 | 27.66, 25.24, 26.52 | 26.47 ± 1.21 | 28.90 ± 0.62 | 0.8721 ± 0.0017 | 0.2078 ± 0.0017 | 0.2801 ± 0.0014 | 10.9 | 5.51 | 23965 |
+
+- **The spread between seeds is large.** cam00's PSNR moves by 0.55 to 1.54 dB (standard deviation) within one configuration, mostly from the strip of section 6.2; the kept-pixel PSNR by 0.16 to 1.48 dB; SSIM₁ by at most 0.0023.
+- **Descriptively,** D4 has the highest mean PSNR and kept-pixel PSNR (28.86 and 30.84 dB, the latter the steadiest of all), then C1 (28.28 and 30.41 dB); A sits at 27.52 and 29.72 dB, B at 27.20 and 29.62 dB, F4 lowest (26.47 and 28.90 dB). SSIM₁ spans 0.8721 to 0.8777.
+- **Each loss leans its own metric:** A has the lowest LPIPS-VGG (0.2423) and C2, trained on an AlexNet distance, the lowest LPIPS-Alex (0.1806); section 6.8 shows the same for the candidates' own distances.
+- **Cost:** A trains in 56.9 minutes and C1 in 55.6, the same convolutions; the others in 9.6 (B) to 40.9 minutes (D2). The candidates without a VGG-type trunk need 5.5 to 5.8 GiB at the allocator's peak against A's 14.0.
+
+### 6.7 The statistics
+
+As declared (section 5.7): each configuration's three per-seed values against A's three, Holm across the 18 comparisons of a family (9 configurations × 2 metrics), α = 0.05. "Better" is the one-sided Welch test; its Holm-adjusted p is 1.000 wherever the difference points the other way.
+
+| Configuration | Metric | Difference from A | Welch 95 % interval | TOST ±owner, Holm | TOST ±L3, Holm | Better, Holm | Verdict at the owner's margin | Verdict at L3's | Seeds a side for 80 % power (owner, L3) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| B | PSNR | -0.321 | [-3.493, +2.851] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 3076, 493 |
+| B | SSIM₁ | -0.0001 | [-0.0055, +0.0052] | 1.000 | 0.376 | 1.000 | inconclusive | inconclusive | 13, 3 |
+| C1 | PSNR | +0.765 | [-1.475, +3.005] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 1446, 232 |
+| C1 | SSIM₁ | +0.0014 | [+0.0001, +0.0026] | 1.000 | 0.050 | 0.320 | inconclusive | equivalent | 2, 2 |
+| C2 | PSNR | -0.202 | [-2.472, +2.068] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 1620, 260 |
+| C2 | SSIM₁ | -0.0027 | [-0.0040, -0.0015] | 1.000 | 0.063 | 1.000 | inconclusive | inconclusive | 2, 2 |
+| D1 | PSNR | +0.458 | [-1.911, +2.828] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 1854, 298 |
+| D1 | SSIM₁ | +0.0025 | [+0.0004, +0.0045] | 1.000 | 0.208 | 0.269 | inconclusive | inconclusive | 4, 2 |
+| D2 | PSNR | -0.217 | [-2.684, +2.251] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 2030, 326 |
+| D2 | SSIM₁ | +0.0020 | [-0.0017, +0.0056] | 1.000 | 0.398 | 1.000 | inconclusive | inconclusive | 8, 2 |
+| D3 | PSNR | -0.375 | [-2.636, +1.885] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 1329, 214 |
+| D3 | SSIM₁ | +0.0006 | [-0.0007, +0.0019] | 0.398 | 0.042 | 1.000 | inconclusive | equivalent | 2, 2 |
+| D4 | PSNR | +1.346 | [-0.932, +3.624] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 1290, 208 |
+| D4 | SSIM₁ | +0.0020 | [+0.0008, +0.0033] | 1.000 | 0.063 | 0.159 | inconclusive | inconclusive | 2, 2 |
+| F1 | PSNR | -0.195 | [-2.533, +2.142] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 1789, 287 |
+| F1 | SSIM₁ | +0.0028 | [+0.0004, +0.0051] | 1.000 | 0.376 | 0.271 | inconclusive | inconclusive | 5, 2 |
+| F4 | PSNR | -1.042 | [-3.674, +1.590] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 2292, 368 |
+| F4 | SSIM₁ | -0.0029 | [-0.0066, +0.0008] | 1.000 | 0.752 | 1.000 | inconclusive | inconclusive | 8, 2 |
+
+The secondary analysis on the kept-pixel PSNR (declared at A's gate), Holm across its 9 comparisons:
+
+| Configuration | Metric | Difference from A | Welch 95 % interval | TOST ±owner, Holm | TOST ±L3, Holm | Better, Holm | Verdict at the owner's margin | Verdict at L3's | Seeds a side for 80 % power (owner, L3) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| B | kept-pixel PSNR | -0.102 | [-3.351, +3.148] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 2112, 339 |
+| C1 | kept-pixel PSNR | +0.691 | [-0.632, +2.013] | 1.000 | 1.000 | 0.873 | inconclusive | inconclusive | 570, 92 |
+| C2 | kept-pixel PSNR | -0.391 | [-1.649, +0.866] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 524, 85 |
+| D1 | kept-pixel PSNR | -0.468 | [-2.405, +1.469] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 996, 160 |
+| D2 | kept-pixel PSNR | -0.594 | [-3.359, +2.171] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 1658, 266 |
+| D3 | kept-pixel PSNR | -0.412 | [-1.524, +0.700] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 406, 66 |
+| D4 | kept-pixel PSNR | +1.118 | [-0.053, +2.288] | 1.000 | 1.000 | 0.248 | inconclusive | inconclusive | 257, 42 |
+| F1 | kept-pixel PSNR | -0.239 | [-1.529, +1.052] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 547, 89 |
+| F4 | kept-pixel PSNR | -0.822 | [-2.133, +0.489] | 1.000 | 1.000 | 1.000 | inconclusive | inconclusive | 562, 91 |
+
+- **At the owner's margins nothing concludes:** no configuration is shown equivalent to A or better than it, on PSNR, SSIM₁ or the kept-pixel PSNR. With A's PSNR varying by 1.10 dB between seeds, TOST at ±0.1 dB would need 1,290 to 3,076 seeds a side; at ±0.002 SSIM₁, 2 to 13.
+- **At L3's margins,** C1's and D3's SSIM₁ are equivalent to A's (Holm-adjusted p 0.0499 and 0.0417); nothing else concludes.
+- **No configuration is better than A after Holm.** The largest differences are D4's +1.35 dB PSNR (interval −0.93 to +3.62) and +1.12 dB kept-pixel PSNR (−0.05 to +2.29), and C1's +0.77 and +0.69 dB, all inside intervals that include 0. On SSIM₁ the 95 % intervals of C1, D1, D4 and F1 lie above 0 (C1's +0.0001 to +0.0026) and C2's below (−0.0040 to −0.0015), uncorrected; after Holm none of them is a declared verdict.
+- **The caveat holds everywhere:** three seeds a side give little power on this view; every "inconclusive" here means that, not equivalence.
+
+### 6.8 The metric study
+
+Every candidate metric on every run's 300 clamped test renders. Correlations have their signs turned so that positive means agreement (a distance that falls as PSNR rises counts as positive). "Pooled" is over all 9,000 images, "within runs" the median over the 30 runs of the per-run correlation, "run means" over the 30 runs' means. The last column is section 6.9's.
+
+| Metric | Better | Per image, with PSNR: pooled, within runs | Per image, with SSIM₁: pooled, within runs | Run means, with PSNR: ρ, τ | Run means, with SSIM₁: ρ, τ | Agreement with the owner (n = 35) |
+| --- | --- | --- | --- | --- | --- | --- |
+| VGG16-CC | lower | +0.35, +0.35 | +0.58, +0.79 | +0.34, +0.25 | +0.45, +0.34 | 17/35, 0.49 [0.31, 0.66] |
+| AlexNet-CC | lower | +0.47, +0.61 | +0.59, +0.91 | +0.49, +0.35 | +0.33, +0.27 | 19/35, 0.54 [0.37, 0.71] |
+| ꟻLIP | lower | +0.57, +0.64 | +0.77, +0.84 | +0.55, +0.42 | +0.80, +0.61 | 13/35, 0.37 [0.21, 0.55] |
+| LASI (own) | lower | +0.26, +0.23 | +0.48, +0.68 | +0.39, +0.28 | +0.04, +0.02 | 21/35, 0.60 [0.42, 0.76] |
+| MDSI | lower | +0.62, +0.62 | +0.68, +0.64 | +0.66, +0.49 | +0.82, +0.62 | 21/35, 0.60 [0.42, 0.76] |
+| DINOv2-S/14 ½ | lower | +0.34, +0.29 | +0.55, +0.57 | +0.34, +0.22 | +0.67, +0.50 | 16/35, 0.46 [0.29, 0.63] |
+| DINOv2-B/14 ½ | lower | +0.27, +0.29 | +0.57, +0.62 | +0.26, +0.17 | +0.69, +0.52 | 15/35, 0.43 [0.26, 0.61] |
+| DINO-S/16 ½ | lower | +0.46, +0.42 | +0.54, +0.60 | +0.48, +0.35 | +0.65, +0.44 | 19/35, 0.54 [0.37, 0.71] |
+| DINO-B/16 ½ | lower | +0.50, +0.43 | +0.58, +0.62 | +0.49, +0.37 | +0.68, +0.46 | 20/35, 0.57 [0.39, 0.74] |
+| HaarPSI | higher | +0.67, +0.70 | +0.68, +0.72 | +0.68, +0.49 | +0.72, +0.54 | 17/35, 0.49 [0.31, 0.66] |
+| MS-SSIM | higher | +0.59, +0.62 | +0.80, +0.83 | +0.60, +0.47 | +0.86, +0.67 | 17/35, 0.49 [0.31, 0.66] |
+| GMSD | lower | +0.62, +0.62 | +0.71, +0.75 | +0.73, +0.51 | +0.67, +0.49 | 16/35, 0.46 [0.29, 0.63] |
+| MS-GMSD | lower | +0.75, +0.75 | +0.67, +0.71 | +0.79, +0.59 | +0.67, +0.48 | 16/35, 0.46 [0.29, 0.63] |
+| FSIM | higher | +0.87, +0.84 | +0.53, +0.52 | +0.86, +0.69 | +0.67, +0.49 | 19/35, 0.54 [0.37, 0.71] |
+| VSI | higher | +0.67, +0.71 | +0.68, +0.68 | +0.68, +0.50 | +0.79, +0.60 | 17/35, 0.49 [0.31, 0.66] |
+| VIF | higher | +0.15, +0.25 | +0.85, +0.87 | +0.22, +0.15 | +0.87, +0.69 | 19/35, 0.54 [0.37, 0.71] |
+| NLPD (own) | lower | +0.78, +0.78 | +0.70, +0.72 | +0.78, +0.61 | +0.83, +0.66 | 14/35, 0.40 [0.24, 0.58] |
+| CW-SSIM (own) | higher | +0.17, +0.08 | +0.50, +0.56 | +0.35, +0.23 | +0.22, +0.17 | 17/35, 0.49 [0.31, 0.66] |
+| LPIPS-Alex | lower | +0.35, +0.39 | +0.55, +0.84 | +0.41, +0.30 | +0.07, +0.04 | 18/35, 0.51 [0.34, 0.69] |
+| LPIPS-VGG | lower | +0.31, +0.32 | +0.47, +0.72 | +0.36, +0.26 | +0.28, +0.19 | 19/35, 0.54 [0.37, 0.71] |
+| PSNR | higher | | | | | 13/35, 0.37 [0.21, 0.55] |
+| SSIM₁ | higher | | | | | 17/35, 0.49 [0.31, 0.66] |
+
+Each configuration's mean, over its three runs, of each candidate metric:
+
+| Configuration | VGG16-CC | AlexNet-CC | DINOv2-S/14 ½ | DINOv2-B/14 ½ | DINO-S/16 ½ | DINO-B/16 ½ | ꟻLIP | LASI (own) | MDSI | HaarPSI | MS-SSIM | GMSD | MS-GMSD | FSIM | VSI | VIF | NLPD (own) | CW-SSIM (own) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A | 1.674 | 0.8647 | 0.5952 | 0.7659 | 0.6377 | 0.6163 | 0.1001 | 0.4507 | 0.2807 | 0.7915 | 0.9504 | 0.07659 | 0.08341 | 0.9614 | 0.9908 | 0.4767 | 0.1557 | 0.5597 |
+| B | 1.813 | 0.9174 | 0.6289 | 0.7953 | 0.6643 | 0.6323 | 0.09897 | 0.4573 | 0.2816 | 0.7781 | 0.9503 | 0.08057 | 0.08799 | 0.958 | 0.9903 | 0.479 | 0.1581 | 0.5509 |
+| C1 | 1.546 | 0.8389 | 0.5625 | 0.7317 | 0.6084 | 0.5834 | 0.09938 | 0.4485 | 0.2773 | 0.793 | 0.9519 | 0.07517 | 0.08173 | 0.9637 | 0.991 | 0.4789 | 0.1518 | 0.5627 |
+| C2 | 1.779 | 0.7754 | 0.606 | 0.771 | 0.6344 | 0.6106 | 0.1015 | 0.4469 | 0.2804 | 0.7893 | 0.9495 | 0.0772 | 0.08412 | 0.9612 | 0.9907 | 0.4694 | 0.1563 | 0.5561 |
+| D1 | 1.716 | 0.8485 | 0.5346 | 0.7046 | 0.5935 | 0.5725 | 0.09758 | 0.4516 | 0.2769 | 0.7991 | 0.9525 | 0.07514 | 0.08138 | 0.9657 | 0.9914 | 0.4822 | 0.1512 | 0.5569 |
+| D2 | 1.706 | 0.8477 | 0.5303 | 0.6819 | 0.599 | 0.578 | 0.09832 | 0.4525 | 0.2777 | 0.7952 | 0.9514 | 0.07596 | 0.08276 | 0.9634 | 0.9911 | 0.4822 | 0.1546 | 0.5574 |
+| D3 | 1.727 | 0.8599 | 0.5706 | 0.7353 | 0.5619 | 0.544 | 0.1006 | 0.452 | 0.2809 | 0.7861 | 0.95 | 0.07785 | 0.08553 | 0.9599 | 0.9904 | 0.4799 | 0.1573 | 0.557 |
+| D4 | 1.733 | 0.8325 | 0.5705 | 0.7445 | 0.5449 | 0.5034 | 0.09668 | 0.451 | 0.2741 | 0.8012 | 0.9525 | 0.07397 | 0.07985 | 0.9678 | 0.9916 | 0.4809 | 0.1497 | 0.5564 |
+| F1 | 1.729 | 0.8551 | 0.5893 | 0.7415 | 0.6137 | 0.5846 | 0.09404 | 0.4594 | 0.2736 | 0.7992 | 0.9547 | 0.07481 | 0.08218 | 0.9626 | 0.9917 | 0.4884 | 0.1503 | 0.5476 |
+| F4 | 1.847 | 0.9394 | 0.6558 | 0.8248 | 0.6985 | 0.6627 | 0.1058 | 0.4646 | 0.2867 | 0.7816 | 0.9471 | 0.07759 | 0.08687 | 0.9542 | 0.9898 | 0.4748 | 0.1622 | 0.5368 |
+| better | lower | lower | lower | lower | lower | lower | lower | lower | lower | higher | higher | lower | lower | higher | higher | higher | lower | higher |
+
+- **Across runs,** FSIM, NLPD, MS-GMSD, GMSD, MS-SSIM, VSI and HaarPSI order the 30 runs most like PSNR (Spearman 0.60 to 0.86) and also like SSIM₁ (0.67 to 0.86); VIF follows SSIM₁ (0.87) but not PSNR (0.22).
+- **The deep distances follow the run ranking less:** the DINO distances 0.26 to 0.49 with PSNR and 0.65 to 0.69 with SSIM₁, VGG16-CC and AlexNet-CC 0.34 and 0.49 with PSNR, LPIPS-Alex and LPIPS-VGG 0.41 and 0.36 with PSNR and 0.07 and 0.28 with SSIM₁. Within a run, frame to frame, AlexNet-CC and LPIPS-Alex do follow SSIM₁ closely (0.91 and 0.84).
+- **A trained-on distance flatters its own run:** C1 has the lowest VGG16-CC, C2 the lowest AlexNet-CC, D2 the lowest DINOv2-B/14, D4 the lowest DINO-B/16 and F1 the lowest ꟻLIP; D1 and D3 come second on their own distances, behind D2 and D4; F4 does not lead on HaarPSI.
+- **LASI and CW-SSIM** (both own implementations, not validated against published figures) track neither PSNR nor SSIM₁ across runs (0.39 and 0.35 with PSNR, 0.04 and 0.22 with SSIM₁).
+- MDSI and LASI ran as metrics though dropped as losses; MDSI's run means follow PSNR at 0.66 and SSIM₁ at 0.82.
+
+### 6.9 The blind comparison
+
+79 triplets (`kept/blind/sheets/01.png` to `79.png`), chosen as section 5.8 declared from the crops of all 30 runs: for each window and pair of runs of different configurations at the same seed, the share of the 18 candidate metrics that disagree; the most-disputed pairs first, one per window. The cap per configuration was written as 13 (2 × 80/13) for 13 configurations; with 10 it was applied as the formula gives, 16, which filled 79 triplets (disagreement 0.44 to 0.50, 49 motion and 30 detail windows, 29, 18 and 32 at seeds 0, 1 and 2). The owner answered on 2026-10-24, without the key: 13 left, 22 right, 44 ties (`kept/blind/scores.json`).
+
+| Configuration | Won / decisive | Share | Clopper–Pearson 95 % | Ties it appeared in |
+| --- | --- | --- | --- | --- |
+| A, LPIPS-VGG | 4 / 10 | 0.40 | [0.12, 0.74] | 6 |
+| B, λ = 0 | 4 / 10 | 0.40 | [0.12, 0.74] | 6 |
+| C1, VGG16-CC | 5 / 7 | 0.71 | [0.29, 0.96] | 9 |
+| C2, AlexNet-CC | 3 / 4 | 0.75 | [0.19, 0.99] | 12 |
+| D1, DINOv2-S/14 ½ | 4 / 7 | 0.57 | [0.18, 0.90] | 9 |
+| D2, DINOv2-B/14 ½ | 5 / 6 | 0.83 | [0.36, 1.00] | 10 |
+| D3, DINO-S/16 ½ | 4 / 6 | 0.67 | [0.22, 0.96] | 10 |
+| D4, DINO-B/16 ½ | 2 / 9 | 0.22 | [0.03, 0.60] | 7 |
+| F1, ꟻLIP | 3 / 8 | 0.38 | [0.09, 0.76] | 8 |
+| F4, HaarPSI | 1 / 3 | 0.33 | [0.01, 0.91] | 11 |
+
+- **The owner preferred neither crop in 44 of 79 triplets,** and the 35 decisive choices split without a clear winner: every configuration's 95 % interval includes one half. D2, C2 and C1 won most of theirs (5 of 6, 3 of 4, 5 of 7); D4, the PSNR leader, won 2 of 9.
+- **No metric agrees with the owner better than chance:** on the 35 decisive triplets the shares run from 0.37 (PSNR, ꟻLIP) to 0.60 (LASI, MDSI), every interval including 0.5; LPIPS-Alex 0.51, LPIPS-VGG 0.54, SSIM₁ 0.49 (table of section 6.8).
+- **What this design can and can't show:** the pairs were chosen where the metrics disagree most, so on them every metric is near a coin toss by construction, and the renders differ least; the comparison measures which metric breaks those ties as a person does, and with 35 decisive answers it can't separate them. It does show that, where the metrics disagree, the owner mostly saw no difference between configurations.
+
+### 6.10 Budget, disk and what stayed unchanged
+
+- **GPU:** the 30 runs' pipelines took 17.2 hours (training, render, evaluation, every metric, crops), the checks about 20 minutes, the calibration 20 seconds, the crop metrics 4.7 minutes and the gate's investigation about 5 minutes: about 17.8 hours against the 28 estimated, since C3, F2 and F3 were dropped and most candidates train faster than A. LASI took 263 of each run's 330 seconds of metrics.
+- **Disk:** at most about 9 GB at a time; kept, 380 MB (every run's files, the crops, the checks, the calibration, the study, the blind sheets and key, and the prototype code under `kept/code/`), beside 1.6 GB of downloads, 66 MB of converted weights, 0.65 GB of the gate's investigation (`investigation/`: run 20's re-evaluation and 10 frames from three models) and the 5.9 GB scratch venv.
+- **Unchanged:** the shared `.venv` (its files' paths, sizes and modification times, and `pip freeze`) and the read-only inputs (kitchen, its frame cache, M17's kitchen runs and the dataset), fingerprinted before the first run and after the last, match.
+
+### 6.11 What the tests show, for #373's recommendation
+
+- **The loss:** no candidate is shown no worse than LPIPS-VGG at the owner's margins, and none is shown worse or better: on kitchen's cam00, three seeds can't resolve differences of the size the margins ask for. Descriptively, D4 (DINO-B/16 at half resolution) and C1 (Oxford's VGG16, uncalibrated) have the highest means of PSNR and of kept-pixel PSNR, D4 the steadiest; C2's SSIM₁ interval lies below A's, uncorrected. Every candidate but C1 trains 1.4 (D2) to 6 times faster than A (C1 matches A's cost), and B, without a perceptual term, is the fastest and not distinguishable from A either.
+- **The owner's eye** saw no difference in most of the disputed crops and preferred no configuration clearly.
+- **The metric:** the weight-free FSIM, NLPD, MS-GMSD, GMSD, MS-SSIM, VSI and HaarPSI agree best with PSNR and SSIM₁ across runs; the deep-feature distances, LPIPS included, agree least, and every candidate distance flatters the run trained on it. No metric agreed with the owner's choices better than chance on the disputed crops.
+- **Limits:** one scene, one held-out view whose PSNR is dominated by a strip the training cameras barely cover, three seeds, own implementations of LASI, NLPD and CW-SSIM validated by sanity checks only, and a blind comparison of 35 decisive answers on the hardest pairs.
 
 ## 7. to 9.
 
