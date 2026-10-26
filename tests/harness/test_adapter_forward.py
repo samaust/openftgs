@@ -267,14 +267,21 @@ def test_relocation_sampling_draws_in_proportion_to_the_scores(tmp_path: Path) -
     assert np.array_equal(again, counts)
 
 
-def test_grad_stats_is_one_training_steps_statistic(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "loss",
+    [LossConfig(lambda_perc=0.0), LossConfig(perc_net="flip", lambda_perc=None)],
+    ids=["no-perceptual", "flip-calibrated"],
+)
+def test_grad_stats_is_one_training_steps_statistic(tmp_path: Path, loss: LossConfig) -> None:
     """D-12: the NDC-scaled 2D-mean gradient norm of E9 for one step, and visibility, as the
-    trainer computes them on the reference backend."""
+    trainer computes them on the reference backend, with the configuration's perceptual
+    network and weight: none at λ_perc = 0; ꟻLIP at λ_perc = None, its calibrated weight
+    (Q-249), a term of the total."""
     ex = _exchange(n=10, sh_degree=1)
     ex.arrays["duration"] = np.full(10, 50.0)  # every primitive present at τ = 5
     cam = ring(1, radius=4.0, elevation=1.0, width_px=24, height_px=16, focal=20.0)[0]
     gt = np.random.default_rng(1).random((16, 24, 3), dtype=np.float32)
-    cfg = TrainConfig(sh_degree=1, loss=LossConfig(lambda_perc=0.0))
+    cfg = TrainConfig(sh_degree=1, loss=loss)
     config = config_to_dict(cfg)
     params, tensors = _with_model(ex, width=24, height=16, iteration=1500, config=config)
     tensors.update(
@@ -299,8 +306,11 @@ def test_grad_stats_is_one_training_steps_statistic(tmp_path: Path) -> None:
         return_aux=True,
         packed=False,
     )
-    loss, _ = total_loss(out.image, torch.from_numpy(gt)[None], model, t, 1500, cfg.loss)
-    torch.autograd.backward(loss)
+    perceptual = None if loss.lambda_perc == 0.0 else PerceptualLoss("flip")
+    image = torch.from_numpy(gt)[None]
+    total, terms = total_loss(out.image, image, model, t, 1500, cfg.loss, perceptual=perceptual)
+    assert ("perceptual" in terms) is (perceptual is not None)
+    torch.autograd.backward(total)
     stats = GradStats(10)
     assert out.means2d is not None and out.means2d.grad is not None and out.visible is not None
     stats.update(out.means2d.grad, width=24, height=16, visible=out.visible)

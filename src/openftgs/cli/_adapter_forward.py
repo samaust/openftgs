@@ -227,6 +227,18 @@ def _relocation_sampling(
     return {"counts": torch.stack(counts).long()}
 
 
+def _perceptual(cfg: LossConfig) -> PerceptualLoss | LPIPSLoss | None:
+    """The configuration's perceptual network, built as the trainer builds it when λ_perc is
+    None, its calibrated weight, or positive (D-77, Q-249); LPIPS's two backbones, still
+    accepted as perc_net until #392 (#380's expand step), as `LPIPSLoss`."""
+    if cfg.lambda_perc is not None and cfg.lambda_perc <= 0.0:
+        return None
+    net = cfg.perc_net
+    if net == "vgg" or net == "alex":
+        return LPIPSLoss(net)
+    return PerceptualLoss(net)
+
+
 def _grad_stats(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:
     """D-12: one training step's NDC-scaled norm of each primitive's 2D-mean gradient of E9
     (§1.3 steps 3 to 5, as the trainer takes them, on the reference backend), and visibility."""
@@ -252,7 +264,7 @@ def _grad_stats(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dic
         return_aux=True,
         packed=False,
     )
-    perceptual = LPIPSLoss(cfg.loss.perc_net) if cfg.loss.lambda_perc > 0.0 else None
+    perceptual = _perceptual(cfg.loss)
     loss, _ = total_loss(
         out.image, tensors["gt"].float()[None], model, t, it, cfg.loss, perceptual=perceptual
     )
