@@ -69,14 +69,18 @@ jobs:
           for required in ("openftgs/py.typed", "licenses/LICENSE", "licenses/NOTICE"):
               assert any(n.endswith(required) for n in names), required
           assert not any(n.startswith("ftgs_harness/") for n in names), "Q-5"
-          # D-65, Q-115, Q-118: the vendored RoMa ships with its license files and VENDOR.json.
-          vendored = "openftgs/_vendor/romatch/"
-          record = json.loads(wheel.read(vendored + "VENDOR.json"))
-          assert [e["path"] for e in record["licenses"]][0] == "LICENSE"
-          assert len(record["licenses"]) == 8 and len(record["files"]) == 22
-          for entry in record["licenses"] + record["files"]:
-              digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
-              assert digest == entry["sha256"], entry["path"]
+          # D-65, Q-115, Q-118: the vendored RoMa ships with its license files and VENDOR.json,
+          # and so does the vendored ꟻLIP (D-89, #383).
+          for vendored, licenses, files in (
+              ("openftgs/_vendor/romatch/", 8, 22),
+              ("openftgs/_vendor/flip/", 1, 1),
+          ):
+              record = json.loads(wheel.read(vendored + "VENDOR.json"))
+              assert [e["path"] for e in record["licenses"]][0] == "LICENSE"
+              assert len(record["licenses"]) == licenses and len(record["files"]) == files
+              for entry in record["licenses"] + record["files"]:
+                  digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
+                  assert digest == entry["sha256"], entry["path"]
           names = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0]).namelist()
           for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):
               assert any(n.endswith(required) for n in names), required

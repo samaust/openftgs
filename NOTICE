@@ -38,3 +38,14 @@ Licensed under the Apache License, Version 2.0 (LICENSES/Kornia.txt).
 InLoc (https://github.com/HajimeTaira/InLoc_demo), whose approach RoMa's utils/utils.py credits
 Copyright (c) 2017 Hajime Taira
 Licensed under the MIT License (LICENSES/InLoc.txt).
+
+openftgs includes a copy of NVIDIA's ꟻLIP loss in the module openftgs._vendor.flip.flip_loss
+(folder openftgs/_vendor/flip), with changes that the file marks and its VENDOR.json lists, and
+its tests include the unmodified file as a reference (folder tests/reference/flip). Both folders
+hold ꟻLIP's license as LICENSE.
+
+ꟻLIP (https://github.com/NVlabs/flip), commit d3ab02a4425eb167d8a4021b382a2bafc6e6c838,
+src/pytorch/flip_loss.py
+Copyright (c) 2020-2025, NVIDIA CORPORATION & AFFILIATES (the file's own header reads
+2020-2024). All rights reserved.
+Licensed under the BSD 3-Clause License (LICENSE).
