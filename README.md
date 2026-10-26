@@ -27,7 +27,7 @@ Training needs a CUDA build of PyTorch. On Linux x86_64 the default `torch` whee
 
 Optional extras:
 
-- `[init]`: the dependencies of the RoMa-based 4D initialization. RoMa's optional speed-up, [fused-local-corr](https://github.com/Parskatt/fused-local-corr) (MIT), isn't part of it: every release since 0.3.27 requires one exact torch release (0.3.211 requires torch 2.11.0), so installing one would replace your torch, and the newest unpinned wheel, 0.2.4, built for CUDA 12, doesn't load with torch 2.14.1 (D-85). On Linux, build it from source against the torch you have; this needs the CUDA toolkit (`nvcc`) and a CUDA build of PyTorch already installed:
+- `[init]`: the dependencies of the RoMa-based 4D initialization, and of the four DINO perceptual networks (`dinov2_s14`, `dinov2_b14`, `dino_s16` and `dino_b16` as `loss.perc_net`), which run on the vendored RoMa's DINOv2 layers: without the extra, building one is an error that names it (Q-248). ꟻLIP, the default perceptual network, and the other three need no extra. RoMa's optional speed-up, [fused-local-corr](https://github.com/Parskatt/fused-local-corr) (MIT), isn't part of it: every release since 0.3.27 requires one exact torch release (0.3.211 requires torch 2.11.0), so installing one would replace your torch, and the newest unpinned wheel, 0.2.4, built for CUDA 12, doesn't load with torch 2.14.1 (D-85). On Linux, build it from source against the torch you have; this needs the CUDA toolkit (`nvcc`) and a CUDA build of PyTorch already installed:
 
   ```bash
   pip install --no-build-isolation git+https://github.com/Parskatt/fused-local-corr@689f2f7303ca0d97ac1f3d1364c732c6d8e889a8
