@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """The harness's E16 metrics against openftgs.eval's: two implementations written separately
-from E16 and E7, each checking the other (§3.3 L3 step 3)."""
+from E16 and E7, each checking the other (§3.3 L3 step 3). The harness's ꟻLIP runs its own
+vendored copy on the CPU (Q-254), checked against openftgs's copy, which U-23 checks against
+NVIDIA's file as published."""
+
+import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 import torch
 
-from ftgs_harness.metrics import Lpips, dssim, psnr, ssim
+from ftgs_harness.metrics import Lpips, dssim, flip, psnr, ssim
 from openftgs import eval as ev
+from openftgs._vendor.flip import LDRFLIPLoss
 
 
 def _pair(seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -42,3 +49,60 @@ def test_lpips_agrees_with_openftgs_eval(net: str) -> None:
     p, g = torch.from_numpy(np.clip(pred, 0, 1))[None], torch.from_numpy(gt)[None]
     expected = float(LPIPSLoss(net)(p, g).detach())  # type: ignore[arg-type]
     assert Lpips(net)(pred, gt) == pytest.approx(expected, abs=1e-5)
+
+
+def _nchw(image: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))[None]
+
+
+def test_flip_of_identical_images_is_zero() -> None:
+    """E16, U-23's criterion: ꟻLIP of identical images is 0 within 1e-6 (its stabilizer leaves
+    a few 1e-7)."""
+    _, gt = _pair(5)
+    assert flip(gt, gt) == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("seed", [6, 7])
+def test_flip_agrees_with_openftgs_vendored_copy_at_67_pixels_per_degree(seed: int) -> None:
+    """E16, Q-254, Q-T391.1: the harness's ꟻLIP is LDR-ꟻLIP at 67.0 pixels per degree on the
+    clamped render against the ground truth, the mean of its error map; on the CPU it agrees
+    with openftgs's vendored copy, which U-23 checks against NVIDIA's file as published, within
+    U-23's 1e-6."""
+    pred, gt = _pair(seed)
+    with torch.no_grad():
+        expected = LDRFLIPLoss()(_nchw(np.clip(pred, 0.0, 1.0)), _nchw(gt), 67.0)
+    value = flip(pred, gt)
+    assert 0.0 < value < 1.0
+    assert value == pytest.approx(float(expected), abs=1e-6)
+
+
+def test_flip_clamps_the_render_first() -> None:
+    """E16: a render above 1 or below 0 is clamped to [0, 1] before ꟻLIP."""
+    pred, gt = _pair(8)
+    assert pred.max() > 1.0 and pred.min() < 0.0
+    assert flip(pred, gt) == flip(np.clip(pred, 0.0, 1.0), gt)
+
+
+_IMPORT_WITHOUT_TORCH = """
+import sys
+sys.modules["torch"] = None  # as if torch weren't installed
+import ftgs_harness.metrics as metrics
+import numpy as np
+image = np.full((16, 16, 3), 0.5, dtype=np.float32)
+print(metrics.psnr(image * 0.9, image) > 0)
+"""
+
+
+def test_metrics_import_without_torch() -> None:
+    """Q-201, Q-254: L0 to L2 run without the harness's extra, so its metrics module imports,
+    and its PSNR and SSIM run, without torch; only ꟻLIP needs it."""
+    done = subprocess.run(
+        [sys.executable, "-c", _IMPORT_WITHOUT_TORCH],
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["True"]

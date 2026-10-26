@@ -13,9 +13,11 @@ from typing import Any
 import numpy as np
 import scipy.ndimage
 
-__all__ = ["Lpips", "dssim", "psnr", "ssim"]
+__all__ = ["FLIP_PIXELS_PER_DEGREE", "Lpips", "dssim", "flip", "psnr", "ssim"]
 
 _WINDOW, _SIGMA = 11, 1.5
+# Q-T391.1: E16's and D-89's 67.0 pixels per degree, passed to ꟻLIP as written.
+FLIP_PIXELS_PER_DEGREE = 67.0
 
 
 def _clamped(image: np.ndarray) -> np.ndarray:
@@ -58,6 +60,23 @@ def ssim(pred: np.ndarray, gt: np.ndarray, k: int = 1) -> float:
 def dssim(pred: np.ndarray, gt: np.ndarray, k: int = 1) -> float:
     """E16: DSSIM_k = (1 − SSIM_k)/2."""
     return (1.0 - ssim(pred, gt, k)) / 2.0
+
+
+def flip(pred: np.ndarray, gt: np.ndarray) -> float:
+    """E16's ꟻLIP (LDR) at 67.0 pixels per degree (Q-T391.1): the mean of its error map for the
+    clamped render against the ground truth, [H, W, 3], in float32 on the CPU, through the
+    harness's own vendored copy of NVIDIA's loss (Q-254), which needs torch."""
+    import torch
+
+    from ftgs_harness._vendor.flip import LDRFLIPLoss
+
+    def nchw(image: np.ndarray) -> Any:
+        planar = np.ascontiguousarray(image.astype(np.float32).transpose(2, 0, 1))
+        return torch.from_numpy(planar)[None]
+
+    with torch.no_grad():
+        value = LDRFLIPLoss()(nchw(_clamped(pred)), nchw(gt), FLIP_PIXELS_PER_DEGREE)
+    return float(value)
 
 
 class Lpips:
