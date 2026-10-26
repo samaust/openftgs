@@ -1980,7 +1980,8 @@ def test_a_dino_network_without_the_init_extra_is_exit_code_2(
 ) -> None:
     """Q-142, Q-248 (#389): a DINO network without the [init] extra, its vendored DINOv2 layers
     made unimportable, is exit 2 with a message naming the extra, before anything is
-    downloaded."""
+    downloaded. That nothing is downloaded is `openftgs.losses`'s order (Q-248: the layers are
+    imported before the checkpoint is fetched), which the CLI relies on."""
     monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.transformer.dinov2", None)
     _no_download(monkeypatch, AssertionError("a download started"))
     out = tmp_path / "run"

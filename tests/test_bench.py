@@ -1765,6 +1765,15 @@ def test_bench_losses_with_a_cached_weight_that_fails_its_check_exits_2(
     assert not out.exists()
 
 
+def _fetch_trunk_weights() -> None:
+    """The six trunk networks' files in torch.hub's cache, downloaded when they aren't, for the
+    `weights` tests of B-4 (Q-7), which never downloads them itself (Q-T389.2)."""
+    from openftgs import _weights
+
+    for net in TRUNKS:
+        _weights.fetch(_weights.DOWNLOADS[net])
+
+
 @pytest.mark.weights
 @pytest.mark.skipif(not has_init_extra, reason="the weights tests fetch DINO's files with it")
 def test_bench_losses_with_a_dino_network_without_the_init_extra_exits_2(
@@ -1774,10 +1783,7 @@ def test_bench_losses_with_a_dino_network_without_the_init_extra_exits_2(
     isn't, under `weights`), a DINO network without the [init] extra, its vendored DINOv2
     layers made unimportable, is exit 2 naming the extra, before anything is measured, with
     nothing written. PyTorch is made to see a CUDA device, which the check comes after."""
-    from openftgs import _weights
-
-    for net in TRUNKS:
-        _weights.fetch(_weights.DOWNLOADS[net])
+    _fetch_trunk_weights()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.transformer.dinov2", None)
     out = tmp_path / "B-4.json"
@@ -1823,6 +1829,7 @@ def losses_bench_weight_free(scene: Path, tmp_path_factory: pytest.TempPathFacto
 
 @pytest.fixture(scope="module")
 def losses_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> Any:
+    _fetch_trunk_weights()  # B-4 never downloads them (Q-T389.2); its tests may, under weights
     return _losses_bench(scene, tmp_path_factory.mktemp("bench-losses") / "B-4.json", None)
 
 
