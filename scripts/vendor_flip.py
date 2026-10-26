@@ -20,6 +20,15 @@ and caching only (D-89):
   every ``device='cuda'`` becomes ``device=<image>.device``, where ``<image>`` is the
   function's image argument; ``generate_spatial_filter`` takes the device as a new last
   argument, and the two colours of the colour maximum are made on the reference's device.
+- ``cache``: ``_once_per_device``, which memoizes a builder of tensors by its arguments, the
+  device last, and builds them outside inference mode.
+- ``filters``: the filters built once per device and size (§2.4's perceptual-loss row):
+  ``generate_spatial_filter`` is memoized, and the lines of ``feature_detection`` that build
+  its filter move into ``generate_feature_filter``, memoized the same way.
+
+The edits are exact substring replacements confined to one function each, located with ast
+and counted; lines added before a named line; and contiguous lines moved out of a function
+into a new one. The script stops (exit code 2) when any of them doesn't find what it expects.
 """
 
 from __future__ import annotations
@@ -73,7 +82,25 @@ CHANGES: dict[str, str] = {
         "colour maximum are made on the reference's device, where the published file's "
         "color_space_transform moved them with .cuda()"
     ),
+    "cache": (
+        "The helper the caching changes share: _once_per_device memoizes a builder of tensors "
+        "whose last argument is their device (functools.lru_cache), so that they are built "
+        "and copied to the device once, and builds them outside inference mode, so that a "
+        "tensor first built while evaluating under torch.inference_mode() can still be saved "
+        "for a backward pass"
+    ),
+    "filters": (
+        "The filters built once per device and size (§2.4's perceptual-loss row): "
+        "generate_spatial_filter is memoized by _once_per_device, and the lines of "
+        "feature_detection that build the edge and point filters move, unchanged but for the "
+        "device change, into a new function generate_feature_filter(pixels_per_degree, "
+        "feature_type, device), memoized the same way, which feature_detection calls. A "
+        "filter's size is set by the pixels per degree alone, so the key is the pixels per "
+        "degree, the channel or feature type and the device"
+    ),
 }
+
+T = "\t"  # the published file indents with tabs
 
 
 @dataclass(frozen=True)
@@ -120,6 +147,89 @@ SUBS: tuple[_Sub, ...] = (
     _device("redistribute_errors", "power_deltaE_hyab", 1, "device='cuda'"),
     _device("feature_detection", "img_y", 1),
     _device("color_space_transform", "input_color", 4),
+)
+
+
+@dataclass(frozen=True)
+class _Insert:
+    """Add ``lines`` before the one line whose text after its indentation starts with
+    ``before``; they carry their own markers."""
+
+    change: str
+    before: str
+    lines: tuple[str, ...]
+
+
+INSERTS: tuple[_Insert, ...] = (
+    _Insert("cache", "import sys", ("import functools  # openftgs (cache)",)),
+    _Insert(
+        "cache",
+        "class HDRFLIPLoss(nn.Module):",
+        (
+            "# openftgs (cache): memoizes a builder of tensors whose last argument is the device",
+            "# they are made on, so that they are built and copied there once (§2.4 rule 3);",
+            "# the builders' callers only read them. They are made outside inference mode, so",
+            "# that a tensor first made while evaluating can still be saved for a backward pass.",
+            "def _once_per_device(build):",
+            f"{T}@functools.lru_cache(maxsize=None)",
+            f"{T}def cached(*args):",
+            f"{T}{T}with torch.inference_mode(False):",
+            f"{T}{T}{T}return build(*args)",
+            f"{T}return functools.wraps(build)(cached)",
+            "",
+            "",
+        ),
+    ),
+    _Insert(
+        "filters",
+        "def generate_spatial_filter(",
+        ("@_once_per_device  # openftgs (filters)",),
+    ),
+)
+
+
+@dataclass(frozen=True)
+class _Move:
+    """Move the lines of the function ``scope`` from the one whose text starts with ``first``
+    through the one that starts with ``last`` into a new top-level function, made of
+    ``header``, the moved lines with ``edits`` made in them (each exactly once) and ``footer``,
+    and added before the top-level function ``before``; ``left`` takes the lines' place."""
+
+    change: str
+    scope: str
+    first: str
+    last: str
+    left: tuple[str, ...]
+    header: tuple[str, ...]
+    footer: tuple[str, ...]
+    edits: tuple[tuple[str, str], ...]
+    before: str
+
+
+MOVES: tuple[_Move, ...] = (
+    _Move(
+        "filters",
+        "feature_detection",
+        "# Set peak to trough value",
+        "Gx = Gx.unsqueeze(0).unsqueeze(0)",
+        (
+            f"{T}Gx, radius = generate_feature_filter(pixels_per_degree, feature_type, "
+            "img_y.device)  # openftgs (filters)",
+        ),
+        (
+            "# openftgs (filters): the edge and point filters and their radius, moved out of",
+            "# feature_detection so that each is built once per pixels per degree, feature",
+            "# type and device (§2.4's perceptual-loss row); the moved lines are the published",
+            "# ones, with the device change.",
+            "@_once_per_device",
+            "def generate_feature_filter(pixels_per_degree, feature_type, device):",
+            f'{T}""" openftgs (filters): the 1x1xKxK filter of feature_detection, K = 2 * radius'
+            ' + 1, and its radius """',
+        ),
+        (f"{T}return Gx, radius  # openftgs (filters)",),
+        (("img_y.device", "device"),),
+        "feature_detection",
+    ),
 )
 
 
@@ -196,7 +306,13 @@ def _patch(source: bytes) -> tuple[bytes, list[str]]:
         edits.append(f"{sub.change}: in {sub.scope}, {sub.old!r} -> {sub.new!r}, {times}")
     for number, names in changed.items():
         lines[number - 1] += f"  {_marker(names)}"
+    # Each line of the published file, as the lines it becomes.
     units: list[list[str]] = [[line] for line in lines]
+    for move in MOVES:
+        edits.append(_move(move, lines, units, spans))
+    for insert in INSERTS:
+        units[_line_starting(lines, insert.before)][:0] = list(insert.lines)
+        edits.append(f"{insert.change}: {len(insert.lines)} lines added before {insert.before!r}")
     units[_line_starting(lines, "# Visualizing and Communicating Errors")][:0] = list(NOTICE)
     edits.append("notice: the modification notice added after NVIDIA's license header")
     out = "\n".join(line for unit in units for line in unit)
@@ -204,9 +320,43 @@ def _patch(source: bytes) -> tuple[bytes, list[str]]:
     return out.encode("utf-8"), edits
 
 
-def _line_starting(lines: Sequence[str], start: str) -> int:
-    """The index of the one line whose text after its indentation starts with ``start``."""
-    found = [i for i, line in enumerate(lines) if line.lstrip().startswith(start)]
+def _move(
+    move: _Move, lines: Sequence[str], units: list[list[str]], spans: dict[str, tuple[int, int]]
+) -> str:
+    """Make ``move`` in ``units``; the edit in words."""
+    for name in (move.scope, move.before):
+        if name not in spans:
+            raise VendorError(f"{SOURCE}: no function {name}")
+    first, last = spans[move.scope]
+    scope = range(first - 1, last)
+    start = _line_starting(lines, move.first, scope)
+    end = _line_starting(lines, move.last, scope)
+    if end < start:
+        raise VendorError(f"{move.scope}: {move.last!r} comes before {move.first!r}")
+    moved = "\n".join(line for unit in units[start : end + 1] for line in unit)
+    for old, new in move.edits:
+        if moved.count(old) != 1:
+            raise VendorError(f"{move.scope}: {moved.count(old)} of {old!r} in the moved lines")
+        moved = moved.replace(old, new)
+    units[start] = list(move.left)
+    for index in range(start + 1, end + 1):
+        units[index] = []
+    function = [*move.header, *moved.split("\n"), *move.footer, "", ""]
+    units[spans[move.before][0] - 1][:0] = function
+    name = next(line for line in move.header if line.startswith("def ")).split("(")[0][4:]
+    replaced = ", ".join(f"{old!r} -> {new!r}" for old, new in move.edits)
+    return (
+        f"{move.change}: lines {start + 1}-{end + 1} of {move.scope} moved into a new function "
+        f"{name}, added before {move.before} ({replaced} in them); in their place "
+        f"{len(move.left)} line"
+    )
+
+
+def _line_starting(lines: Sequence[str], start: str, within: range | None = None) -> int:
+    """The index of the one line (in ``within``, else anywhere) whose text after its
+    indentation starts with ``start``."""
+    indices = range(len(lines)) if within is None else within
+    found = [i for i in indices if lines[i].lstrip().startswith(start)]
     if len(found) != 1:
         raise VendorError(f"{SOURCE}: {len(found)} lines start with {start!r}, not 1")
     return found[0]

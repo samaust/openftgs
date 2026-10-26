@@ -19,7 +19,7 @@
       "upstream_path": "src/pytorch/flip_loss.py",
       "source": "https://raw.githubusercontent.com/NVlabs/flip/d3ab02a4425eb167d8a4021b382a2bafc6e6c838/src/pytorch/flip_loss.py",
       "upstream_sha256": "bf2b83aeb2427a960abe1143d4436d48609f1cc4f256e685daa08d86cc07c4fc",
-      "sha256": "f1eb41bbe6b2ef1576e6fd601f7eb3127b36d8906b7d67e93c9cd38e85a2c294",
+      "sha256": "4dc584b647ed13498c4fb074f1aec9fc97793623d7061e6058bd24fd57b89df6",
       "edits": [
         "device: in HDRFLIPLoss.forward, '.cuda()' -> '.to(reference.device)', 3 times",
         "device: in tone_map, '.cuda()' -> '.to(img.device)', 3 times",
@@ -36,11 +36,17 @@
         "device: in redistribute_errors, \"device='cuda'\" -> 'device=power_deltaE_hyab.device', once",
         "device: in feature_detection, '.cuda()' -> '.to(img_y.device)', once",
         "device: in color_space_transform, '.cuda()' -> '.to(input_color.device)', 4 times",
+        "filters: lines 539-563 of feature_detection moved into a new function generate_feature_filter, added before feature_detection ('img_y.device' -> 'device' in them); in their place 1 line",
+        "cache: 1 lines added before 'import sys'",
+        "cache: 12 lines added before 'class HDRFLIPLoss(nn.Module):'",
+        "filters: 1 lines added before 'def generate_spatial_filter('",
         "notice: the modification notice added after NVIDIA's license header"
       ]
     }
   ],
   "changes": {
-    "device": "Device-agnostic tensors in place of the CUDA-only ones: every .cuda() becomes .to(<image>.device) and every device='cuda' becomes device=<image>.device, where <image> is the function's image argument; generate_spatial_filter takes the device as a new last argument, which compute_ldrflip passes, and the two colours of the colour maximum are made on the reference's device, where the published file's color_space_transform moved them with .cuda()"
+    "device": "Device-agnostic tensors in place of the CUDA-only ones: every .cuda() becomes .to(<image>.device) and every device='cuda' becomes device=<image>.device, where <image> is the function's image argument; generate_spatial_filter takes the device as a new last argument, which compute_ldrflip passes, and the two colours of the colour maximum are made on the reference's device, where the published file's color_space_transform moved them with .cuda()",
+    "cache": "The helper the caching changes share: _once_per_device memoizes a builder of tensors whose last argument is their device (functools.lru_cache), so that they are built and copied to the device once, and builds them outside inference mode, so that a tensor first built while evaluating under torch.inference_mode() can still be saved for a backward pass",
+    "filters": "The filters built once per device and size (§2.4's perceptual-loss row): generate_spatial_filter is memoized by _once_per_device, and the lines of feature_detection that build the edge and point filters move, unchanged but for the device change, into a new function generate_feature_filter(pixels_per_degree, feature_type, device), memoized the same way, which feature_detection calls. A filter's size is set by the pixels per degree alone, so the key is the pixels per degree, the channel or feature type and the device"
   }
 }

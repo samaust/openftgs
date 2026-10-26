@@ -53,10 +53,23 @@
 
 # Code by Pontus Ebelin (formerly Andersson), Jim Nilsson, and Tomas Akenine-Moller.
 
+import functools  # openftgs (cache)
 import sys
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+# openftgs (cache): memoizes a builder of tensors whose last argument is the device
+# they are made on, so that they are built and copied there once (§2.4 rule 3);
+# the builders' callers only read them. They are made outside inference mode, so
+# that a tensor first made while evaluating can still be saved for a backward pass.
+def _once_per_device(build):
+	@functools.lru_cache(maxsize=None)
+	def cached(*args):
+		with torch.inference_mode(False):
+			return build(*args)
+	return functools.wraps(build)(cached)
 
 
 class HDRFLIPLoss(nn.Module):
@@ -393,6 +406,7 @@ def compute_start_stop_exposures(reference, tone_mapper, tmax, tmin):
 	return start_exposure, stop_exposure
 
 
+@_once_per_device  # openftgs (filters)
 def generate_spatial_filter(pixels_per_degree, channel, device):  # openftgs (device)
 	"""
 	Generates spatial contrast sensitivity filters with width depending on
@@ -531,15 +545,13 @@ def redistribute_errors(power_deltaE_hyab, cmax, pc, pt):
 	return deltaE_c
 
 
-def feature_detection(img_y, pixels_per_degree, feature_type):
-	"""
-	Detects edges and points (features) in the achromatic image
-
-	:param imgy: achromatic image tensor (with Nx1xHxW layout, containing normalized Y-values from YCxCz)
-	:param pixels_per_degree: float describing the number of pixels per degree of visual angle of the observer
-	:param feature_type: string indicating the type of feature to detect
-	:return: image tensor (with Nx2xHxW layout, with values in range [0,1]) containing large values where features were detected
-	"""
+# openftgs (filters): the edge and point filters and their radius, moved out of
+# feature_detection so that each is built once per pixels per degree, feature
+# type and device (§2.4's perceptual-loss row); the moved lines are the published
+# ones, with the device change.
+@_once_per_device
+def generate_feature_filter(pixels_per_degree, feature_type, device):
+	""" openftgs (filters): the 1x1xKxK filter of feature_detection, K = 2 * radius + 1, and its radius """
 	# Set peak to trough value (2x standard deviations) of human edge
 	# detection filter
 	w = 0.082
@@ -564,7 +576,20 @@ def feature_detection(img_y, pixels_per_degree, feature_type):
 	positive_weights_sum = np.sum(Gx[Gx > 0])
 	Gx = torch.Tensor(Gx)
 	Gx = torch.where(Gx < 0, Gx / negative_weights_sum, Gx / positive_weights_sum)
-	Gx = Gx.unsqueeze(0).unsqueeze(0).to(img_y.device)  # openftgs (device)
+	Gx = Gx.unsqueeze(0).unsqueeze(0).to(device)  # openftgs (device)
+	return Gx, radius  # openftgs (filters)
+
+
+def feature_detection(img_y, pixels_per_degree, feature_type):
+	"""
+	Detects edges and points (features) in the achromatic image
+
+	:param imgy: achromatic image tensor (with Nx1xHxW layout, containing normalized Y-values from YCxCz)
+	:param pixels_per_degree: float describing the number of pixels per degree of visual angle of the observer
+	:param feature_type: string indicating the type of feature to detect
+	:return: image tensor (with Nx2xHxW layout, with values in range [0,1]) containing large values where features were detected
+	"""
+	Gx, radius = generate_feature_filter(pixels_per_degree, feature_type, img_y.device)  # openftgs (filters)
 
 	# Detect features
 	featuresX = nn.functional.conv2d(nn.functional.pad(img_y, (radius, radius, radius, radius), mode='replicate'), Gx, padding=0)
