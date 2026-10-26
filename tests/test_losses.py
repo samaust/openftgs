@@ -570,7 +570,7 @@ def test_u9_perceptual_network_of_an_image_with_itself(net: PercNet, dtype: torc
     assert max(ratios) <= 1e-5, ratios
 
 
-@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+@pytest.mark.parametrize("net", [*WEIGHT_FREE_NETWORKS, *CAFFE_PARAMS])
 def test_perceptual_loss_is_frozen_in_evaluation_mode_and_differentiates_only_the_render(
     net: PercNet,
 ) -> None:
@@ -686,7 +686,7 @@ def test_flip_takes_float32_images_only(dtype: torch.dtype) -> None:
         PerceptualLoss("flip")(image, image.clone())
 
 
-@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+@pytest.mark.parametrize("net", [*WEIGHT_FREE_NETWORKS, *CAFFE_PARAMS])
 def test_u9_perceptual_network_gradient_is_finite_on_a_render_above_one(net: PercNet) -> None:
     """U-9 (E7: Î isn't clamped, so it can exceed 1): the gradient with respect to a render
     with a raised patch, above 1 where the image is bright, is finite everywhere and nonzero."""
@@ -716,12 +716,12 @@ def test_d89_haarpsi_on_cuda_is_one_minus_piq_haarpsi(
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+@pytest.mark.parametrize("net", [*WEIGHT_FREE_NETWORKS, *CAFFE_PARAMS])
 def test_u9_perceptual_network_of_an_image_with_itself_on_the_gpu(net: PercNet) -> None:
-    """U-9 on CUDA, in float32 for ꟻLIP and float64 for HaarPSI (Q-262): identical images
-    give 0, or at most 10⁻⁵ of the value under σ = 16/255 noise."""
-    dtype = F32 if net == "flip" else F64  # Q-262
-    loss = PerceptualLoss(net)
+    """U-9 on CUDA, in float64 for HaarPSI (Q-262) and float32 for the others (Q-261,
+    Q-T385.1): identical images give 0, or at most 10⁻⁵ of the value under σ = 16/255 noise."""
+    dtype = F64 if net == "haarpsi" else F32  # Q-262
+    loss = PerceptualLoss(net).to("cuda")
     image = _pattern((2, 64, 96, 3), 0.0).to("cuda", dtype)
     same = loss(image, image.clone())
     noise = loss(_with_noise(image.cpu(), seed=46).cuda(), image)
@@ -734,15 +734,16 @@ def test_u9_perceptual_network_of_an_image_with_itself_on_the_gpu(net: PercNet) 
 @pytest.mark.skipif(
     sys.version_info < (3, 12), reason="the recorder needs sys.monitoring (Python 3.12)"
 )
-@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+@pytest.mark.parametrize("net", [*WEIGHT_FREE_NETWORKS, *CAFFE_PARAMS])
 def test_perceptual_loss_forward_and_backward_on_cuda_make_no_synchronization(net: PercNet) -> None:
-    """§2.4 rule 3 (#381): after one call on a device, which builds the networks' constants
-    and filters there (and, for ꟻLIP, reads its colour maximum back once), a forward and
-    backward pass of the network on a render-sized pair make no host synchronization under
-    `torch.cuda.set_sync_debug_mode("warn")`, by any route the recorder sees."""
+    """§2.4 rule 3 (#381, #385): after one call on a device, which builds the networks'
+    constants and filters there (and, for ꟻLIP, reads its colour maximum back once), a
+    forward and backward pass of the network on a render-sized pair make no host
+    synchronization under `torch.cuda.set_sync_debug_mode("warn")`, by any route the recorder
+    sees. The Caffe trunks' weights are moved to the device with the module."""
     from sync_recorder import SyncRecorder, described
 
-    loss = PerceptualLoss(net)
+    loss = PerceptualLoss(net).to("cuda")
     pred, gt = (
         x.to("cuda", F32) for x in (_pattern((1, 96, 128, 3), 0.4), _pattern((1, 96, 128, 3), 0.0))
     )
@@ -988,15 +989,17 @@ def test_total_loss_needs_the_backbone_the_config_names(lpips_nets: dict[str, LP
     assert "perceptual" in terms
 
 
-# D-89's calibrated λ_perc of the two weight-free networks, written out from its table.
-CALIBRATED = {"flip": 0.415, "haarpsi": 0.0617}
+# D-89's calibrated λ_perc of the two weight-free networks and the two Caffe trunks, written
+# out from its table.
+CALIBRATED = {"flip": 0.415, "haarpsi": 0.0617, "vgg16_oxford": 0.00164, "alexnet_bvlc": 0.00408}
 
 
-@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+@pytest.mark.parametrize("net", [*WEIGHT_FREE_NETWORKS, *CAFFE_PARAMS])
 def test_u9_lambda_perc_none_takes_the_network_calibrated_weight(net: PercNet) -> None:
     """U-9 (D-9, D-89; Q-249): with λ_perc = None, total_loss weights the perceptual term by the
-    network's calibrated weight, 0.415 for ꟻLIP and 0.0617 for HaarPSI: the loss and every term
-    are exactly those of the same configuration with that weight written in."""
+    network's calibrated weight, 0.415 for ꟻLIP, 0.0617 for HaarPSI, 0.00164 for VGG16 and
+    0.00408 for AlexNet: the loss and every term are exactly those of the same configuration
+    with that weight written in."""
     model = random_model(10, seed=35)
     pred, gt = _detached_pair(36, dtype=F32)
     perc = PerceptualLoss(net)
