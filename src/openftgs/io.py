@@ -25,6 +25,7 @@ from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
+from openftgs._legacy import with_current_loss
 from openftgs.config import config_from_dict
 from openftgs.types import (
     Camera,
@@ -754,7 +755,10 @@ def check_run_checkpoints(run_dir: Path, *, keep: int = 1) -> None:
 
 def load_checkpoint(directory: Path) -> TrainerState:
     """Read a ftgs-checkpoint directory (§2.2; Q-25), checking its format, major version, file
-    set and every SHA-256 first. Tensors are returned on the CPU."""
+    set and every SHA-256 first. Tensors are returned on the CPU. A checkpoint saved before
+    revision 549o, whose configuration names LPIPS's backbone, is read too, its configuration
+    validated with 549o's loss defaults in that backbone's place and returned as saved
+    (Q-247)."""
     directory = Path(directory)
     where = f"checkpoint {directory}"
     try:
@@ -807,9 +811,10 @@ def load_checkpoint(directory: Path) -> TrainerState:
     if set(params) != set(_PARAM_NAMES):
         _fail(where, f"params.safetensors must hold exactly {_PARAM_NAMES}")
     # §1.1 validity rules, checked on load (Q-25): a valid configuration (Q-10, Q-11), and N
-    # within its N_max, for every reader of a checkpoint.
+    # within its N_max, for every reader of a checkpoint. Q-247: a checkpoint saved before 549o
+    # is validated with 549o's loss defaults in place of LPIPS's backbone, in memory only.
     try:
-        n_max = config_from_dict(state.config).growth.n_max
+        n_max = config_from_dict(with_current_loss(state.config)).growth.n_max
     except ValueError as err:
         raise ValueError(f"{where}: invalid configuration: {err}") from None
     n = int(params["means"].shape[0])

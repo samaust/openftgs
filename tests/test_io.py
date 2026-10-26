@@ -1141,6 +1141,59 @@ def test_checkpoint_loader_enforces_n_max_and_a_valid_config(tmp_path: Path) -> 
         load_checkpoint(out)
 
 
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_checkpoint_loader_reads_a_checkpoint_saved_before_549o(tmp_path: Path, net: str) -> None:
+    """Q-247 (Q-25): a checkpoint whose stored configuration names one of LPIPS's backbones,
+    as those saved before revision 549o do with M17's λ_perc = 0.01, is read, though
+    `config_from_dict` refuses that configuration: it is validated with 549o's defaults in
+    place of its `perc_net` and `lambda_perc`, in memory only, so the state's `config` is the
+    dict as saved and the manifest is unchanged on disk."""
+    from openftgs.config import config_from_dict
+
+    state = _trainer_state(n=7)
+    state.config["loss"] |= {"perc_net": net, "lambda_perc": 0.01}
+    with pytest.raises(ValueError, match="549o"):
+        config_from_dict(state.config)
+    out = save_checkpoint(state, tmp_path / "legacy")
+    manifest = (out / "manifest.json").read_bytes()
+    loaded = load_checkpoint(out)
+    _assert_states_equal(state, loaded)
+    assert (loaded.config["loss"]["perc_net"], loaded.config["loss"]["lambda_perc"]) == (net, 0.01)
+    assert (out / "manifest.json").read_bytes() == manifest
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"growth": {"n_max": 6}}, "N_max"),  # N = 7
+        ({"loss": {"lambda_img": -1.0}}, "lambda_img"),
+        ({"growth": {"n_max": 0}}, "n_max"),
+    ],
+)
+def test_checkpoint_loader_checks_the_rest_of_a_pre_549o_configuration(
+    tmp_path: Path, change: dict[str, dict[str, Any]], match: str
+) -> None:
+    """Q-247, Q-25: only a legacy `perc_net` and its `lambda_perc` give way to 549o's defaults;
+    the rest of such a configuration is checked as any other's, N_max on load included."""
+    state = _trainer_state(n=7)
+    state.config["loss"] |= {"perc_net": "vgg", "lambda_perc": 0.01}
+    for section, values in change.items():
+        state.config[section] |= values
+    out = save_checkpoint(state, tmp_path / "legacy")
+    with pytest.raises(ValueError, match=match):
+        load_checkpoint(out)
+
+
+def test_checkpoint_loader_refuses_a_perc_net_neither_d89s_nor_lpips(tmp_path: Path) -> None:
+    """Q-247: only LPIPS's two backbones are read as a checkpoint from before 549o; any other
+    name outside `PercNet` is an invalid configuration, as before (Q-10, Q-25)."""
+    state = _trainer_state(n=7)
+    state.config["loss"]["perc_net"] = "squeeze"
+    out = save_checkpoint(state, tmp_path / "unknown")
+    with pytest.raises(ValueError, match="perc_net"):
+        load_checkpoint(out)
+
+
 def test_save_checkpoint_restores_the_newest_set_aside_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

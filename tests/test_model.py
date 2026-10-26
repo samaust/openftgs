@@ -928,6 +928,38 @@ def test_load_rejects_a_checkpoint_above_its_n_max(tmp_path: Path) -> None:
         FreeTimeGaussians.load(tmp_path / "ckpt", device="cpu")
 
 
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_model_load_reads_a_checkpoint_saved_before_549o(tmp_path: Path, net: str) -> None:
+    """Q-T392.1 (Q-247): a checkpoint whose stored configuration names one of LPIPS's
+    backbones, as those saved before revision 549o do, still gives its model: the nine
+    tensors, its SH degree and its time normalizer, as any checkpoint's."""
+    from openftgs.config import TrainConfig, config_to_dict
+    from openftgs.io import save_checkpoint
+    from openftgs.types import TrainerState
+
+    model = _model(n=8, sh_degree=1, seed=4)
+    config = config_to_dict(TrainConfig(sh_degree=1))
+    config["loss"] |= {"perc_net": net, "lambda_perc": 0.01}  # M17's defaults
+    params = {k: v.detach() for k, v in model.named_parameters()}
+    state = TrainerState(
+        iteration=10,
+        config=config,
+        time=TIME,
+        spatial_scale=1.0,
+        frame_dt=0.1,
+        params=params,
+        optim={},
+        stats={},
+        rng={},
+        sampler={},
+    )
+    save_checkpoint(state, tmp_path / "ckpt")
+    loaded = FreeTimeGaussians.load(tmp_path / "ckpt", device="cpu")
+    assert (loaded.sh_degree, loaded.time) == (1, TIME)
+    for name in PARAM_NAMES:
+        assert torch.equal(getattr(loaded, name).detach(), params[name]), name
+
+
 def test_constructors_copy_the_callers_tensors() -> None:
     """§2.1: InitPoints, ExchangeModel and the params mapping are plain data; an in-place update
     of the model's parameters leaves them unchanged."""

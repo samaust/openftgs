@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from builders import logit_of, model_from_rows, pinhole, write_scene
+from builders import logit_of, model_from_rows, pinhole, pre_549o_checkpoint, write_scene
 from exr_writer import write_exr, zip_block
 from PIL import Image
 
@@ -243,6 +243,23 @@ def test_run_scores_each_test_frame_against_its_ground_truth(tmp_path: Path) -> 
     assert -0.1 - 1e-5 <= depth["all"]["bias"] <= 1e-5
     assert depth["static"]["median_abs"] == pytest.approx(0.0, abs=1e-5)
     assert result["overall"]["expected_depth"]["all"]["pixels"] == depth["all"]["pixels"]
+
+
+def test_run_reads_a_checkpoint_saved_before_549o(tmp_path: Path) -> None:
+    """Q-T392.1 (Q-247): a checkpoint whose configuration names LPIPS-VGG, as those saved
+    before revision 549o do, is scored as the same checkpoint at 549o's configuration: the
+    script reads only its model, SH degree included."""
+    checkpoint, scene, gt = _ground_truth_scene(tmp_path)
+    legacy = pre_549o_checkpoint(checkpoint, tmp_path / "legacy")
+    module = _module()
+    results = []
+    for model in (checkpoint, legacy):
+        out = tmp_path / f"{model.name}.json"
+        assert module.main([str(model), str(scene), str(gt), "--out", str(out),
+                            "--backend", "reference"]) == 0  # fmt: skip
+        results.append(json.loads(out.read_text()))
+    now, before = results
+    assert (before["frames"], before["overall"]) == (now["frames"], now["overall"])
 
 
 @pytest.mark.parametrize("change", ["K", "pose", "time", "size", "camera"])

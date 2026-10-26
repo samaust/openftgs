@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from openftgs._legacy import resume_refusal
 from openftgs._stages import point, stage
 from openftgs.config import (
     LossConfig,
@@ -554,8 +555,14 @@ class Trainer:
         load_state_dict). A checkpoint of another scene manifest is refused unless forced; a
         forced resume keeps the run's τ₀, τ₁, S and Δt_f (§2.2; Q-70). Given `perf`, the run
         continues with those performance settings, which may differ from the checkpoint's only
-        in the fields that change no number (Q-134, Q-153); else with the checkpoint's."""
+        in the fields that change no number (Q-134, Q-153); else with the checkpoint's. A
+        checkpoint saved before revision 549o, whose configuration names LPIPS's backbone, is
+        refused before anything else (Q-247)."""
         state = load_checkpoint(Path(directory))
+        # Q-247: the stored configuration first; its run trained with a network that is gone.
+        refusal = resume_refusal(state.config, f"checkpoint {directory}")
+        if refusal is not None:
+            raise ValueError(refusal)
         if state.scene_sha256 != dataset.manifest.sha256 and not force:
             raise ValueError(
                 f"checkpoint {directory} was made from the scene manifest {state.scene_sha256}, "

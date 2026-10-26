@@ -2383,6 +2383,41 @@ def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
 
 
 @pytest.mark.gpu
+def test_b7_times_a_checkpoint_saved_before_549o(tested_scene: Path, tmp_path: Path) -> None:
+    """Q-247: `ftgs bench render --model` reads a checkpoint whose stored configuration names
+    LPIPS-VGG ("vgg"), as those saved before revision 549o do, M17's among them, whose B-7
+    floors Q-239 records: B-7 times its model, its N in the cases, with the checkpoint's Δt_f
+    as the buckets' width (D-55)."""
+    from openftgs.config import TrainConfig, config_to_dict
+    from openftgs.io import save_checkpoint
+    from openftgs.types import TrainerState
+
+    model = random_model(32, seed=1, sh_degree=1, time=TIME)
+    config = config_to_dict(TrainConfig(sh_degree=1))
+    config["loss"] |= {"perc_net": "vgg", "lambda_perc": 0.01}  # M17's defaults
+    state = TrainerState(
+        iteration=10,
+        config=config,
+        time=TIME,
+        spatial_scale=1.0,
+        frame_dt=0.25,
+        params={name: getattr(model, name).detach() for name in PARAM_NAMES},
+        optim={},
+        stats={},
+        rng={},
+        sampler={},
+    )
+    checkpoint = save_checkpoint(state, tmp_path / "legacy")
+    out = tmp_path / "B-7.json"
+    assert _ftgs("bench", "render", tested_scene, "--out", out, "--model", checkpoint) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["setup"]["model"] == f"given: {checkpoint}"
+    assert body["setup"]["frame_dt"] == pytest.approx(0.25)
+    models = {(c["case"].get("n"), c["case"].get("active")) for c in body["cases"]}
+    assert models == {(32, None), (None, None)}
+
+
+@pytest.mark.gpu
 def test__b7_floors_wire_one_budget_entry_on_the_index_on_request(
     tested_scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

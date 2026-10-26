@@ -844,6 +844,43 @@ def test_a_resume_refuses_a_changed_scene_manifest_unless_forced(tmp_path: Path)
     assert [log.image_index for log in after] == [log.image_index for log in straight[20:]]
 
 
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_a_resume_refuses_a_checkpoint_saved_before_549o(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: str
+) -> None:
+    """Q-247: a checkpoint whose stored configuration names one of LPIPS's backbones, as those
+    saved before revision 549o do with M17's λ_perc = 0.01, can't be resumed. `from_checkpoint`
+    checks the stored configuration first, so the ValueError names 549o whether or not the
+    resume is forced, given performance settings or given another scene manifest, and no
+    perceptual network is built; `load_state_dict` refuses such a state too."""
+    video = _scene(tmp_path / "scene")
+    trainer = Trainer(
+        _no_perceptual(optim=OptimConfig(iterations=30)), video, _init_points(), device="cpu"
+    )
+    _run(trainer, 5)
+    state = trainer.state_dict()
+    state.config["loss"] |= {"perc_net": net, "lambda_perc": 0.01}
+    save_checkpoint(state, tmp_path / "ckpt")
+    manifest = json.loads(video.manifest.path.read_text())
+    manifest["cameras"]["ring00"]["world_to_camera"][2][3] += 10.0
+    changed_path = tmp_path / "scene" / "changed.json"
+    changed_path.write_text(json.dumps(manifest))
+    changed = MultiViewVideo.from_manifest(changed_path)
+    built = _record_networks(monkeypatch)
+    resumes: list[tuple[MultiViewVideo, dict[str, Any]]] = [
+        (video, {}),
+        (video, {"force": True}),
+        (video, {"perf": PerfConfig()}),
+        (changed, {}),
+    ]
+    for dataset, options in resumes:
+        with pytest.raises(ValueError, match=rf"perc_net '{net}'.*549o"):
+            Trainer.from_checkpoint(tmp_path / "ckpt", dataset, device="cpu", **options)
+    with pytest.raises(ValueError, match="549o"):
+        trainer.load_state_dict(state)
+    assert built == []
+
+
 def test_load_state_dict_refuses_another_run_and_changes_nothing(tmp_path: Path) -> None:
     """Q-69, Q-72: a state of another configuration, whose sampler doesn't fit the dataset,
     whose iteration isn't an int, or whose global generator states are malformed, is a

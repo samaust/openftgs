@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from builders import random_model, ring, shortened_config, write_scene
+from builders import pre_549o_checkpoint, random_model, ring, shortened_config, write_scene
 from PIL import Image
 
 from openftgs.cli import main
@@ -194,6 +194,22 @@ def test_run_leaves_pngs_metrics_and_no_renders(tmp_path: Path) -> None:
     assert comparison["findings"] == []
     assert set(comparison["blocks"]["entire"]) == set(_scene_means(theirs))
     assert all(abs(d) < 1e-6 for d in comparison["blocks"]["entire"].values())
+
+
+def test_run_reads_a_checkpoint_saved_before_549o(tmp_path: Path) -> None:
+    """Q-T392.1 (Q-247): the viewer runs on a checkpoint whose configuration names LPIPS-VGG,
+    as M17's runs saved theirs before revision 549o: it renders the model against the white
+    background the run trained with (D-84) and scores it as the run's own METRICS.json does."""
+    scene = _scene(tmp_path / "scene")
+    run = _trained_run(tmp_path, scene)
+    legacy = pre_549o_checkpoint(run / "checkpoint", tmp_path / "legacy")
+    out = tmp_path / "renders"
+    done = _script("run", legacy, scene, out, "--backend", "reference")
+    assert done.returncode == 0, done.stderr
+    ours = json.loads((out / "METRICS.json").read_text())
+    theirs = json.loads((run / "METRICS.json").read_text())
+    for name, value in _scene_means(theirs).items():
+        assert _scene_means(ours)[name] == pytest.approx(value, rel=1e-6, abs=1e-9)
 
 
 def _module() -> Any:
