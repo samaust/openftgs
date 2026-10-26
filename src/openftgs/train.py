@@ -279,12 +279,15 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # Global PyTorch flags around a training iteration (Q-73).
 
-# Q-173 (changed, #326), Q-223: cuDNN autotuning during a training iteration that isn't
-# deterministic (§2.4 rule 2, D-52). B-4 measured it with LPIPS-VGG, the perceptual network
-# before revision 549o, alone at +4.3 % and −1.0 % (#228), and with that network's NCHW inputs at
-# +7.2 % and +3.9 % (Calibration data); D-89's networks keep it until B-4's rerun sets each
-# one's (Q-251).
-_AUTOTUNE = True
+# §2.4's perceptual-loss row, D-52; Q-173 (changed, #394), Q-T394.1, Q-T394.2: the perceptual
+# networks whose training iterations autotune cuDNN unless deterministic, those for which B-4's
+# recorded rerun (Calibration data, #394) measured autotuning with NCHW inputs at least 3 % faster
+# than the plain path at both sizes in both runs: vgg16_oxford +4.7 % / +4.7 % on the CI scene and
+# +3.4 % / +3.0 % on kitchen, alexnet_bvlc +15.0 % / +18.5 % and +15.4 % / +16.7 %. B-4 measured no
+# such gain for the other six, whose iterations leave the flag as the caller set it (Q-73). With
+# no perceptual network the only cuDNN convolutions are the SSIM fallback's, which autotuning made
+# 7 to 11 % faster in both runs, so such an iteration autotunes, as every one did since #326.
+_AUTOTUNED_NETWORKS = frozenset({"vgg16_oxford", "alexnet_bvlc"})
 
 
 class _PlacementWait:
@@ -310,9 +313,9 @@ class _PlacementWait:
 
 
 @contextlib.contextmanager
-def _perf_flags(perf: PerfConfig) -> Iterator[None]:
+def _perf_flags(perf: PerfConfig, *, autotune: bool) -> Iterator[None]:
     """Q-73: PerfConfig's process-global flags for one training iteration, restored
-    afterwards."""
+    afterwards; cuDNN autotuning when `autotune` and not deterministic (Q-T394.2)."""
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
     algorithms = (
@@ -330,8 +333,8 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
             cudnn.benchmark = False
             cudnn.deterministic = True
             torch.use_deterministic_algorithms(True, warn_only=True)
-        elif _AUTOTUNE:
-            cudnn.benchmark = True  # Q-173; otherwise the flag stays the caller's (Q-73)
+        elif autotune:
+            cudnn.benchmark = True  # Q-T394.2; otherwise the flag stays the caller's (Q-73)
         yield
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
@@ -339,12 +342,38 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
         torch.set_float32_matmul_precision(matmul)
 
 
-# Q-173: the training perceptual network's weights in channels-last memory, turned on only when
-# B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
-# at its two sizes (Calibration data, #228) with LPIPS-VGG, the perceptual network before
-# revision 549o, its inputs channels-last as a render's [..., H, W, 3] batch comes. D-89's
-# networks are measured by B-4's rerun (Q-251), which #394 reads.
+# Q-173: the training perceptual network's weights in channels-last memory. Off, as §2.4's
+# perceptual-loss row leaves them: B-4 has measured no network with them since #389 (Q-269).
 _CHANNELS_LAST_WEIGHTS = False
+
+# Q-T394.2 (Q-223 as changed, #394): per network, the (perc_precision, autotuned) pairs under
+# which the trainer's network gets contiguous NCHW inputs, from B-4's recorded rerun (Calibration
+# data, #394). Under "tf32" with autotuning it is Q-T394.1's adopted option; otherwise NCHW
+# where it was at least 3 % faster than the render's view at both sizes in both runs, at that
+# precision and autotuning: vgg16_oxford under "ieee" (+10 to +16 %), not under "bf16" (−7 to
+# −12 %) nor in a deterministic "tf32" run (−1 to −5 %); alexnet_bvlc everywhere (+3.5 to +88 %).
+# Every other network and pair takes the render's channels-last view as it comes.
+_NCHW_INPUTS: dict[str, frozenset[tuple[str, bool]]] = {
+    "vgg16_oxford": frozenset({("ieee", False), ("ieee", True), ("tf32", True)}),
+    "alexnet_bvlc": frozenset(
+        (precision, autotuned)
+        for precision in ("ieee", "tf32", "bf16")
+        for autotuned in (False, True)
+    ),
+}
+
+
+# Q-T394.2: a subclass in openftgs.train, so that `PerceptualLoss` and its other callers (the
+# evaluator, the harness's adapter) keep the render's view.
+class _NCHWPerceptualLoss(PerceptualLoss):
+    """A perceptual network that gets both images as contiguous NCHW tensors: they are copied
+    so that the batch-first views `PerceptualLoss.forward` takes of the [..., H, W, 3] images
+    are contiguous NCHW (Q-T394.2). The copy is exact (§2.4 rule 2)."""
+
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        # [..., H, W, 3] in memory whose batch-first view [..., 3, H, W] is contiguous
+        pred, gt = (image.movedim(-1, -3).contiguous().movedim(-3, -1) for image in (pred, gt))
+        return super().forward(pred, gt)
 
 
 # Q-172, Q-250, Q-251: autocast is local to the perceptual network, which only the trainer builds
@@ -363,10 +392,21 @@ class _Bf16PerceptualLoss(PerceptualLoss):
         return out.float()
 
 
+class _Bf16NCHWPerceptualLoss(_Bf16PerceptualLoss, _NCHWPerceptualLoss):
+    """bfloat16's network (Q-172) with NCHW inputs (Q-T394.2): the copy, inside the autocast,
+    then the network; alexnet_bvlc's under "bf16"."""
+
+
 def _builds_perceptual(loss: LossConfig) -> bool:
     """D-77, Q-69, Q-249: the trainer builds its perceptual network when λ_perc is None, which
     `total_loss` resolves to the network's calibrated weight (D-89), or positive."""
     return loss.lambda_perc is None or loss.lambda_perc > 0.0
+
+
+def _autotunes(cfg: TrainConfig) -> bool:
+    """Q-T394.2: whether a training iteration of `cfg` that isn't deterministic autotunes cuDNN:
+    for the networks B-4 turned it on for, and without a perceptual network."""
+    return not _builds_perceptual(cfg.loss) or cfg.loss.perc_net in _AUTOTUNED_NETWORKS
 
 
 # Q-250: D-89's networks without trained weights, which have no bfloat16 path (B-4 measures
@@ -388,14 +428,16 @@ def _check_perceptual(cfg: TrainConfig) -> None:
 
 
 def _perceptual_network(cfg: TrainConfig) -> PerceptualLoss:
-    """The trainer's perceptual network for `cfg`, on the CPU. Every network of D-89 takes the
-    render's view as it comes, its layout and autotuning to be set per network after B-4
-    (Q-251), and a trunk network runs under bfloat16 autocast when asked (Q-250;
+    """The trainer's perceptual network for `cfg`, on the CPU: with NCHW inputs where
+    `_NCHW_INPUTS` puts them for its precision and autotuning, otherwise the render's view as it
+    comes (Q-T394.2); a trunk network under bfloat16 autocast when asked (Q-250;
     `_check_perceptual` refuses bf16 for the weight-free ones)."""
-    net = cfg.loss.perc_net
-    if cfg.perf.perc_precision == "bf16":
-        return _Bf16PerceptualLoss(net)
-    return PerceptualLoss(net)
+    net, precision = cfg.loss.perc_net, cfg.perf.perc_precision
+    autotuned = _autotunes(cfg) and not cfg.perf.deterministic
+    nchw = (precision, autotuned) in _NCHW_INPUTS.get(net, frozenset())
+    if precision == "bf16":
+        return _Bf16NCHWPerceptualLoss(net) if nchw else _Bf16PerceptualLoss(net)
+    return _NCHWPerceptualLoss(net) if nchw else PerceptualLoss(net)
 
 
 def _check_ablation(cfg: TrainConfig) -> None:
@@ -609,6 +651,7 @@ class Trainer:
             if _CHANNELS_LAST_WEIGHTS:  # Q-173
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
+        self._autotune = _autotunes(cfg)  # Q-T394.2: per network, as B-4 measured
         self._evaluator: Evaluator | None = None
         self._frames: Prefetcher | None = None  # D-51: training images through the frame cache
         self._placement_wait: _PlacementWait | None = None  # "auto" pending on CUDA (Q-232)
@@ -744,7 +787,7 @@ class Trainer:
         # §3.4: the iteration's stages (B-1); the slice, rasterization and loss stages are
         # render's, at_time's and total_loss's.
         with stage("iteration"):
-            with _perf_flags(cfg.perf), torch.enable_grad():
+            with _perf_flags(cfg.perf, autotune=self._autotune), torch.enable_grad():
                 # Steps 1–2: the next image of the sampler, its normalized time and L_active.
                 index = run.sampler.next()
                 record = self._dataset.records[index]

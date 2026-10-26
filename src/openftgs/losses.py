@@ -438,7 +438,8 @@ class PerceptualLoss(torch.nn.Module):
         # D-89: the reference without a gradient.
         x, y = _batch_first(pred), _batch_first(gt.detach())
         if self._name in CAFFE_TRUNKS:
-            # D-89, #380's candidate 5: the render's view as it comes, until B-4 (#389).
+            # D-89: the images as the caller lays them out; the trainer's subclass gives a
+            # Caffe trunk NCHW inputs where B-4 measured them faster (Q-T394.2).
             caffe: Tensor = self._caffe(x, y).mean()
             return caffe
         if self._name in _DINO_TRUNKS:

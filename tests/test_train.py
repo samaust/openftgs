@@ -799,9 +799,11 @@ def test_a_training_iteration_leaves_the_global_torch_flags_as_they_were(tmp_pat
 def test_cudnn_autotuning_during_a_step_is_on_unless_deterministic(
     tmp_path: Path, deterministic: bool, caller: bool
 ) -> None:
-    """D-52, Q-73, Q-173 (changed, #326): during a training iteration's backward pass, cuDNN
-    autotuning is off under `deterministic` and on otherwise, whatever the caller set. Every
-    flag is the caller's again after the step."""
+    """D-52, Q-73, Q-173 (changed, #394), Q-T394.2: during the backward pass of a training
+    iteration without a perceptual network, whose only cuDNN convolutions are the SSIM
+    fallback's, cuDNN autotuning is off under `deterministic` and on otherwise, whatever the
+    caller set. Every flag is the caller's again after the step. Each network's own setting is
+    `test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose`'s."""
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
     try:
@@ -1344,6 +1346,145 @@ def test_a_bf16_step_changes_only_the_perceptual_term(
     for name in ("l1", "one_minus_ssim", "reg"):
         assert torch.equal(terms["bf16"][name], terms["tf32"][name]), name
     assert not torch.equal(terms["bf16"]["perceptual"], terms["tf32"]["perceptual"])
+
+
+# Q-T394.2's table, from B-4's recorded rerun under Q-T394.1's rule (Calibration data, #394):
+# the networks the trainer autotunes in a step that isn't deterministic, and, per network, the
+# (perc_precision, autotuned) pairs under which it gets contiguous NCHW inputs; every other
+# network and pair gets the render's channels-last view as it comes.
+B4_AUTOTUNED = {"vgg16_oxford", "alexnet_bvlc"}
+B4_NCHW = {
+    "vgg16_oxford": {("ieee", False), ("ieee", True), ("tf32", True)},
+    "alexnet_bvlc": {(p, a) for p in ("ieee", "tf32", "bf16") for a in (False, True)},
+}
+LAYOUT_CASES = [
+    pytest.param(net, precision, marks=marks, id=f"{net}-{precision}")
+    for net, marks in [
+        ("flip", ()),
+        ("haarpsi", ()),
+        *((param.values[0], param.marks) for param in TRUNK_PARAMS),
+    ]
+    for precision in (("ieee", "tf32") if net in ("flip", "haarpsi") else ("ieee", "tf32", "bf16"))
+]
+
+
+def _layout(image: torch.Tensor) -> str:
+    """How a [..., H, W, 3] image lies in memory, seen through the batch-first view a network
+    takes of it (`docs/modules/losses/terms-and-paths.md`, "Input layout")."""
+    if image.movedim(-1, -3).is_contiguous():
+        return "nchw"
+    return "channels_last" if image.is_contiguous() else "other"
+
+
+@pytest.mark.parametrize("caller", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize(("net", "precision"), LAYOUT_CASES)
+def test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    net: PercNet,
+    precision: Literal["tf32", "ieee", "bf16"],
+    deterministic: bool,
+    caller: bool,
+) -> None:
+    """§2.4's perceptual-loss row ("the layout and cuDNN autotuning of each network as B-4
+    measures them"), D-52; Q-T394.1, Q-T394.2: during a training step, the images the network
+    computes on (the arguments of `PerceptualLoss.forward`, which a trainer's subclass reaches
+    after laying them out) are contiguous NCHW exactly where Q-T394.2's table puts them, and
+    otherwise the render's channels-last view as it comes; and cuDNN autotuning is on while
+    the network runs for the networks B-4 turned it on for, unless the step is deterministic,
+    which turns it off, while for the others the flag stays the caller's (Q-73)."""
+    cudnn = torch.backends.cudnn
+    seen: list[tuple[str, str, bool]] = []
+    original = PerceptualLoss.forward
+
+    def recording(self: PerceptualLoss, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        seen.append((_layout(pred), _layout(gt), cudnn.benchmark))
+        return original(self, pred, gt)
+
+    monkeypatch.setattr(PerceptualLoss, "forward", recording)
+    video = _scene(tmp_path, scale=2)  # the DINO networks' 27 and 31 pixels (D-89; Q-265)
+    cfg = _perceptual(net, precision)
+    cfg = dataclasses.replace(cfg, perf=dataclasses.replace(cfg.perf, deterministic=deterministic))
+    saved = cudnn.benchmark
+    try:
+        cudnn.benchmark = caller
+        Trainer(cfg, video, _init_points(), device="cpu").step()
+        assert cudnn.benchmark is caller
+    finally:
+        cudnn.benchmark = saved
+    autotuned = net in B4_AUTOTUNED and not deterministic
+    layout = "nchw" if (precision, autotuned) in B4_NCHW.get(net, set()) else "channels_last"
+    autotuning = False if deterministic else (True if net in B4_AUTOTUNED else caller)
+    assert seen == [(layout, layout, autotuning)]
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("net", sorted(B4_NCHW))
+def test_a_float32_steps_nchw_perceptual_term_is_within_rounding_of_the_renders_view(
+    tmp_path: Path, net: PercNet, device: str, precision: Literal["tf32", "ieee"]
+) -> None:
+    """§2.4 rule 2, D-52; Q-T394.2 (Q-223 as changed, #394): where the trainer gives a network
+    NCHW inputs (vgg16_oxford, alexnet_bvlc under "ieee" and "tf32" with autotuning), a
+    training step's perceptual term equals, bitwise, a direct call of a separately built plain
+    `PerceptualLoss` on the same two images laid out so that their batch-first views are
+    contiguous NCHW, so float32 and the same network; and that NCHW path's value and the
+    prediction's gradient are within rounding of the render's channels-last view, the copy
+    being exact. The direct calls are made at the same moment, under the global flags the step
+    sets. Tolerances (Q-T394.2): the value within 1e-5 relative and the gradient within 1e-3
+    in relative L2 in IEEE float32, which the CPU always computes, since on this step's dim
+    render each layout's float32 gradient of vgg16_oxford lies up to 1.6e-4 from float64's;
+    TF32 on CUDA rounds to 10 mantissa bits, so two TF32 kernels are held to 1e-3 and 0.1
+    (Q-223). The images are caught by a global forward hook, PyTorch's public
+    `register_module_forward_hook`."""
+    from torch.nn.modules.module import register_module_forward_hook
+
+    def nchw(image: torch.Tensor) -> torch.Tensor:
+        # [..., H, W, 3] whose batch-first view [B, 3, H, W] is contiguous
+        return image.detach().movedim(-1, -3).contiguous().movedim(-3, -1)
+
+    def value_and_gradient(
+        pred: torch.Tensor, gt: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pred = pred.requires_grad_()
+        value = direct(pred, gt)
+        (gradient,) = torch.autograd.grad(value, pred)
+        return value.detach(), gradient
+
+    trainer = Trainer(_perceptual(net, precision), _scene(tmp_path), _init_points(), device=device)
+    direct = PerceptualLoss(net).to(device)
+    seen: list[tuple[torch.Tensor, ...]] = []
+    busy = False
+
+    def hook(module: torch.nn.Module, args: Any, output: Any) -> None:
+        nonlocal busy
+        if busy or not isinstance(module, PerceptualLoss):
+            return
+        busy = True  # the direct calls below run the same hook
+        try:
+            pred, gt = args
+            first = value_and_gradient(nchw(pred), nchw(gt))
+            last = value_and_gradient(pred.detach().clone(), gt.detach().clone())
+        finally:
+            busy = False
+        seen.append((output.detach().clone(), *first, *last))
+
+    handle = register_module_forward_hook(hook)
+    try:
+        log = trainer.step()
+    finally:
+        handle.remove()
+    assert len(seen) == 1
+    term, value, gradient, value_last, gradient_last = seen[0]
+    assert torch.equal(term, value)
+    assert float(log.losses["perceptual"]) == float(value)
+    tf32 = device == "cuda" and precision == "tf32"
+    rtol, gtol = (1e-3, 0.1) if tf32 else (1e-5, 1e-3)
+    torch.testing.assert_close(value, value_last, rtol=rtol, atol=0.0)
+    difference = torch.linalg.vector_norm((gradient - gradient_last).double())
+    assert float(difference) <= gtol * float(torch.linalg.vector_norm(gradient_last.double()))
 
 
 def _evaluation_scene(root: Path) -> MultiViewVideo:
