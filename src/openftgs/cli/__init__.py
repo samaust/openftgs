@@ -68,8 +68,8 @@ def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _environment(what: str) -> Iterator[None]:
-    """Q-142: an OSError of a run-time download (the LPIPS weights, §2.3 notes) is an
-    environment error, exit code 2."""
+    """Q-142: an OSError of a run-time download or of a cached file's check (the trunk networks'
+    weights, §2.3 notes; Q-258) is an environment error, exit code 2."""
     try:
         yield
     except OSError as error:
@@ -457,11 +457,15 @@ def _train(args: argparse.Namespace) -> int:
     if cfg.perf.deterministic:  # Q-131 (Q-73 note 2), before any CUDA call
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     device = _device()
+    # Q-142 (#389): the trainer builds its perceptual network, so a trunk weight that can't be
+    # downloaded or fails its check (an OSError naming the file, Q-258) and a DINO network
+    # without the [init] extra (an ImportError naming it, Q-248) are invalid environments.
+    building = (NotImplementedError, OSError, ImportError)
     if args.resume is None:
-        with _as_input_error("training setup", NotImplementedError):
+        with _as_input_error("training setup", *building):
             trainer = Trainer(cfg, video, points, device=device)
     else:
-        with _as_input_error(f"resume from {args.resume}", NotImplementedError):
+        with _as_input_error(f"resume from {args.resume}", *building):
             trainer = Trainer.from_checkpoint(
                 args.resume, video, device=device, force=args.force, perf=cfg.perf
             )
@@ -596,8 +600,9 @@ def _train(args: argparse.Namespace) -> int:
     if trace_failure is not None:
         raise trace_failure
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
-        # Q-161: one call downloads the networks and writes the file, so the message names both.
-        with _environment(f"LPIPS networks or {run_dir / 'METRICS.json'}"):
+        # Q-161 (as #380 changes it, #389): the evaluator's ꟻLIP downloads nothing, so an
+        # OSError here is METRICS.json's write (Q-142 as answered).
+        with _output(str(run_dir / "METRICS.json")):
             try:
                 trainer.evaluate("test", out_dir=run_dir)
             except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; no file

@@ -371,6 +371,24 @@ def test_the_six_trunks_are_pinned_to_their_publishers_files() -> None:
         assert _weights.DOWNLOADS[name] == _weights.Download(url, size, sha256)
 
 
+def test_trunk_files_name_the_cached_files_each_trunk_builds_from(hub: Path) -> None:
+    """Q-258, Q-253 (#389): a trunk's files in torch.hub's cache, any one of which builds it
+    without a download, in the order the build looks for them: a Caffe trunk's conversion
+    `openftgs-<perc_net>.safetensors`, then its publisher's file under the URL's name; a DINO
+    trunk's checkpoint under the URL's name. Listing them reads, makes and downloads nothing;
+    a weight-free network has none to list."""
+    checkpoints = hub / "checkpoints"
+    for name, (url, _, _) in _PUBLISHED.items():
+        publisher = checkpoints / url.rsplit("/", 1)[1]
+        converted = (checkpoints / f"openftgs-{name}.safetensors",)
+        expected = (*converted, publisher) if name in _CAFFE_SHAPES else (publisher,)
+        assert _weights.trunk_files(name) == expected, name
+    assert not hub.exists()
+    for name in ("flip", "haarpsi", "vgg"):
+        with pytest.raises(ValueError, match=name):
+            _weights.trunk_files(name)
+
+
 def test_the_trunks_are_the_perc_net_values_with_weights() -> None:
     """§2.1 `PercNet`, D-89: the trunks carry `perc_net`'s names, every network of D-89's
     table but the weight-free ꟻLIP and HaarPSI, in the table's order."""

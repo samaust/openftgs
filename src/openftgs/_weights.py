@@ -22,7 +22,7 @@ import safetensors.torch
 import torch
 from torch import Tensor
 
-__all__ = ["DOWNLOADS", "TRUNKS", "Download", "fetch", "trunk_tensors"]
+__all__ = ["DOWNLOADS", "TRUNKS", "Download", "fetch", "trunk_files", "trunk_tensors"]
 
 
 @dataclass(frozen=True)
@@ -259,13 +259,18 @@ def _convert(source: pathlib.Path, caffe: _Caffe) -> dict[str, Tensor]:
     return tensors
 
 
+def _converted(name: str) -> pathlib.Path:
+    """Q-258: where a Caffe trunk's conversion is cached, beside its source."""
+    return _checkpoints() / f"openftgs-{name}.safetensors"
+
+
 # Q-258: converted once into `openftgs-<name>.safetensors` beside its source, and checked
 # against the pinned conversion at every load.
 def _caffe_tensors(name: str, caffe: _Caffe) -> dict[str, Tensor]:
     """A Caffe trunk's convolutions, from its converted file in torch.hub's cache, made at
     first use from the publisher's checked file. Raises OSError when a download fails or a
     cached file isn't the publisher's or the pinned conversion (Q-142: exit 2)."""
-    path = _checkpoints() / f"openftgs-{name}.safetensors"
+    path = _converted(name)
     if not path.exists():
         source = fetch(caffe.download)
         tensors = _convert(source, caffe)
@@ -382,6 +387,21 @@ DOWNLOADS: dict[str, Download] = {
     **{name: caffe.download for name, caffe in _CAFFE.items()},
     **_DINO,
 }
+
+
+# Q-253, Q-270: B-4 never downloads, so it needs to know where a trunk is cached.
+def trunk_files(name: str) -> tuple[pathlib.Path, ...]:
+    """The files in torch.hub's cache, any one of which builds the trunk network `name` (one
+    of `TRUNKS`) without a download, in the order `trunk_tensors` looks for them: a Caffe
+    trunk's conversion, then its publisher's file, from which the conversion is made; a DINO
+    trunk's checkpoint (Q-258). Nothing is read, made or downloaded: whether a file is there is
+    the caller's question, and its byte count and SHA-256 are checked when the network is
+    built. Raises ValueError for another name."""
+    if name in _CAFFE:
+        return _converted(name), _checkpoints() / _CAFFE[name].download.file
+    if name in _DINO:
+        return (_checkpoints() / _DINO[name].file,)
+    raise ValueError(f"no trunk network {name!r}; the trunks are {', '.join(TRUNKS)}")
 
 
 def trunk_tensors(name: str) -> dict[str, Tensor]:
