@@ -232,3 +232,50 @@ def test__caffe_trunk_is_lpips_uncalibrated_distance_on_caffes_input_and_layers(
     for control in controls:
         changed = _oracle(name, tensors, x, y, **{control: False})
         assert bool(((changed - expected).abs() > 1e-4 * expected).all()), control
+
+
+@pytest.mark.parametrize("name", list(SHAPES))
+@pytest.mark.parametrize("dtype", [F64, torch.float16, torch.bfloat16])
+def test__caffe_trunk_takes_images_of_its_weights_dtype_only(name: str, dtype: torch.dtype) -> None:
+    """Q-T385.1: a trunk computes in its weights' dtype, float32 as converted, and refuses
+    images of another dtype with a ValueError naming it, rather than casting them."""
+    trunk = _caffe_trunks.CaffeTrunk(name, _stand_in(name, seed=6))
+    image = _images((1, 3, 24, 24), seed=7, dtype=dtype)
+    with pytest.raises(ValueError, match="float32"):
+        trunk(image, image.clone())
+
+
+@pytest.mark.parametrize("name", list(SHAPES))
+def test__caffe_trunk_keeps_its_weights_out_of_the_state_dict(name: str) -> None:
+    """Q-T385.1 (§2.3: never redistributed): the weights and the mean pixel are buffers that no
+    `state_dict` carries, which `.to()` still converts: converted to float64, the trunk
+    takes float64 images, and gives on them the value of a trunk built in float64, to the
+    float32 rounding of the mean pixel it was built with (1e-7 relative)."""
+    tensors = _stand_in(name, seed=8)
+    trunk = _caffe_trunks.CaffeTrunk(name, tensors)
+    assert trunk.state_dict() == {}
+    assert list(trunk.parameters()) == []
+    assert len(list(trunk.buffers())) == 2 * len(SHAPES[name]) + 1
+    built = _caffe_trunks.CaffeTrunk(name, {key: t.to(F64) for key, t in tensors.items()})
+    x = _images((1, 3, 24, 28), seed=9, dtype=F64)
+    y = _images((1, 3, 24, 28), seed=10, dtype=F64)
+    trunk.to(F64)
+    assert all(buffer.dtype == F64 for buffer in trunk.buffers())
+    torch.testing.assert_close(trunk(x, y), built(x, y), rtol=1e-7, atol=0.0)
+
+
+@pytest.mark.parametrize("shape", [(1, 3, 22, 40), (1, 3, 40, 22), (2, 3, 22, 22)])
+def test__caffe_trunk_alexnet_needs_sides_of_23_pixels(shape: tuple[int, ...]) -> None:
+    """Q-T385.1: AlexNet's layers need a height and width of at least 23 pixels (conv1's 11×11
+    of stride 4 gives 4, which its two 3×3 poolings of stride 2 take to 2 and 1); a smaller
+    side is a ValueError naming 23, before any work, and 23 runs. VGG16, whose ceiling pooling
+    takes a side of 1 to 1, runs at any size."""
+    alexnet = _caffe_trunks.CaffeTrunk("alexnet_bvlc", _stand_in("alexnet_bvlc", seed=11))
+    image = _images(shape, seed=12)
+    with pytest.raises(ValueError, match="23"):
+        alexnet(image, image.clone())
+    smallest = _images((1, 3, 23, 23), seed=13)
+    assert alexnet(smallest, smallest.clone()).shape == (1,)
+    vgg = _caffe_trunks.CaffeTrunk("vgg16_oxford", _stand_in("vgg16_oxford", seed=14))
+    pixel = _images((1, 3, 1, 1), seed=15)
+    assert vgg(pixel, pixel.clone()).shape == (1,)

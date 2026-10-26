@@ -65,6 +65,9 @@ _ALEXNET: tuple[_Step, ...] = (
     *(_Conv("conv5", groups=2), "tap"),
 )
 _STEPS: dict[str, tuple[_Step, ...]] = {"vgg16_oxford": _VGG16, "alexnet_bvlc": _ALEXNET}
+# Q-T385.1: the smallest height and width each trunk's layers take: AlexNet's conv1 gives 4
+# from 23, which its poolings take to 2 and 1; VGG16's ceiling pooling takes 1 to 1.
+_MIN_SIDE = {"vgg16_oxford": 1, "alexnet_bvlc": 23}
 
 # D-89: each release's mean pixel, BGR on Caffe's 0 to 255 scale: Oxford's as published
 # (source log 420); BVLC's the per-channel means of Caffe's ilsvrc_2012_mean.npy (source log
@@ -81,18 +84,22 @@ CAFFE_TRUNKS: tuple[str, ...] = tuple(_STEPS)
 class CaffeTrunk(torch.nn.Module):
     """The Caffe trunk `name` (one of `CAFFE_TRUNKS`) on `tensors`, its convolutions'
     `<layer>.weight` and `<layer>.bias` under Caffe's layer names, as `openftgs._weights`'s
-    `trunk_tensors` returns them (D-89)."""
+    `trunk_tensors` returns them (D-89). It computes in their dtype, and holds them, with the
+    mean pixel, as buffers that `.to()` moves and converts but no `state_dict` carries
+    (Q-T385.1; §2.3: never redistributed)."""
 
     def __init__(self, name: str, tensors: Mapping[str, Tensor]) -> None:
         super().__init__()
+        self._name = name
         self._steps = _STEPS[name]
-        self._convs = [step for step in self._steps if isinstance(step, _Conv)]
-        for conv in self._convs:
-            self.register_buffer(f"{conv.name}_weight", tensors[f"{conv.name}.weight"])
-            self.register_buffer(f"{conv.name}_bias", tensors[f"{conv.name}.bias"])
-        dtype = tensors[f"{self._convs[0].name}.weight"].dtype
+        convs = [step for step in self._steps if isinstance(step, _Conv)]
+        for conv in convs:
+            for part in ("weight", "bias"):
+                tensor = tensors[f"{conv.name}.{part}"]
+                self.register_buffer(f"{conv.name}_{part}", tensor, persistent=False)
+        dtype = tensors[f"{convs[0].name}.weight"].dtype
         mean = torch.tensor(_MEAN_BGR[name], dtype=dtype).view(1, 3, 1, 1)
-        self.register_buffer("mean_bgr", mean)
+        self.register_buffer("mean_bgr", mean, persistent=False)
 
     def features(self, image: Tensor) -> list[Tensor]:
         """The taps of D-89's distance for a [B, 3, H, W] RGB image in [0, 1]: Caffe's input,
@@ -118,7 +125,21 @@ class CaffeTrunk(torch.nn.Module):
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
         """D-89's distance between the [B, 3, H, W] RGB images x (the render) and y (the
         reference), per image: lpips's uncalibrated distance, its `lpips=False` (source log
-        350), over the five taps."""
+        350), over the five taps. Images of another dtype than the weights', or AlexNet's
+        sides below 23 pixels, are a ValueError (Q-T385.1)."""
+        # Q-T385.1: checked on the dtype and shape alone, so nothing synchronizes.
+        dtype = self.get_buffer("mean_bgr").dtype
+        if x.dtype != dtype or y.dtype != dtype:
+            raise ValueError(
+                f"the {self._name} trunk computes in its weights' dtype {dtype}, so it takes "
+                f"{dtype} images, got {x.dtype} and {y.dtype}"
+            )
+        side = _MIN_SIDE[self._name]
+        if min(x.shape[-2:]) < side or min(y.shape[-2:]) < side:
+            raise ValueError(
+                f"the {self._name} trunk needs H and W >= {side}, got {tuple(x.shape[-2:])} "
+                f"and {tuple(y.shape[-2:])}"
+            )
         # D-89: the reference without a gradient.
         with torch.no_grad():
             reference = [_unit(tap) for tap in self.features(y)]
