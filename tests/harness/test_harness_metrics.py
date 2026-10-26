@@ -64,6 +64,16 @@ def test_flip_agrees_with_openftgs_vendored_copy_at_67_pixels_per_degree(seed: i
     assert value == pytest.approx(float(expected), abs=1e-6)
 
 
+@pytest.mark.parametrize("seed", [6, 7])
+def test_flip_agrees_with_openftgs_eval(seed: int) -> None:
+    """E16, Q-259 (#387): the harness's ꟻLIP and the one METRICS.json reports, `openftgs.eval`'s
+    Evaluator on the CPU, agree within U-23's 1e-6, both at 67.0 pixels per degree on the
+    clamped render; the published default, 67.02, would put them about 3·10⁻⁵ apart."""
+    pred, gt = _pair(seed)
+    entire, _ = ev.Evaluator(device="cpu")(torch.from_numpy(pred), torch.from_numpy(gt))
+    assert flip(pred, gt) == pytest.approx(entire["flip"], abs=1e-6)
+
+
 def test_flip_clamps_the_render_first() -> None:
     """E16: a render above 1 or below 0 is clamped to [0, 1] before ꟻLIP."""
     pred, gt = _pair(8)
