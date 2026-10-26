@@ -1262,10 +1262,10 @@ def _evaluation_scene(root: Path) -> MultiViewVideo:
     return MultiViewVideo.from_manifest(write_scene(root, gt, images, mask_tests=True))
 
 
-@pytest.mark.weights
 def test_evaluate_returns_scene_means_and_writes_the_metrics_report(tmp_path: Path) -> None:
     """Q-74: the scene means of METRIC_NAMES for the entire images and, with masks, under
-    "dynamic/<name>"; with out_dir, METRICS.json in Q-63's layout with the trainer's header."""
+    "dynamic/<name>"; with out_dir, METRICS.json in Q-63's layout with the trainer's header, at
+    version 2 with ꟻLIP (Q-256)."""
     video = _evaluation_scene(tmp_path / "scene")
     trainer = Trainer(_no_perceptual(), video, _init_points(), device="cpu")
     _run(trainer, 5)
@@ -1273,6 +1273,7 @@ def test_evaluate_returns_scene_means_and_writes_the_metrics_report(tmp_path: Pa
     assert set(result) == set(METRIC_NAMES) | {f"dynamic/{name}" for name in METRIC_NAMES}
     report = json.loads((tmp_path / "out" / "METRICS.json").read_text())
     assert report["format"] == "ftgs-metrics" and report["split"] == "test"
+    assert report["version"] == 2 and report["metrics"] == list(METRIC_NAMES)
     assert report["model"] == {"path": None, "iteration": 5, "sha256": None}  # Q-136
     assert report["manifest"] == {
         "path": str(video.manifest.path),
@@ -1306,7 +1307,6 @@ def _nan_first_render(monkeypatch: pytest.MonkeyPatch, video: MultiViewVideo) ->
     return paths
 
 
-@pytest.mark.weights
 @pytest.mark.parametrize("written", [False, True])
 def test_evaluate_refuses_a_render_that_is_not_finite_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, written: bool
@@ -1324,7 +1324,6 @@ def test_evaluate_refuses_a_render_that_is_not_finite_before_writing(
     assert not (out / "METRICS.json").exists()
 
 
-@pytest.mark.weights
 def test_an_evaluation_between_steps_leaves_the_run_unchanged(tmp_path: Path) -> None:
     """Q-74: evaluate draws from no generator and trains nothing, so a run with an evaluation
     after its fifth iteration equals one without, bitwise."""

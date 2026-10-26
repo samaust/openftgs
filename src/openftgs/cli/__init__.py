@@ -850,8 +850,7 @@ def _eval(args: argparse.Namespace) -> int:
     supplied, entry = (None, None)
     if args.renders_dir is not None:
         supplied, entry = _match_renders(video, args.split, args.renders_dir)
-    with _environment("LPIPS networks"):
-        evaluator = Evaluator(device=device)
+    evaluator = Evaluator(device=device)  # ꟻLIP: nothing to download (E16, D-89)
     try:
         images = evaluate_images(
             loaded.model,
