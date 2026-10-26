@@ -323,6 +323,12 @@ def _vendored_dinov2(net: str) -> Any:
         ) from error
 
 
+def _halved(image: Tensor) -> tuple[int, int]:
+    """D-89's half resolution of [..., H, W] images: each side halved and rounded half to even,
+    as #374's prototype rounds it (Q-T386.1)."""
+    return round(image.shape[-2] / 2), round(image.shape[-1] / 2)
+
+
 def _unit_tokens(tokens: Tensor) -> Tensor:
     """Each token's vector [..., C] at unit length, as lpips normalizes its features."""
     return tokens / (tokens.pow(2).sum(dim=-1, keepdim=True).sqrt() + _UNIT_EPS)
@@ -357,6 +363,7 @@ class _DinoDistance(torch.nn.Module):
                 f"missing {loaded.missing_keys}, unexpected {loaded.unexpected_keys}"
             )
         self._vit: Any = vit
+        self._net = net
         self._patch = patch
         mean = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
         std = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
@@ -366,8 +373,7 @@ class _DinoDistance(torch.nn.Module):
 
     def _tokens(self, image: Tensor) -> list[Tensor]:
         """The patch tokens [B, T, C] after the four blocks, for [B, 3, H, W] images."""
-        # D-89: half resolution, bilinear and antialiased; Q-T386.1: rounded half to even.
-        half = (round(image.shape[-2] / 2), round(image.shape[-1] / 2))
+        half = _halved(image)
         image = F.interpolate(
             image, size=half, mode="bilinear", align_corners=False, antialias=True
         )
@@ -379,6 +385,15 @@ class _DinoDistance(torch.nn.Module):
         return list(self._vit.get_intermediate_layers(image, n=_DINO_BLOCKS, norm=False))
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        # Q-T386.1: the publishers' float32, never a cast; at least one patch at half
+        # resolution, 2p − 1 pixels for an even patch p. Shapes and dtypes only.
+        if x.dtype != torch.float32:
+            _fail(f"PerceptualLoss({self._net!r}) takes float32 images, got {x.dtype}")
+        if min(_halved(x)) < self._patch:
+            _fail(
+                f"PerceptualLoss({self._net!r}) needs H and W >= {2 * self._patch - 1}, one "
+                f"{self._patch}-pixel patch at half resolution, got {tuple(x.shape[-2:])}"
+            )
         with torch.no_grad():  # D-89: the reference without a gradient
             reference = self._tokens(y)
         total = x.new_zeros(x.shape[0])

@@ -975,6 +975,39 @@ def test__dino_distance_is_built_as_its_d89_row(
     torch.testing.assert_close(value.item(), want, rtol=1e-5, atol=0.0)
 
 
+@needs_init
+@pytest.mark.parametrize("net", DINO_NETWORKS)
+def test_dino_networks_take_float32_images_only(
+    net: PercNet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-T386.1: the trunks' weights are float32, as published, so a DINO network refuses
+    images of another dtype with a ValueError naming float32, rather than casting them, as
+    `flip` does (Q-261)."""
+    loss = _built_on_stand_in(net, monkeypatch)
+    image = torch.rand(40, 48, 3, generator=torch.Generator().manual_seed(51))
+    for dtype in (F64, torch.float16, torch.bfloat16):
+        with pytest.raises(ValueError, match="float32"):
+            loss(image.to(dtype), image.to(dtype))
+
+
+@needs_init
+@pytest.mark.parametrize("net", DINO_NETWORKS)
+def test_dino_networks_need_one_patch_at_half_resolution(
+    net: PercNet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q-T386.1: a side that halves to less than one patch (14 pixels for DINOv2, 16 for DINO)
+    leaves no token after the crop, so it is a ValueError naming the smallest side, 27 or 31
+    pixels, which halve to one patch (rounded half to even); an image of that side runs."""
+    smallest = {14: 27, 16: 31}[DINO_ARCHITECTURES[net][1]]
+    loss = _built_on_stand_in(net, monkeypatch)
+    for shape in [(smallest - 1, 40, 3), (40, smallest - 1, 3), (2, smallest - 1, 64, 3)]:
+        image = _pattern(shape, 0.0).float()
+        with pytest.raises(ValueError, match=str(smallest)):
+            loss(image, image.clone())
+    pred, gt = (_pattern((smallest, smallest, 3), phase).float() for phase in (0.5, 0.0))
+    assert bool(torch.isfinite(loss(pred, gt)))
+
+
 # U-10: the 4D regularization (E8, D-11)
 
 
