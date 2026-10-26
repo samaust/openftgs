@@ -21,7 +21,7 @@ B-4 (#228, Calibration data) measured what fused-ssim gains: its forward and the
 
 ## The perceptual networks
 
-`PerceptualLoss(net)` builds the perceptual network `LossConfig.perc_net` names, one of D-89's eight, ꟻLIP by default (D-9). A name outside D-89's table is a ValueError before anything is built, LPIPS's "vgg" and "alex" among them. What every network shares is D-89's common contract:
+`PerceptualLoss(net)` builds the perceptual network `LossConfig.perc_net` names, one of D-89's eight, ꟻLIP by default (D-9). A name outside D-89's table is a ValueError before anything is built, LPIPS's "vgg" and "alex" among them, which `LossConfig` already refuses, naming revision 549o (#375; Q-247 for the checkpoints that carry them). What every network shares is D-89's common contract:
 
 - `forward(pred, gt)` takes two images in Q-41's layout, [..., H, W, 3] of one shape, dtype and device, checked on their shapes alone, and returns the mean over the batch as a 0-d tensor.
 - The reference is detached, D-89's "reference without a gradient": it gets none even when it asks for one, and autograd records nothing on its branch, the separate no-grad pass §2.4 asks for.
@@ -60,14 +60,6 @@ Oxford's weights are licensed under CC BY 4.0, so NOTICE attributes them to Simo
 
 The CPU tests build the DINO networks on stand-in tensors with the publishers' keys and shapes, so their construction is checked without a download: the trunk's input against D-89's, written out, and the value against the distance computed from each block's output. The `weights` tests (Q-7) load the publishers' files, check that they load whole and that the stand-ins have their shapes, and run U-9.
 
-### LPIPSLoss, until the contract ticket
-
-`LPIPSLoss` wraps the lpips package's network for the backbone `LossConfig.perc_net` names (D-9). It maps its inputs from the image range to the network's documented input range (D-9, D-68) and returns the mean over the batch. lpips freezes only its trunk and puts dropout in its linear layers, so the wrapper keeps the network private, freezes every parameter and keeps the network in evaluation mode even when a parent module calls `.train()` (Q-41). With the weights frozen and a target that doesn't require a gradient, autograd records nothing on the target's branch, which is the separate no-grad target pass §2.4 asks for, without reimplementing lpips.
-
-A plain `LPIPSLoss`'s convolutions run channels-last: the batch-first view of a [..., H, W, 3] render is channels-last in memory, and every layer keeps that layout on the CPU and on CUDA (source log 175, 176). B-4 (#228, Calibration data) measured the rest of §2.4's plan for this loss: channels-last weights gain 1.0 % and 2.9 % at 1352×1014 and 1920×1080, and cuDNN autotuning 4.3 % and −1.0 %, so neither reaches Q-173's 3 % at both sizes alone; the weights stay NCHW. Contiguous NCHW inputs are the fastest layout in IEEE float32, and in TF32 with autotuning, so since #326 training uses them there (Q-173, as changed; Q-223): a private subclass in `openftgs.train` copies its two images so that their batch-first views are contiguous NCHW, an exact copy, and calls `LPIPSLoss.forward` (`docs/modules/train/trainer.md`). `LPIPSLoss` itself is unchanged, so the evaluator's networks keep the channels-last view. TF32 is 12 % and 17 % faster than IEEE float32 (D-52's default), and bf16 30 % faster than TF32, with its value within 2.2·10⁻³ relative but its gradient about 18 % off in L2 (`perc_precision = "bf16"`, opt-in; the trainer's private subclass, `docs/modules/train/trainer.md`).
-
-`forward` takes a keyword-only `map_inputs`, on by default. Off, it passes the images to the network unmapped: that is the lpips_vgg_raw metric of D-68, which `openftgs.eval` computes with the same VGG network (Q-58). The rendering loss always maps (D-9).
-
 ## The trunk weights
 
 The six trunk networks of D-89 get their pretrained tensors from `openftgs._weights`, a private top-level module that imports nothing from openftgs, so `openftgs.losses` may import it under §2.1's band order, and nothing of the `[init]` extra (Q-248). Its one entry point, `trunk_tensors(name)`, returns a trunk's tensors as float32 on the CPU; building the network from them is the network's own code (D-89's construction column).
@@ -88,11 +80,11 @@ The CPU tests check the cache and its refusals with small stand-in files and a p
 
 `total_loss` composes E7 and E9 (D-37) from `LossConfig`:
 
-- The perceptual network is passed in as the keyword `perceptual`, a `PerceptualLoss` built once by the trainer (D-77); until #392, an `LPIPSLoss` too.
+- The perceptual network is passed in as the keyword `perceptual`, a `PerceptualLoss` built once by the trainer (D-77).
 - The returned dict holds detached zero-dimensional tensors on the images' device, so computing the loss never synchronizes with the host (§2.4 rule 3, D-77). The trainer reads them at its logging period.
 - A term whose λ is zero is not computed and has no key for the whole run, which saves the perceptual pass in λ_perc = 0 ablations (Q-41).
 - After `reg_until`, which names the last iteration with L_reg (D-10), L_reg leaves the total but is still reported under its key, computed without a gradient. The keys therefore stay fixed for a run, and the loss trace D-10 names shows L_reg after a cutoff (Q-41, owner's answer).
 - The iteration index is counted as D-41 counts it.
-- λ_perc = None is the calibrated weight of `LossConfig.perc_net`, D-89's λ column: 0.415 for ꟻLIP, 0.0617 for HaarPSI, and the trunk networks' from 0.00164 to 0.00484. A private resolver in this module looks it up, so §2.1 gains nothing and no other module imports a private name. The trainer, the harness adapter and `ftgs bench` build the network when λ_perc is None or positive, and `config.json` keeps `null` as written (Q-249). LPIPS's backbones, still accepted as `perc_net` until #392, have no calibrated weight, so None with one of them is a ValueError naming D-89.
+- λ_perc = None is the calibrated weight of `LossConfig.perc_net`, D-89's λ column: 0.415 for ꟻLIP, 0.0617 for HaarPSI, and the trunk networks' from 0.00164 to 0.00484. A private resolver in this module looks it up, so §2.1 gains nothing and no other module imports a private name. The trainer, the harness adapter and `ftgs bench` build the network when λ_perc is None or positive, and `config.json` keeps `null` as written (Q-249). None is the default, with ꟻLIP, so the default loss is ꟻLIP at 0.415 (§2.1 `LossConfig`, §1.5 table C).
 - `total_loss` raises when the resolved weight is positive and no network is passed (D-77, Q-249).
-- A perceptual network built for another `perc_net` than `LossConfig.perc_net` is rejected, whatever λ_perc (D-9, Q-41). `PerceptualLoss` and, until #392, `LPIPSLoss` both keep the name they were built for.
+- A perceptual network built for another `perc_net` than `LossConfig.perc_net` is rejected, whatever λ_perc (D-9, Q-41). `PerceptualLoss` keeps the name it was built for.

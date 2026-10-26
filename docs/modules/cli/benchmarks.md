@@ -114,7 +114,7 @@ On kitchen, 78 % of the rows project into every camera's image (the 32 spheres a
 
 B-1 times `Trainer.step` by stage (§3.4), on synthesized models of 0.5M, 1M and 3M rows with 20 % of the rows active, plus 3M with 5 % active, the conservative case for D-50 since rasterization then does the least per row; or, with `--model`, on that model alone, at its own SH degree (#226; Q-185 for the details below).
 
-**Configuration.** The default `TrainConfig`, ꟻLIP included at its calibrated weight (`perc_net = "flip"`, `lambda_perc = None`, D-89; set explicitly until #392 makes them `LossConfig`'s defaults), except that growth and relocation start at iteration 100, `n_max` = ⌈1.02·N⌉ and `sh_interval` = 1, so every SH band is open from iteration 4 and growth can add at most 2 % to N. The frame cache is built before the first case (`FrameCache.build`), so "auto" only opens it once it decides, after the second iteration on these one-size scenes (Q-225, Q-232): memory-mapped on kitchen, whose cache is about 23 GB.
+**Configuration.** The default `TrainConfig`, ꟻLIP included at its calibrated weight (`perc_net = "flip"`, `lambda_perc = None`, D-89; `LossConfig`'s defaults since #392), except that growth and relocation start at iteration 100, `n_max` = ⌈1.02·N⌉ and `sh_interval` = 1, so every SH band is open from iteration 4 and growth can add at most 2 % to N. The frame cache is built before the first case (`FrameCache.build`), so "auto" only opens it once it decides, after the second iteration on these one-size scenes (Q-225, Q-232): memory-mapped on kitchen, whose cache is about 23 GB.
 
 **Per case**, a fresh trainer runs three windows:
 

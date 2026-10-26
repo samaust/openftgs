@@ -46,7 +46,7 @@ D-50 writes a custom CUDA operator only if B-1 shows the slice taking more than 
 
 B-3, rerun with the row width static (Q-184), found the compiled slice no slower than eager at every size from 10⁵ to 3·10⁶ rows, about half eager's time from 10⁶ rows on (1.24 against 2.29 ms at 3·10⁶), with no recompilation over its 10 resizes. So Q-182's rule keeps Q-13's mapping: `"auto"` is the compiled slice on CUDA.
 
-The SH concat, outside the slice, takes more than the slice's forward at every size (1.87 ms at 3M rows against 0.41 ms, 1.6 % of an iteration), since it copies every row's 48 SH floats; it stays under the 5 % at which PRD #220 asks for a change. An iteration is dominated by LPIPS-VGG at 1352×1014: its forward (`loss.perceptual`, 52.7 ms) and every loss's backward (`backward.losses`, 44.9 ms) take 85 to 96 % of it.
+The SH concat, outside the slice, takes more than the slice's forward at every size (1.87 ms at 3M rows against 0.41 ms, 1.6 % of an iteration), since it copies every row's 48 SH floats; it stays under the 5 % at which PRD #220 asks for a change. B-1's figures in this section were measured with LPIPS-VGG, the perceptual network before revision 549o, which then dominated an iteration at 1352×1014: its forward (`loss.perceptual`, 52.7 ms) and every loss's backward (`backward.losses`, 44.9 ms) took 85 to 96 % of it. ꟻLIP costs about an eighth of it (D-9), so the slice's shares grow; B-1's remeasurement gives the new figures.
 
 ## Unit conversions
 
