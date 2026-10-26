@@ -6,14 +6,16 @@ Spec: E7, E8, E9, D-89. Band: Mechanics (§2.1).
 """
 
 import functools
+import importlib
 import warnings
 from collections.abc import Callable
-from typing import Literal, NoReturn, get_args
+from typing import Any, Literal, NoReturn, get_args
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from openftgs import _weights
 from openftgs._stages import stage
 from openftgs._vendor.flip import LDRFLIPLoss
 from openftgs.config import LossConfig, PercNet
@@ -150,10 +152,6 @@ _PERC_NETS: tuple[str, ...] = get_args(PercNet)
 _TRUNK_TICKETS = {
     "vgg16_oxford": "#385",
     "alexnet_bvlc": "#385",
-    "dinov2_s14": "#386",
-    "dinov2_b14": "#386",
-    "dino_s16": "#386",
-    "dino_b16": "#386",
 }
 # D-89, E16: ꟻLIP's pixels per degree, a Python float, as the vendored copy's filter cache keys it.
 _FLIP_PIXELS_PER_DEGREE = 67.0
@@ -288,6 +286,107 @@ def _haarpsi(x: Tensor, y: Tensor) -> Tensor:
 # End of the code adapted from piq.
 
 
+# The DINO networks (D-89's `dinov2_*` and `dino_*` rows; #386), on the vendored DINOv2 layers
+# (D-65) and their publishers' weights (`openftgs._weights`). The construction is the one #374
+# tested (D-89), adapted from its prototype `candidates.py` (`ViTDistance` and the helpers it
+# calls; the owner's Apache-2.0 research code, SHA-256
+# 4386e7ce8bc97a2f94ca6b9e0eb11cc0d5559b20ccc08b72cb59c85c8e3486eb; source log T386.1).
+
+# D-89: each network's vendored builder, its patch size, the side of the square image its
+# publisher's position embeddings were made for, and its layer scale's initial value (DINOv2's;
+# DINO v1 has none), so that the publisher's state dict loads into the builder as saved.
+_DINO_TRUNKS: dict[str, tuple[str, int, int, float | None]] = {
+    "dinov2_s14": ("vit_small", 14, 518, 1.0),
+    "dinov2_b14": ("vit_base", 14, 518, 1.0),
+    "dino_s16": ("vit_small", 16, 224, None),
+    "dino_b16": ("vit_base", 16, 224, None),
+}
+# D-89: the patch tokens after blocks 3, 6, 9 and 12 of the twelve, counted from 0.
+_DINO_BLOCKS = [2, 5, 8, 11]
+# D-89: ImageNet's standardization.
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+# lpips's ε in the unit normalization, which #374's distances share (source log 435).
+_UNIT_EPS = 1e-10
+
+
+def _vendored_dinov2(net: str) -> Any:
+    """The vendored DINOv2 builders (D-65), imported only when a DINO network is built: their
+    package's `__init__` modules import torchvision, einops and loguru, which the [init] extra
+    installs (Q-248)."""
+    try:
+        return importlib.import_module("openftgs._vendor.romatch.models.transformer.dinov2")
+    except ImportError as error:  # Q-248; Q-142: the CLI's exit 2
+        raise ImportError(
+            f"PerceptualLoss({net!r}) needs the [init] extra (pip install 'openftgs[init]'), "
+            f"whose packages the vendored DINOv2 layers import: {error}"
+        ) from error
+
+
+def _unit_tokens(tokens: Tensor) -> Tensor:
+    """Each token's vector [..., C] at unit length, as lpips normalizes its features."""
+    return tokens / (tokens.pow(2).sum(dim=-1, keepdim=True).sqrt() + _UNIT_EPS)
+
+
+class _DinoDistance(torch.nn.Module):
+    """D-89's distance over four blocks of the DINO network `net`, as the mean over a batch of
+    [B, 3, H, W] images: each image at half resolution (bilinear, antialiased), centre-cropped
+    to a multiple of the patch and standardized; the patch tokens after blocks 3, 6, 9 and 12,
+    unit-normalized, their squared differences summed over channels, averaged over tokens and
+    summed over the blocks. The position embeddings are interpolated by the vendored model's
+    own code."""
+
+    _mean: Tensor
+    _std: Tensor
+
+    def __init__(self, net: str) -> None:
+        super().__init__()
+        builder, patch, img_size, layer_scale = _DINO_TRUNKS[net]
+        vendored = _vendored_dinov2(net)  # Q-248: before anything is downloaded
+        # block_chunks=0 keeps the publisher's key names (`blocks.<i>.…`).
+        vit = getattr(vendored, builder)(
+            patch_size=patch, img_size=img_size, init_values=layer_scale, block_chunks=0
+        )
+        loaded = vit.load_state_dict(_weights.trunk_tensors(net), strict=False)
+        # DINO v1 has no mask token, which the vendored model uses only with masks (#374).
+        missing = [] if net.startswith("dinov2") else ["mask_token"]
+        if loaded.unexpected_keys or loaded.missing_keys != missing:
+            # The file passed its hash, so the builder's arguments are wrong.
+            raise RuntimeError(
+                f"the publisher's state dict of {net} doesn't fit the vendored {builder}: "
+                f"missing {loaded.missing_keys}, unexpected {loaded.unexpected_keys}"
+            )
+        self._vit: Any = vit
+        self._patch = patch
+        mean = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
+        std = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
+        # Buffers, so that `.to(device)` moves them and no call copies them to the device.
+        self.register_buffer("_mean", mean, persistent=False)
+        self.register_buffer("_std", std, persistent=False)
+
+    def _tokens(self, image: Tensor) -> list[Tensor]:
+        """The patch tokens [B, T, C] after the four blocks, for [B, 3, H, W] images."""
+        # D-89: half resolution, bilinear and antialiased; Q-T386.1: rounded half to even.
+        half = (round(image.shape[-2] / 2), round(image.shape[-1] / 2))
+        image = F.interpolate(
+            image, size=half, mode="bilinear", align_corners=False, antialias=True
+        )
+        # D-89: centre-cropped to a multiple of the patch.
+        crop_h, crop_w = (side // self._patch * self._patch for side in half)
+        top, left = (half[0] - crop_h) // 2, (half[1] - crop_w) // 2
+        image = image[..., top : top + crop_h, left : left + crop_w]
+        image = (image - self._mean) / self._std
+        return list(self._vit.get_intermediate_layers(image, n=_DINO_BLOCKS, norm=False))
+
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        with torch.no_grad():  # D-89: the reference without a gradient
+            reference = self._tokens(y)
+        total = x.new_zeros(x.shape[0])
+        for a, b in zip(self._tokens(x), reference, strict=True):
+            total = total + (_unit_tokens(a) - _unit_tokens(b)).pow(2).sum(dim=-1).mean(dim=-1)
+        return total.mean()
+
+
 class PerceptualLoss(torch.nn.Module):
     """L_perc: the perceptual network `net` of D-89 on the render and the training image, as the
     mean over the batch (E7, D-9). `forward(pred, gt)` takes Q-41's [..., H, W, 3] images; the
@@ -309,6 +408,8 @@ class PerceptualLoss(torch.nn.Module):
         self._name = net
         if net == "flip":
             self._flip = LDRFLIPLoss()
+        elif net in _DINO_TRUNKS:
+            self._dino = _DinoDistance(net)
         # D-89: frozen and in evaluation mode, whatever a parent module asks.
         self.requires_grad_(False)
         self.train(False)
@@ -321,6 +422,9 @@ class PerceptualLoss(torch.nn.Module):
         _check_pair(pred, gt)
         # D-89: the reference without a gradient.
         x, y = _batch_first(pred), _batch_first(gt.detach())
+        if self._name in _DINO_TRUNKS:
+            distance: Tensor = self._dino(x, y)
+            return distance
         if self._name == "haarpsi":
             # D-89: 1 − HaarPSI, Î clamped to [0, 1].
             return 1.0 - _haarpsi(x.clamp(0.0, 1.0), y)

@@ -9,14 +9,19 @@ Expected values are worked by hand from the spec, come from scikit-image's
 
 import copy
 import importlib
+import json
+import os
+import subprocess
 import sys
 import warnings
 from collections.abc import Iterator
+from pathlib import Path
 from typing import get_args
 
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from builders import CAM_A, UNIT_TIME, model_from_rows, pinhole, random_model
 from skimage.metrics import structural_similarity
 from torch import Tensor
@@ -497,7 +502,7 @@ def test_perceptual_loss_rejects_a_name_outside_d89(net: str) -> None:
         PerceptualLoss(net)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("net", TRUNK_NETWORKS)
+@pytest.mark.parametrize("net", ["vgg16_oxford", "alexnet_bvlc"])
 def test_perceptual_loss_trunk_networks_are_not_built_yet(net: str) -> None:
     """#381: the six trunk networks of D-89 are built by #385 (the Caffe trunks) and #386 (the
     DINO networks); until then building one raises an error naming its ticket. Those tickets
@@ -746,6 +751,228 @@ def test_perceptual_loss_forward_and_backward_on_cuda_make_no_synchronization(ne
     assert recorder.syncs == [], described(recorder.syncs, __file__)
     assert recorder.unattributed == 0
     assert image.grad is not None
+
+
+# The DINO networks (D-89's `dinov2_*` and `dino_*` rows, D-65; Q-248; #386)
+
+DINO_NETWORKS: tuple[PercNet, ...] = ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
+INIT_PACKAGES = ("torchvision", "einops", "loguru")  # §2.3: the [init] extra's, beside RoMa's
+
+
+def _python(code: str, tmp_path: Path) -> str:
+    """`code` run by this interpreter in a fresh process on this checkout's openftgs, with
+    torch.hub's cache in an empty folder of `tmp_path`; its standard output."""
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(openftgs.losses.__file__).parents[1]),
+        "TORCH_HOME": str(tmp_path / "torch"),
+    }
+    env.pop("OPENFTGS_ALLOW_DOWNLOADS", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+# Imports of the [init] extra's packages fail as they would without the extra installed.
+_WITHOUT_INIT_EXTRA = """
+import importlib.abc
+import json
+import sys
+
+
+class _Absent(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("torchvision", "einops", "loguru"):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return None
+
+
+sys.meta_path.insert(0, _Absent())
+from openftgs.losses import PerceptualLoss
+
+PerceptualLoss("flip")
+errors = {}
+for net in ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16"):
+    try:
+        PerceptualLoss(net)
+    except ImportError as error:
+        errors[net] = str(error)
+print(json.dumps(errors))
+"""
+
+
+def test_dino_networks_without_the_init_extra_raise_an_import_error_naming_it(
+    tmp_path: Path,
+) -> None:
+    """Q-248 (D-65, §2.3): the DINO networks are built on the vendored DINOv2 layers, whose
+    package imports torchvision, einops and loguru, so they need the [init] extra. Without its
+    packages, `openftgs.losses` still imports and builds ꟻLIP, and building each DINO network
+    raises an ImportError naming the extra (the CLI's exit 2, Q-142) before anything is
+    downloaded."""
+    errors = json.loads(_python(_WITHOUT_INIT_EXTRA, tmp_path).splitlines()[-1])
+    assert set(errors) == set(DINO_NETWORKS)
+    for net, message in errors.items():
+        assert "[init]" in message and repr(net) in message, message
+    assert not (tmp_path / "torch").exists()
+
+
+HAS_INIT_EXTRA = all(importlib.util.find_spec(m) is not None for m in INIT_PACKAGES)
+needs_init = pytest.mark.skipif(not HAS_INIT_EXTRA, reason="needs the [init] extra (Q-248)")
+
+# The publishers' architectures (D-89's DINO rows: ViT-S and ViT-B, 12 blocks; DINO v1 "in the
+# same layers"): the width, the patch size, the side of the grid of patches the position
+# embeddings cover (518 / 14 and 224 / 16), and whether the model has DINOv2's layer scale and
+# mask token. `test__dino_stand_in_has_the_publishers_keys_and_shapes` checks them against the
+# files.
+DINO_ARCHITECTURES = {
+    "dinov2_s14": (384, 14, 37, True),
+    "dinov2_b14": (768, 14, 37, True),
+    "dino_s16": (384, 16, 14, False),
+    "dino_b16": (768, 16, 14, False),
+}
+IMAGENET_MEAN = (0.485, 0.456, 0.406)  # D-89: ImageNet's standardization
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _dino_stand_in(net: str, *, seed: int) -> dict[str, Tensor]:
+    """A state dict with the publisher's keys and shapes for `net` and seeded values, so that
+    the network can be built without downloading its weights."""
+    width, patch, grid, dinov2 = DINO_ARCHITECTURES[net]
+    gen = torch.Generator().manual_seed(seed)
+
+    def draw(*shape: int, mean: float = 0.0, std: float = 0.02) -> Tensor:
+        return mean + std * torch.randn(shape, generator=gen)
+
+    state = {
+        "cls_token": draw(1, 1, width),
+        "pos_embed": draw(1, grid * grid + 1, width),
+        "patch_embed.proj.weight": draw(width, 3, patch, patch),
+        "patch_embed.proj.bias": draw(width),
+    }
+    if dinov2:
+        state["mask_token"] = draw(1, width)
+    for i in range(12):
+        block = {
+            "norm1.weight": draw(width, mean=1.0),
+            "norm1.bias": draw(width),
+            "attn.qkv.weight": draw(3 * width, width),
+            "attn.qkv.bias": draw(3 * width),
+            "attn.proj.weight": draw(width, width),
+            "attn.proj.bias": draw(width),
+            "norm2.weight": draw(width, mean=1.0),
+            "norm2.bias": draw(width),
+            "mlp.fc1.weight": draw(4 * width, width),
+            "mlp.fc1.bias": draw(4 * width),
+            "mlp.fc2.weight": draw(width, 4 * width),
+            "mlp.fc2.bias": draw(width),
+        }
+        if dinov2:
+            block["ls1.gamma"] = draw(width, mean=0.5, std=0.1)
+            block["ls2.gamma"] = draw(width, mean=0.5, std=0.1)
+        state.update({f"blocks.{i}.{key}": value for key, value in block.items()})
+    state["norm.weight"] = draw(width, mean=1.0)
+    state["norm.bias"] = draw(width)
+    return state
+
+
+def _built_on_stand_in(net: PercNet, monkeypatch: pytest.MonkeyPatch) -> PerceptualLoss:
+    """`PerceptualLoss(net)` with `openftgs._weights` handing it the stand-in tensors."""
+    stand_in = _dino_stand_in(net, seed=50)
+
+    def trunk_tensors(name: str) -> dict[str, Tensor]:
+        assert name == net
+        return {key: value.clone() for key, value in stand_in.items()}
+
+    monkeypatch.setattr(openftgs._weights, "trunk_tensors", trunk_tensors)
+    return PerceptualLoss(net)
+
+
+def _d89_trunk_input(image: Tensor, patch: int) -> Tensor:
+    """D-89's DINO input, from [..., H, W, 3]: at half resolution, bilinear and antialiased, the
+    halved sides rounded half to even (Q-T386.1); centre-cropped to a multiple of the patch;
+    standardized with ImageNet's mean and standard deviation. [B, 3, h, w]."""
+    nchw = image.reshape(-1, *image.shape[-3:]).permute(0, 3, 1, 2)
+    h, w = nchw.shape[-2:]
+    half = (round(h / 2), round(w / 2))
+    small = F.interpolate(nchw, size=half, mode="bilinear", antialias=True, align_corners=False)
+    crop_h, crop_w = half[0] // patch * patch, half[1] // patch * patch
+    top, left = (half[0] - crop_h) // 2, (half[1] - crop_w) // 2
+    cropped = small[..., top : top + crop_h, left : left + crop_w]
+    mean = torch.tensor(IMAGENET_MEAN, dtype=image.dtype).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=image.dtype).view(1, 3, 1, 1)
+    return (cropped - mean) / std
+
+
+def _d89_dino_distance(blocks_x: list[Tensor], blocks_y: list[Tensor]) -> float:
+    """D-89's distance from the twelve blocks' outputs [B, 1 + T, C] (the class token first) of
+    both images, in float64: the patch tokens after blocks 3, 6, 9 and 12, each unit-normalized
+    over its channels (lpips's ε = 10⁻¹⁰, source log 435), squared differences summed over
+    channels, averaged over tokens, summed over the four blocks; the mean over the batch."""
+    total = torch.zeros((), dtype=F64)
+    for block in (3, 6, 9, 12):
+        a, b = (out[block - 1][:, 1:].double() for out in (blocks_x, blocks_y))
+        a = a / (a.norm(dim=-1, keepdim=True) + 1e-10)
+        b = b / (b.norm(dim=-1, keepdim=True) + 1e-10)
+        total = total + ((a - b) ** 2).sum(dim=-1).mean(dim=-1).mean()
+    return total.item()
+
+
+@needs_init
+@pytest.mark.parametrize("shape", [(2, 60, 90, 3), (1, 61, 91, 3)])
+@pytest.mark.parametrize("net", DINO_NETWORKS)
+def test__dino_distance_is_built_as_its_d89_row(
+    net: PercNet, shape: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-89's DINO rows, on stand-in weights: the vendored DINOv2 layers (D-65) with the
+    publisher's tensors loaded, 12 blocks, patch 14 for DINOv2 and 16 for DINO; the trunk sees
+    each image at half resolution, centre-cropped to a multiple of the patch and standardized;
+    the value is the distance over the patch tokens after blocks 3, 6, 9 and 12, the mean over
+    the batch. Odd sides check the rounding of the halved side (Q-T386.1)."""
+    patch = DINO_ARCHITECTURES[net][1]
+    loss = _built_on_stand_in(net, monkeypatch)
+    vit = loss._dino._vit
+    assert vit.patch_embed.proj.kernel_size == (patch, patch)
+    assert vit.patch_embed.proj.stride == (patch, patch)
+    assert len(vit.blocks) == 12
+    loaded = vit.state_dict()
+    for key, value in _dino_stand_in(net, seed=50).items():
+        assert torch.equal(loaded[key], value), key
+
+    inputs: list[Tensor] = []
+    outputs: list[list[Tensor]] = [[], []]
+    vit.patch_embed.register_forward_pre_hook(lambda _, args: inputs.append(args[0].clone()))
+    for block in vit.blocks:
+        block.register_forward_hook(
+            lambda _, __, out: outputs[len(inputs) - 1].append(out.detach().clone())
+        )
+    gt = _pattern(shape, 0.0).float()
+    pred = _pattern(shape, 0.6).float()
+    value = loss(pred, gt)
+
+    # One trunk pass per image, in an order D-89 doesn't fix: each pass is matched to its image
+    # by its input.
+    assert len(inputs) == 2 and all(len(out) == 12 for out in outputs)
+    calls = {}
+    for name, image in (("pred", pred), ("gt", gt)):
+        expected = _d89_trunk_input(image, patch)
+        matches = [
+            i
+            for i, seen in enumerate(inputs)
+            if seen.shape == expected.shape and torch.allclose(seen, expected, rtol=1e-6, atol=1e-6)
+        ]
+        assert len(matches) == 1, (name, [tuple(seen.shape) for seen in inputs])
+        calls[name] = matches[0]
+    assert sorted(calls.values()) == [0, 1]
+    want = _d89_dino_distance(outputs[calls["pred"]], outputs[calls["gt"]])
+    assert value.shape == () and value.dtype == F32
+    torch.testing.assert_close(value.item(), want, rtol=1e-5, atol=0.0)
 
 
 # U-10: the 4D regularization (E8, D-11)
