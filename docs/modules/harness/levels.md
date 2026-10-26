@@ -26,7 +26,7 @@ A main case: the first trained model of the run settings, else a random one with
 
 Seeds 0…K−1 for A and B, K…2K−1 for A′, one adapter process per run, round robin over the settings' GPUs with `CUDA_VISIBLE_DEVICES` set to one of them (D-54). The held-out request comes from the manifest's test split with the config's background; the native model renders it, and the exported FTGS-IF file feeds the distributions (Q-210).
 
-- Image metrics (E16, computed by the harness): PSNR, SSIM₁, SSIM₂, LPIPS-Alex and LPIPS-VGG are tested by Welch and TOST at α = 0.05, Holm-corrected across metrics × scenes; DSSIM is reported only.
+- Image metrics (E16, computed by the harness from the saved renders, ꟻLIP with its own copy, `overview.md`): PSNR, SSIM₁, SSIM₂ and ꟻLIP are tested by Welch and TOST at α = 0.05 with §3.3's margins of ±0.25 dB, ±0.005, ±0.005 and ±0.005, Holm-corrected across the four metrics × scenes (Q-210); DSSIM is reported only.
 - Distributions: d(A, B) − d(A, A′) for KS and Wasserstein-1, by an exact permutation over the C(2K, K) splits of B ∪ A′. A flag (p < 0.01) is a failed check, Holm-corrected at 0.01 across quantities × distances × scenes; when no flag is reachable at this K the check is `inconclusive`, naming the smallest reachable p and the K needed.
 - Traces: loss terms and N at 1k, 7k, 15k and 30k scaled by `optim.iterations`/30,000, reported by median and spread, with whether B's median lies within A's and A′'s spread.
 - Each run's samples are subsampled to 20,000 per quantity before KS and W1.

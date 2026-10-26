@@ -5,7 +5,8 @@ For each scene of the run settings, A and B train with seeds 0…K−1 and A aga
 (A′, the null distribution), one adapter process per run, round robin over the settings' GPUs
 with CUDA_VISIBLE_DEVICES set to one of them, so each run is a single-GPU run. Each run is
 exported to FTGS-IF and renders the scene's held-out request; the harness computes every metric
-itself (E16). Image metrics get Welch and TOST verdicts, Holm-corrected across metrics × scenes;
+itself (E16), ꟻLIP with its own vendored copy (Q-254). PSNR, SSIM₁, SSIM₂ and ꟻLIP get Welch and
+TOST verdicts, Holm-corrected across those four metrics × scenes (§3.3 L3 step 4, Q-210);
 distributions of the exported models get the seed-permutation test of d(A, B) − d(A, A′),
 Holm-corrected at 0.01, and `inconclusive` where no flag is reachable at this K; the training
 traces are reported at 1k, 7k, 15k and 30k iterations scaled to the run's length."""
@@ -26,7 +27,7 @@ from ftgs_harness.artifacts import plot_cdfs, plot_lines
 from ftgs_harness.cameras import Cam
 from ftgs_harness.checks import Check, Status
 from ftgs_harness.formats import FormatError, RequestItem, read_exchange, read_renders, read_scene
-from ftgs_harness.metrics import Lpips, dssim, psnr, ssim
+from ftgs_harness.metrics import dssim, flip, psnr, ssim
 from ftgs_harness.rendering import CaseItem, relative, request_for
 from ftgs_harness.runner import Context
 from ftgs_harness.settings import HarnessError, Scene
@@ -44,8 +45,9 @@ from ftgs_harness.stats import (
 
 __all__ = ["MARGINS", "QUANTITIES", "run", "trace_targets"]
 
-# §3.3 L3 step 4: the TOST margins; DSSIM is reported only, a function of SSIM (Q-210).
-MARGINS = {"psnr": 0.25, "ssim1": 0.005, "ssim2": 0.005, "lpips_alex": 0.01, "lpips_vgg": 0.01}
+# §3.3 L3 step 4: the TOST margins of the four tested metrics; DSSIM is reported only, a
+# function of SSIM (Q-210).
+MARGINS = {"psnr": 0.25, "ssim1": 0.005, "ssim2": 0.005, "flip": 0.005}
 _ALPHA = 0.05  # Q-210: Welch and TOST, Holm-corrected
 _FLAG = 0.01  # §3.3 L3 step 5
 _TRACE_POINTS = (1_000, 7_000, 15_000, 30_000)  # §3.3 L3 step 6, for T_it = 30,000
@@ -576,25 +578,19 @@ def _not_comparable(ctx: Context, name: str, results: list[_RunResult]) -> list[
     return checks
 
 
-def _measurer() -> Callable[[np.ndarray, np.ndarray], dict[str, float]]:
-    alex, vgg = Lpips("alex"), Lpips("vgg")
-
-    def measure(pred: np.ndarray, gt: np.ndarray) -> dict[str, float]:
-        return {
-            "psnr": psnr(pred, gt),
-            "ssim1": ssim(pred, gt, 1),
-            "ssim2": ssim(pred, gt, 2),
-            "dssim1": dssim(pred, gt, 1),
-            "dssim2": dssim(pred, gt, 2),
-            "lpips_alex": alex(pred, gt),
-            "lpips_vgg": vgg(pred, gt),
-        }
-
-    return measure
+def _measure(pred: np.ndarray, gt: np.ndarray) -> dict[str, float]:
+    """E16's metrics of one held-out render (§3.3 L3 step 3)."""
+    return {
+        "psnr": psnr(pred, gt),
+        "ssim1": ssim(pred, gt, 1),
+        "ssim2": ssim(pred, gt, 2),
+        "dssim1": dssim(pred, gt, 1),
+        "dssim2": dssim(pred, gt, 2),
+        "flip": flip(pred, gt),
+    }
 
 
 def run(ctx: Context) -> list[Check]:
-    measure = _measurer()
     background = list(ctx.config.get("background", [0.0, 0.0, 0.0]))
     by_scene: dict[str, list[_RunResult]] = {}
     checks: list[Check] = []
@@ -608,7 +604,7 @@ def run(ctx: Context) -> list[Check]:
         request = ctx.cases / "L3" / f"{scene.name}.request.json"
         request.parent.mkdir(parents=True, exist_ok=True)
         sha = request_for(request, items, background)
-        results = _runs(ctx, scene, _HeldOut(request, sha, items, truths, measure))
+        results = _runs(ctx, scene, _HeldOut(request, sha, items, truths, _measure))
         by_scene[scene.name] = results
         checks += [r.failure for r in results if r.failure is not None and ctx.wants(r.failure.id)]
         checks += _not_comparable(ctx, scene.name, results)

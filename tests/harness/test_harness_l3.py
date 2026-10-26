@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """L3 · multi-seed statistics, its plumbing (§3.3 L3; D-54; Q-203, Q-210, Q-211), with a replay
 adapter whose `train` copies pre-made tiny CPU runs. The verdicts and statistics themselves are
-pinned in test_harness_stats.py; the S-9 run is test_harness_e2e.py."""
+pinned in test_harness_stats.py; the S-9 run is test_harness_e2e.py. L3 computes ꟻLIP with the
+harness's own copy on the CPU and downloads nothing, so these tests run in CPU CI (Q-254)."""
 
 import json
 import shlex
@@ -16,13 +17,14 @@ from builders import random_model, ring, write_scene
 from harness_runs import ADAPTER, BIN, HERE, checks, run_harness
 
 from ftgs_harness.level3 import QUANTITIES, trace_targets
+from ftgs_harness.stats import holm, tost_p, welch_p
 from openftgs.config import LossConfig, PerfConfig, TrainConfig, config_to_dict
 from openftgs.io import write_init_points
 from openftgs.types import InitPoints, TimeNormalizer
 
-pytestmark = pytest.mark.weights  # L3 computes LPIPS-Alex and LPIPS-VGG itself (E16)
-
 ITERATIONS = 4
+# §3.3 L3 step 4: the TOST margins of the four tested metrics (Q-210).
+MARGINS = {"psnr": 0.25, "ssim1": 0.005, "ssim2": 0.005, "flip": 0.005}
 
 
 def test_trace_targets_scale_with_the_runs_length() -> None:
@@ -74,11 +76,24 @@ def _replay(source: Path, *extra: str) -> str:
     )
 
 
+def _assert_holm_across(metrics: dict[str, dict[str, Any]]) -> None:
+    """§3.3 L3 step 4, Q-210: each metric check's TOST and Welch p are Holm-corrected across
+    every metric check of the run, the four metrics times the scenes, recomputed from the
+    per-seed values the checks report."""
+    rows = [(c["inputs"]["metric"], c["localization"]) for c in metrics.values()]
+    raw_tost = [tost_p(loc["per_seed_A"], loc["per_seed_B"], MARGINS[m]) for m, loc in rows]
+    raw_welch = [welch_p(loc["per_seed_A"], loc["per_seed_B"]) for _, loc in rows]
+    for (_, loc), p_tost, p_welch in zip(rows, holm(raw_tost), holm(raw_welch), strict=True):
+        assert loc["p_tost_holm"] == pytest.approx(p_tost, rel=1e-12)
+        assert loc["p_welch_holm"] == pytest.approx(p_welch, rel=1e-12)
+
+
 def test_l3_runs_compares_and_reports(tmp_path: Path, scene: dict[str, Path]) -> None:
     """K = 5: five runs of A and of B and five of A′ on seeds 5 to 9, round robin over two GPU
-    slots (D-54); the five image metrics get verdicts, the distribution checks are inconclusive
-    because no Holm-corrected flag is reachable at K = 5 (Q-210), and the traces sit at the
-    scaled iterations. A setting B can't honor is not comparable."""
+    slots (D-54); the four tested image metrics, PSNR, SSIM₁, SSIM₂ and ꟻLIP, get verdicts,
+    Holm-corrected across the four (§3.3 L3 steps 3 and 4, Q-210), the distribution checks are
+    inconclusive because no Holm-corrected flag is reachable at K = 5 (Q-210), and the traces sit
+    at the scaled iterations. A setting B can't honor is not comparable."""
     settings = {
         "k": 5,
         "gpus": ["0", "1"],
@@ -113,13 +128,15 @@ def test_l3_runs_compares_and_reports(tmp_path: Path, scene: dict[str, Path]) ->
     }
     assert devices == {"0", "1"}
     metrics = checks(report, "L3.metric.tiny.")
-    assert sorted(metrics) == sorted(
-        f"L3.metric.tiny.{m}" for m in ("psnr", "ssim1", "ssim2", "lpips_alex", "lpips_vgg")
-    )
+    assert sorted(metrics) == sorted(f"L3.metric.tiny.{m}" for m in MARGINS)
     assert all(
         c["localization"]["verdict"] in ("equivalent", "inconclusive") for c in metrics.values()
     )
     assert "dssim_A" in metrics["L3.metric.tiny.ssim1"]["localization"]
+    flip = metrics["L3.metric.tiny.flip"]
+    assert flip["metric"] == "flip_mean_B_minus_A" and "0.005" in flip["expected"]
+    assert all(0.0 < v < 1.0 for v in flip["localization"]["per_seed_A"])
+    _assert_holm_across(metrics)
     dists = checks(report, "L3.dist.tiny.")
     assert len(dists) == 2 * len(QUANTITIES)
     assert {c["status"] for c in dists.values()} == {"inconclusive"}
@@ -177,5 +194,9 @@ def test_a_rerun_of_an_l3_check_reruns_its_own_scene_only(
     )
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout)["id"] == "L3.metric.two.psnr"
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    metrics = checks(report, "L3.metric.")
+    assert len(metrics) == 2 * len(MARGINS)
+    _assert_holm_across(metrics)
     rerun = tmp_path / "run" / "reruns" / "L3.metric.two.psnr" / "L3"
     assert sorted(p.name for p in rerun.iterdir()) == ["two"]

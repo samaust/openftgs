@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Vendor ꟻLIP's PyTorch loss into ``openftgs._vendor.flip`` (D-65, D-89; Q-252; #383).
+"""Vendor ꟻLIP's PyTorch loss into ``openftgs._vendor.flip`` (D-65, D-89; Q-252; #383), and
+into the harness's own ``ftgs_harness._vendor.flip`` (§3.3 L3 step 3, §2.1; Q-254; #391).
 
 Usage::
 
-    python scripts/vendor_flip.py           # write the copy
+    python scripts/vendor_flip.py           # write openftgs's copy
     python scripts/vendor_flip.py --check   # rebuild in a temporary folder and compare
+    python scripts/vendor_flip.py --target harness [--check]   # the same for the harness's copy
 
 The source is the reference copy beside the tests, ``tests/reference/flip`` (Q-252): NVIDIA's
 ``src/pytorch/flip_loss.py`` and ``LICENSE`` at commit d3ab02a, unchanged, each checked
@@ -37,6 +39,14 @@ HDR-ꟻLIP keeps its host read of the number of exposures, which sets its loop.
 The edits are exact substring replacements confined to one function each, located with ast
 and counted; lines added before a named line; and contiguous lines moved out of a function
 into a new one. The script stops (exit code 2) when any of them doesn't find what it expects.
+
+``--target harness`` writes the harness's copy into ``harness/src/ftgs_harness/_vendor/flip``
+instead (Q-254): the harness computes ꟻLIP itself in L3 and never imports openftgs (§2.1), so
+it carries a copy of its own, with its own license file and VENDOR.json. That copy has the
+``device`` change only, its lines marked ``# ftgs_harness (device)``: the colour transforms'
+constants, which openftgs's copy keeps per device ('constants'), are moved to the input's
+device like the other tensors, and nothing is cached, so the filters, the constants and the
+colour maximum are made at every call, as published.
 """
 
 from __future__ import annotations
@@ -62,6 +72,10 @@ PACKAGE = "openftgs._vendor.flip"
 REPOSITORY = Path(__file__).resolve().parents[1]
 REFERENCE = REPOSITORY / "tests" / "reference" / "flip"  # Q-252
 DEST = REPOSITORY / "src" / "openftgs" / "_vendor" / "flip"
+# Q-254 (#391): the harness's own copy.
+HARNESS_SCRIPT = "scripts/vendor_flip.py --target harness"
+HARNESS_PACKAGE = "ftgs_harness._vendor.flip"
+HARNESS_DEST = REPOSITORY / "harness" / "src" / "ftgs_harness" / "_vendor" / "flip"
 _RAW = f"https://raw.githubusercontent.com/NVlabs/flip/{COMMIT}"
 
 SOURCE = "flip_loss.py"
@@ -216,6 +230,33 @@ SUBS: tuple[_Sub, ...] = (
     ),
 )
 
+# Q-254 (#391): the harness's copy takes the device change alone. Its colour transforms move
+# their constants to the input's device at every call, as the published file moves them to CUDA,
+# where openftgs's copy keeps them per device ('constants').
+HARNESS_SUBS: tuple[_Sub, ...] = (
+    *(sub for sub in SUBS if sub.change == "device"),
+    _device("color_space_transform", "input_color", 2, "]]).cuda()"),
+    _device("color_space_transform", "input_color", 1, "A.cuda()"),
+)
+HARNESS_CHANGES: dict[str, str] = {
+    "device": (
+        "Device-agnostic tensors in place of the CUDA-only ones, so that the harness computes "
+        "ꟻLIP on the CPU (Q-254): every .cuda() becomes .to(<image>.device) and every "
+        "device='cuda' becomes device=<image>.device, where <image> is the function's image "
+        "argument, the colour transforms' constants included; generate_spatial_filter takes "
+        "the device as a new last argument, which compute_ldrflip passes, and the two colours "
+        "of the colour maximum are made on the reference's device, where the published file's "
+        "color_space_transform moved them with .cuda(). Nothing is cached: the filters, the "
+        "constants and the colour maximum are made at every call, as published"
+    ),
+}
+HARNESS_NOTICE = (
+    "# Modified for ftgs_harness from ꟻLIP d3ab02a by scripts/vendor_flip.py --target harness:",
+    "# every changed line ends with a comment 'ftgs_harness (device)'; VENDOR.json lists the",
+    "# edits.",
+    "",
+)
+
 
 @dataclass(frozen=True)
 class _Insert:
@@ -333,6 +374,72 @@ MOVES: tuple[_Move, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class _Target:
+    """One copy the script makes: where it goes, its package, the edits it takes, the name its
+    markers carry, the functions left reading a value back to the host with ``.item()``, and
+    the fields its VENDOR.json adds after ``changes``."""
+
+    name: str
+    script: str
+    package: str
+    dest: Path
+    marker: str
+    subs: tuple[_Sub, ...]
+    moves: tuple[_Move, ...]
+    inserts: tuple[_Insert, ...]
+    notice: tuple[str, ...]
+    changes: dict[str, str]
+    reads: tuple[str, ...]
+    extra: dict[str, object]
+
+
+TARGETS: dict[str, _Target] = {
+    "openftgs": _Target(
+        name="openftgs",
+        script=SCRIPT,
+        package=PACKAGE,
+        dest=DEST,
+        marker="openftgs",
+        subs=SUBS,
+        moves=MOVES,
+        inserts=INSERTS,
+        notice=NOTICE,
+        changes=CHANGES,
+        reads=("HDRFLIPLoss.forward", "_cmax"),
+        extra={
+            "first_call": (
+                "The first call of LDR-ꟻLIP on a device builds and copies there the five "
+                "filters of its pixels per degree and the four colour constants, and reads the "
+                "colour maximum back once; later calls on it copy and read nothing (§2.4 rule 3)"
+            ),
+            "filter_support": FILTER_SUPPORT,
+        },
+    ),
+    # Q-254 (#391): the harness's own copy, for L3's ꟻLIP (§3.3 L3 step 3).
+    "harness": _Target(
+        name="harness",
+        script=HARNESS_SCRIPT,
+        package=HARNESS_PACKAGE,
+        dest=HARNESS_DEST,
+        marker="ftgs_harness",
+        subs=HARNESS_SUBS,
+        moves=(),
+        inserts=(),
+        notice=HARNESS_NOTICE,
+        changes=HARNESS_CHANGES,
+        reads=("HDRFLIPLoss.forward", "compute_ldrflip"),
+        extra={
+            "purpose": (
+                "The harness's own copy (Q-254): L3 computes ꟻLIP itself from the saved renders "
+                "(§3.3 L3 step 3) and the harness never imports openftgs (§2.1); it runs on the "
+                "CPU, so the L3 metric tests run in CPU CI"
+            ),
+        },
+    ),
+}
+
+
 class VendorError(Exception):
     """A check failed."""
 
@@ -370,12 +477,12 @@ def _string_lines(text: str) -> set[int]:
     return covered
 
 
-def _marker(changes: Sequence[str]) -> str:
-    return f"# openftgs ({', '.join(changes)})"
+def _marker(changes: Sequence[str], name: str) -> str:
+    return f"# {name} ({', '.join(changes)})"
 
 
-def _patch(source: bytes) -> tuple[bytes, list[str]]:
-    """The vendored file and the edits made, in words."""
+def _patch(source: bytes, target: _Target) -> tuple[bytes, list[str]]:
+    """The vendored file of ``target`` and the edits made, in words."""
     text = source.decode("utf-8")
     if "\r" in text:
         raise VendorError(f"{SOURCE}: carriage returns are not handled")
@@ -385,7 +492,7 @@ def _patch(source: bytes) -> tuple[bytes, list[str]]:
     lines = text.split("\n")
     changed: dict[int, list[str]] = {}
     edits: list[str] = []
-    for sub in SUBS:
+    for sub in target.subs:
         if sub.scope not in spans:
             raise VendorError(f"{SOURCE}: no function {sub.scope}")
         first, last = spans[sub.scope]
@@ -405,18 +512,18 @@ def _patch(source: bytes) -> tuple[bytes, list[str]]:
         times = "once" if sub.count == 1 else f"{sub.count} times"
         edits.append(f"{sub.change}: in {sub.scope}, {sub.old!r} -> {sub.new!r}, {times}")
     for number, names in changed.items():
-        lines[number - 1] += f"  {_marker(names)}"
+        lines[number - 1] += f"  {_marker(names, target.marker)}"
     # Each line of the published file, as the lines it becomes.
     units: list[list[str]] = [[line] for line in lines]
-    for move in MOVES:
+    for move in target.moves:
         edits.append(_move(move, lines, units, spans))
-    for insert in INSERTS:
+    for insert in target.inserts:
         units[_line_starting(lines, insert.before)][:0] = list(insert.lines)
         edits.append(f"{insert.change}: {_lines(len(insert.lines))} added before {insert.before!r}")
-    units[_line_starting(lines, "# Visualizing and Communicating Errors")][:0] = list(NOTICE)
+    units[_line_starting(lines, "# Visualizing and Communicating Errors")][:0] = list(target.notice)
     edits.append("notice: the modification notice added after NVIDIA's license header")
     out = "\n".join(line for unit in units for line in unit)
-    _check(text, out)
+    _check(text, out, target)
     return out.encode("utf-8"), edits
 
 
@@ -493,21 +600,24 @@ def _line_starting(lines: Sequence[str], start: str, within: range | None = None
     return found[0]
 
 
-def _check(before: str, after: str) -> None:
+def _check(before: str, after: str, target: _Target) -> None:
     """The copy parses, names CUDA nowhere, and every block of lines the diff adds holds a
     marker or the notice."""
     ast.parse(after, filename=SOURCE)
     for cuda in (".cuda(", "'cuda'", '"cuda"'):
         if cuda in after:
             raise VendorError(f"{SOURCE}: {cuda!r} is left")
-    # The host reads left: the colour maximum's, once per device, and HDR-ꟻLIP's exposures.
+    # The host reads left: HDR-ꟻLIP's exposures, and the colour maximum's, once per device in
+    # openftgs's copy and at every call in the harness's.
     reads = [s.name for s in _spans_with(after, ".item()")]
-    if reads != ["HDRFLIPLoss.forward", "_cmax"]:
+    if reads != list(target.reads):
         raise VendorError(f"{SOURCE}: .item() in {reads}")
     old, new = before.split("\n"), after.split("\n")
     matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
     for tag, _, _, first, last in matcher.get_opcodes():
-        if tag in ("insert", "replace") and not any("openftgs" in line for line in new[first:last]):
+        if tag in ("insert", "replace") and not any(
+            target.marker in line for line in new[first:last]
+        ):
             raise VendorError(f"{SOURCE}: lines {first + 1}-{last} changed without a marker")
 
 
@@ -527,18 +637,18 @@ def _dump(record: dict[str, object]) -> bytes:
     return (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def build(reference: Path, out: Path) -> None:
-    """Write the vendored file, its license and VENDOR.json into ``out``."""
+def build(reference: Path, out: Path, target: _Target) -> None:
+    """Write ``target``'s vendored file, its license and VENDOR.json into ``out``."""
     source, license_text = _read_reference(reference)
-    vendored, edits = _patch(source)
+    vendored, edits = _patch(source, target)
     out.mkdir(parents=True, exist_ok=True)
     (out / SOURCE).write_bytes(vendored)
     (out / LICENSE).write_bytes(license_text)
     record: dict[str, object] = {
         "upstream": UPSTREAM,
         "commit": COMMIT,
-        "script": SCRIPT,
-        "package": PACKAGE,
+        "script": target.script,
+        "package": target.package,
         "reference": REFERENCE.relative_to(REPOSITORY).as_posix(),
         "licenses": [
             {
@@ -559,13 +669,8 @@ def build(reference: Path, out: Path) -> None:
                 "edits": edits,
             }
         ],
-        "changes": CHANGES,
-        "first_call": (
-            "The first call of LDR-ꟻLIP on a device builds and copies there the five filters "
-            "of its pixels per degree and the four colour constants, and reads the colour "
-            "maximum back once; later calls on it copy and read nothing (§2.4 rule 3)"
-        ),
-        "filter_support": FILTER_SUPPORT,
+        "changes": target.changes,
+        **target.extra,
     }
     (out / RECORD).write_bytes(_dump(record))
     newline = b"\n"
@@ -583,11 +688,11 @@ def _files_under(root: Path) -> dict[str, bytes]:
     }
 
 
-def check(reference: Path, dest: Path) -> bool:
-    """Rebuild in a temporary folder; True when the copy at ``dest`` is the same and its
-    files have the SHA-256 that VENDOR.json records."""
+def check(reference: Path, dest: Path, target: _Target) -> bool:
+    """Rebuild ``target``'s copy in a temporary folder; True when the copy at ``dest`` is the
+    same and its files have the SHA-256 that VENDOR.json records."""
     with tempfile.TemporaryDirectory() as tmp:
-        build(reference, Path(tmp))
+        build(reference, Path(tmp), target)
         rebuilt = _files_under(Path(tmp))
     present = _files_under(dest)
     ok = True
@@ -620,23 +725,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--reference", type=Path, default=REFERENCE, help="the reference copy's folder (Q-252)"
     )
-    parser.add_argument("--dest", type=Path, default=DEST, help="the vendored copy's folder")
+    parser.add_argument(
+        "--target",
+        choices=sorted(TARGETS),
+        default="openftgs",
+        help="the copy to make: openftgs's (D-65) or the harness's own (Q-254)",
+    )
+    parser.add_argument(
+        "--dest", type=Path, help="the vendored copy's folder (default: the target's)"
+    )
     parser.add_argument(
         "--check", action="store_true", help="rebuild in a temporary folder and compare"
     )
     args = parser.parse_args(argv)
+    target = TARGETS[args.target]
+    dest: Path = target.dest if args.dest is None else args.dest
     try:
         if args.check:
-            return 0 if check(args.reference, args.dest) else 1
+            return 0 if check(args.reference, dest, target) else 1
         with tempfile.TemporaryDirectory() as tmp:
-            build(args.reference, Path(tmp))
-            args.dest.mkdir(parents=True, exist_ok=True)
-            for path in _files_under(args.dest):
-                (args.dest / path).unlink()
+            build(args.reference, Path(tmp), target)
+            dest.mkdir(parents=True, exist_ok=True)
+            for path in _files_under(dest):
+                (dest / path).unlink()
             for path in _files_under(Path(tmp)):
-                target = args.dest / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(Path(tmp) / path, target)
+                written = dest / path
+                written.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(Path(tmp) / path, written)
     except VendorError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
