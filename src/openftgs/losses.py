@@ -419,7 +419,7 @@ class PerceptualLoss(torch.nn.Module):
         if net not in _PERC_NETS:
             _fail(f"net must be one of D-89's perceptual networks {_PERC_NETS}, got {net!r}")
         if net in _TRUNK_TICKETS:
-            # #381: the trunk networks come with #385 and #386.
+            # #381: the Caffe trunks come with #385.
             raise NotImplementedError(
                 f"PerceptualLoss({net!r}) is not built yet: the trunk networks of D-89 come with "
                 f"{_TRUNK_TICKETS[net]}"

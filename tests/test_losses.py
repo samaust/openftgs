@@ -9,6 +9,7 @@ Expected values are worked by hand from the spec, come from scikit-image's
 
 import copy
 import importlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -514,10 +515,9 @@ def test_perceptual_loss_rejects_a_name_outside_d89(net: str) -> None:
 
 @pytest.mark.parametrize("net", ["vgg16_oxford", "alexnet_bvlc"])
 def test_perceptual_loss_trunk_networks_are_not_built_yet(net: str) -> None:
-    """#381: the six trunk networks of D-89 are built by #385 (the Caffe trunks) and #386 (the
-    DINO networks); until then building one raises an error naming its ticket. Those tickets
-    replace this test."""
-    with pytest.raises(NotImplementedError, match="#385|#386"):
+    """#381: the two Caffe trunks of D-89 are built by #385; until then building one raises an
+    error naming the ticket, which replaces this test."""
+    with pytest.raises(NotImplementedError, match="#385"):
         PerceptualLoss(net)  # type: ignore[arg-type]
 
 
