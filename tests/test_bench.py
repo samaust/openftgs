@@ -843,12 +843,10 @@ def test_bench_slice_refuses_a_single_timestamp_scene_and_an_unwritable_out(
 
 def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> None:
     """#226, #389 (Q-168): the default configuration, ꟻLIP included at its calibrated weight
-    (D-89; `perc_net` "flip" and `lambda_perc` None, set explicitly until #392 makes them the
-    defaults), except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and
+    (D-89; `perc_net` "flip" and `lambda_perc` None, `LossConfig`'s defaults since #392),
+    except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and
     sh_interval = 1; so the timed iterations 121 to 420 hold exactly the events at 200, 300 and
     400, all at SH degree 3."""
-    import dataclasses
-
     from openftgs.cli._bench import _train_step_config
     from openftgs.config import TrainConfig
     from openftgs.train import calendar_entry
@@ -862,9 +860,8 @@ def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> No
     assert _train_step_config(100).growth.n_max == 102  # exactly 102: no rounding up
     assert (cfg.loss.lambda_perc, cfg.loss.perc_net) == (None, "flip")
     assert cfg.sh_degree == 3 and _train_step_config(10, sh_degree=1).sh_degree == 1
-    # Everything else is the default.
-    flip = dataclasses.replace(default.loss, perc_net="flip", lambda_perc=None)
-    assert cfg.loss == flip and cfg.perf == default.perf and cfg.init == default.init
+    # Everything else is the default, the loss included.
+    assert cfg.loss == default.loss and cfg.perf == default.perf and cfg.init == default.init
     assert cfg.growth.stop == default.growth.stop and cfg.reloc.stop == default.reloc.stop
     assert cfg.optim.iterations == default.optim.iterations
     entries = {it: calendar_entry(cfg, it) for it in range(121, 421)}

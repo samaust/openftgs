@@ -86,7 +86,7 @@ def _init_points(n: int = 30, seed: int = 1, *, extent: float = 1.2) -> InitPoin
 
 
 def _no_perceptual(**fields: object) -> TrainConfig:
-    """A configuration without the perceptual loss, so CPU tests download nothing."""
+    """A configuration without the perceptual loss (λ_perc = 0), so a test runs no network."""
     return TrainConfig(loss=LossConfig(lambda_perc=0.0), **fields)  # type: ignore[arg-type]
 
 

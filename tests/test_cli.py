@@ -123,7 +123,7 @@ def _init(path: Path, *, n: int = 30, unit: str = "s") -> Path:
 
 
 def _cfg(iterations: int = ITERATIONS, **fields: Any) -> TrainConfig:
-    """No perceptual loss (no downloads), a shortened calendar (§3.2, Q-75), logs every 5."""
+    """No perceptual loss (λ_perc = 0), a shortened calendar (§3.2, Q-75), logs every 5."""
     fields.setdefault("perf", PerfConfig(log_every=5))
     base = TrainConfig(loss=LossConfig(lambda_perc=0.0), **fields)
     cfg = shortened_config(iterations, base)
