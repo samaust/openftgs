@@ -49,3 +49,12 @@ src/pytorch/flip_loss.py
 Copyright (c) 2020-2025, NVIDIA CORPORATION & AFFILIATES (the file's own header reads
 2020-2024). All rights reserved.
 Licensed under the BSD 3-Clause License (LICENSE).
+
+openftgs adapts piq's HaarPSI in the module openftgs.losses (the functions _haarpsi_constants,
+_similarity and _haarpsi), with the changes its comments list.
+
+piq (https://github.com/photosynthesis-team/piq), version 0.8.0, piq/haarpsi.py and the helpers
+it calls (piq/functional/colour_conversion.py, piq/functional/filters.py, piq/functional/base.py)
+By Sergey Kastryulin and the piq contributors (the package's metadata names its author; its
+license file names no copyright holder, and it has no NOTICE file).
+Licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).

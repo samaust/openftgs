@@ -12,6 +12,7 @@ import importlib
 import sys
 import warnings
 from collections.abc import Iterator
+from typing import get_args
 
 import numpy as np
 import pytest
@@ -21,8 +22,8 @@ from skimage.metrics import structural_similarity
 from torch import Tensor
 
 import openftgs.losses
-from openftgs.config import LossConfig, OptimConfig
-from openftgs.losses import LPIPSLoss, l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.config import LossConfig, OptimConfig, PercNet
+from openftgs.losses import LPIPSLoss, PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.types import Camera
@@ -475,6 +476,278 @@ def test_u9_lpips_of_an_image_with_itself_is_zero_on_the_gpu() -> None:
     assert loss(image, image.clone()).item() == 0.0
 
 
+# U-9: the perceptual networks (E7, D-9, D-89; Q-41)
+
+TRUNK_NETWORKS = (  # D-89's table, written out: the networks built on pretrained weights
+    "vgg16_oxford",
+    "alexnet_bvlc",
+    "dinov2_s14",
+    "dinov2_b14",
+    "dino_s16",
+    "dino_b16",
+)
+WEIGHT_FREE_NETWORKS: tuple[PercNet, ...] = ("flip", "haarpsi")  # D-89: the two without weights
+
+
+@pytest.mark.parametrize("net", ["vgg", "alex", "lpips", "FLIP", ""])
+def test_perceptual_loss_rejects_a_name_outside_d89(net: str) -> None:
+    """§2.1, D-89: `PerceptualLoss(net)` takes one of D-89's eight names; LPIPS's backbones, the
+    names before revision 549o, are not among them."""
+    with pytest.raises(ValueError, match="D-89"):
+        PerceptualLoss(net)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("net", TRUNK_NETWORKS)
+def test_perceptual_loss_trunk_networks_are_not_built_yet(net: str) -> None:
+    """#381: the six trunk networks of D-89 are built by #385 (the Caffe trunks) and #386 (the
+    DINO networks); until then building one raises an error naming its ticket. Those tickets
+    replace this test."""
+    with pytest.raises(NotImplementedError, match="#385|#386"):
+        PerceptualLoss(net)  # type: ignore[arg-type]
+
+
+def _with_noise(image: Tensor, *, seed: int, sigma: float = 16 / 255) -> Tensor:
+    """The image plus seeded Gaussian noise of standard deviation σ, clipped to [0, 1]."""
+    gen = torch.Generator().manual_seed(seed)
+    noise = torch.randn(image.shape, generator=gen, dtype=F64)
+    return (image.double() + sigma * noise).clamp(0.0, 1.0).to(image.dtype)
+
+
+def _pattern(shape: tuple[int, ...], phase: float) -> Tensor:
+    """A closed-form textured image in [0.05, 0.95], float64: three sinusoids of different
+    frequencies and orientations per channel, shifted by `phase` and by the batch index. The
+    script that computed the piq values below builds the same images."""
+    h, w = shape[-3], shape[-2]
+    batch = 1
+    for n in shape[:-3]:
+        batch *= n
+    k = torch.arange(batch, dtype=F64).view(batch, 1, 1, 1)
+    y = torch.arange(h, dtype=F64).view(1, h, 1, 1)
+    x = torch.arange(w, dtype=F64).view(1, w, 1)[None]
+    c = torch.arange(3, dtype=F64).view(1, 1, 1, 3)
+    image = (
+        0.5
+        + 0.2 * torch.sin(0.9 * x + 0.4 * y + 2.0 * c + phase + k)
+        + 0.15 * torch.sin(0.13 * x - 0.29 * y + c * phase)
+        + 0.1 * torch.sin(2.3 * x + 1.7 * y + phase + 0.5 * k)
+    )
+    return image.reshape(shape)
+
+
+# Q-262: ꟻLIP runs in float32 only (Q-261); HaarPSI's identity case runs in float64, where
+# its float32 rounding (the logit of float32's sigmoid(4.2)) doesn't reach U-9's bound.
+@pytest.mark.parametrize(("net", "dtype"), [("flip", F32), ("haarpsi", F64)])
+def test_u9_perceptual_network_of_an_image_with_itself(net: PercNet, dtype: torch.dtype) -> None:
+    """U-9 (D-89): on identical images a network gives 0, or at most 10⁻⁵ of its value under
+    Gaussian noise of σ = 16/255 (float32 rounding, ꟻLIP's stabilizer), on each of five images:
+    uniform noise and closed-form textures, one and two to an image batch. ꟻLIP is checked in
+    float32, its only dtype (Q-261), and HaarPSI in float64 (Q-262)."""
+    loss = PerceptualLoss(net)
+    images = [
+        _image_pair((2, 32, 40, 3), seed=40, correlated=False)[0],
+        _image_pair((64, 96, 3), seed=40, correlated=False)[0],
+        _pattern((2, 32, 40, 3), 0.0),
+        _pattern((64, 96, 3), 0.0),
+        _pattern((128, 160, 3), 0.3),
+    ]
+    ratios = []
+    for image in (image.to(dtype) for image in images):
+        same = loss(image, image.clone())
+        noise = loss(_with_noise(image, seed=41), image)
+        assert same.shape == () and same.dtype == dtype
+        assert noise.item() > 0.0
+        ratios.append(abs(same.item()) / noise.item())
+    assert max(ratios) <= 1e-5, ratios
+
+
+@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+def test_perceptual_loss_is_frozen_in_evaluation_mode_and_differentiates_only_the_render(
+    net: PercNet,
+) -> None:
+    """D-89 (common to all, Q-41): the network is frozen and in evaluation mode, also after
+    `.train()`; the render gets a gradient and the reference none, even when it asks for one."""
+    loss = PerceptualLoss(net)
+    loss.train()
+    assert not any(module.training for module in loss.modules())
+    assert all(not p.requires_grad for p in loss.parameters())
+    pred, gt = _image_pair((32, 40, 3), seed=42, correlated=True, dtype=F32)
+    pred.requires_grad_()
+    gt.requires_grad_()
+    loss(pred, gt).backward()
+    assert pred.grad is not None and bool(pred.grad.abs().sum() > 0)
+    assert gt.grad is None
+
+
+def test_d89_flip_is_the_vendored_ldr_flip_at_67_pixels_per_degree() -> None:
+    """D-89's `flip` row: NVIDIA's LDR-ꟻLIP loss (the vendored copy, #383) at 67.0 pixels per
+    degree, the mean of its error map over the batch, on the [B, 3, H, W] views of the images,
+    bitwise; a render above 1 gives the loss of the render clamped to [0, 1], since the loss
+    clamps both images. The published default, 67.02 pixels per degree, gives another value."""
+    from openftgs._vendor.flip import LDRFLIPLoss
+
+    pred, gt = _image_pair((2, 32, 40, 3), seed=44, correlated=True, dtype=F32)
+    pred[:, 4:12, 6:18] += 0.4
+    nchw = [x.permute(0, 3, 1, 2) for x in (pred, gt)]
+    reference = LDRFLIPLoss()
+    value = PerceptualLoss("flip")(pred, gt)
+    assert value.item() == reference(*nchw, pixels_per_degree=67.0).item()
+    assert value.item() != reference(*nchw).item()
+    assert value.item() == PerceptualLoss("flip")(pred.clamp(0.0, 1.0), gt).item()
+
+
+# 1 − HaarPSI from piq 0.8.0's `haarpsi` at its defaults (3 scales, subsampled, c = 30, α = 4.2,
+# data range 1), in float64, on the render clamped to [0, 1] and the reference (source log
+# 448): (shape, phase of the render, a patch raised by 0.3, the value).
+PIQ_HAARPSI = [
+    ((2, 33, 47, 3), 0.35, True, 0.35540822979323505),
+    ((40, 64, 3), 1.1, False, 0.5703410520768328),
+    ((16, 17, 3), 0.7, False, 0.4269709218029545),
+]
+
+
+@pytest.mark.parametrize(("shape", "phase", "raised", "expected"), PIQ_HAARPSI)
+def test_d89_haarpsi_is_one_minus_piq_haarpsi_with_the_render_clamped(
+    shape: tuple[int, ...], phase: float, raised: bool, expected: float
+) -> None:
+    """D-89's `haarpsi` row and §2.3's HaarPSI row: 1 − HaarPSI (3 scales, subsampled, c = 30,
+    α = 4.2) as piq 0.8.0 computes it, the render clamped to [0, 1], as the mean over the batch;
+    against piq's values in float64, to 1e-12. Odd sides take piq's padding before the
+    subsampling, and 16 pixels is the smallest side 3 scales allow."""
+    gt = _pattern(shape, 0.0)
+    pred = _pattern(shape, phase)
+    if raised:
+        pred[..., 5:20, 10:30, :] += 0.3
+        assert bool((pred > 1.0).any())
+    value = PerceptualLoss("haarpsi")(pred, gt)
+    assert value.shape == () and value.dtype == F64
+    torch.testing.assert_close(value.item(), expected, rtol=0.0, atol=1e-12)
+
+
+def test__haarpsi_constants_built_in_inference_mode_still_serve_a_backward() -> None:
+    """The YIQ matrix and Haar filters are kept per device and dtype: when the first call is a
+    metric's, under `torch.inference_mode()`, a later training call still differentiates the
+    render, since the kept tensors aren't inference tensors."""
+    openftgs.losses._haarpsi_constants.cache_clear()
+    gt = _pattern((32, 40, 3), 0.0)
+    pred = _pattern((32, 40, 3), 0.5)
+    loss = PerceptualLoss("haarpsi")
+    with torch.inference_mode():
+        metric = loss(pred, gt)
+    pred.requires_grad_()
+    value = loss(pred, gt)
+    value.backward()
+    assert value.item() == metric.item()
+    assert pred.grad is not None and bool(torch.isfinite(pred.grad).all())
+
+
+@pytest.mark.parametrize("shape", [(15, 16, 3), (16, 15, 3), (2, 15, 40, 3)])
+def test_haarpsi_needs_sides_of_16_pixels(shape: tuple[int, ...]) -> None:
+    """Q-261: as in piq, three Haar scales need a height and width of at least 2^(3+1) = 16
+    pixels, checked before the subsampling; a smaller image is a ValueError."""
+    image = _pattern(shape, 0.0)
+    with pytest.raises(ValueError, match="16"):
+        PerceptualLoss("haarpsi")(image, image.clone())
+
+
+def test_haarpsi_checks_no_values() -> None:
+    """Q-261: piq's check that both images lie in [0, 1] is gone, since it reads them back
+    to the host: a render outside [0, 1] is clamped (D-89), and a reference outside it is used
+    as given, without an error."""
+    gt = _pattern((32, 40, 3), 0.0)
+    pred = _pattern((32, 40, 3), 0.5)
+    outside = gt.clone()
+    outside[4:10, 4:10] = torch.tensor([1.5, -0.25, 0.5], dtype=F64)
+    value = PerceptualLoss("haarpsi")(pred, outside)
+    assert bool(torch.isfinite(value))
+    assert value.item() != PerceptualLoss("haarpsi")(pred, gt).item()
+    low = pred - 0.6
+    assert bool((low < 0.0).any())
+    assert PerceptualLoss("haarpsi")(low, gt).item() == (
+        PerceptualLoss("haarpsi")(low.clamp(0.0, 1.0), gt).item()
+    )
+
+
+@pytest.mark.parametrize("dtype", [F64, torch.float16, torch.bfloat16])
+def test_flip_takes_float32_images_only(dtype: torch.dtype) -> None:
+    """Q-261: NVIDIA's ꟻLIP loss computes with float32 constants, so `flip` refuses images
+    of another dtype with a ValueError, before any work, rather than casting them."""
+    image = torch.rand(16, 16, 3, generator=torch.Generator().manual_seed(45)).to(dtype)
+    with pytest.raises(ValueError, match="float32"):
+        PerceptualLoss("flip")(image, image.clone())
+
+
+@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+def test_u9_perceptual_network_gradient_is_finite_on_a_render_above_one(net: PercNet) -> None:
+    """U-9 (E7: Î isn't clamped, so it can exceed 1): the gradient with respect to a render
+    with a raised patch, above 1 where the image is bright, is finite everywhere and nonzero."""
+    pred, gt = _image_pair((2, 32, 40, 3), seed=43, correlated=True, dtype=F32)
+    pred = pred.clone()
+    pred[:, 8:24, 10:30] += 0.3
+    assert bool((pred > 1.0).any())
+    pred.requires_grad_()
+    PerceptualLoss(net)(pred, gt).backward()
+    assert pred.grad is not None
+    assert bool(torch.isfinite(pred.grad).all()) and bool(pred.grad.abs().sum() > 0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(("shape", "phase", "raised", "expected"), PIQ_HAARPSI)
+def test_d89_haarpsi_on_cuda_is_one_minus_piq_haarpsi(
+    shape: tuple[int, ...], phase: float, raised: bool, expected: float
+) -> None:
+    """D-89's `haarpsi` row on CUDA: piq's values in float64, to 1e-12, as on the CPU."""
+    gt = _pattern(shape, 0.0)
+    pred = _pattern(shape, phase)
+    if raised:
+        pred[..., 5:20, 10:30, :] += 0.3
+    value = PerceptualLoss("haarpsi")(pred.cuda(), gt.cuda())
+    assert value.device.type == "cuda"
+    torch.testing.assert_close(value.item(), expected, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+def test_u9_perceptual_network_of_an_image_with_itself_on_the_gpu(net: PercNet) -> None:
+    """U-9 on CUDA, in float32 for ꟻLIP and float64 for HaarPSI (Q-262): identical images
+    give 0, or at most 10⁻⁵ of the value under σ = 16/255 noise."""
+    dtype = F32 if net == "flip" else F64  # Q-262
+    loss = PerceptualLoss(net)
+    image = _pattern((2, 64, 96, 3), 0.0).to("cuda", dtype)
+    same = loss(image, image.clone())
+    noise = loss(_with_noise(image.cpu(), seed=46).cuda(), image)
+    assert same.device.type == "cuda"
+    assert noise.item() > 0.0
+    assert abs(same.item()) <= 1e-5 * noise.item()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="the recorder needs sys.monitoring (Python 3.12)"
+)
+@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+def test_perceptual_loss_forward_and_backward_on_cuda_make_no_synchronization(net: PercNet) -> None:
+    """§2.4 rule 3 (#381): after one call on a device, which builds the networks' constants
+    and filters there (and, for ꟻLIP, reads its colour maximum back once), a forward and
+    backward pass of the network on a render-sized pair make no host synchronization under
+    `torch.cuda.set_sync_debug_mode("warn")`, by any route the recorder sees."""
+    from sync_recorder import SyncRecorder, described
+
+    loss = PerceptualLoss(net)
+    pred, gt = (
+        x.to("cuda", F32) for x in (_pattern((1, 96, 128, 3), 0.4), _pattern((1, 96, 128, 3), 0.0))
+    )
+    warm_up = pred.clone().requires_grad_(True)
+    loss(warm_up, gt).backward()
+    image = pred.clone().requires_grad_(True)
+    torch.cuda.synchronize()
+    with SyncRecorder() as recorder:
+        loss(image, gt).backward()
+    torch.cuda.synchronize()
+    assert recorder.syncs == [], described(recorder.syncs, __file__)
+    assert recorder.unattributed == 0
+    assert image.grad is not None
+
+
 # U-10: the 4D regularization (E8, D-11)
 
 
@@ -703,6 +976,115 @@ def test_total_loss_needs_the_backbone_the_config_names(lpips_nets: dict[str, LP
     cfg = LossConfig(perc_net="alex")
     _, terms = total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=lpips_nets["alex"])
     assert "perceptual" in terms
+
+
+# D-89's calibrated λ_perc of the two weight-free networks, written out from its table.
+CALIBRATED = {"flip": 0.415, "haarpsi": 0.0617}
+
+
+@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
+def test_u9_lambda_perc_none_takes_the_network_calibrated_weight(net: PercNet) -> None:
+    """U-9 (D-9, D-89; Q-249): with λ_perc = None, total_loss weights the perceptual term by the
+    network's calibrated weight, 0.415 for ꟻLIP and 0.0617 for HaarPSI: the loss and every term
+    are exactly those of the same configuration with that weight written in."""
+    model = random_model(10, seed=35)
+    pred, gt = _detached_pair(36, dtype=F32)
+    perc = PerceptualLoss(net)
+    by_none = total_loss(
+        pred, gt, model, 0.5, 1, LossConfig(perc_net=net, lambda_perc=None), perceptual=perc
+    )
+    written = LossConfig(perc_net=net, lambda_perc=CALIBRATED[net])
+    by_value = total_loss(pred, gt, model, 0.5, 1, written, perceptual=perc)
+    assert by_none[0].item() == by_value[0].item()
+    assert {k: v.item() for k, v in by_none[1].items()} == {
+        k: v.item() for k, v in by_value[1].items()
+    }
+    assert "perceptual" in by_none[1]
+    for weight in (0.0, 1.0):
+        other = LossConfig(perc_net=net, lambda_perc=weight)
+        assert total_loss(pred, gt, model, 0.5, 1, other, perceptual=perc)[0].item() != (
+            by_none[0].item()
+        )
+
+
+@pytest.mark.parametrize("net", ["flip", "haarpsi", *TRUNK_NETWORKS])
+def test_total_loss_needs_the_perceptual_network_when_lambda_perc_is_none(net: PercNet) -> None:
+    """D-77 with Q-249: λ_perc = None resolves to the network's calibrated weight, which is
+    positive for each of D-89's networks, so perceptual=None is a ValueError; λ_perc = 0 needs
+    no network."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(37, dtype=F32)
+    with pytest.raises(ValueError, match="perceptual"):
+        total_loss(pred, gt, model, 0.5, 1, LossConfig(perc_net=net, lambda_perc=None))
+    _, terms = total_loss(pred, gt, model, 0.5, 1, LossConfig(perc_net=net, lambda_perc=0.0))
+    assert "perceptual" not in terms
+
+
+def test_u9_total_loss_with_flip_is_the_weighted_sum_of_its_terms() -> None:
+    """U-9 (E7, E9, D-37, D-89): at λ_perc = None, L = 0.8·L1 + 0.2·(1 − SSIM) + 0.415·ꟻLIP +
+    0.01·L_reg, to 1e-6, each term recomputed with the public functions; the terms are
+    detached 0-d tensors on the images' device and "total" is the loss's value (D-77)."""
+    model = random_model(30, seed=39)
+    pred, gt = _detached_pair(40, dtype=F32)
+    perc = PerceptualLoss("flip")
+    cfg = LossConfig(perc_net="flip", lambda_perc=None)
+    loss, terms = total_loss(pred.requires_grad_(), gt, model, 0.6, 1, cfg, perceptual=perc)
+    assert set(terms) == {"l1", "one_minus_ssim", "perceptual", "reg", "total"}
+    for value in terms.values():
+        assert isinstance(value, Tensor) and value.shape == () and not value.requires_grad
+        assert value.device == pred.device
+    with torch.no_grad():
+        expected = (
+            0.8 * l1_loss(pred, gt).item()
+            + 0.2 * (1.0 - ssim(pred, gt).item())
+            + 0.415 * perc(pred, gt).item()
+            + 0.01 * reg4d_loss(model, 0.6).item()
+        )
+        assert terms["perceptual"].item() == perc(pred, gt).item()
+    torch.testing.assert_close(loss.item(), expected, rtol=0.0, atol=1e-6)
+    assert terms["total"].item() == loss.item()
+
+
+def test_total_loss_needs_the_perceptual_network_the_config_names() -> None:
+    """Q-41 (D-9): a PerceptualLoss built for another network than cfg.perc_net is a
+    ValueError, whatever λ_perc."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(41, dtype=F32)
+    for weight in (None, 0.0):
+        cfg = LossConfig(perc_net="haarpsi", lambda_perc=weight)
+        with pytest.raises(ValueError, match="perc_net"):
+            total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=PerceptualLoss("flip"))
+    cfg = LossConfig(perc_net="haarpsi", lambda_perc=None)
+    _, terms = total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=PerceptualLoss("haarpsi"))
+    assert "perceptual" in terms
+
+
+def test__calibrated_weights_are_d89s_table() -> None:
+    """D-89's table: the calibrated λ_perc of each of the eight networks, the trunk networks'
+    included, so that #385 and #386 find theirs; one per `PercNet` value."""
+    assert openftgs.losses._CALIBRATED_WEIGHTS == {
+        "flip": 0.415,
+        "haarpsi": 0.0617,
+        "vgg16_oxford": 0.00164,
+        "alexnet_bvlc": 0.00408,
+        "dinov2_s14": 0.00185,
+        "dinov2_b14": 0.00204,
+        "dino_s16": 0.00358,
+        "dino_b16": 0.00484,
+    }
+    assert set(openftgs.losses._CALIBRATED_WEIGHTS) == set(get_args(PercNet))
+
+
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_total_loss_refuses_lambda_perc_none_for_an_lpips_backbone(net: str) -> None:
+    """#380's expand step (Q-249): LPIPS's backbones stay valid `perc_net` values until the
+    contract ticket (#392), but D-89's table gives them no calibrated weight, so λ_perc = None
+    with one of them is a ValueError naming D-89, raised before any network is used."""
+    model = random_model(4, seed=0)
+    pred, gt = _detached_pair(38, dtype=F32)
+    cfg = LossConfig(perc_net=net, lambda_perc=None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="D-89"):
+        total_loss(pred, gt, model, 0.5, 1, cfg)
 
 
 # U-11: the full forward through the reference backend

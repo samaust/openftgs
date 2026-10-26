@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""L1, SSIM, the LPIPS wrapper, 4D regularization and the total loss.
+"""L1, SSIM, the perceptual networks (D-89), 4D regularization and the total loss; the LPIPS
+wrapper stays until the contract ticket of #380 (#392) removes it.
 
-Spec: E7, E8, E9. Band: Mechanics (§2.1).
+Spec: E7, E8, E9, D-89. Band: Mechanics (§2.1).
 """
 
 import functools
 import warnings
 from collections.abc import Callable
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, get_args
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from openftgs._stages import stage
-from openftgs.config import LossConfig
+from openftgs._vendor.flip import LDRFLIPLoss
+from openftgs.config import LossConfig, PercNet
 from openftgs.model import FreeTimeGaussians
 from openftgs.motion import reg4d_terms
 
-__all__ = ["LPIPSLoss", "l1_loss", "reg4d_loss", "ssim", "total_loss"]
+__all__ = ["LPIPSLoss", "PerceptualLoss", "l1_loss", "reg4d_loss", "ssim", "total_loss"]
 
 
 def _fail(reason: str) -> NoReturn:
@@ -143,6 +145,192 @@ def ssim(
     )
 
 
+# D-89: the eight networks `perc_net` selects, and the trunk networks among them.
+_PERC_NETS: tuple[str, ...] = get_args(PercNet)
+_TRUNK_TICKETS = {
+    "vgg16_oxford": "#385",
+    "alexnet_bvlc": "#385",
+    "dinov2_s14": "#386",
+    "dinov2_b14": "#386",
+    "dino_s16": "#386",
+    "dino_b16": "#386",
+}
+# D-89, E16: ꟻLIP's pixels per degree, a Python float, as the vendored copy's filter cache keys it.
+_FLIP_PIXELS_PER_DEGREE = 67.0
+# D-89's `haarpsi` row: piq's defaults.
+_HAARPSI_SCALES = 3
+_HAARPSI_C = 30.0
+_HAARPSI_ALPHA = 4.2
+
+
+# The HaarPSI below is adapted from piq 0.8.0 (https://github.com/photosynthesis-team/piq):
+# `haarpsi` in piq/haarpsi.py, with the helpers it calls, `rgb2yiq`
+# (piq/functional/colour_conversion.py), `haar_filter` (piq/functional/filters.py) and
+# `similarity_map` (piq/functional/base.py). piq is by Sergey Kastryulin and its contributors,
+# licensed under the Apache License, Version 2.0 (NOTICE; source log 446, 447).
+# Changed for openftgs (#381): the defaults D-89 sets (3 scales, subsampled, c = 30, α = 4.2) and
+# a data range of 1 are fixed; `_validate_input`'s asserts give way to Q-41's checks, and its
+# check of the values, which reads them back to the host, to D-89's clamp of the render
+# (Q-261); the YIQ matrix and the Haar filters are built once per device and dtype rather
+# than at every call, and the pairs of Haar channels are taken by strided slices rather than by
+# tuple indices, since both copies to the GPU synchronize (§2.4 rule 3); the helpers are inlined,
+# `similarity_map` without its masking terms, whose coefficient is 0 here; "mean" is the only
+# reduction. On random images it agrees with piq bitwise (source log 448).
+
+
+@functools.cache
+def _haarpsi_constants(device: torch.device, dtype: torch.dtype) -> tuple[Tensor, list[Tensor]]:
+    """The RGB-to-YIQ matrix, transposed for a matmul over the channels-last image, and the
+    stacked horizontal and vertical Haar filters of each scale, on `device` in `dtype`. Made
+    outside inference mode, so that a loss first called by a metric under
+    `torch.inference_mode()` still serves a training step's backward."""
+    with torch.inference_mode(False):
+        yiq = torch.tensor(
+            [[0.299, 0.587, 0.114], [0.5959, -0.2746, -0.3213], [0.2115, -0.5227, 0.3112]],
+            dtype=dtype,
+            device=device,
+        ).t()
+        kernels = []
+        for scale in range(_HAARPSI_SCALES):
+            size = 2 ** (scale + 1)
+            haar = torch.ones((size, size), device=device, dtype=dtype) / size
+            haar[size // 2 :, :] = -haar[size // 2 :, :]
+            haar = haar.unsqueeze(0)
+            kernels.append(torch.stack([haar, haar.transpose(-1, -2)]))
+    return yiq, kernels
+
+
+def _similarity(x: Tensor, y: Tensor, c: float) -> Tensor:
+    """piq's `similarity_map` with its masking coefficient at its default 0, whose terms are
+    dropped."""
+    return (2.0 * x * y + c) / (x**2 + y**2 + c)
+
+
+def _haarpsi(x: Tensor, y: Tensor) -> Tensor:
+    """HaarPSI of [B, 3, H, W] images in [0, 1], the mean over the batch, as piq 0.8.0's
+    `haarpsi` at D-89's settings computes it."""
+    # Q-261: piq's minimal size, checked before the subsampling.
+    kernel_size = 2 ** (_HAARPSI_SCALES + 1)
+    if x.size(-1) < kernel_size or x.size(-2) < kernel_size:
+        _fail(f"HaarPSI needs H and W >= {kernel_size}, got {tuple(x.shape[-2:])}")
+    yiq_weights, kernels = _haarpsi_constants(x.device, x.dtype)
+
+    # Rescale images, from a data range of 1
+    x = x * 255
+    y = y * 255
+
+    # Convert RGB to YIQ color space
+    x_yiq = torch.matmul(x.permute(0, 2, 3, 1), yiq_weights).permute(0, 3, 1, 2)
+    y_yiq = torch.matmul(y.permute(0, 2, 3, 1), yiq_weights).permute(0, 3, 1, 2)
+
+    # Downscale input to simulate the typical distance between an image and its viewer.
+    up_pad = 0
+    down_pad = max(x.shape[2] % 2, x.shape[3] % 2)
+    pad_to_use = [up_pad, down_pad, up_pad, down_pad]
+    x_yiq = F.pad(x_yiq, pad=pad_to_use)
+    y_yiq = F.pad(y_yiq, pad=pad_to_use)
+    x_yiq = F.avg_pool2d(x_yiq, kernel_size=2, stride=2, padding=0)
+    y_yiq = F.avg_pool2d(y_yiq, kernel_size=2, stride=2, padding=0)
+
+    # Haar wavelet decomposition
+    coefficients_x, coefficients_y = [], []
+    for scale in range(_HAARPSI_SCALES):
+        kernel_size = 2 ** (scale + 1)
+        # Asymmetrical padding due to even kernel size. Matches MATLAB conv2(A, B, 'same')
+        upper_pad = kernel_size // 2 - 1
+        bottom_pad = kernel_size // 2
+        pad_to_use = [upper_pad, bottom_pad, upper_pad, bottom_pad]
+        coefficients_x.append(F.conv2d(F.pad(x_yiq[:, :1], pad=pad_to_use), kernels[scale]))
+        coefficients_y.append(F.conv2d(F.pad(y_yiq[:, :1], pad=pad_to_use), kernels[scale]))
+
+    # Shape (N, {scales * 2}, H, W)
+    coeffs_x = torch.cat(coefficients_x, dim=1)
+    coeffs_y = torch.cat(coefficients_y, dim=1)
+
+    # Low-frequency coefficients used as weights
+    # Shape (N, 2, H, W)
+    weights = torch.max(torch.abs(coeffs_x[:, 4:]), torch.abs(coeffs_y[:, 4:]))
+
+    # High-frequency coefficients used for similarity computation in 2 orientations
+    sim_map = []
+    for orientation in range(2):
+        # The channels (orientation, orientation + 2), as a strided slice: piq's tuple index
+        # copies an index tensor to the device, which synchronizes (§2.4 rule 3).
+        pair = slice(orientation, orientation + 3, 2)
+        magnitude_x = torch.abs(coeffs_x[:, pair])
+        magnitude_y = torch.abs(coeffs_y[:, pair])
+        similarity = _similarity(magnitude_x, magnitude_y, _HAARPSI_C)
+        sim_map.append(similarity.sum(dim=1, keepdim=True) / 2)
+
+    pad_to_use = [0, 1, 0, 1]
+    x_yiq = F.pad(x_yiq, pad=pad_to_use)
+    y_yiq = F.pad(y_yiq, pad=pad_to_use)
+    coefficients_x_iq = torch.abs(F.avg_pool2d(x_yiq[:, 1:], kernel_size=2, stride=1, padding=0))
+    coefficients_y_iq = torch.abs(F.avg_pool2d(y_yiq[:, 1:], kernel_size=2, stride=1, padding=0))
+
+    # Compute weights and similarity
+    weights = torch.cat([weights, weights.mean(dim=1, keepdim=True)], dim=1)
+    similarity = _similarity(coefficients_x_iq, coefficients_y_iq, _HAARPSI_C)
+    sim_map.append(similarity.sum(dim=1, keepdim=True) / 2)
+
+    sim = torch.cat(sim_map, dim=1)
+
+    # Calculate the final score
+    eps = torch.finfo(sim.dtype).eps
+    score = (((sim * _HAARPSI_ALPHA).sigmoid() * weights).sum(dim=[1, 2, 3]) + eps) / (
+        torch.sum(weights, dim=[1, 2, 3]) + eps
+    )
+    # Logit of score
+    score = (torch.log(score / (1 - score)) / _HAARPSI_ALPHA) ** 2
+    return score.mean(dim=0)
+
+
+# End of the code adapted from piq.
+
+
+class PerceptualLoss(torch.nn.Module):
+    """L_perc: the perceptual network `net` of D-89 on the render and the training image, as the
+    mean over the batch (E7, D-9). `forward(pred, gt)` takes Q-41's [..., H, W, 3] images; the
+    reference gets no gradient. The network is frozen and stays in evaluation mode under
+    `.train()` (D-89). "flip" is the vendored LDR-ꟻLIP loss at 67.0 pixels per degree, on
+    float32 images; "haarpsi" is 1 − HaarPSI, the render clamped to [0, 1], on sides of at least
+    16 pixels (Q-261). The six trunk networks are built by #385 and #386."""
+
+    def __init__(self, net: PercNet = "flip") -> None:
+        super().__init__()
+        if net not in _PERC_NETS:
+            _fail(f"net must be one of D-89's perceptual networks {_PERC_NETS}, got {net!r}")
+        if net in _TRUNK_TICKETS:
+            # #381: the trunk networks come with #385 and #386.
+            raise NotImplementedError(
+                f"PerceptualLoss({net!r}) is not built yet: the trunk networks of D-89 come with "
+                f"{_TRUNK_TICKETS[net]}"
+            )
+        self._name = net
+        if net == "flip":
+            self._flip = LDRFLIPLoss()
+        # D-89: frozen and in evaluation mode, whatever a parent module asks.
+        self.requires_grad_(False)
+        self.train(False)
+
+    def train(self, mode: bool = True) -> "PerceptualLoss":
+        # D-89: in evaluation mode, also when a parent module calls `.train()`.
+        return super().train(False)
+
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        _check_pair(pred, gt)
+        # D-89: the reference without a gradient.
+        x, y = _batch_first(pred), _batch_first(gt.detach())
+        if self._name == "haarpsi":
+            # D-89: 1 − HaarPSI, Î clamped to [0, 1].
+            return 1.0 - _haarpsi(x.clamp(0.0, 1.0), y)
+        # Q-261: the published loss's constants are float32, and other dtypes fail inside it.
+        if pred.dtype != torch.float32:
+            _fail(f"ꟻLIP takes float32 images, got {pred.dtype}")
+        out: Tensor = self._flip(x, y, pixels_per_degree=_FLIP_PIXELS_PER_DEGREE)
+        return out
+
+
 class LPIPSLoss(torch.nn.Module):
     """L_perc: LPIPS with the given backbone on images in [0, 1], mapped to [−1, 1] (E7, D-9,
     D-68), as the mean over the batch; `forward(…, map_inputs=False)` skips the mapping, for
@@ -161,7 +349,7 @@ class LPIPSLoss(torch.nn.Module):
             warnings.filterwarnings("ignore", "The parameter 'pretrained'", UserWarning)
             warnings.filterwarnings("ignore", "Arguments other than a weight enum", UserWarning)
             self._net: torch.nn.Module = lpips.LPIPS(net=net, verbose=False)
-        self._backbone = net
+        self._name = net  # the perc_net value it was built for, as PerceptualLoss's
         # lpips freezes only its trunk; the linear layers would stay trainable.
         self._net.requires_grad_(False)
         self._net.eval()
@@ -195,6 +383,35 @@ def reg4d_loss(model: FreeTimeGaussians, t: float) -> Tensor:
     return terms.mean() if terms.numel() > 0 else terms.sum()
 
 
+# D-89's table: each network's calibrated λ_perc, the weight `lambda_perc = None` stands for.
+_CALIBRATED_WEIGHTS = {
+    "flip": 0.415,
+    "haarpsi": 0.0617,
+    "vgg16_oxford": 0.00164,
+    "alexnet_bvlc": 0.00408,
+    "dinov2_s14": 0.00185,
+    "dinov2_b14": 0.00204,
+    "dino_s16": 0.00358,
+    "dino_b16": 0.00484,
+}
+
+
+# Q-249: a private resolver, so that no §2.1 addition is needed.
+def _resolve_lambda_perc(cfg: LossConfig) -> float:
+    """λ_perc as `total_loss` applies it: `cfg.lambda_perc`, or the calibrated weight of
+    `cfg.perc_net` when it is None (D-9, D-89)."""
+    if cfg.lambda_perc is not None:
+        return cfg.lambda_perc
+    if cfg.perc_net not in _CALIBRATED_WEIGHTS:
+        # #380's expand step: LPIPS's backbones, still accepted as perc_net until #392, have no
+        # calibrated weight.
+        _fail(
+            f"lambda_perc = None takes perc_net's calibrated weight in D-89's table, which has "
+            f"none for {cfg.perc_net!r}; set lambda_perc or choose one of {_PERC_NETS}"
+        )
+    return _CALIBRATED_WEIGHTS[cfg.perc_net]
+
+
 # D-77: the dict holds detached 0-d tensors, so the loss never syncs with the host (§2.4 rule 3),
 # and the perceptual network is passed in.
 def total_loss(
@@ -205,21 +422,27 @@ def total_loss(
     it: int,
     cfg: LossConfig,
     *,
-    perceptual: LPIPSLoss | None = None,
+    perceptual: PerceptualLoss | LPIPSLoss | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·LPIPS + λ_reg·L_reg(t) at iteration `it` (E7, E9,
-    D-37), and its unweighted terms with the total under "total". t is the training image's
-    normalized time (§1.4), as for `reg4d_loss`. A term whose λ is 0 is neither computed nor
-    reported. After `cfg.reg_until`, L_reg leaves the total but is still reported, computed
-    without a gradient, so the keys stay fixed for a run (D-10, Q-41)."""
+    """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·L_perc + λ_reg·L_reg(t) at iteration `it` (E7,
+    E9, D-37), and its unweighted terms with the total under "total". t is the training image's
+    normalized time (§1.4), as for `reg4d_loss`. λ_perc = None is the calibrated weight of
+    `cfg.perc_net` (D-89; Q-249). A term whose λ is 0 is neither computed nor reported. After
+    `cfg.reg_until`, L_reg leaves the total but is still reported, computed without a gradient,
+    so the keys stay fixed for a run (D-10, Q-41)."""
     # Q-41: iterations count from 1 (D-41).
     if isinstance(it, bool) or not isinstance(it, int) or it < 1:
         _fail(f"it must be an int >= 1, got {it!r}")
-    if cfg.lambda_perc > 0.0 and perceptual is None:
-        _fail("lambda_perc > 0 needs the perceptual network (perceptual=LPIPSLoss(...))")
-    # Q-41: a network passed in must be the backbone LossConfig names (D-9), whatever λ_perc.
-    if perceptual is not None and perceptual._backbone != cfg.perc_net:
-        _fail(f"perceptual uses {perceptual._backbone!r}, but cfg.perc_net is {cfg.perc_net!r}")
+    lambda_perc = _resolve_lambda_perc(cfg)
+    # D-77, Q-249: the resolved weight, not the configured one, asks for the network.
+    if lambda_perc > 0.0 and perceptual is None:
+        _fail(
+            f"lambda_perc {lambda_perc} (configured {cfg.lambda_perc!r}) needs the perceptual "
+            f"network of perc_net {cfg.perc_net!r}, passed as perceptual="
+        )
+    # Q-41: a network passed in must be the one LossConfig names (D-9), whatever λ_perc.
+    if perceptual is not None and perceptual._name != cfg.perc_net:
+        _fail(f"perceptual is {perceptual._name!r}, but cfg.perc_net is {cfg.perc_net!r}")
     _check_pair(pred, gt)
     terms: dict[str, Tensor] = {}
     weighted: list[Tensor] = []
@@ -235,10 +458,10 @@ def total_loss(
             )
             terms["one_minus_ssim"] = 1.0 - value
             weighted.append(cfg.lambda_ssim * terms["one_minus_ssim"])
-    if perceptual is not None and cfg.lambda_perc > 0.0:
+    if perceptual is not None and lambda_perc > 0.0:
         with stage("loss.perceptual"):
             terms["perceptual"] = perceptual(pred, gt)
-            weighted.append(cfg.lambda_perc * terms["perceptual"])
+            weighted.append(lambda_perc * terms["perceptual"])
     if cfg.lambda_reg > 0.0:
         with stage("loss.reg"):
             if cfg.reg_until is None or it <= cfg.reg_until:
