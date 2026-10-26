@@ -6,8 +6,9 @@ Added tests, not §3 rows: the request it writes is matched record for record by
 --renders-dir` (Q-137's rule); its background is the model's training background (D-84); the
 whole run leaves one 8-bit PNG per test record equal to the clamped render, a METRICS.json equal
 to the run's own, and no renders file; its comparison's findings follow Q-224's bounds, and it
-reads METRICS.json versions 1 and 2 and says which it read (Q-256). The script runs as #327 runs
-it, in a process of its own, here on the CPU (the reference backend).
+reads METRICS.json versions 1 and 2 and says which it read (Q-256), leaving uncompared the
+metrics one version holds alone (Q-T387.1). The script runs as #327 runs it, in a process of its
+own, here on the CPU (the reference backend).
 """
 
 import dataclasses
@@ -189,6 +190,7 @@ def test_run_leaves_pngs_metrics_and_no_renders(tmp_path: Path) -> None:
         assert _scene_means(ours)[name] == pytest.approx(value, rel=1e-6, abs=1e-9)
     comparison = json.loads((out / "COMPARISON.json").read_text())
     assert comparison["versions"] == {"this_run": 2, "given": 2}  # Q-256
+    assert comparison["not_compared"] == {"this_run": [], "given": []}  # Q-T387.1
     assert comparison["findings"] == []
     assert set(comparison["blocks"]["entire"]) == set(_scene_means(theirs))
     assert all(abs(d) < 1e-6 for d in comparison["blocks"]["entire"].values())
@@ -300,22 +302,40 @@ def _version_1(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_comparison_says_which_versions_it_read() -> None:
-    """Q-256, Q-224: a version-2 run compared with a version-1 file says which version each
-    holds; the metrics both hold (PSNR, SSIM₁ here) are compared as Q-224 compares them, and
-    each metric one version holds alone (ꟻLIP, the three LPIPS values) is a finding, as any
-    metric in one file only is."""
+    """Q-256, Q-T387.1: a version-2 run compared with a version-1 file says which version each
+    holds. The metrics both versions hold (PSNR and SSIM₁ in these bodies) are compared as
+    Q-224 compares them, the PSNR difference above 0.01 dB being the only finding; the metrics
+    one version holds alone (ꟻLIP; LPIPS-Alex, LPIPS-VGG, lpips_vgg_raw) are compared nowhere,
+    listed once under `not_compared`, and are no finding, in scene means or image rows."""
     compare = _module().compare
     ours = _metrics(entire_scene_psnr=30.02)
     result = compare(ours, _version_1(_metrics()))
     assert result["versions"] == {"this_run": 2, "given": 1}
+    assert result["not_compared"] == {
+        "this_run": ["flip"],
+        "given": ["lpips_alex", "lpips_vgg", "lpips_vgg_raw"],
+    }
+    assert result["findings"] == ["entire: scene psnr differs by +0.02"]
     assert result["blocks"]["entire"]["psnr"] == pytest.approx(0.02, abs=1e-9)
-    assert set(result["blocks"]["entire"]) == {"psnr", "ssim1"}
-    findings = result["findings"]
-    assert "entire: scene psnr differs by +0.02" in findings
-    for metric, side in [("flip", "this run's"), ("lpips_alex", "the given"),
-                         ("lpips_vgg", "the given"), ("lpips_vgg_raw", "the given")]:  # fmt: skip
-        assert f"entire: scene metric {metric} is only in {side} METRICS.json" in findings
-    assert compare(ours, ours)["versions"] == {"this_run": 2, "given": 2}
+    for block in ("entire", "dynamic"):
+        assert set(result["blocks"][block]) == {"psnr", "ssim1"}
+        assert set(result["largest_image_difference"][block]) == {"psnr", "ssim1"}
+    same = compare(ours, ours)
+    assert same["versions"] == {"this_run": 2, "given": 2}
+    assert same["not_compared"] == {"this_run": [], "given": []}
+
+
+def test_comparison_across_versions_still_flags_a_shared_metric_in_one_file_only() -> None:
+    """Q-T387.1, Q-224: across versions, a metric both versions hold that one file lacks, in
+    its scene means or in an image row, is still a finding."""
+    compare = _module().compare
+    theirs = _version_1(_metrics())
+    del theirs["entire"]["scene"]["ssim1"]
+    del theirs["dynamic"]["images"][0]["psnr"]
+    assert compare(_metrics(), theirs)["findings"] == [
+        "entire: scene metric ssim1 is only in this run's METRICS.json",
+        "dynamic: images/cam02/000000.png metric psnr is only in this run's METRICS.json",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -35,7 +35,7 @@ Each metric is computed per test image, averaged over a scene's test images, the
 
 The `dynamic` block counts under `missing` the images of the split that have no mask, 0 for a full set, so a partial set is visible in the report (Q-135); `ftgs eval` and `ftgs train` refuse a partial set before doing any work.
 
-Version 2 is the report since revision 549o. Version 1, which M17's runs wrote and the validation-run records cite, held LPIPS-Alex, LPIPS-VGG and lpips_vgg_raw in place of ꟻLIP, and an `lpips_backbone` label; the package writes version 2 only, and `scripts/run_summary.py` and `scripts/view_renders.py`'s comparison read both versions and say which they read (Q-256).
+Version 2 is the report since revision 549o. Version 1, which M17's runs wrote and the validation-run records cite, held LPIPS-Alex, LPIPS-VGG and lpips_vgg_raw in place of ꟻLIP, and an `lpips_backbone` label; the package writes version 2 only, and `scripts/run_summary.py` and `scripts/view_renders.py`'s comparison read both versions and say which they read (Q-256). Between files of different versions, the comparison compares the five metrics both versions hold, PSNR, SSIM₁, SSIM₂, DSSIM₁ and DSSIM₂, and lists the metrics one version holds alone (ꟻLIP; the three LPIPS values) once under `not_compared`, with no finding, so that a rerun on an M17 model against its version-1 file reports only real differences (Q-T387.1).
 
 A null in the report means "not defined here": a perfect render's PSNR, a mean over no images, a dynamic region that was skipped (Q-61). It never stands for a failed render, which `evaluate_images` refuses before any report is built (below; Q-129, Q-147).
 

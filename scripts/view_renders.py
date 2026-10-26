@@ -24,10 +24,12 @@ null where either value is null), per block and metric the largest per-image dif
 any other metric, every value null on one side only, and every block, metric and image path in
 one file only (#327, Q-224); and under `versions` the METRICS.json version of each file. The
 given file may be of version 1 (M17's runs, LPIPS-Alex, LPIPS-VGG and lpips_vgg_raw) or 2
-(since 549o, ꟻLIP); against version 1, the metrics one version holds alone are findings, as
-any metric in one file only is. A given file of another version or format is exit 2, before
-anything is run (Q-256). The backend is gsplat unless `--backend reference`; on a
-machine without CUDA `ftgs render` refuses gsplat rather than falling back (Q-125).
+(since 549o, ꟻLIP); a given file of another version or format is exit 2, before anything is run
+(Q-256). Between files of different versions, the metrics both versions hold (PSNR, SSIM₁,
+SSIM₂, DSSIM₁, DSSIM₂) are compared as above, and those one version holds alone are compared
+nowhere, listed once under `not_compared` by file, and are no finding (Q-T387.1). The backend
+is gsplat unless `--backend reference`; on a machine without CUDA `ftgs render` refuses gsplat
+rather than falling back (Q-125).
 
 Exit 0 once written; 2 for an input that can't be read or matched; a failing ftgs command's own
 exit code otherwise.
@@ -52,7 +54,13 @@ _PSNR_FINDING_DB = 0.01
 _UNIT_FINDING = 1e-4
 _BLOCKS = ("entire", "dynamic")  # fastest_10 is out of #327's scope: no M17 manifest names it
 _FORMAT = "ftgs-metrics"  # Q-63: METRICS.json's format tag
-_VERSIONS = (1, 2)  # Q-256: version 1 (LPIPS) and version 2 (ꟻLIP, since 549o)
+# Q-256: the metrics of each METRICS.json version read, version 1 (LPIPS) and version 2 (ꟻLIP,
+# since 549o), in their files' order (Q-63).
+_VERSION_METRICS = {
+    1: ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "lpips_alex", "lpips_vgg", "lpips_vgg_raw"),
+    2: ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip"),
+}
+_VERSIONS = tuple(_VERSION_METRICS)
 
 
 class InputError(Exception):
@@ -188,8 +196,28 @@ def _compare_values(
     return deltas
 
 
+def _not_compared(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, list[str]]:
+    """Q-T387.1: between files of different versions, each file's metrics that the other's
+    version doesn't hold; none between files of one version."""
+    ours_v, theirs_v = ours.get("version"), theirs.get("version")
+    if ours_v == theirs_v or ours_v not in _VERSION_METRICS or theirs_v not in _VERSION_METRICS:
+        return {"this_run": [], "given": []}
+    mine, other = _VERSION_METRICS[ours_v], _VERSION_METRICS[theirs_v]
+    return {
+        "this_run": [name for name in mine if name not in other],
+        "given": [name for name in other if name not in mine],
+    }
+
+
+def _without(values: dict[str, Any], names: set[str]) -> dict[str, Any]:
+    return {name: value for name, value in values.items() if name not in names}
+
+
 def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
-    """#327, Q-224: this run's metrics minus the given METRICS.json's."""
+    """#327, Q-224: this run's metrics minus the given METRICS.json's; across versions, the
+    metrics one version holds alone are left out (Q-T387.1)."""
+    not_compared = _not_compared(ours, theirs)
+    skip = {*not_compared["this_run"], *not_compared["given"]}  # Q-T387.1
     blocks: dict[str, dict[str, float | None]] = {}
     largest: dict[str, dict[str, float]] = {}
     findings: list[str] = []
@@ -198,7 +226,8 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
     for block in _BLOCKS:
         if block not in ours or block not in theirs:
             continue
-        our_means, their_means = ours[block]["scene"], theirs[block]["scene"]
+        our_means = _without(ours[block]["scene"], skip)
+        their_means = _without(theirs[block]["scene"], skip)
         blocks[block] = _compare_values(f"{block}: scene", our_means, their_means, findings)
         metrics = list(dict.fromkeys([*their_means, *our_means]))  # a row's other keys aren't
         our_images = {row["path"]: row for row in ours[block].get("images", [])}
@@ -224,6 +253,7 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
     return {
         # Q-256: the version of each METRICS.json compared
         "versions": {"this_run": ours.get("version"), "given": theirs.get("version")},
+        "not_compared": not_compared,  # Q-T387.1
         "blocks": blocks,
         "largest_image_difference": largest,
         "largest_image_psnr_difference": {
