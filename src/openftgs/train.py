@@ -23,6 +23,7 @@ from torch import Tensor
 
 from openftgs._stages import point, stage
 from openftgs.config import (
+    LossConfig,
     PerfConfig,
     TrainConfig,
     config_from_dict,
@@ -48,7 +49,7 @@ from openftgs.eval import (
     write_metrics,
 )
 from openftgs.io import load_checkpoint
-from openftgs.losses import LPIPSLoss, total_loss
+from openftgs.losses import LPIPSLoss, PerceptualLoss, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.optim import FTGSOptimizer, build_optimizer
 from openftgs.render import render
@@ -338,12 +339,14 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
 # Q-173: the training perceptual network's weights in channels-last memory, turned on only when
 # B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
 # at its two sizes (Calibration data, #228), with the inputs channels-last as `LPIPSLoss` views
-# a render's [..., H, W, 3] batch first; since #326 mostly NCHW (_perceptual_network, Q-223).
+# a render's [..., H, W, 3] batch first; since #326 mostly NCHW (_lpips_network, Q-223). D-89's
+# networks are measured by B-4's rerun (Q-251), which #394 reads.
 _CHANNELS_LAST_WEIGHTS = False
 
 
-# Q-173 (changed, #326), Q-223: B-4 measured NCHW inputs the fastest layout in IEEE float32, and
-# in TF32 with autotuning; slower in TF32 without it and in bfloat16, which keep the plain view.
+# Q-173 (changed, #326), Q-223: B-4 measured NCHW inputs the fastest layout for LPIPS-VGG in IEEE
+# float32, and in TF32 with autotuning; slower in TF32 without it and in bfloat16, which keep the
+# plain view. LPIPS's backbones only, until #392 removes them (#380's expand step).
 class _NCHWLPIPSLoss(LPIPSLoss):
     """LPIPS with its two images copied so that the network gets them as contiguous NCHW
     tensors: the trainer's network under `perc_precision` "ieee", and "tf32" with autotuning.
@@ -368,15 +371,67 @@ class _Bf16LPIPSLoss(LPIPSLoss):
         return out.float()
 
 
-def _perceptual_network(perf: PerfConfig) -> type[LPIPSLoss]:
-    """The trainer's perceptual network for `perf`: bf16's (Q-172), NCHW inputs where B-4
-    measured them faster (Q-223), else plain `LPIPSLoss` with its channels-last view."""
+# Q-172, Q-250, Q-251: the bfloat16 path generalized to D-89's trunk networks.
+class _Bf16PerceptualLoss(PerceptualLoss):
+    """D-52's approximate option, `perc_precision = "bf16"`, for a trunk network: the network
+    runs under bfloat16 autocast on the images' device, the CPU included (Q-191), and returns
+    float32. The images enter as float32, as the networks require (Q-263, Q-265), and the
+    module keeps its float32 weights and constants; only the operations autocast covers run
+    in bfloat16. The evaluator's networks stay float32."""
+
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        with torch.autocast(pred.device.type, dtype=torch.bfloat16):
+            out = super().forward(pred, gt)
+        return out.float()
+
+
+def _lpips_network(perf: PerfConfig) -> type[LPIPSLoss]:
+    """The trainer's LPIPS network for `perf`: bf16's (Q-172), NCHW inputs where B-4 measured
+    them faster (Q-223), else plain `LPIPSLoss` with its channels-last view."""
     if perf.perc_precision == "bf16":
         return _Bf16LPIPSLoss
     autotuned = _AUTOTUNE and not perf.deterministic
     if perf.perc_precision == "ieee" or autotuned:
         return _NCHWLPIPSLoss
     return LPIPSLoss
+
+
+def _builds_perceptual(loss: LossConfig) -> bool:
+    """D-77, Q-69, Q-249: the trainer builds its perceptual network when λ_perc is None, which
+    `total_loss` resolves to the network's calibrated weight (D-89), or positive."""
+    return loss.lambda_perc is None or loss.lambda_perc > 0.0
+
+
+# Q-250: D-89's networks without trained weights, which have no bfloat16 path (B-4 measures
+# bfloat16 for the trunk networks only).
+_WEIGHT_FREE = ("flip", "haarpsi")
+
+
+def _check_perceptual(cfg: TrainConfig) -> None:
+    """Q-250: bf16 with a weight-free network is refused before anything is built; the
+    `TrainConfig` stays valid on its own, so it can move to a trunk network. Without a network
+    (λ_perc = 0) nothing would run in bfloat16, and nothing is refused (Q-267)."""
+    net = cfg.loss.perc_net
+    # Q-267: refused only when the network is built.
+    if cfg.perf.perc_precision == "bf16" and net in _WEIGHT_FREE and _builds_perceptual(cfg.loss):
+        raise ValueError(
+            f"perf.perc_precision 'bf16' runs a trunk network in bfloat16 (D-52), and "
+            f"loss.perc_net {net!r} has no bfloat16 path: use 'tf32' or 'ieee', or a trunk network"
+        )
+
+
+def _perceptual_network(cfg: TrainConfig) -> PerceptualLoss | LPIPSLoss:
+    """The trainer's perceptual network for `cfg`, on the CPU. LPIPS's two backbones, still
+    accepted as `perc_net` until #392 (#380's expand step), are built as before (Q-172, Q-223);
+    every network of D-89 takes the render's view as it comes, its layout and autotuning to be
+    set per network after B-4 (Q-251), and a trunk network runs under bfloat16 autocast when
+    asked (Q-250; `_check_perceptual` refuses bf16 for the weight-free ones)."""
+    net = cfg.loss.perc_net
+    if net == "vgg" or net == "alex":
+        return _lpips_network(cfg.perf)(net)
+    if cfg.perf.perc_precision == "bf16":
+        return _Bf16PerceptualLoss(net)
+    return PerceptualLoss(net)
 
 
 def _check_ablation(cfg: TrainConfig) -> None:
@@ -562,6 +617,7 @@ class Trainer:
     def _configure(self, cfg: TrainConfig, dataset: MultiViewVideo, device: str) -> None:
         _check_ablation(cfg)
         _check_perf(cfg.perf)
+        _check_perceptual(cfg)  # Q-250
         self._cfg = cfg
         self._dataset = dataset
         self._device = torch.device(device)
@@ -571,11 +627,15 @@ class Trainer:
         )
         self._training = [i for i, r in enumerate(dataset.records) if r.split == "train"]
         self._background = torch.tensor(cfg.background, dtype=torch.float32, device=self._device)
-        # D-77: one perceptual network, built only when its weight is positive; D-52: in bfloat16
-        # when asked (Q-172), otherwise with NCHW inputs where they are faster (Q-223).
-        self._perceptual: LPIPSLoss | None = None
-        if cfg.loss.lambda_perc > 0.0:
-            perceptual = _perceptual_network(cfg.perf)(cfg.loss.perc_net).to(self._device)
+        # D-77: one perceptual network, built when its weight is None or positive (Q-69, Q-249).
+        self._perceptual: PerceptualLoss | LPIPSLoss | None = None
+        if _builds_perceptual(cfg.loss):
+            # Q-72: lpips's trunk and the vendored DINOv2 builders initialize their weights from
+            # torch's global CPU generator before the publisher's are loaded; its state is
+            # restored, so the trainer draws nothing from it.
+            with torch.random.fork_rng(devices=[]):
+                perceptual = _perceptual_network(cfg)
+            perceptual = perceptual.to(self._device)
             if _CHANNELS_LAST_WEIGHTS:  # Q-173
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
