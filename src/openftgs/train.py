@@ -369,6 +369,20 @@ class _Bf16LPIPSLoss(LPIPSLoss):
         return out.float()
 
 
+# Q-172, Q-250, Q-251: the bfloat16 path generalized to D-89's trunk networks.
+class _Bf16PerceptualLoss(PerceptualLoss):
+    """D-52's approximate option, `perc_precision = "bf16"`, for a trunk network: the network
+    runs under bfloat16 autocast on the images' device, the CPU included (Q-191), and returns
+    float32. The images enter as float32, as the networks require (Q-263, Q-265), and the
+    module keeps its float32 weights and constants; only the operations autocast covers run
+    in bfloat16. The evaluator's networks stay float32."""
+
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        with torch.autocast(pred.device.type, dtype=torch.bfloat16):
+            out = super().forward(pred, gt)
+        return out.float()
+
+
 def _lpips_network(perf: PerfConfig) -> type[LPIPSLoss]:
     """The trainer's LPIPS network for `perf`: bf16's (Q-172), NCHW inputs where B-4 measured
     them faster (Q-223), else plain `LPIPSLoss` with its channels-last view."""
@@ -407,10 +421,13 @@ def _perceptual_network(cfg: TrainConfig) -> PerceptualLoss | LPIPSLoss:
     """The trainer's perceptual network for `cfg`, on the CPU. LPIPS's two backbones, still
     accepted as `perc_net` until #392 (#380's expand step), are built as before (Q-172, Q-223);
     every network of D-89 takes the render's view as it comes, its layout and autotuning to be
-    set per network after B-4 (Q-251)."""
+    set per network after B-4 (Q-251), and a trunk network runs under bfloat16 autocast when
+    asked (Q-250; `_check_perceptual` refuses bf16 for the weight-free ones)."""
     net = cfg.loss.perc_net
     if net == "vgg" or net == "alex":
         return _lpips_network(cfg.perf)(net)
+    if cfg.perf.perc_precision == "bf16":
+        return _Bf16PerceptualLoss(net)
     return PerceptualLoss(net)
 
 

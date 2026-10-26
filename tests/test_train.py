@@ -10,6 +10,7 @@ and U-24 state.
 """
 
 import dataclasses
+import importlib.util
 import json
 import math
 import warnings
@@ -57,10 +58,18 @@ TAU1 = 4.0 / 30.0  # five frames at 30 FPS
 TIME = TimeNormalizer(0.0, TAU1)
 
 
-def _scene(root: Path, *, frames: int = 5) -> MultiViewVideo:
+def _scene(root: Path, *, frames: int = 5, scale: int = 1) -> MultiViewVideo:
     """A ring of four 32×24 cameras around a random ground-truth model: three train at frames
-    k/30, the fourth is the test view."""
-    cams = ring(4, radius=4.0, elevation=1.0, width_px=32, height_px=24, focal=30.0)
+    k/30, the fourth is the test view. `scale` multiplies the image sides and the focal
+    length, for the perceptual networks that need larger images (D-89)."""
+    cams = ring(
+        4,
+        radius=4.0,
+        elevation=1.0,
+        width_px=32 * scale,
+        height_px=24 * scale,
+        focal=30.0 * scale,
+    )
     gt = random_model(24, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
     images = [(cam, k / 30.0, "train") for k in range(frames) for cam in cams[:3]]
     images += [(cams[3], k / 30.0, "test") for k in range(frames)]
@@ -1064,6 +1073,32 @@ def test_gpu_deterministic_run(tmp_path: Path) -> None:
 
 # D-89's table: the calibrated λ_perc of the networks the tests below train with.
 CALIBRATED = {"flip": 0.415, "haarpsi": 0.0617}
+# D-89's trunk networks, built on pretrained weights, hence `weights` (Q-7); the four DINO
+# networks also need the [init] extra (Q-248).
+CAFFE_TRUNKS = ("vgg16_oxford", "alexnet_bvlc")
+DINO_TRUNKS = ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
+HAS_INIT_EXTRA = all(
+    importlib.util.find_spec(name) is not None for name in ("torchvision", "einops", "loguru")
+)
+needs_init = pytest.mark.skipif(not HAS_INIT_EXTRA, reason="needs the [init] extra (Q-248)")
+TRUNK_PARAMS = [
+    *(pytest.param(net, marks=pytest.mark.weights) for net in CAFFE_TRUNKS),
+    *(pytest.param(net, marks=(pytest.mark.weights, needs_init)) for net in DINO_TRUNKS),
+]
+# The networks the trainer runs under bfloat16 autocast: LPIPS-VGG, the default until #392
+# (Q-172, Q-191), and the six trunk networks (Q-250, Q-251).
+BF16_NETWORKS = [pytest.param("vgg", marks=pytest.mark.weights), *TRUNK_PARAMS]
+
+
+def _perceptual(net: str, precision: Literal["tf32", "ieee", "bf16"] = "tf32") -> TrainConfig:
+    """The default configuration with the perceptual network `net` at its weight, D-89's
+    calibrated one (None), or 0.01 for LPIPS-VGG ("vgg", until #392), in `precision`, with the
+    frame cache off."""
+    lambda_perc = 0.01 if net == "vgg" else None
+    return TrainConfig(
+        loss=LossConfig(perc_net=net, lambda_perc=lambda_perc),  # type: ignore[arg-type]
+        perf=PerfConfig(perc_precision=precision, frame_cache="off"),
+    )
 
 
 def _record_networks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -1145,21 +1180,23 @@ def _step_with_gradients(trainer: Trainer) -> tuple[StepLog, dict[str, torch.Ten
     return trainer.step(), grads
 
 
-@pytest.mark.weights
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("net", BF16_NETWORKS)
 def test_a_bf16_step_gives_a_finite_perceptual_term_near_float32(
-    tmp_path: Path, device: str
+    tmp_path: Path, device: str, net: str
 ) -> None:
-    """D-52, Q-172 (#228): with perc_precision = "bf16" one training step runs LPIPS-VGG under
-    bfloat16 autocast; its perceptual term is finite and within 5e-2 relative of the float32
-    ("ieee") step from the same seed, which renders the same image, and the gradients that reach
-    the model are finite. bf16 is approximate (D-52), so the two terms differ."""
-    video = _scene(tmp_path)
+    """D-52, Q-172 (#228), Q-250: with perc_precision = "bf16" one training step runs the
+    perceptual network under bfloat16 autocast: LPIPS-VGG, the legacy default until #392, or
+    any of D-89's six trunk networks at its calibrated weight. The perceptual term is float32,
+    finite and within 5e-2 relative of the float32 ("ieee") step from the same seed, which
+    renders the same image, and the gradients that reach the model are finite. bf16 is
+    approximate (D-52), so the two terms differ."""
+    video = _scene(tmp_path, scale=2)  # the DINO networks' 27 and 31 pixels (D-89; Q-265)
     terms, gradients = {}, {}
     for precision in ("ieee", "bf16"):
-        cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
-        trainer = Trainer(cfg, video, _init_points(), device=device)
+        trainer = Trainer(_perceptual(net, precision), video, _init_points(), device=device)
         log, grads = _step_with_gradients(trainer)
+        assert log.losses["perceptual"].dtype == torch.float32
         terms[precision] = float(log.losses["perceptual"])
         gradients[precision] = grads
     assert math.isfinite(terms["bf16"]) and terms["ieee"] > 0.0
@@ -1298,18 +1335,20 @@ def test_cudnn_tf32_during_a_step_follows_the_perceptual_precision(
         cudnn.allow_tf32 = saved
 
 
-@pytest.mark.weights
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
-def test_a_bf16_step_changes_only_the_perceptual_term(tmp_path: Path, device: str) -> None:
-    """D-52, Q-172 (#245): bf16's autocast is local to the perceptual network, so a "bf16" step
-    and a "tf32" step from the same seed, both with TF32 on, give bitwise the same L1, 1 − SSIM
-    and L_reg terms, and only the perceptual term differs. On the CPU, SSIM takes its PyTorch
-    fallback, whose convolution an autocast around the whole loss would reach."""
-    video = _scene(tmp_path)
+@pytest.mark.parametrize("net", BF16_NETWORKS)
+def test_a_bf16_step_changes_only_the_perceptual_term(
+    tmp_path: Path, device: str, net: str
+) -> None:
+    """D-52, Q-172 (#245), Q-250: bf16's autocast is local to the perceptual network, LPIPS-VGG
+    or a trunk network of D-89, so a "bf16" step and a "tf32" step from the same seed, both
+    with TF32 on, give bitwise the same L1, 1 − SSIM and L_reg terms, and only the perceptual
+    term differs. On the CPU, SSIM takes its PyTorch fallback, whose convolution an autocast
+    around the whole loss would reach."""
+    video = _scene(tmp_path, scale=2)  # the DINO networks' 27 and 31 pixels (D-89; Q-265)
     terms: dict[str, dict[str, torch.Tensor]] = {}
     for precision in ("tf32", "bf16"):
-        cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
-        trainer = Trainer(cfg, video, _init_points(), device=device)
+        trainer = Trainer(_perceptual(net, precision), video, _init_points(), device=device)
         terms[precision] = {name: value.cpu() for name, value in trainer.step().losses.items()}
     assert terms["bf16"].keys() == terms["tf32"].keys()
     for name in ("l1", "one_minus_ssim", "reg"):
