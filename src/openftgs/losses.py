@@ -373,6 +373,7 @@ class _DinoDistance(torch.nn.Module):
 
     def _tokens(self, image: Tensor) -> list[Tensor]:
         """The patch tokens [B, T, C] after the four blocks, for [B, 3, H, W] images."""
+        # D-89: half resolution, bilinear and antialiased (Q-T386.1: the rounding).
         half = _halved(image)
         image = F.interpolate(
             image, size=half, mode="bilinear", align_corners=False, antialias=True
@@ -381,7 +382,8 @@ class _DinoDistance(torch.nn.Module):
         crop_h, crop_w = (side // self._patch * self._patch for side in half)
         top, left = (half[0] - crop_h) // 2, (half[1] - crop_w) // 2
         image = image[..., top : top + crop_h, left : left + crop_w]
-        image = (image - self._mean) / self._std
+        image = (image - self._mean) / self._std  # D-89: ImageNet's standardization
+        # D-89: after blocks 3, 6, 9 and 12, before the final norm, without the class token.
         return list(self._vit.get_intermediate_layers(image, n=_DINO_BLOCKS, norm=False))
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
