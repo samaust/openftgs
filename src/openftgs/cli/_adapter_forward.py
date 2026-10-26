@@ -31,7 +31,7 @@ from openftgs.config import GrowthConfig, LossConfig, OptimConfig, RelocConfig, 
 from openftgs.data import spatial_scale
 from openftgs.density import GradStats, draw_targets, growth_masks, mcmc_split, sampling_score
 from openftgs.init import knn_velocities
-from openftgs.losses import LPIPSLoss, l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.losses import LPIPSLoss, PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.motion import effective_opacity, moved_means, temporal_opacity
 from openftgs.optim import build_optimizer
@@ -130,18 +130,17 @@ def _sh_color(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[
 
 
 def _losses(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    """E7 to E9 on one image pair: each unweighted term and the total at `iteration` with the
-    query's LossConfig fields; LPIPS-VGG only when `lpips` is true (Q-207)."""
+    """E7 to E9 on one image pair: each unweighted term, ꟻLIP among them, and the total at
+    `iteration` with the query's LossConfig fields, ꟻLIP its perceptual network at the query's
+    λ_perc, None its calibrated weight (Q-207, Q-249, Q-255)."""
     model = _model(params, tensors)
-    cfg = LossConfig(**params.get("loss", {}))
-    use_lpips = bool(params.get("lpips", True))
-    if not use_lpips:
-        cfg = dataclasses.replace(cfg, lambda_perc=0.0)
+    # Q-255: §3.3's `losses` row is ꟻLIP's, whatever perc_net the configuration names.
+    cfg = dataclasses.replace(LossConfig(**params.get("loss", {})), perc_net="flip")
     pred, gt = tensors["pred"].float(), tensors["gt"].float()
     t = _t(model, float(tensors["t"]))
     it = int(params.get("iteration", 1))
-    perceptual = LPIPSLoss(cfg.perc_net) if use_lpips else None
-    total, _ = total_loss(pred[None], gt[None], model, t, it, cfg, perceptual=perceptual)
+    flip = PerceptualLoss("flip")
+    total, _ = total_loss(pred[None], gt[None], model, t, it, cfg, perceptual=flip)
     out = {
         "l1": l1_loss(pred[None], gt[None]),
         "one_minus_ssim": 1.0
@@ -152,11 +151,10 @@ def _losses(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[st
             sigma=cfg.ssim_sigma,
             padding=cfg.ssim_padding,
         ),
+        "flip": flip(pred[None], gt[None]),
         "reg": reg4d_loss(model, t),
         "total": total,
     }
-    if perceptual is not None:
-        out["lpips_vgg"] = LPIPSLoss("vgg")(pred[None], gt[None])
     return {k: v.detach().double().reshape(()) for k, v in out.items()}
 
 
