@@ -195,6 +195,18 @@ def test_expand_step_keeps_the_legacy_perc_nets_and_defaults(net: str) -> None:
     assert (default.perc_net, default.lambda_perc) == ("vgg", 0.01)
 
 
+def test_lambda_perc_none_is_accepted_and_written_as_null() -> None:
+    """§2.1 `LossConfig.lambda_perc` (D-9: None = perc_net's calibrated weight, D-89): None is
+    accepted by the dataclass and by the JSON reader, and goes through JSON text as null (Q-10,
+    Q-249: config.json and the manifest keep null as written)."""
+    assert LossConfig(lambda_perc=None).lambda_perc is None
+    cfg = config_from_dict({"loss": {"lambda_perc": None, "perc_net": "flip"}})
+    assert cfg.loss.lambda_perc is None
+    text = json.dumps(config_to_dict(cfg), allow_nan=False)
+    assert '"lambda_perc": null' in text
+    assert config_from_dict(json.loads(text)) == cfg
+
+
 # Q-11: (dotted path, an accepted boundary value, a rejected value)
 RANGES: list[tuple[str, Any, Any]] = [
     ("init.points_per_frame", 1, 0),
@@ -274,6 +286,9 @@ def test_q11_window_start_must_not_exceed_stop(section: str) -> None:
         ("reloc.enabled", 1),
         ("perf.packed", "true"),
         ("loss.lambda_reg", None),
+        ("loss.lambda_perc", "0.01"),  # None or a number (§2.1)
+        ("loss.lambda_perc", float("inf")),
+        ("loss.lambda_perc", True),
         ("init.points_per_frame", 1000.0),
         ("optim.eps", 10**400),
     ],
