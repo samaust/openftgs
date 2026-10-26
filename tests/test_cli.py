@@ -49,6 +49,7 @@ from openftgs.config import (
     GrowthConfig,
     InitConfig,
     LossConfig,
+    PercNet,
     PerfConfig,
     TrainConfig,
     config_to_dict,
@@ -1894,25 +1895,121 @@ def test_eval_refuses_supplied_renders_that_do_not_match_the_split(tmp_path: Pat
     assert not out.exists()
 
 
-def test_unavailable_lpips_weights_are_exit_code_2(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Q-142, Q-161: an OSError while ftgs train's final evaluation builds its evaluator is an
-    environment error, after the checkpoint is saved (Q-132). Since ꟻLIP (#387) the evaluator
-    downloads nothing, so ftgs eval no longer guards building it; Q-161's message for ftgs
-    train is #389's to change."""
-    import openftgs.eval
+# The trunk networks' weights and the [init] extra in ftgs train (Q-142 as #380 extends it to the
+# trunk weights, #389): the trainer builds its perceptual network when it is constructed, before
+# the run directory is made. torch.hub's folder is moved to an empty one, and the network is the
+# publisher's host, which these tests never reach.
+
+
+@pytest.fixture
+def hub(tmp_path: Path) -> Iterator[Path]:
+    """torch.hub's directory moved to an empty folder for one test, as the weights tests do."""
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(tmp_path / "hub"))
+    try:
+        yield tmp_path / "hub"
+    finally:
+        torch.hub.set_dir(previous)
+
+
+def _no_download(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Every download raises `error`, as an unreachable host does (or as a test whose download
+    must not start wants)."""
 
     def offline(*args: Any, **kwargs: Any) -> None:
-        raise OSError("no network")
+        raise error
 
-    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", offline)
-    scene = _scene(tmp_path / "scene", test=True)
-    init = _init(tmp_path / "again.safetensors")
-    cfg = _config_file(tmp_path / "cfg.json")
+    monkeypatch.setattr(torch.hub, "download_url_to_file", offline)
+
+
+def _trunk_config(path: Path, net: PercNet) -> Path:
+    """A configuration file training with the perceptual network `net` at its calibrated weight
+    (λ_perc None, D-89)."""
+    cfg = _cfg()
+    loss = dataclasses.replace(cfg.loss, perc_net=net, lambda_perc=None)
+    return _config_file(path, dataclasses.replace(cfg, loss=loss))
+
+
+def test_a_trunk_weight_that_cannot_be_downloaded_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (#389): a trunk network's weight that can't be downloaded at first use (§2.3), here
+    VGG16's from an unreachable host, is exit 2, an invalid environment, with a message naming
+    the file; nothing is left in torch.hub's cache, and the run directory isn't made."""
+    _no_download(monkeypatch, OSError("no network (stood in for)"))
     out = tmp_path / "run"
-    assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 2
-    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+    assert _train(run, out, "--config", _trunk_config(tmp_path / "vgg.json", "vgg16_oxford")) == 2
+    err = capsys.readouterr().err
+    assert "VGG_ILSVRC_16_layers.caffemodel" in err and "no network (stood in for)" in err
+    assert not out.exists()
+    checkpoints = hub / "checkpoints"
+    assert not checkpoints.exists() or list(checkpoints.iterdir()) == []
+
+
+def test_a_cached_trunk_weight_that_fails_its_hash_check_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142, Q-258 (#389): a file in torch.hub's cache under the publisher's name that isn't the
+    publisher's (here AlexNet's, a few bytes) is exit 2 naming it, with no download started and
+    the file left as it was."""
+    _no_download(monkeypatch, AssertionError("a download started"))
+    cached = hub / "checkpoints" / "bvlc_alexnet.caffemodel"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"not the publisher's file")
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", _trunk_config(tmp_path / "alex.json", "alexnet_bvlc")) == 2
+    assert str(cached) in capsys.readouterr().err
+    assert cached.read_bytes() == b"not the publisher's file"
+    assert not out.exists()
+
+
+def test_a_dino_network_without_the_init_extra_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142, Q-248 (#389): a DINO network without the [init] extra, its vendored DINOv2 layers
+    made unimportable, is exit 2 with a message naming the extra, before anything is
+    downloaded."""
+    monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.transformer.dinov2", None)
+    _no_download(monkeypatch, AssertionError("a download started"))
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", _trunk_config(tmp_path / "dino.json", "dinov2_s14")) == 2
+    err = capsys.readouterr().err
+    assert "[init]" in err and "dinov2_s14" in err
+    assert not hub.exists() and not out.exists()
+
+
+def test_resuming_with_a_trunk_weight_that_cannot_be_downloaded_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (#389): `--resume` builds the checkpoint's perceptual network as a new run does, so
+    a trunk weight that can't be downloaded is exit 2 there too, naming the file."""
+    first = tmp_path / "first"
+    assert _train(run, first, "--config", run["config"]) == 0
+    state = load_checkpoint(first / "checkpoint")
+    config = json.loads(json.dumps(state.config))
+    config["loss"] |= {"perc_net": "alexnet_bvlc", "lambda_perc": None}
+    alex = tmp_path / "alex-checkpoint"
+    save_checkpoint(dataclasses.replace(state, config=config), alex)
+    _no_download(monkeypatch, OSError("no network (stood in for)"))
+    assert _train(run, tmp_path / "resumed", "--resume", alex) == 2
+    err = capsys.readouterr().err
+    assert "bvlc_alexnet.caffemodel" in err and "no network (stood in for)" in err
 
 
 def test_eval_refuses_a_partial_mask_set_and_an_empty_split(
@@ -2799,8 +2896,9 @@ def test_out_of_memory_in_a_profile_window_writes_the_trace(
 def test_metrics_that_cannot_be_written_in_training_are_exit_code_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-142 (as answered), Q-161: a METRICS.json write that fails in ftgs train's final
-    evaluation is exit code 2 naming METRICS.json, after the checkpoint is saved (Q-132)."""
+    """Q-142 (as answered), Q-161 (as #380 changes it, #389): a METRICS.json write that fails in
+    ftgs train's final evaluation is exit code 2 naming METRICS.json alone, after the checkpoint
+    is saved (Q-132): the evaluator builds ꟻLIP, which downloads nothing (#387)."""
 
     def full(*args: Any, **kwargs: Any) -> None:
         raise OSError(28, "No space left on device")
@@ -2813,5 +2911,6 @@ def test_metrics_that_cannot_be_written_in_training_are_exit_code_2(
     capsys.readouterr()
     assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 2
     err = capsys.readouterr().err
-    assert "METRICS.json" in err and "No space left" in err
+    assert str(out / "METRICS.json") in err and "No space left" in err
+    assert "LPIPS" not in err and "network" not in err
     assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
