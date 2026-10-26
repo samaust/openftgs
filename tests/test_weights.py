@@ -11,6 +11,7 @@ import http.server
 import re
 import struct
 import threading
+import typing
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import safetensors.torch
 import torch
 
 from openftgs import _weights
+from openftgs.config import PercNet
 
 
 @pytest.fixture
@@ -367,6 +369,13 @@ def test_the_six_trunks_are_pinned_to_their_publishers_files() -> None:
     assert _weights.TRUNKS == tuple(_PUBLISHED)
     for name, (url, size, sha256) in _PUBLISHED.items():
         assert _weights.DOWNLOADS[name] == _weights.Download(url, size, sha256)
+
+
+def test_the_trunks_are_the_perc_net_values_with_weights() -> None:
+    """§2.1 `PercNet`, D-89: the trunks carry `perc_net`'s names, every network of D-89's
+    table but the weight-free ꟻLIP and HaarPSI, in the table's order."""
+    weight_free = ("flip", "haarpsi")
+    assert _weights.TRUNKS == tuple(n for n in typing.get_args(PercNet) if n not in weight_free)
 
 
 @pytest.mark.weights
