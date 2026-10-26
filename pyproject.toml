@@ -64,6 +64,8 @@ where = ["src"]
 openftgs = ["py.typed"]
 # D-65, Q-115: the vendored RoMa's license texts and its patch record ship with it.
 "openftgs._vendor.romatch" = ["LICENSE", "LICENSES/*", "VENDOR.json"]
+# D-65, D-89: so do the vendored ꟻLIP's license and its vendoring record (#383).
+"openftgs._vendor.flip" = ["LICENSE", "VENDOR.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -90,7 +92,15 @@ skip_empty = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-extend-exclude = [".claude", "docs", "src/openftgs/_vendor/romatch"]
+# D-65: the vendored RoMa and ꟻLIP, and U-23's reference copy of ꟻLIP (Q-252), stay as upstream
+# wrote them.
+extend-exclude = [
+    ".claude",
+    "docs",
+    "src/openftgs/_vendor/romatch",
+    "src/openftgs/_vendor/flip/flip_loss.py",
+    "tests/reference/flip",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
@@ -102,7 +112,14 @@ known-first-party = ["openftgs", "ftgs_harness"]
 python_version = "3.11"
 strict = true
 files = ["src/openftgs", "harness/src/ftgs_harness", "tests", "scripts"]
-exclude = ["^src/openftgs/_vendor/romatch/"]
+exclude = [
+    "^src/openftgs/_vendor/romatch/",
+    "^src/openftgs/_vendor/flip/flip_loss\\.py$",
+    "^tests/reference/flip/",
+]
+# D-65, D-89: the vendored ꟻLIP's classes are nn.Modules to mypy, but upstream's functions carry
+# no annotations; typed code may call them (#383).
+untyped_calls_exclude = ["openftgs._vendor.flip.flip_loss"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -121,4 +138,9 @@ ignore_missing_imports = true
 # D-65: the vendored RoMa is third-party code, kept as upstream wrote it.
 module = ["openftgs._vendor.romatch.*"]
 follow_imports = "skip"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# D-65, D-89: the vendored ꟻLIP too (#383); read for its classes, its errors ignored.
+module = ["openftgs._vendor.flip.flip_loss"]
 ignore_errors = true
