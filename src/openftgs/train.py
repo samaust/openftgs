@@ -386,6 +386,23 @@ def _builds_perceptual(loss: LossConfig) -> bool:
     return loss.lambda_perc is None or loss.lambda_perc > 0.0
 
 
+# Q-250: D-89's networks without trained weights, which have no bfloat16 path (B-4 measures
+# bfloat16 for the trunk networks only).
+_WEIGHT_FREE = ("flip", "haarpsi")
+
+
+def _check_perceptual(cfg: TrainConfig) -> None:
+    """Q-250: bf16 with a weight-free network is refused before anything is built; the
+    `TrainConfig` stays valid on its own, so it can move to a trunk network. Without a network
+    (λ_perc = 0) nothing would run in bfloat16, and nothing is refused (Q-T388.1)."""
+    net = cfg.loss.perc_net
+    if cfg.perf.perc_precision == "bf16" and net in _WEIGHT_FREE and _builds_perceptual(cfg.loss):
+        raise ValueError(
+            f"perf.perc_precision 'bf16' runs a trunk network in bfloat16 (D-52), and "
+            f"loss.perc_net {net!r} has no bfloat16 path: use 'tf32' or 'ieee', or a trunk network"
+        )
+
+
 def _perceptual_network(cfg: TrainConfig) -> PerceptualLoss | LPIPSLoss:
     """The trainer's perceptual network for `cfg`, on the CPU. LPIPS's two backbones, still
     accepted as `perc_net` until #392 (#380's expand step), are built as before (Q-172, Q-223);
@@ -580,6 +597,7 @@ class Trainer:
     def _configure(self, cfg: TrainConfig, dataset: MultiViewVideo, device: str) -> None:
         _check_ablation(cfg)
         _check_perf(cfg.perf)
+        _check_perceptual(cfg)  # Q-250
         self._cfg = cfg
         self._dataset = dataset
         self._device = torch.device(device)

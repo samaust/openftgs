@@ -37,6 +37,7 @@ from openftgs.config import (
     InitConfig,
     LossConfig,
     OptimConfig,
+    PercNet,
     PerfConfig,
     RelocConfig,
     TrainConfig,
@@ -1099,6 +1100,26 @@ def test_the_perceptual_network_is_built_when_its_weight_is_none_or_positive(
     expected = 0.8 * terms["l1"] + 0.2 * terms["one_minus_ssim"] + 0.01 * terms["reg"]
     expected += weight * terms.get("perceptual", 0.0)
     assert terms["total"] == pytest.approx(expected, rel=1e-6, abs=0.0)
+
+
+@pytest.mark.parametrize("net", ["flip", "haarpsi"])
+@pytest.mark.parametrize("lambda_perc", [None, 0.5])
+def test_bf16_is_refused_for_a_weight_free_network_when_the_trainer_is_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: PercNet, lambda_perc: float | None
+) -> None:
+    """D-52, Q-250: `perc_precision = "bf16"` with ꟻLIP or HaarPSI, which have no bfloat16
+    path, is a ValueError when the `Trainer` is built, before any network is; the
+    `TrainConfig` itself is valid. With λ_perc = 0 no network is built, and the run trains as
+    any other (Q-T388.1)."""
+    built = _record_networks(monkeypatch)
+    video = _scene(tmp_path)
+    perf = PerfConfig(perc_precision="bf16")
+    cfg = TrainConfig(loss=LossConfig(perc_net=net, lambda_perc=lambda_perc), perf=perf)
+    with pytest.raises(ValueError, match=rf"bf16.*{net}"):
+        Trainer(cfg, video, _init_points(), device="cpu")
+    assert built == []
+    unweighted = dataclasses.replace(cfg, loss=LossConfig(perc_net=net, lambda_perc=0.0))
+    assert _all_finite([Trainer(unweighted, video, _init_points(), device="cpu").step()])
 
 
 # With the LPIPS networks (weights; D-77, Q-74).
