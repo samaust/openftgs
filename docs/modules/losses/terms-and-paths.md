@@ -1,6 +1,6 @@
 # Loss terms and their paths in `openftgs.losses`
 
-How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are the owner's answers recorded in `docs/clean-room/questions.md` (Q-41, Q-42). The signature of `total_loss` (D-77) and U-11's reading of the stop-gradient (D-78) entered the spec in revision 549c.
+How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the perceptual networks of D-89, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are the owner's answers recorded in `docs/clean-room/questions.md` (Q-41, Q-42); the networks' input checks are Q-T381.1's, and λ_perc = None is Q-249's. The signature of `total_loss` (D-77) and U-11's reading of the stop-gradient (D-78) entered the spec in revision 549c, and the perceptual networks (D-89) in revision 549o.
 
 ## Input layout
 
@@ -19,7 +19,27 @@ The two paths agree in value. "same" means zero padding in both, and fused-ssim'
 
 B-4 (#228, Calibration data) measured what fused-ssim gains: its forward and the prediction's backward take 0.41 ms at 1352×1014 and 0.66 ms at 1920×1080, against 8.5 and 13.2 ms for the PyTorch fallback in TF32, about 95 % less, so it stays in use whenever it imports and Q-42 needs no second look.
 
-## The LPIPS wrapper
+## The perceptual networks
+
+`PerceptualLoss(net)` builds the perceptual network `LossConfig.perc_net` names, one of D-89's eight, ꟻLIP by default (D-9). A name outside D-89's table is a ValueError before anything is built, LPIPS's "vgg" and "alex" among them. What every network shares is D-89's common contract:
+
+- `forward(pred, gt)` takes two images in Q-41's layout, [..., H, W, 3] of one shape, dtype and device, checked on their shapes alone, and returns the mean over the batch as a 0-d tensor.
+- The reference is detached, D-89's "reference without a gradient": it gets none even when it asks for one, and autograd records nothing on its branch, the separate no-grad pass §2.4 asks for.
+- The network is frozen and in evaluation mode. `.train()` leaves it there, also when a parent module calls it.
+
+**ꟻLIP** (`flip`) is the vendored LDR-ꟻLIP loss of `openftgs._vendor.flip` (`docs/modules/losses/vendored-flip.md`), on the batch-first views of the two images at 67.0 pixels per degree. The value is passed as a Python float, the key of the vendored copy's filter cache, so a training loss and #387's metric at the same value share the filters. 67.0 and the published default, 67.02, give filters of the same size but not the same values. The loss clamps both images to [0, 1] itself, so a render above 1 gets no gradient there, while L1 and SSIM still see it. Its constants are float32, so it refuses images of another dtype with a ValueError rather than casting them (Q-T381.1). On identical images it gives about 3.2·10⁻⁷, its stabilizer, not 0.
+
+**HaarPSI** (`haarpsi`) is 1 − HaarPSI with D-89's settings, piq's defaults: 3 scales, subsampled, c = 30, α = 4.2, and a data range of 1. The render is clamped to [0, 1] first. It is adapted from piq 0.8.0's `haarpsi` (Apache-2.0, NOTICE; source log T381.1 to T381.3), not imported: piq is not a dependency, and it requires torchvision. The code carries piq's attribution and lists what changed, and on random images it agrees with piq bitwise in float32 and float64, on the CPU and on CUDA. The changes:
+
+- piq's `assert`s give way to Q-41's checks and piq's 16-pixel minimum side, which three scales need. Its check that both images lie in [0, 1] goes: it reads them back to the host, a synchronization §2.4 rule 3 forbids, and D-89's clamp of the render covers it. The reference, E7's I in [0, 1], is used as given (Q-T381.1).
+- The YIQ matrix and the Haar filters are built once per device and dtype and kept, outside inference mode, as the vendored ꟻLIP keeps its constants. piq copied the matrix to the device at every call.
+- The pairs of Haar channels are strided slices rather than piq's tuple indices, which copy an index tensor to the device.
+
+So after one call on a device, a forward and backward pass make no synchronization. Two quirks come with piq's construction. HaarPSI of two flat images is infinite, because their weights are all zero. And in float32, 1 − HaarPSI(I, I) is a few 10⁻⁶ rather than 0, from rounding the logit of float32's sigmoid(4.2): up to 3.2·10⁻⁵ of its value under σ = 16/255 noise, above U-9's 10⁻⁵, which #381 reported to the owner. In float64 it is below 10⁻¹⁴.
+
+**The trunk networks.** `vgg16_oxford` and `alexnet_bvlc` come with #385, and the four DINO networks, which need `[init]`, with #386. Until then `PerceptualLoss` raises NotImplementedError naming the ticket. Their weights are those of the next section, and their calibrated weights are already in the resolver's table (below).
+
+### LPIPSLoss, until the contract ticket
 
 `LPIPSLoss` wraps the lpips package's network for the backbone `LossConfig.perc_net` names (D-9). It maps its inputs from the image range to the network's documented input range (D-9, D-68) and returns the mean over the batch. lpips freezes only its trunk and puts dropout in its linear layers, so the wrapper keeps the network private, freezes every parameter and keeps the network in evaluation mode even when a parent module calls `.train()` (Q-41). With the weights frozen and a target that doesn't require a gradient, autograd records nothing on the target's branch, which is the separate no-grad target pass §2.4 asks for, without reimplementing lpips.
 
@@ -47,9 +67,11 @@ The CPU tests check the cache and its refusals with small stand-in files and a p
 
 `total_loss` composes E7 and E9 (D-37) from `LossConfig`:
 
-- The perceptual network is passed in as the keyword `perceptual`, built once by the trainer (D-77).
+- The perceptual network is passed in as the keyword `perceptual`, a `PerceptualLoss` built once by the trainer (D-77); until #392, an `LPIPSLoss` too.
 - The returned dict holds detached zero-dimensional tensors on the images' device, so computing the loss never synchronizes with the host (§2.4 rule 3, D-77). The trainer reads them at its logging period.
 - A term whose λ is zero is not computed and has no key for the whole run, which saves the perceptual pass in λ_perc = 0 ablations (Q-41).
 - After `reg_until`, which names the last iteration with L_reg (D-10), L_reg leaves the total but is still reported under its key, computed without a gradient. The keys therefore stay fixed for a run, and the loss trace D-10 names shows L_reg after a cutoff (Q-41, owner's answer).
 - The iteration index is counted as D-41 counts it.
-- A perceptual network built for another backbone than `LossConfig.perc_net` is rejected (D-9, Q-41).
+- λ_perc = None is the calibrated weight of `LossConfig.perc_net`, D-89's λ column: 0.415 for ꟻLIP, 0.0617 for HaarPSI, and the trunk networks' from 0.00164 to 0.00484. A private resolver in this module looks it up, so §2.1 gains nothing and no other module imports a private name. The trainer, the harness adapter and `ftgs bench` build the network when λ_perc is None or positive, and `config.json` keeps `null` as written (Q-249). LPIPS's backbones, still accepted as `perc_net` until #392, have no calibrated weight, so None with one of them is a ValueError naming D-89.
+- `total_loss` raises when the resolved weight is positive and no network is passed (D-77, Q-249).
+- A perceptual network built for another `perc_net` than `LossConfig.perc_net` is rejected, whatever λ_perc (D-9, Q-41). `PerceptualLoss` and, until #392, `LPIPSLoss` both keep the name they were built for.
