@@ -173,8 +173,9 @@ _HAARPSI_ALPHA = 4.2
 # check of the values, which reads them back to the host, to D-89's clamp of the render
 # (Q-T381.1); the YIQ matrix and the Haar filters are built once per device and dtype rather
 # than at every call, and the pairs of Haar channels are taken by strided slices rather than by
-# tuple indices, since both copies to the GPU synchronize (§2.4 rule 3); the helpers are inlined;
-# "mean" is the only reduction.
+# tuple indices, since both copies to the GPU synchronize (§2.4 rule 3); the helpers are inlined,
+# `similarity_map` without its masking terms, whose coefficient is 0 here; "mean" is the only
+# reduction. On random images it agrees with piq bitwise (source log T381.3).
 
 
 @functools.cache
