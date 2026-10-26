@@ -1526,7 +1526,7 @@ def test_eval_of_a_model_that_changes_while_it_is_read_is_exit_code_2(
 ) -> None:
     """Q-154, Q-136: ftgs eval hashes MODEL before and after reading it; a checkpoint whose
     manifest.json changes in between, as a periodic save changes RUN_DIR/checkpoint (D-83),
-    is exit 2 and nothing is written, before any LPIPS weights are needed."""
+    is exit 2 and nothing is written, before the evaluator is built."""
     import openftgs.io
 
     scene, checkpoint = _trained(tmp_path)

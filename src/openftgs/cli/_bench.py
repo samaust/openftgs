@@ -2,10 +2,11 @@
 """`ftgs bench`: the performance benchmarks B-1 to B-8 of §3.4, each a subcommand that writes
 BENCH.json.
 
-Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-55, D-56, D-81,
-D-88 (`--model`). Q-166 (BENCH.json and the exit codes), Q-199 (a numerical failure in a
-run), Q-168 (the setups), Q-178 and Q-189 (B-6), Q-174 (the index threshold T that B-7 sets),
-Q-194, Q-195, Q-239 and Q-240 (B-7), Q-169, Q-192 and Q-193 (B-8).
+Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-52, D-55, D-56,
+D-81, D-88 (`--model`), D-89 (B-4's networks). Q-166 (BENCH.json and the exit codes), Q-199 (a
+numerical failure in a run), Q-168 (the setups), Q-178 and Q-189 (B-6), Q-190, Q-253, Q-T389.1
+and Q-T389.2 (B-4), Q-174 (the index threshold T that B-7 sets), Q-194, Q-195, Q-239 and Q-240
+(B-7), Q-169, Q-192 and Q-193 (B-8).
 docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
 Each subcommand has an entry in `_BENCHMARKS`, at the end of this module: its B-n, the function
@@ -36,7 +37,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from openftgs.cli import (
     _INPUT,
@@ -55,9 +56,10 @@ if TYPE_CHECKING:
     from torch import Tensor
 
     from openftgs._stages import Timing
-    from openftgs.config import TrainConfig
+    from openftgs.config import PercNet, TrainConfig
     from openftgs.data import MultiViewVideo
     from openftgs.eval import Evaluator
+    from openftgs.losses import PerceptualLoss
     from openftgs.model import FreeTimeGaussians
     from openftgs.optim import FTGSOptimizer
     from openftgs.train import StepLog, Trainer
@@ -1701,41 +1703,46 @@ def _budget(
     }
 
 
-# -- B-4: the losses' precisions and layouts (§3.4, D-52; Q-42, Q-172, Q-173, Q-190) -----------
+# -- B-4: the perceptual networks' precisions and layouts, and SSIM's two paths (§3.4, D-52,
+# D-89; Q-42, Q-172, Q-173, Q-190, Q-253, Q-T389.1, Q-T389.2) ---------------------------------
 
 _LOSS_SIZES: tuple[tuple[int, int], ...] = ((1352, 1014), (1920, 1080))  # §3.4 B-4: width, height
-_LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52
-# Q-190: contiguous NCHW inputs; channels-last inputs, as `LPIPSLoss` passes a render (its
-# batch-first view of [..., H, W, 3] is channels-last), so training's path until #326; and both
-# the inputs and the network's weights channels-last.
-_LOSS_LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
-# Q-223: the layout training gives the network per precision since #326, with autotuning (under
-# `deterministic`, TF32 keeps channels-last inputs); `train._perceptual_network` decides.
-_TRAINING_LAYOUTS = {"ieee": "nchw", "tf32": "nchw", "bf16": "channels_last_inputs"}
+# §3.4 B-4: each perceptual network of D-89, in its table's order (`config.PercNet`); the
+# benchmark passes them to its child processes.
+_LOSS_NETWORKS: tuple[str, ...] = (
+    "flip",
+    "haarpsi",
+    "vgg16_oxford",
+    "alexnet_bvlc",
+    "dinov2_s14",
+    "dinov2_b14",
+    "dino_s16",
+    "dino_b16",
+)
+_WEIGHT_FREE = ("flip", "haarpsi")  # D-89: no pretrained weights, so no bfloat16 (Q-250)
+_LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52; bfloat16 for the trunk networks only
+# Q-T389.1: the render's batch-first view as it comes, channels-last in memory, which every
+# network takes in training until #394 sets each one's layout (Q-251); and a contiguous NCHW
+# input, the copy #394 may give a network instead. Channels-last weights left with LPIPS (Q-173).
+_LOSS_LAYOUTS = ("nchw", "channels_last_inputs")
+_TRAINING_LAYOUT = "channels_last_inputs"  # Q-251: every network's in training until #394
 _LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
 _LOSS_REPETITIONS = 30  # Q-190
 _LOSS_NOISE = 0.05  # Q-190: the prediction's seeded Gaussian noise
 _GAIN_THRESHOLD = 0.03  # Q-173: a gain is at least 3 % at both sizes
-# Q-190: the comparisons the turn-on rule reads (Q-173), and the others reported beside
-# them, each as (baseline, variant) LPIPS cases `(precision, layout, autotuning)`.
-_LPIPS_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, bool]]] = {
+# Q-T389.1: per network, the comparisons the turn-on rule reads (Q-173) and the others reported
+# beside them, each as (baseline, variant) cases `(precision, layout, autotuning)`; the baseline
+# is the network's plain path, the render's view without autotuning, as Q-190's was LPIPS-VGG's.
+# "bf16" applies to the trunk networks only.
+_PERCEPTUAL_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, bool]]] = {
     "autotuning": (("tf32", "channels_last_inputs", False), ("tf32", "channels_last_inputs", True)),
-    "channels_last_weights": (
-        ("tf32", "channels_last_inputs", False),
-        ("tf32", "channels_last_inputs_and_weights", False),
-    ),
-    "autotuning_and_channels_last_weights": (
-        ("tf32", "channels_last_inputs", False),
-        ("tf32", "channels_last_inputs_and_weights", True),
-    ),
-    # Q-223: the path Q-173's change adopted (#326) against training's earlier one; B-4's NCHW
-    # cases start from an NCHW leaf, so they leave out the trainer's copy, which B-1 includes
+    "nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", False)),
     "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
 }
-# The exact options Q-173's rule decides: since #326, autotuning together with NCHW inputs (Q-223)
-_TURN_ON = ("autotuning_and_nchw_inputs", "channels_last_weights")
+# The exact options Q-173's rule decides for each network, which #394 applies (Q-251).
+_TURN_ON = ("autotuning", "nchw_inputs", "autotuning_and_nchw_inputs")
 # The child process of one autotuning setting (Q-190). cuDNN caches the algorithm it picked
 # for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off
 # and on can't be compared in one process. `fused_ssim` can't be imported there, so
@@ -1749,6 +1756,54 @@ _CHILD = (
 # line of its output; one the interpreter never gives (1 for an uncaught exception, 2 for a
 # usage error).
 _CHILD_OUT_OF_MEMORY = 75
+
+
+def _precisions(net: str) -> tuple[str, ...]:
+    """§3.4 B-4: IEEE float32 and TF32 for every network, and bfloat16 for the trunk ones."""
+    return _LOSS_PRECISIONS[:2] if net in _WEIGHT_FREE else _LOSS_PRECISIONS
+
+
+def _cached_weights(networks: Sequence[str]) -> tuple[dict[str, str], list[str]]:
+    """Q-253, Q-T389.2: for each trunk network among `networks`, the file in torch.hub's cache
+    it will be built from, and, for one with none, its name and the publisher's file a build
+    would download. Only whether the files are there is looked at."""
+    from openftgs._weights import TRUNKS, trunk_files
+
+    found: dict[str, str] = {}
+    missing: list[str] = []
+    for net in networks:
+        if net not in TRUNKS:
+            continue
+        files = trunk_files(net)
+        cached = next((path for path in files if path.is_file()), None)
+        if cached is None:
+            missing.append(f"{net} ({files[-1]})")
+        else:
+            found[net] = str(cached)
+    return found, missing
+
+
+def _perceptual_network(net: str) -> PerceptualLoss:
+    """D-89's network `net` as `openftgs.losses.PerceptualLoss` builds it, on the CPU: frozen,
+    in evaluation mode, a trunk's weights checked against their SHA-256 (Q-258)."""
+    from openftgs.losses import PerceptualLoss
+
+    return PerceptualLoss(cast("PercNet", net))
+
+
+def _built_networks(networks: Sequence[str]) -> dict[str, PerceptualLoss]:
+    """Q-T389.2: every network of B-4 built in the benchmark's process before anything is
+    measured, so that a cached file that fails its check (an OSError naming it, Q-258) and a
+    DINO network without the [init] extra (an ImportError naming it, Q-248) are exit 2 before
+    any child starts (Q-142, Q-166)."""
+    built: dict[str, PerceptualLoss] = {}
+    for net in networks:
+        try:
+            with _environment_error(f"B-4's perceptual network {net!r}"):
+                built[net] = _perceptual_network(net)
+        except ImportError as error:
+            _fail(f"B-4's perceptual network {net!r}: {error}")
+    return built
 
 
 def _loss_images(
@@ -1819,66 +1874,52 @@ def _cudnn_flags(*, tf32: bool, autotuning: bool) -> Iterator[None]:
         torch.set_float32_matmul_precision(matmul)
 
 
-def _lpips_networks() -> dict[bool, Any]:
-    """lpips 0.1.4's LPIPS-VGG on CUDA, frozen and in evaluation mode as `LPIPSLoss` keeps it
-    (Q-41), called directly (PRD #220); keyed by whether its weights are channels-last."""
-    import copy
-    import warnings
+def _perceptual_inputs(gt: Tensor, pred: Tensor, layout: str) -> tuple[Tensor, Tensor]:
+    """The prediction, a leaf that requires its gradient, and the target, in the layout's
+    memory (Q-T389.1): for `channels_last_inputs` [1, H, W, 3] contiguous, as a render comes,
+    whose batch-first view `PerceptualLoss` takes is channels-last; for `nchw` [1, 3, H, W]
+    contiguous, which the trainer would copy a render into, the copy itself left out (B-1 times
+    the whole path)."""
+    if layout == "nchw":
+        x = pred[None].permute(0, 3, 1, 2).contiguous().requires_grad_()
+        return x, gt[None].permute(0, 3, 1, 2).contiguous()
+    return pred[None].clone().requires_grad_(), gt[None].clone()
 
-    import lpips
+
+def _perceptual_forward(
+    network: Any, x: Tensor, y: Tensor, *, precision: str, layout: str
+) -> Tensor:
+    """`network` on B-4's inputs as [1, H, W, 3] images (Q-41), an NCHW input through its
+    [1, H, W, 3] view, whose batch-first view is the contiguous input itself; for "bf16" under
+    bfloat16 autocast around the call, the images float32, the value cast to float32, as the
+    trainer runs a trunk network (`train._Bf16PerceptualLoss`; Q-172, Q-250)."""
     import torch
 
-    with warnings.catch_warnings():
-        # As in `LPIPSLoss`: lpips passes torchvision's deprecated `pretrained=True`.
-        warnings.filterwarnings("ignore", "The parameter 'pretrained'", UserWarning)
-        warnings.filterwarnings("ignore", "Arguments other than a weight enum", UserWarning)
-        network = lpips.LPIPS(net="vgg", verbose=False)
-    network.requires_grad_(False)
-    network.eval()
-    network = network.to("cuda")
-    channels_last = copy.deepcopy(network).to(memory_format=torch.channels_last)
-    return {False: network, True: channels_last}
-
-
-def _lpips_forward(network: Any, x: Tensor, y: Tensor, precision: str) -> Tensor:
-    """LPIPS of [1, 3, H, W] images in [0, 1], mapped to [−1, 1] as `LPIPSLoss` maps them (D-68),
-    under bfloat16 autocast for "bf16" (Q-172), as float32."""
-    import torch
-
+    if layout == "nchw":
+        x, y = x.permute(0, 2, 3, 1), y.permute(0, 2, 3, 1)
     if precision == "bf16":
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            value = network(x, y, normalize=True).mean()
-    else:
-        value = network(x, y, normalize=True).mean()
-    out: Tensor = value.float()
-    return out
+            value = network(x, y)
+        out: Tensor = value.float()
+        return out
+    plain: Tensor = network(x, y)
+    return plain
 
 
-def _lpips_inputs(gt: Tensor, pred: Tensor, layout: str) -> tuple[Tensor, Tensor]:
-    """The prediction, a leaf that requires its gradient, and the target, [1, 3, H, W] in the
-    layout's memory format."""
-    import torch
-
-    memory = torch.contiguous_format if layout == "nchw" else torch.channels_last
-    x = pred[None].permute(0, 3, 1, 2).clone(memory_format=memory).requires_grad_()
-    y = gt[None].permute(0, 3, 1, 2).clone(memory_format=memory)
-    return x, y
-
-
-def _lpips_call(
+def _perceptual_call(
     network: Any, gt: Tensor, pred: Tensor, *, precision: str, layout: str
 ) -> Callable[[], None]:
-    """One B-4 LPIPS call: the forward on both images as the stage `loss.perceptual`, then the
-    prediction's gradient as the stage `backward`."""
+    """One B-4 call of a perceptual network: the forward on both images and the mean as the
+    stage `loss.perceptual`, then the prediction's gradient as the stage `backward`."""
     import torch
 
     from openftgs._stages import stage
 
-    x, y = _lpips_inputs(gt, pred, layout)
+    x, y = _perceptual_inputs(gt, pred, layout)
 
     def call() -> None:
         with stage("loss.perceptual"):
-            value = _lpips_forward(network, x, y, precision)
+            value = _perceptual_forward(network, x, y, precision=precision, layout=layout)
         with stage("backward"):
             torch.autograd.grad(value, x)
 
@@ -1940,13 +1981,25 @@ def _fused_ssim_importable() -> bool:
     return True
 
 
+def _release_networks() -> None:
+    """Frees the last network's memory before the next is built (Q-T389.1): VGG16's autotuned
+    workspace and the ViT-B weights shouldn't sit in the allocator beside the next network."""
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _losses_child(spec: str) -> None:
     """B-4's cases of one cuDNN autotuning setting, run as `python -c _CHILD SPEC` (Q-190),
     where `fused_ssim` can't be imported (PRD #220): `SPEC` is JSON with the scene's path, the
-    sizes, the seed, the repetitions and the setting. Every LPIPS case, then the PyTorch SSIM
-    path with TF32 on as in training (D-52), at every size. Prints its cases as one line of
-    JSON; out of GPU memory, prints `{"out_of_memory": error}` instead and exits with
-    `_CHILD_OUT_OF_MEMORY` (Q-166 as answered)."""
+    networks, the sizes, the seed, the repetitions and the setting. Every network's cases, one
+    network at a time, then the PyTorch SSIM path with TF32 on as in training (D-52), at every
+    size. Prints its cases as one line of JSON; out of GPU memory, prints
+    `{"out_of_memory": error}` instead and exits with `_CHILD_OUT_OF_MEMORY` (Q-166 as
+    answered)."""
     import torch
 
     if _fused_ssim_importable():
@@ -1960,7 +2013,8 @@ def _losses_child(spec: str) -> None:
 
 
 def _measure_in_child(given: dict[str, Any]) -> list[dict[str, Any]]:
-    """`_losses_child`'s measurements, from its parsed SPEC: the cases it prints."""
+    """`_losses_child`'s measurements, from its parsed SPEC: the cases it prints. The benchmark
+    built and checked every network before starting the child (Q-T389.2)."""
     from openftgs.data import MultiViewVideo
 
     autotuning, repetitions = bool(given["autotuning"]), int(given["repetitions"])
@@ -1969,8 +2023,15 @@ def _measure_in_child(given: dict[str, Any]) -> list[dict[str, Any]]:
         (int(w), int(h)): _loss_images(video, int(w), int(h), seed=given["seed"], device="cuda")
         for w, h in given["sizes"]
     }
-    timed = _lpips_timed(_lpips_networks(), images, autotuning=autotuning, repetitions=repetitions)
-    cases = [{"case": _lpips_case(*key), "figures": figures} for key, figures in timed.items()]
+    cases: list[dict[str, Any]] = []
+    for net in given["networks"]:
+        network = _perceptual_network(str(net)).to("cuda")
+        timed = _perceptual_timed(
+            str(net), network, images, autotuning=autotuning, repetitions=repetitions
+        )
+        cases += [{"case": _perceptual_case(*key), "figures": f} for key, f in timed.items()]
+        del network
+        _release_networks()
     for (width, height), (gt, pred) in images.items():
         with _cudnn_flags(tf32=True, autotuning=autotuning):
             figures = _call_figures(_ssim_call(gt, pred), "loss.ssim", repetitions)
@@ -1981,7 +2042,7 @@ def _measure_in_child(given: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _child_cases(
-    scene: Path, sizes: Sequence[tuple[int, int]], *, autotuning: bool
+    scene: Path, sizes: Sequence[tuple[int, int]], *, networks: Sequence[str], autotuning: bool
 ) -> list[dict[str, Any]]:
     """The cases of one autotuning setting, from a child process (`_losses_child`) running this
     openftgs: the folder it is imported from goes first on the child's PYTHONPATH. A child out
@@ -1995,6 +2056,7 @@ def _child_cases(
     env["PYTHONPATH"] = os.pathsep.join(p for p in (root, env.get("PYTHONPATH")) if p)
     spec = {
         "scene": str(scene.resolve()),
+        "networks": list(networks),
         "sizes": [list(size) for size in sizes],
         "seed": _SEED,
         "repetitions": _LOSS_REPETITIONS,
@@ -2017,54 +2079,56 @@ def _child_cases(
     return cases
 
 
-# B-4's images per (width, height), as (target, prediction); an LPIPS case's key.
+# B-4's images per (width, height), as (target, prediction); a perceptual case's key.
 _Images = dict[tuple[int, int], tuple["Tensor", "Tensor"]]
-_LpipsKey = tuple[int, int, str, str, bool]
+_PerceptualKey = tuple[str, int, int, str, str, bool]
 
 
-def _lpips_case(
-    width: int, height: int, precision: str, layout: str, autotuning: bool
+def _perceptual_case(
+    net: str, width: int, height: int, precision: str, layout: str, autotuning: bool
 ) -> dict[str, Any]:
-    """An LPIPS case's parameters (Q-190, Q-180)."""
-    case = {"loss": "lpips_vgg", "width": width, "height": height, "precision": precision}
-    return case | {"layout": layout, "autotuning": autotuning}
+    """A perceptual network's case (Q-T389.1, Q-180)."""
+    case = {"loss": "perceptual", "network": net, "width": width, "height": height}
+    return case | {"precision": precision, "layout": layout, "autotuning": autotuning}
 
 
-def _lpips_deviations(network: Any, images: _Images) -> list[dict[str, Any]]:
-    """Per size, TF32's and bf16's deviation from IEEE float32 in value and in the prediction's
-    gradient (Q-190), with the network as training ran it until #326 (and bf16 still does, but
-    for autotuning; Q-223): NCHW weights, channels-last inputs, autotuning off."""
+def _perceptual_deviations(net: str, network: Any, images: _Images) -> list[dict[str, Any]]:
+    """Per size, TF32's and, for a trunk network, bf16's deviation from IEEE float32 in value
+    and in the prediction's gradient (Q-190, Q-T389.1), with the network as training runs it
+    until #394 (the render's view, Q-251), autotuning off."""
     import torch
 
     cases: list[dict[str, Any]] = []
     for (width, height), (gt, pred) in images.items():
         results: dict[str, tuple[Tensor, Tensor]] = {}
-        for precision in _LOSS_PRECISIONS:
-            x, y = _lpips_inputs(gt, pred, "channels_last_inputs")
+        for precision in _precisions(net):
+            x, y = _perceptual_inputs(gt, pred, _TRAINING_LAYOUT)
             with _cudnn_flags(tf32=precision != "ieee", autotuning=False):
-                value = _lpips_forward(network, x, y, precision)
+                value = _perceptual_forward(
+                    network, x, y, precision=precision, layout=_TRAINING_LAYOUT
+                )
                 (grad,) = torch.autograd.grad(value, x)
             results[precision] = (value.detach(), grad)
-        for precision in ("tf32", "bf16"):
+        for precision in _precisions(net)[1:]:
             figures = _deviation(*results[precision], *results["ieee"])
-            case = {"deviation": precision, "width": width, "height": height}
+            case = {"deviation": precision, "network": net, "width": width, "height": height}
             cases.append({"case": case, "figures": figures})
     return cases
 
 
-def _lpips_timed(
-    networks: dict[bool, Any], images: _Images, *, autotuning: bool, repetitions: int
-) -> dict[_LpipsKey, dict[str, Any]]:
-    """Every LPIPS case's figures under one autotuning setting (Q-190)."""
-    timed: dict[_LpipsKey, dict[str, Any]] = {}
+def _perceptual_timed(
+    net: str, network: Any, images: _Images, *, autotuning: bool, repetitions: int
+) -> dict[_PerceptualKey, dict[str, Any]]:
+    """Every case of the network `net` under one autotuning setting (Q-190, Q-T389.1): each
+    size, precision and layout."""
+    timed: dict[_PerceptualKey, dict[str, Any]] = {}
     for (width, height), (gt, pred) in images.items():
-        for precision in _LOSS_PRECISIONS:
+        for precision in _precisions(net):
             for layout in _LOSS_LAYOUTS:
-                network = networks[layout == "channels_last_inputs_and_weights"]
-                call = _lpips_call(network, gt, pred, precision=precision, layout=layout)
+                call = _perceptual_call(network, gt, pred, precision=precision, layout=layout)
                 with _cudnn_flags(tf32=precision != "ieee", autotuning=autotuning):
                     figures = _call_figures(call, "loss.perceptual", repetitions)
-                timed[(width, height, precision, layout, autotuning)] = figures
+                timed[(net, width, height, precision, layout, autotuning)] = figures
     return timed
 
 
@@ -2078,54 +2142,72 @@ def _ssim_fused_timed(images: _Images) -> dict[tuple[int, int], dict[str, Any]]:
 
 
 def _losses(ctx: _Context) -> _Result:
-    """B-4 (§3.4, D-52): LPIPS-VGG's forward and the prediction's backward in IEEE float32,
-    TF32 and bfloat16, with NCHW inputs, channels-last inputs and channels-last inputs and
-    weights, with cuDNN autotuning off and on; SSIM through fused-ssim and through the PyTorch
-    path; bf16's (and TF32's) deviation from IEEE float32 in value and gradient; at 1352×1014
-    and 1920×1080 (Q-190). The deviations and fused-ssim run in this process, everything
-    else in one child process per autotuning setting. The gains Q-173's rule reads are cases
-    too; the rule's B-1 half is a rerun of B-1."""
-    import gc
-
-    import torch
-
+    """B-4 (§3.4, D-52, D-89): each perceptual network of D-89, its forward and the
+    prediction's backward in IEEE float32, TF32 and, for the trunk networks, bfloat16, with
+    NCHW inputs and the render's channels-last view, with cuDNN autotuning off and on; SSIM
+    through fused-ssim and through the PyTorch path; TF32's and bf16's deviation from IEEE
+    float32 in value and gradient, per network; at 1352×1014 and 1920×1080 (Q-190, Q-T389.1).
+    The trunk networks' weights must be in torch.hub's cache already, and none is downloaded
+    (Q-253, Q-T389.2). Every network is built and the deviations and fused-ssim are measured in
+    this process; the timed cases in one child process per autotuning setting. The gains Q-173's
+    rule reads are cases too; the rule's B-1 half is a rerun of B-1."""
     sizes = [(int(w), int(h)) for w, h in _LOSS_SIZES]
-    with _environment_error("LPIPS networks"):  # exit 2 here, before any child starts
-        networks = _lpips_networks()
+    networks = list(_LOSS_NETWORKS)
+    weights, missing = _cached_weights(networks)
+    if missing:  # Q-253, Q-T389.2: before anything runs, and nothing downloaded
+        _fail(
+            "B-4 needs the trunk networks' weights in torch.hub's cache and doesn't download "
+            f"them; missing {', '.join(missing)} (building openftgs.losses.PerceptualLoss(net) "
+            "once, as `ftgs train` does with that loss.perc_net, downloads its file)"
+        )
+    built = _built_networks(networks)  # exit 2 here, before anything is measured
     images = {size: _loss_images(ctx.video, *size, seed=_SEED, device="cuda") for size in sizes}
-    cases = _lpips_deviations(networks[False], images)
+    cases: list[dict[str, Any]] = []
+    for net in networks:
+        network = built.pop(net).to("cuda")
+        cases += _perceptual_deviations(net, network, images)
+        del network
+        _release_networks()
     fused = _fused_ssim_importable()
     ssim_fused = _ssim_fused_timed(images) if fused else {}
     for (width, height), figures in ssim_fused.items():
         case = {"loss": "ssim", "width": width, "height": height, "path": "fused"}
         cases.append({"case": case, "figures": figures})
-    del networks, images
-    gc.collect()
-    torch.cuda.empty_cache()  # for the child processes
+    del images
+    _release_networks()  # for the child processes
     children: list[dict[str, Any]] = []
     for autotuning in _LOSS_AUTOTUNING:
-        children += _child_cases(ctx.args.scene, sizes, autotuning=autotuning)
+        children += _child_cases(ctx.args.scene, sizes, networks=networks, autotuning=autotuning)
     cases += children
     timed = {
-        (c["width"], c["height"], c["precision"], c["layout"], c["autotuning"]): entry["figures"]
+        (c["network"], c["width"], c["height"], c["precision"], c["layout"], c["autotuning"]): (
+            entry["figures"]
+        )
         for entry in children
-        if (c := entry["case"])["loss"] == "lpips_vgg"
+        if (c := entry["case"])["loss"] == "perceptual"
     }
     ssim_torch = [entry for entry in children if entry["case"]["loss"] == "ssim"]
 
-    def compare(name: str, pairs: list[tuple[dict[str, Any], dict[str, Any]]]) -> None:
+    def compare(
+        name: str, pairs: list[tuple[dict[str, Any], dict[str, Any]]], net: str | None = None
+    ) -> None:
+        of = {} if net is None else {"network": net}
         gains = []
         for (width, height), (base, variant) in zip(sizes, pairs, strict=True):
             figures = _comparison(base, variant)
             gains.append(figures["gain"])
-            case = {"comparison": name, "width": width, "height": height}
+            case = {"comparison": name, **of, "width": width, "height": height}
             cases.append({"case": case, "figures": figures})
         smallest = min(gains)
         figures = {"smallest_gain": smallest, "meets_gain_threshold": smallest >= _GAIN_THRESHOLD}
-        cases.append({"case": {"comparison": name}, "figures": figures})
+        cases.append({"case": {"comparison": name, **of}, "figures": figures})
 
-    for name, (base, variant) in _LPIPS_COMPARISONS.items():
-        compare(name, [(timed[(*size, *base)], timed[(*size, *variant)]) for size in sizes])
+    for net in networks:
+        for name, (base, variant) in _PERCEPTUAL_COMPARISONS.items():
+            if variant[0] not in _precisions(net):  # bf16: the trunk networks only
+                continue
+            pairs = [(timed[(net, *size, *base)], timed[(net, *size, *variant)]) for size in sizes]
+            compare(name, pairs, net)
     if fused:
         torch_off = {
             (c["case"]["width"], c["case"]["height"]): c["figures"]
@@ -2149,22 +2231,34 @@ def _losses(ctx: _Context) -> _Result:
             f"target; the prediction adds Gaussian noise of σ {_LOSS_NOISE} (Q-190)"
         ),
         "seed": _SEED,
-        "lpips": "lpips 0.1.4, VGG, called directly; inputs mapped to [−1, 1] (D-68)",
-        "precisions": list(_LOSS_PRECISIONS),
+        "networks": networks,
+        "network": (
+            "openftgs.losses.PerceptualLoss(net), D-89's construction, frozen and in evaluation "
+            "mode, built on the CPU and moved to CUDA for its cases; its forward on [1, H, W, 3] "
+            "images (Q-41)"
+        ),
+        "weights": weights,
+        "precisions": {net: list(_precisions(net)) for net in networks},
+        "bf16": (
+            "bfloat16 autocast around the network's call, the images float32 and the value cast "
+            "to float32, as the trainer runs a trunk network (Q-172, Q-250); TF32 on"
+        ),
         "layouts": list(_LOSS_LAYOUTS),
-        "training_layout": dict(_TRAINING_LAYOUTS),
+        "training_layout": {net: _TRAINING_LAYOUT for net in networks},
         "autotuning": list(_LOSS_AUTOTUNING),
         "processes": (
-            "the deviations and fused-ssim in the benchmark's process; LPIPS and the PyTorch "
-            "SSIM path in one child process per autotuning setting, in which fused_ssim can't "
-            "be imported"
+            "the networks' construction, the deviations and fused-ssim in the benchmark's "
+            "process; every network's cases, one network at a time, and the PyTorch SSIM path "
+            "in one child process per autotuning setting, in which fused_ssim can't be imported"
         ),
         "ssim": cfg_ssim,
         "fused_ssim": fused,
         "warmup": _WARMUP,
         "repetitions": _LOSS_REPETITIONS,
         "clock": "CUDA events: loss.perceptual or loss.ssim (forward), backward (the prediction's)",
-        "comparisons": {name: [list(b), list(v)] for name, (b, v) in _LPIPS_COMPARISONS.items()},
+        "comparisons": {
+            name: [list(b), list(v)] for name, (b, v) in _PERCEPTUAL_COMPARISONS.items()
+        },
         "turn_on": list(_TURN_ON),
         "gain_threshold": _GAIN_THRESHOLD,
     }
