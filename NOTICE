@@ -58,3 +58,18 @@ it calls (piq/functional/colour_conversion.py, piq/functional/filters.py, piq/fu
 By Sergey Kastryulin and the piq contributors (the package's metadata names its author; its
 license file names no copyright holder, and it has no NOTICE file).
 Licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+
+Pretrained weights
+------------------
+
+openftgs downloads the pretrained weights of its trunk perceptual networks from their
+publishers at first use; it neither includes nor redistributes them.
+
+The perceptual network vgg16_oxford uses the 16-layer VGG model of the Visual Geometry Group,
+University of Oxford, from its Caffe release
+(https://www.robots.ox.ac.uk/~vgg/research/very_deep/), whose convolutions openftgs converts
+into the user's torch.hub cache at first use. The model is licensed under the Creative Commons
+Attribution 4.0 International License (https://creativecommons.org/licenses/by/4.0/), with
+attribution to its technical report: Karen Simonyan and Andrew Zisserman, "Very Deep
+Convolutional Networks for Large-Scale Image Recognition", arXiv:1409.1556 (2014).

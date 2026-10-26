@@ -14,8 +14,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from openftgs._caffe_trunks import CAFFE_TRUNKS, CaffeTrunk
 from openftgs._stages import stage
 from openftgs._vendor.flip import LDRFLIPLoss
+from openftgs._weights import trunk_tensors
 from openftgs.config import LossConfig, PercNet
 from openftgs.model import FreeTimeGaussians
 from openftgs.motion import reg4d_terms
@@ -148,8 +150,6 @@ def ssim(
 # D-89: the eight networks `perc_net` selects, and the trunk networks among them.
 _PERC_NETS: tuple[str, ...] = get_args(PercNet)
 _TRUNK_TICKETS = {
-    "vgg16_oxford": "#385",
-    "alexnet_bvlc": "#385",
     "dinov2_s14": "#386",
     "dinov2_b14": "#386",
     "dino_s16": "#386",
@@ -294,7 +294,9 @@ class PerceptualLoss(torch.nn.Module):
     reference gets no gradient. The network is frozen and stays in evaluation mode under
     `.train()` (D-89). "flip" is the vendored LDR-ꟻLIP loss at 67.0 pixels per degree, on
     float32 images; "haarpsi" is 1 − HaarPSI, the render clamped to [0, 1], on sides of at least
-    16 pixels (Q-261). The six trunk networks are built by #385 and #386."""
+    16 pixels (Q-261). "vgg16_oxford" and "alexnet_bvlc" are lpips's uncalibrated distance on
+    the Caffe trunks, their weights fetched at first use, on float32 images, AlexNet's sides of
+    at least 23 pixels (Q-263). The four DINO networks are built by #386."""
 
     def __init__(self, net: PercNet = "flip") -> None:
         super().__init__()
@@ -309,6 +311,10 @@ class PerceptualLoss(torch.nn.Module):
         self._name = net
         if net == "flip":
             self._flip = LDRFLIPLoss()
+        elif net in CAFFE_TRUNKS:
+            # D-89 (#385): the Caffe trunks on their publishers' weights, fetched and checked
+            # at first use (#384; Q-142: OSError, exit 2).
+            self._caffe = CaffeTrunk(net, trunk_tensors(net))
         # D-89: frozen and in evaluation mode, whatever a parent module asks.
         self.requires_grad_(False)
         self.train(False)
@@ -321,6 +327,10 @@ class PerceptualLoss(torch.nn.Module):
         _check_pair(pred, gt)
         # D-89: the reference without a gradient.
         x, y = _batch_first(pred), _batch_first(gt.detach())
+        if self._name in CAFFE_TRUNKS:
+            # D-89, #380's candidate 5: the render's view as it comes, until B-4 (#389).
+            caffe: Tensor = self._caffe(x, y).mean()
+            return caffe
         if self._name == "haarpsi":
             # D-89: 1 − HaarPSI, Î clamped to [0, 1].
             return 1.0 - _haarpsi(x.clamp(0.0, 1.0), y)
