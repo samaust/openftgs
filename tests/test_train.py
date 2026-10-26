@@ -45,7 +45,7 @@ from openftgs.config import (
 from openftgs.data import FrameCache, MultiViewVideo
 from openftgs.eval import METRIC_NAMES
 from openftgs.io import load_checkpoint, save_checkpoint
-from openftgs.losses import LPIPSLoss
+from openftgs.losses import LPIPSLoss, PerceptualLoss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer, _Sampler, calendar_entry
@@ -1059,6 +1059,48 @@ def test_gpu_deterministic_run(tmp_path: Path) -> None:
     ) == saved
 
 
+# The perceptual network of D-89 (D-77, D-52; Q-69, Q-249, Q-250, Q-251).
+
+# D-89's table: the calibrated λ_perc of the networks the tests below train with.
+CALIBRATED = {"flip": 0.415, "haarpsi": 0.0617}
+
+
+def _record_networks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The networks built from now on, by name, `PerceptualLoss`'s and the legacy
+    `LPIPSLoss`'s alike, seen by wrapping the two public classes' constructors."""
+    built: list[str] = []
+    for cls in (PerceptualLoss, LPIPSLoss):
+        original = cls.__init__
+
+        def recording(self: Any, net: Any, *, _original: Any = original) -> None:
+            built.append(net)
+            _original(self, net)
+
+        monkeypatch.setattr(cls, "__init__", recording)
+    return built
+
+
+@pytest.mark.parametrize("lambda_perc", [None, 0.5, 0.0])
+def test_the_perceptual_network_is_built_when_its_weight_is_none_or_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lambda_perc: float | None
+) -> None:
+    """D-77, Q-69, Q-249: the trainer builds one `PerceptualLoss(cfg.loss.perc_net)` when
+    λ_perc is None, which stands for the network's calibrated weight (D-89: 0.415 for ꟻLIP),
+    or positive, and passes it to `total_loss`: the step reports a "perceptual" term, weighted
+    in the total by the resolved λ_perc beside E7's λ_img = 0.8 and λ_ssim = 0.2 and E8's
+    λ_reg = 0.01. At λ_perc = 0 it builds no network, and the step has no perceptual term."""
+    built = _record_networks(monkeypatch)
+    cfg = TrainConfig(loss=LossConfig(perc_net="flip", lambda_perc=lambda_perc))
+    trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device="cpu")
+    terms = {name: float(value) for name, value in trainer.step().losses.items()}
+    weight = CALIBRATED["flip"] if lambda_perc is None else lambda_perc
+    assert built == (["flip"] if weight > 0.0 else [])
+    assert ("perceptual" in terms) is (weight > 0.0)
+    expected = 0.8 * terms["l1"] + 0.2 * terms["one_minus_ssim"] + 0.01 * terms["reg"]
+    expected += weight * terms.get("perceptual", 0.0)
+    assert terms["total"] == pytest.approx(expected, rel=1e-6, abs=0.0)
+
+
 # With the LPIPS networks (weights; D-77, Q-74).
 
 
@@ -1140,6 +1182,7 @@ def test_a_float32_steps_perceptual_term_takes_nchw_inputs_within_rounding_of_ch
 
     cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
     trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device=device)
+    assert cfg.loss.perc_net == "vgg"  # the default until #392 (#380's expand step)
     direct = LPIPSLoss(cfg.loss.perc_net).to(device)
     seen: list[tuple[torch.Tensor, ...]] = []
     busy = False
@@ -1197,7 +1240,7 @@ def test_the_trainers_perceptual_network_gets_nchw_inputs_where_b4_measured_them
 
     perf = PerfConfig(perc_precision=precision, deterministic=deterministic, frame_cache="off")
     trainer = Trainer(TrainConfig(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
-    plain = LPIPSLoss(TrainConfig().loss.perc_net)
+    plain = LPIPSLoss("vgg")  # the default perc_net until #392 (#380's expand step)
     generator = torch.Generator().manual_seed(0)
     handle = register_module_forward_pre_hook(hook)
     try:
