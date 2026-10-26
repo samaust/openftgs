@@ -839,9 +839,13 @@ def test_bench_slice_refuses_a_single_timestamp_scene_and_an_unwritable_out(
 
 
 def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> None:
-    """#226: the default configuration, LPIPS-VGG included, except that growth and relocation
-    start at iteration 100, n_max = ⌈1.02·N⌉ and sh_interval = 1; so the timed iterations 121 to
-    420 hold exactly the events at 200, 300 and 400, all at SH degree 3."""
+    """#226, #389 (Q-168): the default configuration, ꟻLIP included at its calibrated weight
+    (D-89; `perc_net` "flip" and `lambda_perc` None, set explicitly until #392 makes them the
+    defaults), except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and
+    sh_interval = 1; so the timed iterations 121 to 420 hold exactly the events at 200, 300 and
+    400, all at SH degree 3."""
+    import dataclasses
+
     from openftgs.cli._bench import _train_step_config
     from openftgs.config import TrainConfig
     from openftgs.train import calendar_entry
@@ -853,10 +857,11 @@ def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> No
     assert _train_step_config(3_000_000).growth.n_max == 3_060_000
     assert _train_step_config(101).growth.n_max == 104  # ⌈103.02⌉
     assert _train_step_config(100).growth.n_max == 102  # exactly 102: no rounding up
-    assert (cfg.loss.lambda_perc, cfg.loss.perc_net) == (0.01, "vgg")
+    assert (cfg.loss.lambda_perc, cfg.loss.perc_net) == (None, "flip")
     assert cfg.sh_degree == 3 and _train_step_config(10, sh_degree=1).sh_degree == 1
     # Everything else is the default.
-    assert cfg.loss == default.loss and cfg.perf == default.perf and cfg.init == default.init
+    flip = dataclasses.replace(default.loss, perc_net="flip", lambda_perc=None)
+    assert cfg.loss == flip and cfg.perf == default.perf and cfg.init == default.init
     assert cfg.growth.stop == default.growth.stop and cfg.reloc.stop == default.reloc.stop
     assert cfg.optim.iterations == default.optim.iterations
     entries = {it: calendar_entry(cfg, it) for it in range(121, 421)}
@@ -938,8 +943,8 @@ def test__training_bound_counts_the_default_calendars_iterations_and_events() ->
 
 
 # B-1 run on the small scene with reduced sizes (#226: "a test on a small scene, with reduced
-# sizes, checks the layout"): two synthesized models, and once with `--model`. The default
-# configuration holds LPIPS-VGG, so these need its weights.
+# sizes, checks the layout"): two synthesized models, and once with `--model`. The configuration
+# holds ꟻLIP, which needs no weights (#389).
 
 TRAIN_STEP_CASES = ((300, 0.2), (400, 0.05))
 TRAINING_STAGES = (
@@ -991,7 +996,6 @@ def _cases_by(body: dict[str, Any]) -> dict[tuple[tuple[str, Any], ...], dict[st
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__train_step_times_every_stage_and_bounds_a_training_run(
     train_step_bench: dict[str, Any],
 ) -> None:
@@ -1064,7 +1068,6 @@ def test__train_step_times_every_stage_and_bounds_a_training_run(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b1_takes_a_model(train_step_model_bench: dict[str, Any]) -> None:
     """D-88, #226: with `--model`, B-1 times that model, at its SH degree, as its one case,
     which carries the bound."""
@@ -1452,7 +1455,7 @@ def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
 
 # B-6 run on the small scene with reduced sizes, as B-1's tests (#226): every placement at 300
 # rows and the GPU cache at 400 for Q-99's note; then with a cache too large for "auto" to place
-# on the GPU. The default configuration holds LPIPS-VGG, so these need its weights.
+# on the GPU. B-1's configuration holds ꟻLIP, which needs no weights (#389).
 
 DATA_N, MEMORY_N = 300, 400
 
@@ -1469,7 +1472,6 @@ def data_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[st
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> None:
     """A private test of `_data` at reduced sizes (`_DATA_N` and `_MEMORY_N` patched): §3.4 B-6
     itself is the recorded BENCH.json runs, not this test. D-51 (#232, Q-189): with B-1's
@@ -1536,7 +1538,6 @@ def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) ->
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__data_skips_the_gpu_placement_where_auto_would_not_choose_it(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2269,7 +2270,6 @@ def _diverging_in_iteration_3(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_bench_out_of_gpu_memory_in_a_benchmark_exits_2(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2338,7 +2338,6 @@ def test_bench_out_of_gpu_memory_in_b4s_child_process_exits_2(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_bench_divergence_in_training_exits_3(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2355,7 +2354,6 @@ def test_bench_divergence_in_training_exits_3(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__data_exits_3_when_training_diverges(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

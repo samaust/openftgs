@@ -642,18 +642,23 @@ _COPY_REPETITIONS = 50  # Q-72 note 5: copies of the relocation scores, after _W
 
 
 def _train_step_config(n: int, *, sh_degree: int = 3) -> TrainConfig:
-    """B-1's configuration for a model of `n` rows (#226): the default, LPIPS-VGG included,
-    except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and the SH bands
-    all open by iteration 4 (sh_interval = 1); `sh_degree` is the model's (Q-185)."""
+    """B-1's configuration for a model of `n` rows (#226): the default, ꟻLIP included at its
+    calibrated weight (D-89; #389), except that growth and relocation start at iteration 100,
+    n_max = ⌈1.02·N⌉ and the SH bands all open by iteration 4 (sh_interval = 1); `sh_degree` is
+    the model's (Q-185)."""
     import dataclasses
 
     from openftgs.config import TrainConfig
 
     base = TrainConfig()
     n_max = -(-(100 + _HEADROOM_PERCENT) * n // 100)  # ⌈1.02·N⌉ in integers, so never one over
+    # #380's expand step: ꟻLIP at its calibrated weight, set here until #392 makes them the
+    # defaults of `LossConfig`, when this line goes.
+    loss = dataclasses.replace(base.loss, perc_net="flip", lambda_perc=None)
     return dataclasses.replace(
         base,
         sh_degree=sh_degree,
+        loss=loss,
         growth=dataclasses.replace(base.growth, start=_EVENTS_FROM, n_max=n_max),
         reloc=dataclasses.replace(base.reloc, start=_EVENTS_FROM),
         optim=dataclasses.replace(base.optim, sh_interval=1),
@@ -806,8 +811,8 @@ def _train_step_case(
 
     cfg = _train_step_config(model.num_gaussians, sh_degree=model.sh_degree)
     given = f"model {ctx.args.model}" if ctx.model is not None else f"scene {ctx.args.scene}"
-    # A model of another scene's time can't train on this one; the LPIPS weights may download.
-    with _environment_error("LPIPS networks"), _as_input_error(given):
+    # A model of another scene's time can't train on this one. ꟻLIP downloads nothing (D-89).
+    with _as_input_error(given):
         trainer = Trainer(cfg, ctx.video, model, device="cuda")
     del model
     n_start = trainer.model.num_gaussians
@@ -945,7 +950,8 @@ def _train_step(ctx: _Context) -> _Result:
         "seed": None if ctx.model is not None else _SEED,
         "cases": listed,
         "configuration": (
-            "the default, LPIPS-VGG included, except growth.start = reloc.start = "
+            "the default, ꟻLIP included at its calibrated weight (perc_net flip, lambda_perc "
+            "null), except growth.start = reloc.start = "
             f"{_EVENTS_FROM}, growth.n_max = ⌈1.02·N⌉, optim.sh_interval = 1, and the "
             "model's SH degree"
         ),
@@ -1522,8 +1528,7 @@ def _data_trainer(ctx: _Context, volume: _Volume, cfg: TrainConfig, n: int) -> T
     from openftgs.train import Trainer
 
     model = _synthesize(volume, n, active=_DATA_ACTIVE, seed=_SEED, device="cuda")
-    with _environment_error("LPIPS networks"):  # the LPIPS weights may download
-        return Trainer(cfg, ctx.video, model, device="cuda")
+    return Trainer(cfg, ctx.video, model, device="cuda")  # ꟻLIP downloads nothing (D-89)
 
 
 def _probe(ctx: _Context, volume: _Volume, n: int) -> _AutoEstimate:
@@ -1640,7 +1645,8 @@ def _data(ctx: _Context) -> _Result:
         "active_fraction": _DATA_ACTIVE,
         "cases": [[n, placement, prefetch] for n, placement, prefetch in runs],
         "configuration": (
-            "B-1's (#226): the default, LPIPS-VGG included, except growth.start = reloc.start = "
+            "B-1's (#226): the default, ꟻLIP included at its calibrated weight, except "
+            "growth.start = reloc.start = "
             f"{_EVENTS_FROM}, growth.n_max = ⌈1.02·N⌉ and optim.sh_interval = 1; with the "
             "case's perf.frame_cache and perf.prefetch"
         ),
