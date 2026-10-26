@@ -17,8 +17,8 @@ jobs:
     runs-on: [self-hosted, linux, gpu]
     timeout-minutes: 120
     env:
-      # The runner's Python, with a CUDA build of torch, gsplat, lpips and fused-ssim installed as
-      # the README says; the checked-out openftgs comes first on its path.
+      # The runner's Python, with a CUDA build of torch, gsplat, fused-ssim and the [init] extra's
+      # packages installed as the README says; the checked-out openftgs comes first on its path.
       FTGS_PYTHON: ${{ vars.FTGS_CI_PYTHON }}
       # Where the scene is generated, outside the workspace, with room for its PNGs and the
       # frame caches B-6 builds beside them (about 40 GB); empty: the runner's temporary folder.
@@ -34,7 +34,7 @@ jobs:
           fi
           echo "FTGS_SCENE=${FTGS_SCENE:-$RUNNER_TEMP/ci-scene}" >> "$GITHUB_ENV"
           "$FTGS_PYTHON" - <<'PY'
-          import fused_ssim, gsplat, lpips, torch  # B-4 needs fused-ssim for its fused case
+          import fused_ssim, gsplat, torch  # B-4 needs fused-ssim for its fused case
           import openftgs
           import einops, loguru, torchvision  # [init]: B-4's DINO networks (Q-248, Q-253)
           assert torch.cuda.is_available(), "no CUDA device"

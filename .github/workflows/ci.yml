@@ -63,7 +63,7 @@ jobs:
         run: |
           python -m pip wheel . ./harness --no-deps -w dist
           python - <<'PY'
-          import glob, hashlib, json, zipfile
+          import glob, hashlib, json, re, zipfile
           wheel = zipfile.ZipFile(glob.glob("dist/openftgs-*.whl")[0])
           names = wheel.namelist()
           for required in ("openftgs/py.typed", "licenses/LICENSE", "licenses/NOTICE"):
@@ -81,6 +81,21 @@ jobs:
               for entry in record["licenses"] + record["files"]:
                   digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
                   assert digest == entry["sha256"], entry["path"]
+          # Q-248, §2.3 (#393): the core requires no lpips, no tqdm and none of the [init]
+          # extra's packages, which only RoMa and the DINO networks need; no extra names lpips,
+          # tqdm or torchmetrics.
+          metadata = wheel.read(next(n for n in names if n.endswith(".dist-info/METADATA")))
+          requires = [
+              line.split(":", 1)[1].strip()
+              for line in metadata.decode("utf-8").splitlines()
+              if line.startswith("Requires-Dist:")
+          ]
+          named = lambda r: re.sub(r"[-_.]+", "-", re.match(r"[A-Za-z0-9._-]+", r)[0]).lower()
+          core = {named(r) for r in requires if not re.search(r"\bextra\s*==", r)}
+          init = {named(r) for r in requires if re.search(r"\bextra\s*==\s*['\"]init['\"]", r)}
+          assert not core & {"torchvision", "einops", "loguru", "lpips", "tqdm"}, sorted(core)
+          assert {"torchvision", "einops", "loguru"} <= init, sorted(init)
+          assert not {named(r) for r in requires} & {"lpips", "tqdm", "torchmetrics"}, requires
           wheel = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0])
           names = wheel.namelist()
           for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):
