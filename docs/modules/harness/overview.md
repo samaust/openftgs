@@ -18,7 +18,7 @@ ftgs-harness rerun CHECK_ID [--out RUN_DIR]
 
 ## Exit codes
 
-0 when no check failed, 1 when at least one did, 2 for a harness or configuration error: bad arguments, an unreadable config or settings file, a `seed` key in the config, a missing adapter executable, L3 requested without scenes or without the `[lpips]` extra (§3.3, Q-211). An `inconclusive` or `not_comparable` check fails nothing.
+0 when no check failed, 1 when at least one did, 2 for a harness or configuration error: bad arguments, an unreadable config or settings file, a `seed` key in the config, a missing adapter executable, L3 requested without scenes or without the `[torch]` extra, whose message names it (§3.3, Q-211, Q-T391.2). An `inconclusive` or `not_comparable` check fails nothing.
 
 ## The run directory
 
@@ -32,4 +32,12 @@ ftgs-harness rerun CHECK_ID [--out RUN_DIR]
 
 ## Dependencies
 
-numpy, scipy, safetensors and matplotlib, with the Agg backend for every plot (owner decision, 2026-10-11). The extra `ftgs-harness[lpips]` adds torch and lpips 0.1.4, which L3's LPIPS-Alex and LPIPS-VGG need (Q-201). L0 to L2 run without them.
+numpy, scipy, safetensors and matplotlib, with the Agg backend for every plot (owner decision, 2026-10-11). The extra `ftgs-harness[torch]` holds torch alone, with which L3 computes ꟻLIP (Q-201, Q-254, Q-T391.2). L0 to L2 run without it: the metrics module imports torch only to compute ꟻLIP.
+
+## The harness's ꟻLIP
+
+L3 computes ꟻLIP with a copy of NVIDIA's loss of its own, `ftgs_harness._vendor.flip`, since the harness never imports openftgs (§2.1, Q-254). It is `src/pytorch/flip_loss.py` at commit d3ab02a with the device-agnostic change alone, so that it runs on the CPU: each `.cuda()` and `device='cuda'` becomes the image argument's device, the colour transforms' constants included, on lines marked `ftgs_harness (device)`. Unlike openftgs's copy (`docs/modules/losses/vendored-flip.md`) it caches nothing: the filters, the colour constants and the colour maximum are made at every call, as published.
+
+`python scripts/vendor_flip.py --target harness` makes it from U-23's reference copy in `tests/reference/flip` (Q-252), never by hand, and `--check` rebuilds it offline and compares it byte for byte. Its BSD-3-Clause `LICENSE` and its provenance record `VENDOR.json`, which records the upstream commit, the published file's SHA-256 and the copy's, and every edit with its count, sit beside it and ship in the wheel as package data; CI's wheel job checks them against the record. `tests/harness/test_harness_flip.py` checks the hashes, the device-only edits and the check mode.
+
+The harness calls it in float32 on the CPU, one held-out image at a time, at 67.0 pixels per degree (Q-T391.1), on the render clamped to [0, 1] (E16): about a second for a 1352×1014 image on six threads. On the CPU it agrees with openftgs's copy within U-23's 1e-6.

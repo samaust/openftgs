@@ -28,7 +28,7 @@ Kept tensors are made outside inference mode, the matrices copied with `copy=Tru
 
 VENDOR.json records the upstream URL and commit, the script, the reference copy's folder, the license with its source and SHA-256, the published file's SHA-256 and the copy's, every edit in words with its count, a description of each change, what the first call on a device does, and the filter support below. ꟻLIP's BSD-3-Clause license sits beside the copy as `LICENSE`, the file keeps NVIDIA's header, and NOTICE names both copies. The license, the record and the copy ship in the wheel, and CI's wheel job checks them against VENDOR.json.
 
-`python scripts/vendor_flip.py` rewrites the copy, its license and VENDOR.json, and leaves the package's own `__init__.py` alone; with `--check` it rebuilds them in a temporary folder and compares them with the committed ones byte for byte, and checks the SHA-256 that VENDOR.json records. Neither needs network.
+`python scripts/vendor_flip.py` rewrites the copy, its license and VENDOR.json, and leaves the package's own `__init__.py` alone; with `--check` it rebuilds them in a temporary folder and compares them with the committed ones byte for byte, and checks the SHA-256 that VENDOR.json records. Neither needs network. With `--target harness` it does the same for the harness's own copy, which has the device change alone (`docs/modules/harness/overview.md`, Q-254).
 
 ## The filter support
 
