@@ -226,6 +226,18 @@ def test_legacy_module_imports_nothing_from_openftgs() -> None:
     assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
 
 
+def test_no_module_imports_lpips() -> None:
+    """#392 (#380's contract step; §2.3: lpips leaves): no module of `openftgs` or
+    `ftgs_harness` imports lpips, at the top or inside a function."""
+    offenders = [
+        str(p.relative_to(ROOT))
+        for top in (PACKAGE_DIR, HARNESS_DIR)
+        for p in sorted(top.rglob("*.py"))
+        if any(n.split(".")[0] == "lpips" for n in _imported_modules(p))
+    ]
+    assert offenders == []
+
+
 def test_harness_never_imports_openftgs() -> None:
     offenders = [
         str(p.relative_to(ROOT))

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""openftgs.losses (E7, E8, E9; D-7 to D-11, D-37, D-38, D-52, D-68, D-77, D-78; Q-41, Q-42):
+"""openftgs.losses (E7, E8, E9; D-7 to D-11, D-37, D-38, D-52, D-77, D-78, D-89; Q-41, Q-42):
 U-9, U-10, U-11 and the added tests of PRD #53.
 
 Expected values are worked by hand from the spec, come from scikit-image's
@@ -14,7 +14,6 @@ import json
 import os
 import subprocess
 import sys
-import warnings
 from collections.abc import Iterator
 from pathlib import Path
 from typing import get_args
@@ -29,7 +28,7 @@ from torch import Tensor
 
 import openftgs.losses
 from openftgs.config import LossConfig, OptimConfig, PercNet
-from openftgs.losses import LPIPSLoss, PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.losses import PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.types import Camera
@@ -363,123 +362,6 @@ def test__fused_ssim_is_called_only_under_q42_conditions(
     ssim(pred.double(), gt.double())
     ssim(pred.cpu(), gt.cpu())
     assert calls == []
-
-
-# U-9: LPIPS (E7, D-9, D-68; Q-41)
-
-
-@pytest.fixture(scope="module")
-def lpips_nets() -> dict[str, LPIPSLoss]:
-    """One LPIPSLoss per backbone, built once (the trunk weights are downloaded)."""
-    return {net: LPIPSLoss(net) for net in ("vgg", "alex")}
-
-
-def test_lpips_rejects_an_unknown_backbone() -> None:
-    """Q-41: the backbone is vgg or alex, checked before anything is downloaded."""
-    with pytest.raises(ValueError):
-        LPIPSLoss("squeeze")  # type: ignore[arg-type]
-
-
-@pytest.mark.weights
-@pytest.mark.parametrize("net", ["vgg", "alex"])
-def test_u9_lpips_of_an_image_with_itself_is_zero(
-    lpips_nets: dict[str, LPIPSLoss], net: str
-) -> None:
-    """U-9: LPIPS(I, I) = 0, also after .train(), which must not switch on lpips's dropout."""
-    loss = lpips_nets[net]
-    image, _ = _image_pair((2, 32, 40, 3), seed=9, correlated=False, dtype=F32)
-    assert loss(image, image.clone()).item() == 0.0
-    loss.train()
-    try:
-        assert loss(image, image.clone()).item() == 0.0
-        pred, gt = _image_pair((32, 40, 3), seed=10, correlated=True, dtype=F32)
-        assert loss(pred, gt).item() == loss(pred, gt).item()
-    finally:
-        loss.eval()
-
-
-@pytest.mark.weights
-@pytest.mark.parametrize("net", ["vgg", "alex"])
-def test_u9_lpips_maps_inputs_from_unit_range_to_plus_minus_one(
-    lpips_nets: dict[str, LPIPSLoss], net: str
-) -> None:
-    """U-9 (D-9, D-68): LPIPSLoss on [0, 1] images equals lpips 0.1.4's network on the images
-    mapped to [−1, 1] by 2x − 1, exactly, as a mean over the batch. The reference gets the
-    [B, 3, H, W] view of the same channels-last memory, since the CPU convolutions pick their
-    kernels by memory format and would otherwise differ by rounding (about 1e-8)."""
-    import lpips
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)  # torchvision's `pretrained` deprecation
-        reference = lpips.LPIPS(net=net, verbose=False)
-    pred, gt = _image_pair((2, 32, 40, 3), seed=11, correlated=True, dtype=F32)
-    nchw = [x.permute(0, 3, 1, 2) for x in (pred, gt)]
-    with torch.no_grad():
-        expected = reference(2 * nchw[0] - 1, 2 * nchw[1] - 1).mean()
-        unmapped = reference(nchw[0], nchw[1]).mean()
-        value = lpips_nets[net](pred, gt)
-    assert value.shape == ()
-    assert value.item() == expected.item()
-    assert value.item() != unmapped.item()
-
-
-@pytest.mark.weights
-@pytest.mark.parametrize("net", ["vgg", "alex"])
-def test_lpips_without_mapping_feeds_the_unit_range_images_to_the_network(
-    lpips_nets: dict[str, LPIPSLoss], net: str
-) -> None:
-    """D-68, Q-58: with map_inputs=False, LPIPSLoss equals lpips 0.1.4's network on the [0, 1]
-    images themselves (lpips_vgg_raw), exactly, as a mean over the batch; the default still
-    maps."""
-    import lpips
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)  # torchvision's `pretrained` deprecation
-        reference = lpips.LPIPS(net=net, verbose=False)
-    pred, gt = _image_pair((2, 32, 40, 3), seed=12, correlated=True, dtype=F32)
-    nchw = [x.permute(0, 3, 1, 2) for x in (pred, gt)]
-    with torch.no_grad():
-        expected = reference(nchw[0], nchw[1]).mean()
-        value = lpips_nets[net](pred, gt, map_inputs=False)
-        mapped = lpips_nets[net](pred, gt)
-    assert value.shape == ()
-    assert value.item() == expected.item()
-    assert mapped.item() != value.item()
-
-
-@pytest.mark.weights
-@pytest.mark.parametrize("flag", [1, 0, None, "yes"])
-def test_lpips_map_inputs_must_be_a_bool(lpips_nets: dict[str, LPIPSLoss], flag: object) -> None:
-    """Q-58: map_inputs is a bool."""
-    image = torch.zeros(32, 32, 3)
-    with pytest.raises(ValueError, match="map_inputs"):
-        lpips_nets["vgg"](image, image, map_inputs=flag)
-
-
-@pytest.mark.weights
-def test_lpips_weights_are_frozen_and_only_the_prediction_gets_a_gradient(
-    lpips_nets: dict[str, LPIPSLoss],
-) -> None:
-    """Q-41, D-52: every LPIPS parameter is frozen; the loss differentiates the prediction, and a
-    target that doesn't require a gradient gets none."""
-    loss = lpips_nets["vgg"]
-    assert all(not p.requires_grad for p in loss.parameters())
-    pred, gt = _image_pair((32, 40, 3), seed=12, correlated=True, dtype=F32)
-    pred.requires_grad_()
-    loss(pred, gt).backward()
-    assert pred.grad is not None and bool(pred.grad.abs().sum() > 0)
-    assert gt.grad is None
-    assert all(p.grad is None for p in loss.parameters())
-
-
-@pytest.mark.gpu
-@pytest.mark.weights
-def test_u9_lpips_of_an_image_with_itself_is_zero_on_the_gpu() -> None:
-    """U-9: LPIPS(I, I) = 0 on CUDA too."""
-    loss = LPIPSLoss("vgg").cuda()
-    image, _ = _image_pair((2, 32, 40, 3), seed=13, correlated=False, dtype=F32)
-    image = image.cuda()
-    assert loss(image, image.clone()).item() == 0.0
 
 
 # U-9: the perceptual networks (E7, D-9, D-89; Q-41)
