@@ -4,6 +4,7 @@ openftgs as both implementations and with the fault-injecting wrapper as B. The 
 always carry ꟻLIP, which needs no weights, so nothing is downloaded."""
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -14,10 +15,9 @@ from ftgs_harness.info import QUERY_KINDS
 from ftgs_harness.level2 import TOLERANCES
 
 SETTINGS = {"l2": {"queries": 2}}
-# 549o's perceptual defaults (D-9, D-89): ꟻLIP at its calibrated weight, which grad_stats takes
-# from the configuration. Spelled out until #392 makes them LossConfig's; LPIPS-VGG, today's
-# default, would need its weights downloaded.
-CONFIG = {"loss": {"perc_net": "flip", "lambda_perc": None}}
+# The default configuration: ꟻLIP at its calibrated weight (§2.1 `LossConfig`, D-9, D-89), which
+# grad_stats takes from it.
+CONFIG: dict[str, Any] = {}
 
 
 def test_l2_passes_with_openftgs_as_both_implementations(tmp_path: Path) -> None:

@@ -79,7 +79,10 @@ def _background(model: Path) -> list[float]:
     from openftgs.io import load_checkpoint, read_exchange
 
     if model.is_dir():
-        return list(config_from_dict(load_checkpoint(model).config).background)
+        # Q-271: the loss, which load_checkpoint has checked, is left out, so a checkpoint
+        # saved before 549o (LPIPS's backbone as perc_net, Q-247) gives its background too.
+        stored = load_checkpoint(model).config
+        return list(config_from_dict({k: v for k, v in stored.items() if k != "loss"}).background)
     return list(read_exchange(model).background)
 
 

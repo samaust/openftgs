@@ -33,7 +33,7 @@ ftgs-adapter [--backend …] train SCENE INIT CONFIG SEED OUT_DIR
 | relocation_math | `density.mcmc_split`, then D-14's lower bound on the float32 logit, as the trainer applies it (Q-50) |
 | velocity_init | `init.knn_velocities` (E15) |
 | relocation_sampling | `density.draw_targets` per seed, counted per row (D-15) |
-| grad_stats | the trainer's steps 3 to 5 for one image on the reference backend: `render(…, return_aux=True, packed=False)`, `total_loss` with the configuration's perceptual network, built when λ_perc is None or positive as the trainer builds it (`PerceptualLoss`; `LPIPSLoss` for LPIPS's backbones until #392), backward, `GradStats.update` (D-12; Q-249) |
+| grad_stats | the trainer's steps 3 to 5 for one image on the reference backend: `render(…, return_aux=True, packed=False)`, `total_loss` with the configuration's perceptual network, built when λ_perc is None or positive as the trainer builds it (`PerceptualLoss`), backward, `GradStats.update` (D-12; Q-249) |
 | relocation_score | `density.sampling_score` over a model whose logits are the opacities' and a `GradStats` holding the sums and counts (E10, D-13) |
 | spatial_scale | `data.spatial_scale` over records built from the cameras, no image read (D-27) |
 | growth_decisions | `density.growth_masks` (D-18, D-44) |

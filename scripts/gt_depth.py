@@ -435,9 +435,12 @@ def run(checkpoint: Path, scene: Path, gt_dir: Path, *, backend: _Backend) -> di
     if not records:
         raise InputError(f"the test split of {scene} holds no images")
     device = "cuda" if backend == "gsplat" else "cpu"
+    # Q-271: the loss, which load_checkpoint has checked, is left out, so a checkpoint saved
+    # before 549o (LPIPS's backbone as perc_net, Q-247) gives its model too.
+    config = config_from_dict({k: v for k, v in state.config.items() if k != "loss"})
     model = FreeTimeGaussians(
         {k: v.to(device) for k, v in state.params.items()},
-        sh_degree=config_from_dict(state.config).sh_degree,
+        sh_degree=config.sh_degree,
         time=state.time,
         time_unit=state.time_unit,
     )

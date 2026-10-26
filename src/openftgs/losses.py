@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""L1, SSIM, the perceptual networks (D-89), 4D regularization and the total loss; the LPIPS
-wrapper stays until the contract ticket of #380 (#392) removes it.
+"""L1, SSIM, the perceptual networks (D-89), 4D regularization and the total loss.
 
 Spec: E7, E8, E9, D-89. Band: Mechanics (§2.1).
 """
 
 import functools
 import importlib
-import warnings
 from collections.abc import Callable
 from typing import Any, Literal, NoReturn, get_args
 
@@ -24,7 +22,7 @@ from openftgs.config import LossConfig, PercNet
 from openftgs.model import FreeTimeGaussians
 from openftgs.motion import reg4d_terms
 
-__all__ = ["LPIPSLoss", "PerceptualLoss", "l1_loss", "reg4d_loss", "ssim", "total_loss"]
+__all__ = ["PerceptualLoss", "l1_loss", "reg4d_loss", "ssim", "total_loss"]
 
 
 def _fail(reason: str) -> NoReturn:
@@ -456,50 +454,6 @@ class PerceptualLoss(torch.nn.Module):
         return out
 
 
-class LPIPSLoss(torch.nn.Module):
-    """L_perc: LPIPS with the given backbone on images in [0, 1], mapped to [−1, 1] (E7, D-9,
-    D-68), as the mean over the batch; `forward(…, map_inputs=False)` skips the mapping, for
-    the lpips_vgg_raw metric (Q-58). The network is lpips 0.1.4's, frozen and kept in
-    evaluation mode (Q-41)."""
-
-    def __init__(self, net: Literal["vgg", "alex"] = "vgg") -> None:
-        super().__init__()
-        if net not in ("vgg", "alex"):
-            _fail(f'net must be "vgg" or "alex", got {net!r}')
-        import lpips  # torchvision comes with it; imported only when a network is built
-
-        with warnings.catch_warnings():
-            # lpips 0.1.4 (pinned, §2.3) passes torchvision's deprecated `pretrained=True`, which
-            # torchvision maps to the ImageNet weights with two UserWarnings.
-            warnings.filterwarnings("ignore", "The parameter 'pretrained'", UserWarning)
-            warnings.filterwarnings("ignore", "Arguments other than a weight enum", UserWarning)
-            self._net: torch.nn.Module = lpips.LPIPS(net=net, verbose=False)
-        self._name = net  # the perc_net value it was built for, as PerceptualLoss's
-        # lpips freezes only its trunk; the linear layers would stay trainable.
-        self._net.requires_grad_(False)
-        self._net.eval()
-
-    def train(self, mode: bool = True) -> "LPIPSLoss":
-        # The linear layers hold dropout, which training mode would switch on (Q-41).
-        super().train(mode)
-        self._net.eval()
-        return self
-
-    # Q-58: map_inputs=False feeds the [0, 1] images unmapped, D-68's lpips_vgg_raw metric.
-    def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
-        if not isinstance(map_inputs, bool):
-            _fail(f"map_inputs must be a bool, got {map_inputs!r}")
-        _check_pair(pred, gt)
-        x, y = _batch_first(pred), _batch_first(gt)
-        if map_inputs:
-            # D-68: the network's documented input range.
-            x, y = 2 * x - 1, 2 * y - 1
-        # With frozen weights and a target that doesn't require a gradient, autograd records
-        # nothing on the target's branch (§2.4).
-        out: Tensor = self._net(x, y)
-        return out.mean()
-
-
 def reg4d_loss(model: FreeTimeGaussians, t: float) -> Tensor:
     """L_reg(t) = (1/N)·Σ σᵢ·sg[σt,ᵢ(t)] over all N primitives at normalized time t (E8, D-11).
     The stop-gradient is motion's (Q-12); the parameters are read at call time."""
@@ -527,13 +481,6 @@ def _resolve_lambda_perc(cfg: LossConfig) -> float:
     `cfg.perc_net` when it is None (D-9, D-89)."""
     if cfg.lambda_perc is not None:
         return cfg.lambda_perc
-    if cfg.perc_net not in _CALIBRATED_WEIGHTS:
-        # #380's expand step: LPIPS's backbones, still accepted as perc_net until #392, have no
-        # calibrated weight.
-        _fail(
-            f"lambda_perc = None takes perc_net's calibrated weight in D-89's table, which has "
-            f"none for {cfg.perc_net!r}; set lambda_perc or choose one of {_PERC_NETS}"
-        )
     return _CALIBRATED_WEIGHTS[cfg.perc_net]
 
 
@@ -547,7 +494,7 @@ def total_loss(
     it: int,
     cfg: LossConfig,
     *,
-    perceptual: PerceptualLoss | LPIPSLoss | None = None,
+    perceptual: PerceptualLoss | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·L_perc + λ_reg·L_reg(t) at iteration `it` (E7,
     E9, D-37), and its unweighted terms with the total under "total". t is the training image's

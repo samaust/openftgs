@@ -47,7 +47,7 @@ from openftgs.config import (
 from openftgs.data import FrameCache, MultiViewVideo
 from openftgs.eval import METRIC_NAMES
 from openftgs.io import load_checkpoint, save_checkpoint
-from openftgs.losses import LPIPSLoss, PerceptualLoss
+from openftgs.losses import PerceptualLoss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.train import StepLog, Trainer, _Sampler, calendar_entry
@@ -86,7 +86,7 @@ def _init_points(n: int = 30, seed: int = 1, *, extent: float = 1.2) -> InitPoin
 
 
 def _no_perceptual(**fields: object) -> TrainConfig:
-    """A configuration without the perceptual loss, so CPU tests download nothing."""
+    """A configuration without the perceptual loss (λ_perc = 0), so a test runs no network."""
     return TrainConfig(loss=LossConfig(lambda_perc=0.0), **fields)  # type: ignore[arg-type]
 
 
@@ -310,8 +310,9 @@ def test_the_cuda_slice_is_refused_at_construction(tmp_path: Path) -> None:
 
 
 def test_bf16_perceptual_precision_is_accepted(tmp_path: Path) -> None:
-    """D-52, Q-73's note (4): bf16 LPIPS is built in M15 (#228), so the trainer no longer refuses
-    it; without the perceptual term it trains as any other run."""
+    """D-52, Q-73's note (4): bf16 is built since M15 (#228, for LPIPS-VGG before revision
+    549o), so the trainer no longer refuses it; without the perceptual term, at the default
+    `perc_net` "flip", no network is built and it trains as any other run (Q-267)."""
     video = _scene(tmp_path)
     cfg = _no_perceptual(perf=PerfConfig(perc_precision="bf16"))
     trainer = Trainer(cfg, video, _init_points(), device="cpu")
@@ -437,11 +438,11 @@ def test_u21_checkpoint_round_trip_keeps_every_part_of_the_state(tmp_path: Path)
     _assert_states_equal(state, resumed.state_dict())
 
 
-# U-21's and U-24's losses: without the perceptual term, and with ꟻLIP at its calibrated weight
-# (D-89), the default from #392 on, whose CPU path must be deterministic too (#380).
+# U-21's and U-24's losses: without the perceptual term, and the default, ꟻLIP at its calibrated
+# weight (§2.1 `LossConfig`, D-89), whose CPU path must be deterministic too (#380).
 DETERMINISM_LOSSES = [
     pytest.param(LossConfig(lambda_perc=0.0), id="no-perceptual"),
-    pytest.param(LossConfig(perc_net="flip", lambda_perc=None), id="flip"),
+    pytest.param(LossConfig(), id="flip"),
 ]
 
 
@@ -843,6 +844,43 @@ def test_a_resume_refuses_a_changed_scene_manifest_unless_forced(tmp_path: Path)
     assert [log.image_index for log in after] == [log.image_index for log in straight[20:]]
 
 
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_a_resume_refuses_a_checkpoint_saved_before_549o(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: str
+) -> None:
+    """Q-247: a checkpoint whose stored configuration names one of LPIPS's backbones, as those
+    saved before revision 549o do with M17's λ_perc = 0.01, can't be resumed. `from_checkpoint`
+    checks the stored configuration first, so the ValueError names 549o whether or not the
+    resume is forced, given performance settings or given another scene manifest, and no
+    perceptual network is built; `load_state_dict` refuses such a state too."""
+    video = _scene(tmp_path / "scene")
+    trainer = Trainer(
+        _no_perceptual(optim=OptimConfig(iterations=30)), video, _init_points(), device="cpu"
+    )
+    _run(trainer, 5)
+    state = trainer.state_dict()
+    state.config["loss"] |= {"perc_net": net, "lambda_perc": 0.01}
+    save_checkpoint(state, tmp_path / "ckpt")
+    manifest = json.loads(video.manifest.path.read_text())
+    manifest["cameras"]["ring00"]["world_to_camera"][2][3] += 10.0
+    changed_path = tmp_path / "scene" / "changed.json"
+    changed_path.write_text(json.dumps(manifest))
+    changed = MultiViewVideo.from_manifest(changed_path)
+    built = _record_networks(monkeypatch)
+    resumes: list[tuple[MultiViewVideo, dict[str, Any]]] = [
+        (video, {}),
+        (video, {"force": True}),
+        (video, {"perf": PerfConfig()}),
+        (changed, {}),
+    ]
+    for dataset, options in resumes:
+        with pytest.raises(ValueError, match=rf"perc_net '{net}'.*549o"):
+            Trainer.from_checkpoint(tmp_path / "ckpt", dataset, device="cpu", **options)
+    with pytest.raises(ValueError, match="549o"):
+        trainer.load_state_dict(state)
+    assert built == []
+
+
 def test_load_state_dict_refuses_another_run_and_changes_nothing(tmp_path: Path) -> None:
     """Q-69, Q-72: a state of another configuration, whose sampler doesn't fit the dataset,
     whose iteration isn't an int, or whose global generator states are malformed, is a
@@ -1108,34 +1146,31 @@ TRUNK_PARAMS = [
     *(pytest.param(net, marks=pytest.mark.weights) for net in CAFFE_TRUNKS),
     *(pytest.param(net, marks=(pytest.mark.weights, needs_init)) for net in DINO_TRUNKS),
 ]
-# The networks the trainer runs under bfloat16 autocast: LPIPS-VGG, the default until #392
-# (Q-172, Q-191), and the six trunk networks (Q-250, Q-251).
-BF16_NETWORKS = [pytest.param("vgg", marks=pytest.mark.weights), *TRUNK_PARAMS]
+# The networks the trainer runs under bfloat16 autocast: the six trunk networks (Q-172, Q-191,
+# Q-250, Q-251).
+BF16_NETWORKS = TRUNK_PARAMS
 
 
-def _perceptual(net: str, precision: Literal["tf32", "ieee", "bf16"] = "tf32") -> TrainConfig:
-    """The default configuration with the perceptual network `net` at its weight, D-89's
-    calibrated one (None), or 0.01 for LPIPS-VGG ("vgg", until #392), in `precision`, with the
-    frame cache off."""
-    lambda_perc = 0.01 if net == "vgg" else None
+def _perceptual(net: PercNet, precision: Literal["tf32", "ieee", "bf16"] = "tf32") -> TrainConfig:
+    """The default configuration with the perceptual network `net` at its calibrated weight
+    (D-89; λ_perc None), in `precision`, with the frame cache off."""
     return TrainConfig(
-        loss=LossConfig(perc_net=net, lambda_perc=lambda_perc),  # type: ignore[arg-type]
+        loss=LossConfig(perc_net=net),
         perf=PerfConfig(perc_precision=precision, frame_cache="off"),
     )
 
 
 def _record_networks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """The networks built from now on, by name, `PerceptualLoss`'s and the legacy
-    `LPIPSLoss`'s alike, seen by wrapping the two public classes' constructors."""
+    """The networks built from now on, by name, seen by wrapping the public class's
+    constructor."""
     built: list[str] = []
-    for cls in (PerceptualLoss, LPIPSLoss):
-        original = cls.__init__
+    original = PerceptualLoss.__init__
 
-        def recording(self: Any, net: Any, *, _original: Any = original) -> None:
-            built.append(net)
-            _original(self, net)
+    def recording(self: Any, net: Any) -> None:
+        built.append(net)
+        original(self, net)
 
-        monkeypatch.setattr(cls, "__init__", recording)
+    monkeypatch.setattr(PerceptualLoss, "__init__", recording)
     return built
 
 
@@ -1180,18 +1215,15 @@ def test_bf16_is_refused_for_a_weight_free_network_when_the_trainer_is_built(
     assert _all_finite([Trainer(unweighted, video, _init_points(), device="cpu").step()])
 
 
-@pytest.mark.parametrize(
-    "net",
-    [pytest.param("vgg", marks=pytest.mark.weights), "flip", "haarpsi", *TRUNK_PARAMS],
-)
+@pytest.mark.parametrize("net", ["flip", "haarpsi", *TRUNK_PARAMS])
 def test_building_the_perceptual_network_draws_nothing_from_the_global_generator(
-    tmp_path: Path, net: str
+    tmp_path: Path, net: PercNet
 ) -> None:
     """Q-72: the trainer never draws from the global generators, also while it builds its
     perceptual network, whose builder may initialize weights from torch's global CPU generator
-    before the publisher's are loaded (lpips's trunk, the vendored DINOv2 builders); and two
-    runs of one configuration, the second built after the first has trained, give the same
-    step logs, bitwise."""
+    before the publisher's are loaded (the vendored DINOv2 builders); and two runs of one
+    configuration, the second built after the first has trained, give the same step logs,
+    bitwise."""
     video = _scene(tmp_path, scale=2)  # the DINO networks' 27 and 31 pixels (D-89; Q-265)
     cfg = dataclasses.replace(_perceptual(net), optim=OptimConfig(iterations=3))
     before = torch.get_rng_state()
@@ -1221,16 +1253,16 @@ def test_a_checkpoint_holds_no_perceptual_network(tmp_path: Path, net: PercNet) 
     assert saved < 4 * vit_tensors  # the ViT's float32 parameters alone would take more
 
 
-# With the LPIPS networks (weights; D-77, Q-74).
+# The default configuration's perceptual network, ꟻLIP at its calibrated weight (D-9, D-77).
 
 
-@pytest.mark.weights
 def test_training_with_the_perceptual_loss(tmp_path: Path) -> None:
-    """D-77: with λ_perc > 0 the trainer builds the perceptual network once and passes it to
-    total_loss, whose "perceptual" term is reported."""
+    """D-77, §2.1 `LossConfig`: the default configuration, ꟻLIP at its calibrated weight, has
+    the trainer build the perceptual network once and pass it to total_loss, whose
+    "perceptual" term is reported, positive and finite, at every step."""
     trainer = Trainer(TrainConfig(), _scene(tmp_path), _init_points(), device="cpu")
     logs = _run(trainer, 3)
-    assert all(math.isfinite(float(log.losses["perceptual"])) for log in logs)
+    assert all(0.0 < float(log.losses["perceptual"]) < math.inf for log in logs)
 
 
 def _step_with_gradients(trainer: Trainer) -> tuple[StepLog, dict[str, torch.Tensor]]:
@@ -1247,11 +1279,11 @@ def _step_with_gradients(trainer: Trainer) -> tuple[StepLog, dict[str, torch.Ten
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("net", BF16_NETWORKS)
 def test_a_bf16_step_gives_a_finite_perceptual_term_near_float32(
-    tmp_path: Path, device: str, net: str
+    tmp_path: Path, device: str, net: PercNet
 ) -> None:
     """D-52, Q-172 (#228), Q-250: with perc_precision = "bf16" one training step runs the
-    perceptual network under bfloat16 autocast: LPIPS-VGG, the legacy default until #392, or
-    any of D-89's six trunk networks at its calibrated weight. The perceptual term is float32,
+    perceptual network under bfloat16 autocast: any of D-89's six trunk networks at its
+    calibrated weight. The perceptual term is float32,
     finite and within 5e-2 relative of the float32 ("ieee") step from the same seed, which
     renders the same image, and the gradients that reach the model are finite. bf16 is
     approximate (D-52), so the two terms differ."""
@@ -1268,112 +1300,6 @@ def test_a_bf16_step_gives_a_finite_perceptual_term_near_float32(
     assert abs(terms["bf16"] - terms["ieee"]) <= 5e-2 * terms["ieee"]
     assert "means" in gradients["bf16"]
     assert all(bool(torch.isfinite(g).all()) for g in gradients["bf16"].values())
-
-
-@pytest.mark.weights
-@pytest.mark.parametrize("precision", ["ieee", "tf32"])
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
-def test_a_float32_steps_perceptual_term_takes_nchw_inputs_within_rounding_of_channels_last(
-    tmp_path: Path, device: str, precision: Literal["ieee", "tf32"]
-) -> None:
-    """D-52, Q-172 (#228), Q-173 (changed, #326), Q-223: with perc_precision "ieee" or "tf32" a
-    training step's perceptual term equals, bitwise, a direct call of a separately built
-    plain `LPIPSLoss`, so float32 and not bf16's, on the same two images laid out so that
-    their batch-first views are contiguous NCHW; and that NCHW path's value and the
-    prediction's gradient are within rounding of the channels-last path the trainer ran
-    before #326, the copy being exact (§2.4 rule 2). The direct calls are made at the same
-    moment, so under the global flags the step sets (`cudnn.allow_tf32` per precision,
-    autotuning). Tolerances (Q-223): the value within 1e-5 relative and the gradient within
-    1e-4 in relative L2 in IEEE float32, which the CPU always computes; TF32 on CUDA rounds
-    to 10 mantissa bits, about 2·10⁻⁵ in value and 3 % in gradient L2 from IEEE float32 in
-    B-4 (Calibration data), so two TF32 kernels are held to 1e-3 and 0.1. The images are
-    caught by a global forward hook, PyTorch's public `register_module_forward_hook`."""
-    from torch.nn.modules.module import register_module_forward_hook
-
-    def nchw(image: torch.Tensor) -> torch.Tensor:
-        # [..., H, W, 3] whose batch-first view [B, 3, H, W] is contiguous
-        return image.detach().movedim(-1, -3).contiguous().movedim(-3, -1)
-
-    def value_and_gradient(
-        pred: torch.Tensor, gt: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pred = pred.requires_grad_()
-        value = direct(pred, gt)
-        (gradient,) = torch.autograd.grad(value, pred)
-        return value.detach(), gradient
-
-    cfg = TrainConfig(perf=PerfConfig(perc_precision=precision, frame_cache="off"))
-    trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device=device)
-    assert cfg.loss.perc_net == "vgg"  # the default until #392 (#380's expand step)
-    direct = LPIPSLoss(cfg.loss.perc_net).to(device)
-    seen: list[tuple[torch.Tensor, ...]] = []
-    busy = False
-
-    def hook(module: torch.nn.Module, args: Any, output: Any) -> None:
-        nonlocal busy
-        if busy or not isinstance(module, LPIPSLoss):
-            return
-        busy = True  # the direct calls below run the same hook
-        try:
-            pred, gt = args
-            first = value_and_gradient(nchw(pred), nchw(gt))
-            last = value_and_gradient(pred.detach().clone(), gt.detach().clone())
-        finally:
-            busy = False
-        seen.append((output.detach().clone(), *first, *last))
-
-    handle = register_module_forward_hook(hook)
-    try:
-        log = trainer.step()
-    finally:
-        handle.remove()
-    assert len(seen) == 1
-    term, value, gradient, value_last, gradient_last = seen[0]
-    assert torch.equal(term, value)
-    assert float(log.losses["perceptual"]) == float(value)
-    tf32 = device == "cuda" and precision == "tf32"
-    rtol, gtol = (1e-3, 0.1) if tf32 else (1e-5, 1e-4)
-    torch.testing.assert_close(value, value_last, rtol=rtol, atol=0.0)
-    difference = torch.linalg.vector_norm((gradient - gradient_last).double())
-    assert float(difference) <= gtol * float(torch.linalg.vector_norm(gradient_last.double()))
-
-
-@pytest.mark.weights
-@pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("precision", ["ieee", "tf32", "bf16"])
-def test_the_trainers_perceptual_network_gets_nchw_inputs_where_b4_measured_them_faster(
-    tmp_path: Path, precision: Literal["ieee", "tf32", "bf16"], deterministic: bool
-) -> None:
-    """Q-173 (changed, #326), Q-223: during a training step, lpips's network gets both images as
-    contiguous NCHW tensors under perc_precision "ieee", and under "tf32" when the step
-    autotunes (not `deterministic`); otherwise, and always under "bf16", it gets the
-    channels-last view of the render, the layout B-4 measured faster there. A plain
-    `LPIPSLoss`, as the evaluator builds (E16), still passes the channels-last view. The inputs
-    are caught by PyTorch's public `register_module_forward_pre_hook`."""
-    import lpips
-    from torch.nn.modules.module import register_module_forward_pre_hook
-
-    layouts: list[list[tuple[bool, bool]]] = []
-
-    def hook(module: torch.nn.Module, args: Any) -> None:
-        if isinstance(module, lpips.LPIPS):
-            last = torch.channels_last
-            layouts.append([(a.is_contiguous(), a.is_contiguous(memory_format=last)) for a in args])
-
-    perf = PerfConfig(perc_precision=precision, deterministic=deterministic, frame_cache="off")
-    trainer = Trainer(TrainConfig(perf=perf), _scene(tmp_path), _init_points(), device="cpu")
-    plain = LPIPSLoss("vgg")  # the default perc_net until #392 (#380's expand step)
-    generator = torch.Generator().manual_seed(0)
-    handle = register_module_forward_pre_hook(hook)
-    try:
-        trainer.step()
-        plain(*(torch.rand(32, 40, 3, generator=generator) for _ in range(2)))
-    finally:
-        handle.remove()
-    nchw, channels_last = (True, False), (False, True)
-    faster = precision == "ieee" or (precision == "tf32" and not deterministic)
-    expected = nchw if faster else channels_last
-    assert layouts == [[expected, expected], [channels_last, channels_last]]
 
 
 @pytest.mark.parametrize(("precision", "tf32"), [("ieee", False), ("tf32", True), ("bf16", True)])
@@ -1402,10 +1328,10 @@ def test_cudnn_tf32_during_a_step_follows_the_perceptual_precision(
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("net", BF16_NETWORKS)
 def test_a_bf16_step_changes_only_the_perceptual_term(
-    tmp_path: Path, device: str, net: str
+    tmp_path: Path, device: str, net: PercNet
 ) -> None:
-    """D-52, Q-172 (#245), Q-250: bf16's autocast is local to the perceptual network, LPIPS-VGG
-    or a trunk network of D-89, so a "bf16" step and a "tf32" step from the same seed, both
+    """D-52, Q-172 (#245), Q-250: bf16's autocast is local to the perceptual network, a trunk
+    network of D-89, so a "bf16" step and a "tf32" step from the same seed, both
     with TF32 on, give bitwise the same L1, 1 − SSIM and L_reg terms, and only the perceptual
     term differs. On the CPU, SSIM takes its PyTorch fallback, whose convolution an autocast
     around the whole loss would reach."""

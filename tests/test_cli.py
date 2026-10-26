@@ -31,6 +31,7 @@ from builders import (
     bad_exchange,
     look_at,
     n3dv_source,
+    pre_549o_checkpoint,
     random_model,
     ring,
     selfcap_archives,
@@ -67,7 +68,7 @@ from openftgs.io import (
 )
 from openftgs.model import FreeTimeGaussians
 from openftgs.train import Trainer
-from openftgs.types import InitPoints, Renders, TimeNormalizer
+from openftgs.types import ExchangeModel, InitPoints, Renders, TimeNormalizer
 
 TAU1 = 2.0 / 30.0  # three frames at 30 FPS
 TIME = TimeNormalizer(0.0, TAU1)
@@ -122,7 +123,7 @@ def _init(path: Path, *, n: int = 30, unit: str = "s") -> Path:
 
 
 def _cfg(iterations: int = ITERATIONS, **fields: Any) -> TrainConfig:
-    """No perceptual loss (no downloads), a shortened calendar (§3.2, Q-75), logs every 5."""
+    """No perceptual loss (λ_perc = 0), a shortened calendar (§3.2, Q-75), logs every 5."""
     fields.setdefault("perf", PerfConfig(log_every=5))
     base = TrainConfig(loss=LossConfig(lambda_perc=0.0), **fields)
     cfg = shortened_config(iterations, base)
@@ -2011,6 +2012,73 @@ def test_resuming_with_a_trunk_weight_that_cannot_be_downloaded_is_exit_code_2(
     assert _train(run, tmp_path / "resumed", "--resume", alex) == 2
     err = capsys.readouterr().err
     assert "bvlc_alexnet.caffemodel" in err and "no network (stood in for)" in err
+
+
+# Checkpoints saved before revision 549o (Q-247): read by the model readers, refused by resume.
+
+
+def test_a_checkpoint_saved_before_549o_is_evaluated_rendered_and_exported(
+    tmp_path: Path,
+) -> None:
+    """Q-247: `ftgs eval`, `render` and `export` of a checkpoint whose configuration names
+    LPIPS-VGG ("vgg") succeed, and give what they give for the same checkpoint at 549o's
+    configuration, the model and its background being the same; nothing is written into it."""
+    scene, checkpoint = _trained(tmp_path, background=(0.25, 0.5, 0.75))
+    legacy = pre_549o_checkpoint(checkpoint, tmp_path / "legacy")
+    manifest = (legacy / "manifest.json").read_bytes()
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
+    results: dict[str, tuple[Any, Renders, ExchangeModel]] = {}
+    for name, model in (("now", checkpoint), ("legacy", legacy)):
+        out = tmp_path / name
+        assert _ftgs("eval", model, scene, "--out", out / "METRICS.json") == 0
+        renders_file = out / "renders.safetensors"
+        ref = ("--backend", "reference")
+        assert _ftgs("render", model, "--request", request, "--out", renders_file, *ref) == 0
+        exchange_file = out / "model.safetensors"
+        assert _ftgs("export", model, "--format", "ftgs-if", "--out", exchange_file) == 0
+        report = json.loads((out / "METRICS.json").read_text())["entire"]["scene"]
+        results[name] = (report, read_renders(renders_file), read_exchange(exchange_file))
+    (metrics, renders, exchange), (old_metrics, old_renders, old_exchange) = results.values()
+    assert old_metrics == metrics
+    assert sorted(old_renders.rgb) == sorted(renders.rgb)
+    for key in renders.rgb:
+        assert torch.equal(old_renders.rgb[key], renders.rgb[key]), key
+    assert old_exchange.background == exchange.background == (0.25, 0.5, 0.75)
+    for key, array in exchange.arrays.items():
+        assert torch.equal(old_exchange.arrays[key], array), key
+    assert (legacy / "manifest.json").read_bytes() == manifest
+    assert load_checkpoint(legacy).config["loss"]["perc_net"] == "vgg"
+
+
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_resuming_a_checkpoint_saved_before_549o_is_exit_code_2_naming_549o(
+    run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str], net: str
+) -> None:
+    """Q-247: `ftgs train --resume` of a checkpoint whose configuration names LPIPS's backbone
+    is exit 2, naming the backbone and revision 549o, and writes nothing; so is a `--config`
+    file naming one (#375), and a run directory whose config.json names one is no resumed
+    run's own."""
+    first = tmp_path / "first"
+    assert _train(run, first, "--config", run["config"]) == 0
+    legacy = pre_549o_checkpoint(first / "checkpoint", tmp_path / "legacy", net)
+    capsys.readouterr()
+    resumed = tmp_path / "resumed"
+    assert _train(run, resumed, "--resume", legacy) == 2
+    err = capsys.readouterr().err
+    assert f"'{net}'" in err and "549o" in err and "Traceback" not in err
+    assert not resumed.exists()
+    config = json.loads(run["config"].read_text())
+    config["loss"] |= {"perc_net": net}
+    named = tmp_path / "named.json"
+    named.write_text(json.dumps(config))
+    assert _train(run, tmp_path / "new", "--config", named) == 2
+    assert "549o" in capsys.readouterr().err
+    assert not (tmp_path / "new").exists()
+    recorded = json.loads((first / "config.json").read_text())
+    recorded["loss"] |= {"perc_net": net, "lambda_perc": 0.01}
+    (first / "config.json").write_text(json.dumps(recorded))
+    assert _train(run, first, "--resume", first / "checkpoint") == 2
+    assert "config.json" in capsys.readouterr().err
 
 
 def test_eval_refuses_a_partial_mask_set_and_an_empty_split(

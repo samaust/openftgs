@@ -409,6 +409,7 @@ class _Profile:
 def _train(args: argparse.Namespace) -> int:
     import torch
 
+    from openftgs._legacy import resume_refusal
     from openftgs.config import config_from_dict, config_to_dict, resume_conflicts
     from openftgs.io import (
         check_run_checkpoints,
@@ -437,7 +438,13 @@ def _train(args: argparse.Namespace) -> int:
         cfg = _read_config(args.config, args.seed)
     else:
         with _as_input_error(f"checkpoint {args.resume}"):
-            cfg = config_from_dict(load_checkpoint(args.resume).config)
+            stored = load_checkpoint(args.resume).config
+        # Q-247: a checkpoint saved before 549o is refused first, naming the revision.
+        refusal = resume_refusal(stored, f"checkpoint {args.resume}")
+        if refusal is not None:
+            _fail(refusal)
+        with _as_input_error(f"checkpoint {args.resume}"):
+            cfg = config_from_dict(stored)
         if args.config is not None or args.seed is not None:  # Q-134
             if args.config is not None:
                 given = _read_config(args.config, args.seed)
@@ -697,6 +704,7 @@ def _model_sha256_or_none(path: Path) -> str | None:
 
 
 def _read_model(path: Path, device: str) -> _Loaded:
+    from openftgs._legacy import with_current_loss
     from openftgs.config import config_from_dict
     from openftgs.io import load_checkpoint, read_exchange
     from openftgs.model import FreeTimeGaussians
@@ -710,7 +718,8 @@ def _read_model(path: Path, device: str) -> _Loaded:
             None,
         )
     state = load_checkpoint(path)
-    cfg = config_from_dict(state.config)
+    # Q-247: a checkpoint saved before 549o gives its model too; its loss isn't read here.
+    cfg = config_from_dict(with_current_loss(state.config))
     model = FreeTimeGaussians(
         {k: v.to(device) for k, v in state.params.items()},
         sh_degree=cfg.sh_degree,

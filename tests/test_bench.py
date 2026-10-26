@@ -844,12 +844,10 @@ def test_bench_slice_refuses_a_single_timestamp_scene_and_an_unwritable_out(
 
 def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> None:
     """#226, #389 (Q-168): the default configuration, ꟻLIP included at its calibrated weight
-    (D-89; `perc_net` "flip" and `lambda_perc` None, set explicitly until #392 makes them the
-    defaults), except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and
+    (D-89; `perc_net` "flip" and `lambda_perc` None, `LossConfig`'s defaults since #392),
+    except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and
     sh_interval = 1; so the timed iterations 121 to 420 hold exactly the events at 200, 300 and
     400, all at SH degree 3."""
-    import dataclasses
-
     from openftgs.cli._bench import _train_step_config
     from openftgs.config import TrainConfig
     from openftgs.train import calendar_entry
@@ -863,9 +861,8 @@ def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> No
     assert _train_step_config(100).growth.n_max == 102  # exactly 102: no rounding up
     assert (cfg.loss.lambda_perc, cfg.loss.perc_net) == (None, "flip")
     assert cfg.sh_degree == 3 and _train_step_config(10, sh_degree=1).sh_degree == 1
-    # Everything else is the default.
-    flip = dataclasses.replace(default.loss, perc_net="flip", lambda_perc=None)
-    assert cfg.loss == flip and cfg.perf == default.perf and cfg.init == default.init
+    # Everything else is the default, the loss included.
+    assert cfg.loss == default.loss and cfg.perf == default.perf and cfg.init == default.init
     assert cfg.growth.stop == default.growth.stop and cfg.reloc.stop == default.reloc.stop
     assert cfg.optim.iterations == default.optim.iterations
     entries = {it: calendar_entry(cfg, it) for it in range(121, 421)}
@@ -2421,6 +2418,41 @@ def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
     assert models == {(32, None), (None, None)}  # the threshold case has neither
     assert body["budgets"] == []  # Q-239: the scene records no floor
     assert body["setup"]["floor_fps"] is None
+
+
+@pytest.mark.gpu
+def test_b7_times_a_checkpoint_saved_before_549o(tested_scene: Path, tmp_path: Path) -> None:
+    """Q-247: `ftgs bench render --model` reads a checkpoint whose stored configuration names
+    LPIPS-VGG ("vgg"), as those saved before revision 549o do, M17's among them, whose B-7
+    floors Q-239 records: B-7 times its model, its N in the cases, with the checkpoint's Δt_f
+    as the buckets' width (D-55)."""
+    from openftgs.config import TrainConfig, config_to_dict
+    from openftgs.io import save_checkpoint
+    from openftgs.types import TrainerState
+
+    model = random_model(32, seed=1, sh_degree=1, time=TIME)
+    config = config_to_dict(TrainConfig(sh_degree=1))
+    config["loss"] |= {"perc_net": "vgg", "lambda_perc": 0.01}  # M17's defaults
+    state = TrainerState(
+        iteration=10,
+        config=config,
+        time=TIME,
+        spatial_scale=1.0,
+        frame_dt=0.25,
+        params={name: getattr(model, name).detach() for name in PARAM_NAMES},
+        optim={},
+        stats={},
+        rng={},
+        sampler={},
+    )
+    checkpoint = save_checkpoint(state, tmp_path / "legacy")
+    out = tmp_path / "B-7.json"
+    assert _ftgs("bench", "render", tested_scene, "--out", out, "--model", checkpoint) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["setup"]["model"] == f"given: {checkpoint}"
+    assert body["setup"]["frame_dt"] == pytest.approx(0.25)
+    models = {(c["case"].get("n"), c["case"].get("active")) for c in body["cases"]}
+    assert models == {(32, None), (None, None)}
 
 
 @pytest.mark.gpu

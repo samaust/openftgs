@@ -74,7 +74,7 @@ markers = [
     "cpu: added to every test not marked gpu; uses the reference backend, but may still need a dataset or downloaded weights",
     "gpu: needs a CUDA device; skipped without one",
     "dataset: needs a real dataset under $OPENFTGS_DATASETS; skipped otherwise (Q-7)",
-    "weights: downloads pretrained weights at run time (RoMa, DINOv2, LPIPS backbones); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1 (Q-7)",
+    "weights: downloads pretrained weights at run time (RoMa, DINOv2, the trunk networks of D-89); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1 (Q-7)",
 ]
 
 # Q-216: coverage of the CPU suite in CI, the ftgs and harness subprocesses included; the vendored

@@ -709,7 +709,9 @@ def run_report(
     if not records:
         raise InputError(f"the test split of {scene} holds no images")
     device = torch.device("cuda" if backend == "gsplat" else "cpu")
-    config = config_from_dict(state.config)
+    # Q-271: the loss, which load_checkpoint has checked, is left out, so a checkpoint saved
+    # before 549o (LPIPS's backbone as perc_net, Q-247) gives its model and background too.
+    config = config_from_dict({k: v for k, v in state.config.items() if k != "loss"})
     # E16's Î is the render composited over the run's background (D-34), as evaluate() renders.
     background = torch.tensor(config.background, dtype=torch.float32, device=device)
     model = FreeTimeGaussians(
