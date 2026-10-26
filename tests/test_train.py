@@ -437,16 +437,29 @@ def test_u21_checkpoint_round_trip_keeps_every_part_of_the_state(tmp_path: Path)
     _assert_states_equal(state, resumed.state_dict())
 
 
-def test_u21_resumed_run_is_bitwise_equal_to_the_straight_run(tmp_path: Path) -> None:
+# U-21's and U-24's losses: without the perceptual term, and with ꟻLIP at its calibrated weight
+# (D-89), the default from #392 on, whose CPU path must be deterministic too (#380).
+DETERMINISM_LOSSES = [
+    pytest.param(LossConfig(lambda_perc=0.0), id="no-perceptual"),
+    pytest.param(LossConfig(perc_net="flip", lambda_perc=None), id="flip"),
+]
+
+
+@pytest.mark.parametrize("loss", DETERMINISM_LOSSES)
+def test_u21_resumed_run_is_bitwise_equal_to_the_straight_run(
+    tmp_path: Path, loss: LossConfig
+) -> None:
     """U-21 (reference backend, CPU): 300 iterations straight against 150, a resume through a
     checkpoint directory, and 150 more give the same images, rates, loss terms, event reports
     and final state, bitwise. Events grow and relocate rows on both sides of the resume, which
     falls in the middle of an epoch, so a partly used permutation is restored. The log window
-    restarts at a resume, so its means are compared before the resume only."""
+    restarts at a resume, so its means are compared before the resume only. With ꟻLIP, the
+    resumed trainer builds its own network."""
     video = _scene(tmp_path / "scene", frames=U21_FRAMES)
-    straight_trainer = _u21_trainer(video)
+    cfg = dataclasses.replace(U21, loss=loss)
+    straight_trainer = _u21_trainer(video, cfg)
     straight = _run(straight_trainer)
-    first = _u21_trainer(video)
+    first = _u21_trainer(video, cfg)
     before = _run(first, 150)
     state = first.state_dict()
     assert 0 < state.sampler["cursor"] < len(state.sampler["permutation"])
@@ -459,13 +472,23 @@ def test_u21_resumed_run_is_bitwise_equal_to_the_straight_run(tmp_path: Path) ->
     _assert_states_equal(straight_trainer.state_dict(), resumed.state_dict(), global_rng=False)
 
 
-def test_u24_two_seeded_runs_are_bitwise_identical(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "loss",
+    [
+        *DETERMINISM_LOSSES,
+        pytest.param(LossConfig(perc_net="haarpsi", lambda_perc=None), id="haarpsi"),
+    ],
+)
+def test_u24_two_seeded_runs_are_bitwise_identical(tmp_path: Path, loss: LossConfig) -> None:
     """U-24: two 100-iteration runs from one configuration and seed, with events, give the same
-    step logs and final state, bitwise; neither seeds the global generators (Q-72)."""
+    step logs and final state, bitwise; neither seeds the global generators (Q-72). Without the
+    perceptual term, and with each weight-free network of D-89 at its calibrated weight."""
     video = _scene(tmp_path)
-    a, b = _u21_trainer(video, U24), _u21_trainer(video, U24)
+    cfg = dataclasses.replace(U24, loss=loss)
+    a, b = _u21_trainer(video, cfg), _u21_trainer(video, cfg)
     logs_a, logs_b = _run(a), _run(b)
     assert _events_did_work(logs_a)
+    assert ("perceptual" in logs_a[0].losses) is (loss.lambda_perc != 0.0)
     _assert_logs_equal(logs_a, logs_b)
     _assert_states_equal(a.state_dict(), b.state_dict(), global_rng=False)
 
