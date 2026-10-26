@@ -1720,11 +1720,12 @@ _WEIGHT_FREE = ("flip", "haarpsi")  # D-89: no pretrained weights, so no bfloat1
 # Q-248: the DINO networks, whose vendored DINOv2 layers need the [init] extra.
 _NEEDS_INIT = ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
 _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52; bfloat16 for the trunk networks only
-# Q-269: the render's batch-first view as it comes, channels-last in memory, which every
-# network takes in training until #394 sets each one's layout (Q-251); and a contiguous NCHW
-# input, the copy #394 may give a network instead. Channels-last weights left with LPIPS (Q-173).
+# Q-269: the render's batch-first view as it comes, channels-last in memory; and a contiguous
+# NCHW input, the copy the trainer gives a network where B-4 measured it faster (Q-T394.2).
+# Channels-last weights left with LPIPS (Q-173).
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs")
-_TRAINING_LAYOUT = "channels_last_inputs"  # Q-251: every network's in training until #394
+# Q-190, Q-269: the deviations' layout, the render's view, with autotuning off.
+_DEVIATION_LAYOUT = "channels_last_inputs"
 _LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
 _LOSS_REPETITIONS = 30  # Q-190
 _LOSS_NOISE = 0.05  # Q-190: the prediction's seeded Gaussian noise
@@ -1760,6 +1761,23 @@ _CHILD_OUT_OF_MEMORY = 75
 def _precisions(net: str) -> tuple[str, ...]:
     """§3.4 B-4: IEEE float32 and TF32 for every network, and bfloat16 for the trunk ones."""
     return _LOSS_PRECISIONS[:2] if net in _WEIGHT_FREE else _LOSS_PRECISIONS
+
+
+def _training_paths(networks: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """The setup's record of what the trainer runs for each network in an iteration that isn't
+    deterministic (Q-T394.2): `training_autotuning`, whether it autotunes cuDNN, and
+    `training_layout`, the layout it gives the network per precision."""
+    from openftgs.train import _AUTOTUNED_NETWORKS, _NCHW_INPUTS
+
+    def layout(net: str, precision: str) -> str:
+        autotuned = net in _AUTOTUNED_NETWORKS
+        nchw = (precision, autotuned) in _NCHW_INPUTS.get(net, frozenset())
+        return "nchw" if nchw else "channels_last_inputs"
+
+    return {
+        "training_autotuning": {net: net in _AUTOTUNED_NETWORKS for net in networks},
+        "training_layout": {net: {p: layout(net, p) for p in _precisions(net)} for net in networks},
+    }
 
 
 def _cached_weights(networks: Sequence[str]) -> tuple[dict[str, str], dict[str, Path]]:
@@ -2121,18 +2139,18 @@ def _perceptual_case(
 
 def _perceptual_deviations(net: str, network: Any, images: _Images) -> list[dict[str, Any]]:
     """Per size, TF32's and, for a trunk network, bf16's deviation from IEEE float32 in value
-    and in the prediction's gradient (Q-190, Q-269), with the network as training runs it
-    until #394 (the render's view, Q-251), autotuning off."""
+    and in the prediction's gradient (Q-190, Q-269), with the render's view and autotuning off,
+    the plain path every comparison starts from."""
     import torch
 
     cases: list[dict[str, Any]] = []
     for (width, height), (gt, pred) in images.items():
         results: dict[str, tuple[Tensor, Tensor]] = {}
         for precision in _precisions(net):
-            x, y = _perceptual_inputs(gt, pred, _TRAINING_LAYOUT)
+            x, y = _perceptual_inputs(gt, pred, _DEVIATION_LAYOUT)
             with _cudnn_flags(tf32=precision != "ieee", autotuning=False):
                 value = _perceptual_forward(
-                    network, x, y, precision=precision, layout=_TRAINING_LAYOUT
+                    network, x, y, precision=precision, layout=_DEVIATION_LAYOUT
                 )
                 (grad,) = torch.autograd.grad(value, x)
             results[precision] = (value.detach(), grad)
@@ -2267,7 +2285,7 @@ def _losses(ctx: _Context) -> _Result:
             "to float32, as the trainer runs a trunk network (Q-172, Q-250); TF32 on"
         ),
         "layouts": list(_LOSS_LAYOUTS),
-        "training_layout": {net: _TRAINING_LAYOUT for net in networks},
+        **_training_paths(networks),
         "autotuning": list(_LOSS_AUTOTUNING),
         "processes": (
             "the networks' construction, the deviations and fused-ssim in the benchmark's "
