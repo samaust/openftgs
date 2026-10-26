@@ -156,6 +156,134 @@ _TRUNK_TICKETS = {
 }
 # D-89, E16: ꟻLIP's pixels per degree, a Python float, as the vendored copy's filter cache keys it.
 _FLIP_PIXELS_PER_DEGREE = 67.0
+# D-89's `haarpsi` row: piq's defaults.
+_HAARPSI_SCALES = 3
+_HAARPSI_C = 30.0
+_HAARPSI_ALPHA = 4.2
+
+
+# The HaarPSI below is adapted from piq 0.8.0 (https://github.com/photosynthesis-team/piq):
+# `haarpsi` in piq/haarpsi.py, with the helpers it calls, `rgb2yiq`
+# (piq/functional/colour_conversion.py), `haar_filter` (piq/functional/filters.py) and
+# `similarity_map` (piq/functional/base.py). piq is by Sergey Kastryulin and its contributors,
+# licensed under the Apache License, Version 2.0 (NOTICE; source log T381.1, T381.2).
+# Changed for openftgs (#381): the defaults D-89 sets (3 scales, subsampled, c = 30, α = 4.2) and
+# a data range of 1 are fixed; `_validate_input`'s asserts give way to Q-41's checks, and its
+# check of the values, which reads them back to the host, to D-89's clamp of the render
+# (Q-T381.1); the YIQ matrix and the Haar filters are built once per device and dtype rather
+# than at every call, and the pairs of Haar channels are taken by strided slices rather than by
+# tuple indices, since both copies to the GPU synchronize (§2.4 rule 3); the helpers are inlined;
+# "mean" is the only reduction.
+
+
+@functools.cache
+def _haarpsi_constants(device: torch.device, dtype: torch.dtype) -> tuple[Tensor, list[Tensor]]:
+    """The RGB-to-YIQ matrix, transposed for a matmul over the channels-last image, and the
+    stacked horizontal and vertical Haar filters of each scale, on `device` in `dtype`. Made
+    outside inference mode, so that a loss first called by a metric under
+    `torch.inference_mode()` still serves a training step's backward."""
+    with torch.inference_mode(False):
+        yiq = torch.tensor(
+            [[0.299, 0.587, 0.114], [0.5959, -0.2746, -0.3213], [0.2115, -0.5227, 0.3112]],
+            dtype=dtype,
+            device=device,
+        ).t()
+        kernels = []
+        for scale in range(_HAARPSI_SCALES):
+            size = 2 ** (scale + 1)
+            haar = torch.ones((size, size), device=device, dtype=dtype) / size
+            haar[size // 2 :, :] = -haar[size // 2 :, :]
+            haar = haar.unsqueeze(0)
+            kernels.append(torch.stack([haar, haar.transpose(-1, -2)]))
+    return yiq, kernels
+
+
+def _similarity(x: Tensor, y: Tensor, c: float) -> Tensor:
+    """piq's `similarity_map` with its masking coefficient at its default 0, whose terms are
+    dropped."""
+    return (2.0 * x * y + c) / (x**2 + y**2 + c)
+
+
+def _haarpsi(x: Tensor, y: Tensor) -> Tensor:
+    """HaarPSI of [B, 3, H, W] images in [0, 1], the mean over the batch, as piq 0.8.0's
+    `haarpsi` at D-89's settings computes it."""
+    # Q-T381.1: piq's minimal size, checked before the subsampling.
+    kernel_size = 2 ** (_HAARPSI_SCALES + 1)
+    if x.size(-1) < kernel_size or x.size(-2) < kernel_size:
+        _fail(f"HaarPSI needs H and W >= {kernel_size}, got {tuple(x.shape[-2:])}")
+    yiq_weights, kernels = _haarpsi_constants(x.device, x.dtype)
+
+    # Rescale images, from a data range of 1
+    x = x * 255
+    y = y * 255
+
+    # Convert RGB to YIQ color space
+    x_yiq = torch.matmul(x.permute(0, 2, 3, 1), yiq_weights).permute(0, 3, 1, 2)
+    y_yiq = torch.matmul(y.permute(0, 2, 3, 1), yiq_weights).permute(0, 3, 1, 2)
+
+    # Downscale input to simulate the typical distance between an image and its viewer.
+    up_pad = 0
+    down_pad = max(x.shape[2] % 2, x.shape[3] % 2)
+    pad_to_use = [up_pad, down_pad, up_pad, down_pad]
+    x_yiq = F.pad(x_yiq, pad=pad_to_use)
+    y_yiq = F.pad(y_yiq, pad=pad_to_use)
+    x_yiq = F.avg_pool2d(x_yiq, kernel_size=2, stride=2, padding=0)
+    y_yiq = F.avg_pool2d(y_yiq, kernel_size=2, stride=2, padding=0)
+
+    # Haar wavelet decomposition
+    coefficients_x, coefficients_y = [], []
+    for scale in range(_HAARPSI_SCALES):
+        kernel_size = 2 ** (scale + 1)
+        # Asymmetrical padding due to even kernel size. Matches MATLAB conv2(A, B, 'same')
+        upper_pad = kernel_size // 2 - 1
+        bottom_pad = kernel_size // 2
+        pad_to_use = [upper_pad, bottom_pad, upper_pad, bottom_pad]
+        coefficients_x.append(F.conv2d(F.pad(x_yiq[:, :1], pad=pad_to_use), kernels[scale]))
+        coefficients_y.append(F.conv2d(F.pad(y_yiq[:, :1], pad=pad_to_use), kernels[scale]))
+
+    # Shape (N, {scales * 2}, H, W)
+    coeffs_x = torch.cat(coefficients_x, dim=1)
+    coeffs_y = torch.cat(coefficients_y, dim=1)
+
+    # Low-frequency coefficients used as weights
+    # Shape (N, 2, H, W)
+    weights = torch.max(torch.abs(coeffs_x[:, 4:]), torch.abs(coeffs_y[:, 4:]))
+
+    # High-frequency coefficients used for similarity computation in 2 orientations
+    sim_map = []
+    for orientation in range(2):
+        # The channels (orientation, orientation + 2), as a strided slice: piq's tuple index
+        # copies an index tensor to the device, which synchronizes (§2.4 rule 3).
+        pair = slice(orientation, orientation + 3, 2)
+        magnitude_x = torch.abs(coeffs_x[:, pair])
+        magnitude_y = torch.abs(coeffs_y[:, pair])
+        similarity = _similarity(magnitude_x, magnitude_y, _HAARPSI_C)
+        sim_map.append(similarity.sum(dim=1, keepdim=True) / 2)
+
+    pad_to_use = [0, 1, 0, 1]
+    x_yiq = F.pad(x_yiq, pad=pad_to_use)
+    y_yiq = F.pad(y_yiq, pad=pad_to_use)
+    coefficients_x_iq = torch.abs(F.avg_pool2d(x_yiq[:, 1:], kernel_size=2, stride=1, padding=0))
+    coefficients_y_iq = torch.abs(F.avg_pool2d(y_yiq[:, 1:], kernel_size=2, stride=1, padding=0))
+
+    # Compute weights and similarity
+    weights = torch.cat([weights, weights.mean(dim=1, keepdim=True)], dim=1)
+    similarity = _similarity(coefficients_x_iq, coefficients_y_iq, _HAARPSI_C)
+    sim_map.append(similarity.sum(dim=1, keepdim=True) / 2)
+
+    sim = torch.cat(sim_map, dim=1)
+
+    # Calculate the final score
+    eps = torch.finfo(sim.dtype).eps
+    score = (((sim * _HAARPSI_ALPHA).sigmoid() * weights).sum(dim=[1, 2, 3]) + eps) / (
+        torch.sum(weights, dim=[1, 2, 3]) + eps
+    )
+    # Logit of score
+    score = (torch.log(score / (1 - score)) / _HAARPSI_ALPHA) ** 2
+    return score.mean(dim=0)
+
+
+# End of the code adapted from piq.
 
 
 class PerceptualLoss(torch.nn.Module):
@@ -173,7 +301,8 @@ class PerceptualLoss(torch.nn.Module):
                 f"{_TRUNK_TICKETS[net]}"
             )
         self._name = net
-        self._net = LDRFLIPLoss()
+        if net == "flip":
+            self._flip = LDRFLIPLoss()
         # D-89: frozen and in evaluation mode, whatever a parent module asks.
         self.requires_grad_(False)
         self.train(False)
@@ -184,11 +313,15 @@ class PerceptualLoss(torch.nn.Module):
 
     def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
         _check_pair(pred, gt)
+        # D-89: the reference without a gradient.
+        x, y = _batch_first(pred), _batch_first(gt.detach())
+        if self._name == "haarpsi":
+            # D-89: 1 − HaarPSI, Î clamped to [0, 1].
+            return 1.0 - _haarpsi(x.clamp(0.0, 1.0), y)
         # Q-T381.1: the published loss's constants are float32, and other dtypes fail inside it.
         if pred.dtype != torch.float32:
             _fail(f"ꟻLIP takes float32 images, got {pred.dtype}")
-        x, y = _batch_first(pred), _batch_first(gt.detach())
-        out: Tensor = self._net(x, y, pixels_per_degree=_FLIP_PIXELS_PER_DEGREE)
+        out: Tensor = self._flip(x, y, pixels_per_degree=_FLIP_PIXELS_PER_DEGREE)
         return out
 
 
