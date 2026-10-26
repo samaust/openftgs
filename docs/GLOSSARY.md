@@ -530,6 +530,14 @@ _Avoid_: D-SSIM loss (the loss term is 1 − SSIM), 1 − SSIM
 NVIDIA's image-difference metric for LDR images, the mean of its error map at 67.0 pixels per degree; both the default perceptual network and the reported perceptual metric. E16, D-9, D-89
 _Avoid_: FLIP (except in identifiers such as `flip`), LDR-FLIP, perceptual metric (unqualified), LPIPS
 
+**Vendored ꟻLIP**:
+The copy of NVIDIA's PyTorch ꟻLIP loss at commit d3ab02a inside `openftgs._vendor.flip`, changed for device and caching only, on which the default perceptual network and the perceptual metric are built. §2.3, D-65, D-89
+_Avoid_: flip_loss (the upstream file's name), the published file (the unmodified one), FLIP
+
+**Reference copy of ꟻLIP**:
+NVIDIA's `flip_loss.py` and its license at commit d3ab02a, unmodified, kept beside the tests as U-23's oracle and as the source the vendored ꟻLIP is made from. U-23, Q-252
+_Avoid_: pristine copy, the published file (the one NVIDIA hosts), the harness's copy (Q-254's)
+
 **LPIPS-VGG**:
 The LPIPS metric with the VGG backbone: the paper's perceptual term and metric, which openftgs neither trains with nor reports since revision 549o, and the reference its calibrated weights are scaled to. E7, E16, D-9, D-89
 _Avoid_: lpips (unqualified), perceptual network (ꟻLIP by default)
