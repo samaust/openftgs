@@ -16,7 +16,7 @@ The sampler's order is known ahead (D-26): its private `peek` returns the rest o
 
 ## Measured: B-6 and Q-99's note
 
-B-6 (`ftgs bench data`, `docs/modules/cli/benchmarks.md`) times the data wait, the training stream's `data` stage, against D-51's budget of 1 %, with B-1's configuration at 1M rows on openftgs-synth's kitchen and its 60-frame conversion (Calibration data, #232):
+B-6 (`ftgs bench data`, `docs/modules/cli/benchmarks.md`) times the data wait, the training stream's `data` stage, against D-51's budget of 1 %, with B-1's configuration at 1M rows on openftgs-synth's kitchen and its 60-frame conversion (Calibration data, #232), measured with LPIPS-VGG, the perceptual network before revision 549o:
 
 | Placement | Share of an iteration | Data stage, GPU (host) | Budget |
 | --- | --- | --- | --- |
@@ -27,4 +27,8 @@ B-6 (`ftgs bench data`, `docs/modules/cli/benchmarks.md`) times the data wait, t
 
 With the cache, the training stream spends its data stage converting the frame to float32. At prefetch 0 the read moved to the training thread, with, when B-6 was recorded, the wait on a pinned buffer's previous copy: 0.44 ms of host time, which runs while the GPU still works through the previous iteration's losses and backward pass, so the stream barely notices. That wait has since been removed (PRD #220's review): the read takes a fresh block of the caching pinned allocator instead. Without the cache, decoding a PNG takes 36 ms of host time, hidden the same way, and the stream copies a float32 image, four times a cached frame's bytes.
 
+With ꟻLIP an iteration is about a sixth as long, so the same wait is a larger share of it, and less of a host wait hides behind the GPU's backlog. #394's B-6 on the CI scene, kitchen's size, gives 0.21 % for "gpu" and for "mmap" at prefetch 8, 0.26 % at prefetch 0, and 63 % for "off", 31.8 ms of PNG decoding in a 50.1 ms iteration (Calibration data, #394; `docs/modules/cli/benchmarks.md`). On kitchen itself, B-1 on validation run 35's trained model (#395), memory-mapped at prefetch 8, gives a data stage of 0.038 ms, 0.12 % of a 31.7 ms iteration.
+
 "auto"'s rule for the GPU placement (Q-99) was checked at N = 3M rows, the default N_max, with the 60-frame cache (4.37 GiB) on the GPU, measured with LPIPS-VGG, the perceptual network before revision 549o. After the warm-up iteration it measured 20.31 GiB free and 0.058 GiB of growth, a limit of 10.10 GiB. The run then peaked at 12.09 GiB allocated and 15.23 GiB reserved, 8.57 GiB beyond the cache and the growth from reserved memory (5.43 GiB allocated). That is 84 % of the half of free memory the rule leaves for the iteration's own buffers, LPIPS's activations among them, so a cache at the rule's limit would still have fit, with about 1.6 GiB to spare. The rule stands as it is, and `frame_cache="mmap"` stays the safe setting at the edge of GPU memory.
+
+With ꟻLIP the iteration's own buffers are smaller: B-1 on validation run 35's trained kitchen model (N = 3M, #395) peaks at 4.32 GiB allocated and 8.02 GiB reserved, against 8.46 and 12.37 GiB with LPIPS-VGG at M17, and #394's B-6 on the CI scene's 60 frames at 3M, the cache on the GPU, used 0.31 of the rule's margin against 0.84 (Calibration data).

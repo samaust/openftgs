@@ -2,6 +2,8 @@
 
 M17's training and evaluation runs on openftgs-synth's `kitchen`, `courtyard` and `studio` (§1.4 "Validation data", D-79; PRD #317). Each run is listed here with its command, commit, the configuration's differences from the default, its wall time, its files and its headline metrics. The measured values themselves are rows of the Calibration data table of `docs/clean-room/questions.md`, which carry the owner's decisions; this page points to them. No result is compared with the paper's tables (D-79).
 
+Steps 35 to 38 are PRD #380's reruns after spec revision 549o (#395): the three default trainings and B-1 on the trained kitchen model, with ꟻLIP (LDR) at its calibrated weight as the perceptual network and as the reported perceptual metric (D-9, D-89). The steps before them trained and scored with LPIPS.
+
 The runs are under `<m17-runs>` (`docs/modules/cli/benchmarks.md`), outside the repository; `kitchen` is M15's conversion at `<m15-runs>/kitchen`, read and never written. Nothing a run produces is deleted: every final checkpoint, the reg_until runs' periodic checkpoints, the converted scenes and their frame caches stay, for the test-view renders and diagnostics of #318 (owner, 2026-10-21).
 
 ## The scenes
@@ -12,6 +14,8 @@ The runs are under `<m17-runs>` (`docs/modules/cli/benchmarks.md`), outside the 
 | `courtyard` | `enerf_outdoor/courtyard` with `ftgs convert opencv-yaml --fps 60 --frames 300 --resize 1.0 --test-camera 0009` | 0009 (Q-218) | 18 × 300, 1920×1080, 60 fps | LPIPS label `vgg` |
 | `studio` | `selfcap` with `ftgs convert selfcap --scene studio --window N0:N1 --test-camera 0007 --undistort internal --resize 1.0 --masks DIR` | 0007 (the dataset card's) | 24 × 60, 1920×1080, 60 fps, unsynchronized | 60-frame window around the test view's fastest range, exact ground-truth masks (Q-219); LPIPS label `vgg` |
 
+The LPIPS labels are the backbones M17's metrics reported (D-29), retired with LPIPS by revision 549o; from step 35 on, every scene reports ꟻLIP.
+
 The reference images themselves have flaws, seen by eye (owner, 2026-10-21): some scenes have over-bright regions clipped to white, and soft cloth textures that look blurry and change from frame to frame in a way the motion doesn't explain. Where the reference changes in a way the scene's geometry and motion can't account for, no model can match it, so part of every metric's error, and its spread from frame to frame and region to region, belongs to the data rather than to the run.
 
 ## How a run is made and summarized
@@ -20,6 +24,8 @@ The reference images themselves have flaws, seen by eye (owner, 2026-10-21): som
 - A configuration change is a TrainConfig JSON file holding only that override (Q-10), kept in `<m17-runs>/configs/`.
 - `scripts/run_summary.py RUN_DIR` writes `SUMMARY.json` beside the run: the N trace from `train_log.jsonl` (start, iteration 15,000, end, the first iteration at `growth.n_max`), the mean reg and total losses per 1,000 iterations, the opacity statistics of every checkpoint the run kept, and the scene means of METRICS.json with its `dynamic` and `fastest_10` blocks; with `--fastest N0:N1` (added after the M17 review), also the means over the 10 frames of that range from the per-image rows, for studio, whose manifest has no `fastest_10` (Q-222).
 - `scripts/synth_window.py` and `scripts/synth_masks.py` build studio's window and its mask directory from the ground truth (Q-219).
+- Since step 35, each training's kept-pixel PSNR (Q-233) is measured as #374 measured it: `python scripts/reference_flaws.py run RUN_DIR/checkpoint SCENE.json <m17-runs>/reference/<scene>/flags --out RUN_DIR/REFERENCE_PSNR.json`, against #329's flags for that scene; the figure is `overall.union.kept_psnr`.
+- Steps 35 to 38 ran a worktree's code at the commit given: the shared `.venv`'s editable install points at the main checkout, so each command ran with `PYTHONPATH=<worktree>/src` before the shared `.venv`'s `ftgs` or `python`, as each step's `command.txt` records.
 
 ## Runs
 
@@ -62,5 +68,9 @@ The reference images themselves have flaws, seen by eye (owner, 2026-10-21): som
 | 32 | B-7 on kitchen against its floor (#351) | `ftgs bench render $K/scene.json --model $M/kitchen/default/checkpoint --out $M/bench/B-7-kitchen-351.json` | 033543f | 5 min 43 s | 184.5 / 167.6 FPS (index on / off); the floor of 169 passed | §3.4 B-7's floors on the trained models (#351) |
 | 33 | B-7 on courtyard against its floor (#351) | `ftgs bench render $M/courtyard/scene/scene.json --model $M/courtyard/default/checkpoint --out $M/bench/B-7-courtyard-351.json` | 033543f | 5 min 41 s | 214.0 / 193.6 FPS (index on / off); the floor of 198 passed | §3.4 B-7's floors on the trained models (#351) |
 | 34 | B-7 on studio against its floor (#351) | `ftgs bench render $M/studio/scene/scene.json --model $M/studio/default/checkpoint --out $M/bench/B-7-studio-351.json` | 033543f | 2 min 5 s | 151.4 / 149.7 FPS at 0007's 60 times (Q-221); the floor of 136 passed | §3.4 B-7's floors on the trained models (#351) |
+| 35 | kitchen default at 549o (#395), seed 0 | the step 2 command with `--out $M/kitchen/default-395`; `python scripts/reference_flaws.py run $M/kitchen/default-395/checkpoint $K/scene.json $M/reference/kitchen/flags --out $M/kitchen/default-395/REFERENCE_PSNR.json` | eaeb791 | 14 min 22 s; 21 s | PSNR 28.32 dB on cam00, inside F1's seed spread of 26.58 to 28.38 dB (#374): **passes**; kept-pixel PSNR 30.64 dB against F1-s0's 30.18; ꟻLIP 0.0900; N reaches 3,000,000 at iteration 2,100, as in F1-s0; GPU peak 23,533 MiB | §1.5, §3.4 B-1 at 549o; E16 on kitchen at 549o, the parity check against F1-s0 |
+| 36 | courtyard default at 549o (#395) | the step 12 training with `--out $M/courtyard/default-395`; `reference_flaws.py run` as in step 35, on courtyard | eaeb791 | 18 min 1 s; 28 s | PSNR 31.35 dB on 0009 (step 12: 30.27), kept-pixel 31.68 dB, ꟻLIP 0.0796; N reaches 3,000,000 at iteration 5,000; GPU peak 22,887 MiB | E16 and Growth on courtyard at 549o |
+| 37 | studio default at 549o (#395) | the step 16 training with `--out $M/studio/default-395`; `reference_flaws.py run` as in step 35, on studio | eaeb791 | 18 min 55 s; 11 s | PSNR 22.69 dB on 0007 (dynamic 25.19), ꟻLIP 0.1893 (dynamic 0.1263), kept-pixel 22.74 dB; steps 16, 23 and 27: 22.86 to 23.24 dB (dynamic 25.78 to 25.80); N reaches 3,000,000 at iteration 6,800; GPU peak 23,581 MiB, during growth | E16 and Growth on studio at 549o |
+| 38 | B-1 on the trained model at 549o (#395) | `ftgs bench train-step $K/scene.json --model $M/kitchen/default-395/checkpoint --out $M/bench/B-1-kitchen-trained-395.json` | eaeb791 | 31 s | 30.9 ms an iteration, bound 934 s: **passes**; slice share 4.37 %, SH concat 5.91 % | §3.4 B-1 on the trained model at 549o |
 
 Kitchen's default run reached N_max inside the growth window, so the τ_pos = 10⁻⁴ run of Q-220's first decision is replaced by one at τ_pos = 4·10⁻⁴ (Q-220 as answered).
