@@ -279,3 +279,29 @@ def test__caffe_trunk_alexnet_needs_sides_of_23_pixels(shape: tuple[int, ...]) -
     vgg = _caffe_trunks.CaffeTrunk("vgg16_oxford", _stand_in("vgg16_oxford", seed=14))
     pixel = _images((1, 3, 1, 1), seed=15)
     assert vgg(pixel, pixel.clone()).shape == (1,)
+
+
+@pytest.mark.weights
+@pytest.mark.parametrize("name", list(SHAPES))
+def test_d89_caffe_trunk_is_the_rows_distance_on_the_publishers_weights(name: str) -> None:
+    """D-89's `vgg16_oxford` and `alexnet_bvlc` rows at the public seam: `PerceptualLoss(name)`
+    on [..., H, W, 3] float32 images is the mean over the batch of the float64 distance the
+    rows describe (`_oracle`), on the publisher's converted weights (Q-7, Q-258), to 1e-5
+    relative (float32's rounding). The render isn't clamped: a patch raised above 1 changes
+    the value from that of the render clamped to [0, 1]."""
+    from openftgs._weights import trunk_tensors
+    from openftgs.losses import PerceptualLoss
+
+    loss = PerceptualLoss(name)  # type: ignore[arg-type]
+    gt = _images((2, 48, 56, 3), seed=16)
+    pred = (gt + 0.2 * _images((2, 48, 56, 3), seed=17) - 0.1).clamp(0.0, 1.0)
+    pred[:, 10:30, 12:40] += 0.3
+    assert bool((pred > 1.0).any())
+    value = loss(pred, gt)
+    tensors = trunk_tensors(name)
+    nchw = [image.permute(0, 3, 1, 2).to(F64) for image in (pred, gt)]
+    expected = _oracle(name, tensors, *nchw).mean()
+    assert value.shape == () and value.dtype == torch.float32
+    torch.testing.assert_close(value.double(), expected, rtol=1e-5, atol=0.0)
+    clamped = loss(pred.clamp(0.0, 1.0), gt)
+    assert abs(clamped.item() - value.item()) > 1e-3 * value.item()
