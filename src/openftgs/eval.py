@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PSNR, SSIM_k, DSSIM_k, LPIPS-Alex and LPIPS-VGG, the dynamic-region crop and mask, the
-evaluation of a model on a scene's images, and the metrics report that `ftgs eval` writes.
+"""PSNR, SSIM_k, DSSIM_k and ꟻLIP, the dynamic-region crop and mask, the evaluation of a model
+on a scene's images, and the metrics report that `ftgs eval` writes.
 
-Spec: E16, App. B.1, D-29, D-52, D-55, D-64, D-67, D-68, D-69. Band: Orchestration (§2.1).
+Spec: E16, App. B.1, D-29, D-52, D-55, D-64, D-67, D-69, D-89. Band: Orchestration (§2.1).
 """
 
 import contextlib
@@ -23,7 +23,7 @@ from torch import Tensor
 
 from openftgs import _shards
 from openftgs.data import MultiViewVideo
-from openftgs.losses import LPIPSLoss, ssim
+from openftgs.losses import PerceptualLoss, ssim
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render_request
 from openftgs.types import RenderItem, RenderRequest, SceneManifest
@@ -36,7 +36,6 @@ __all__ = [
     "dssim_k",
     "dynamic_region",
     "evaluate_images",
-    "lpips_backbone",
     "metrics_report",
     "psnr",
     "ssim_k",
@@ -44,41 +43,38 @@ __all__ = [
 ]
 
 # §2.1 CLI paragraph: the metrics METRICS.json reports, in this order (Q-60).
-METRIC_NAMES = (
-    "psnr",
-    "ssim1",
-    "ssim2",
-    "dssim1",
-    "dssim2",
-    "lpips_alex",
-    "lpips_vgg",
-    "lpips_vgg_raw",
-)
+METRIC_NAMES = ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip")
 
-# Q-61: the smallest side of a dynamic region every metric accepts: SSIM's valid window needs
-# 11 px, LPIPS-VGG 16 and LPIPS-Alex 31 (lpips 0.1.4; source log #67).
-_MIN_REGION_SIDE = 31
+# Q-61, Q-257: the smallest side of a dynamic region every metric accepts, the larger of SSIM's
+# valid window, 11 px, and ꟻLIP's filters at 67.0 pixels per degree, 21 px (three 21×21
+# spatial filters; `filter_support` in openftgs/_vendor/flip/VENDOR.json, #383).
+_MIN_REGION_SIDE = 21
 _MASK_THRESHOLD = 0.5  # D-67: soft masks are binarized at 0.5; Q-61: 0.5 counts as dynamic
 
 
 @contextlib.contextmanager
 def _tf32_off() -> Iterator[None]:
-    """D-52, §2.4 Precision: cuDNN's TF32 flag cleared, and restored on exit. The flag is one
-    for the whole process, so a sharded evaluation clears it once in the caller's thread around
-    the whole run: each metric's own save and restore in a worker thread then reads and writes
-    False only, and no thread can restore True while another computes (Q-175, Q-186)."""
-    before = torch.backends.cudnn.allow_tf32
+    """D-52, §2.4 Precision: cuDNN's TF32 flag cleared and float32 matrix products at "highest"
+    precision (ꟻLIP's colour transforms are matrix products, Q-60), both restored on exit. Both
+    are one for the whole process, so a sharded evaluation sets them once in the caller's thread
+    around the whole run: each metric's own save and restore in a worker thread then reads and
+    writes IEEE float32's values only, and no thread can restore TF32 while another computes
+    (Q-175, Q-186)."""
+    before = torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision()
     torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
     try:
         yield
     finally:
-        torch.backends.cudnn.allow_tf32 = before
+        torch.backends.cudnn.allow_tf32 = before[0]
+        torch.set_float32_matmul_precision(before[1])
 
 
 @contextlib.contextmanager
 def _metric_mode() -> Iterator[None]:
-    """D-52, §2.4 Precision: evaluation is a forward pass with plain float32 convolutions, so
-    cuDNN's TF32 flag is cleared, and restored on exit; inference mode, as for rendering."""
+    """D-52, §2.4 Precision: evaluation is a forward pass in IEEE float32, so cuDNN's TF32 flag
+    is cleared and matrix products run at "highest" precision, both restored on exit; inference
+    mode, as for rendering."""
     with _tf32_off(), torch.inference_mode():
         yield
 
@@ -140,8 +136,8 @@ def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tens
     """The pair a dynamic-region metric compares (App. B.1, D-67): the render clamped to
     [0, 1], then both images set to black outside the mask and cropped to the mask's bounding
     box. `mask` is [H, W] or [H, W, 1], bool or floating, binarized at 0.5 (≥ 0.5 is dynamic).
-    None, with a warning, for an empty mask or a box narrower than 31 px on a side, which some
-    metric can't evaluate (Q-61)."""
+    None, with a warning, for an empty mask or a box narrower than 21 px on a side, which some
+    metric can't evaluate (Q-61, Q-257)."""
     if pred.dim() != 3:
         raise ValueError(f"dynamic_region takes one image pair [H, W, 3], got {list(pred.shape)}")
     _check_pair(pred, gt)
@@ -187,17 +183,6 @@ def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tens
     return pred_crop, gt_crop
 
 
-# Q-62: the dataset is read from metadata.source.
-def lpips_backbone(source: str | None) -> Literal["alex", "vgg"]:
-    """The LPIPS backbone the paper reports for a dataset (D-29): AlexNet for Neural3DV, VGG
-    otherwise, read from the scene manifest's `metadata.source`."""
-    if source is not None and not isinstance(source, str):
-        raise ValueError(f"metadata.source must be a string, got {source!r}")
-    if source is not None and (source == "n3dv" or source.startswith("n3dv/")):
-        return "alex"
-    return "vgg"
-
-
 def average_metrics(rows: Sequence[Mapping[str, float]]) -> dict[str, float]:
     """The arithmetic mean of each metric over the rows (D-67): images → scene, then scenes →
     overall. Every row must hold the same keys."""
@@ -210,14 +195,14 @@ def average_metrics(rows: Sequence[Mapping[str, float]]) -> dict[str, float]:
 
 
 class Evaluator:
-    """All eight metrics of METRIC_NAMES for one image pair, with the LPIPS networks built once
-    on `device` (E16, D-68; Q-60). Calling it with a dynamic-region mask also gives the same
-    metrics on `dynamic_region`'s pair, or None when the mask has no usable region (Q-61)."""
+    """The six metrics of METRIC_NAMES for one image pair on `device`, ꟻLIP among them (E16,
+    D-89; Q-60). Calling it with a dynamic-region mask also gives the same metrics on
+    `dynamic_region`'s pair, or None when the mask has no usable region (Q-61)."""
 
     def __init__(self, *, device: str | torch.device = "cuda") -> None:
         self._device = torch.device(device)
-        self._alex = LPIPSLoss("alex").to(self._device)
-        self._vgg = LPIPSLoss("vgg").to(self._device)
+        # E16, D-89: LDR-ꟻLIP at 67.0 pixels per degree, the loss's network; no weights (Q-259).
+        self._flip = PerceptualLoss("flip").to(self._device)
 
     def __call__(
         self, pred: Tensor, gt: Tensor, *, mask: Tensor | None = None
@@ -225,7 +210,7 @@ class Evaluator:
         if pred.dim() != 3:
             raise ValueError(f"Evaluator takes one image pair [H, W, 3], got {list(pred.shape)}")
         _check_pair(pred, gt)
-        # D-52: reported metrics are plain float32, the networks' dtype (Q-60).
+        # D-52: reported metrics are plain float32, ꟻLIP's only dtype (Q-60, Q-261).
         pred = pred.to(self._device, torch.float32)
         gt = gt.to(self._device, torch.float32)
         entire = self._metrics(pred, gt)
@@ -240,11 +225,8 @@ class Evaluator:
         with _metric_mode():
             values["dssim1"] = (1.0 - ssim1) / 2.0  # as dssim_k, from the same SSIM
             values["dssim2"] = (1.0 - ssim2) / 2.0
-            clamped = pred.clamp(0.0, 1.0)  # D-67
-            values["lpips_alex"] = self._alex(clamped, gt)
-            values["lpips_vgg"] = self._vgg(clamped, gt)
-            # D-68, Q-58: the same VGG network on the unmapped [0, 1] images.
-            values["lpips_vgg_raw"] = self._vgg(clamped, gt, map_inputs=False)
+            # E16: the clamped render against the reference, the mean of the error map.
+            values["flip"] = self._flip(pred.clamp(0.0, 1.0), gt)
         return {name: float(values[name]) for name in METRIC_NAMES}
 
 
@@ -255,7 +237,7 @@ class ImageMetrics:
     timestamp: float  # raw τ
     frame_index: int | None
     path: str  # the image path of the scene manifest
-    entire: Mapping[str, float]  # the eight METRIC_NAMES values
+    entire: Mapping[str, float]  # the METRIC_NAMES values
     dynamic: Mapping[str, float] | None  # None without a usable dynamic region (Q-61)
     masked: bool  # the image carries a dynamic-region mask
 
@@ -409,6 +391,7 @@ def _finite(*tensors: Tensor) -> bool:
 
 
 _REPORT = "ftgs-metrics"  # Q-63
+_VERSION = 2  # Q-256: version 2 since 549o, ꟻLIP in place of LPIPS, with no `lpips_backbone`
 _SHA256 = re.compile(r"[0-9a-f]{64}")  # Q-136, as Q-56 spells a digest
 _FASTEST_COUNT = 10  # §2.2: metadata.fastest_10 holds [n0, n0 + 10) (D-69)
 
@@ -464,10 +447,9 @@ def metrics_report(
     masked = [image for image in images if image.masked]
     report: dict[str, Any] = {
         "format": _REPORT,
-        "version": 1,
+        "version": _VERSION,
         "split": split,
         "metrics": list(METRIC_NAMES),
-        "lpips_backbone": lpips_backbone(metadata.get("source")),
         "entire": {
             "scene": _means([image.entire for image in images]),
             "images": [_row(image, image.entire) for image in images],
