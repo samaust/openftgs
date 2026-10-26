@@ -412,7 +412,7 @@ def _patch(source: bytes) -> tuple[bytes, list[str]]:
         edits.append(_move(move, lines, units, spans))
     for insert in INSERTS:
         units[_line_starting(lines, insert.before)][:0] = list(insert.lines)
-        edits.append(f"{insert.change}: {len(insert.lines)} lines added before {insert.before!r}")
+        edits.append(f"{insert.change}: {_lines(len(insert.lines))} added before {insert.before!r}")
     units[_line_starting(lines, "# Visualizing and Communicating Errors")][:0] = list(NOTICE)
     edits.append("notice: the modification notice added after NVIDIA's license header")
     out = "\n".join(line for unit in units for line in unit)
@@ -448,7 +448,7 @@ def _move(
     return (
         f"{move.change}: lines {start + 1}-{end + 1} of {move.scope} moved into a new function "
         f"{name}, added before {move.before} ({replaced} in them); in their place "
-        f"{len(move.left)} line"
+        f"{_lines(len(move.left))}"
     )
 
 
@@ -477,6 +477,10 @@ def _spans_with(text: str, fragment: str) -> list[_Span]:
         if innermost not in found:
             found.append(innermost)
     return found
+
+
+def _lines(count: int) -> str:
+    return "1 line" if count == 1 else f"{count} lines"
 
 
 def _line_starting(lines: Sequence[str], start: str, within: range | None = None) -> int:

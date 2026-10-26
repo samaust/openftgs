@@ -42,9 +42,9 @@
         "constants: in color_space_transform, 'torch.matmul(A.cuda(), input_color)' -> 'torch.matmul(_constant(fromSpace2toSpace, input_color.device, lambda: A), input_color)', once",
         "cmax: lines 202-204 of compute_ldrflip moved into a new function _cmax, added before tone_map ('reference.device' -> 'device' 2x in them); in their place 1 line",
         "filters: lines 539-563 of feature_detection moved into a new function generate_feature_filter, added before feature_detection ('img_y.device' -> 'device' 1x in them); in their place 1 line",
-        "cache: 1 lines added before 'import sys'",
+        "cache: 1 line added before 'import sys'",
         "cache: 26 lines added before 'class HDRFLIPLoss(nn.Module):'",
-        "filters: 1 lines added before 'def generate_spatial_filter('",
+        "filters: 1 line added before 'def generate_spatial_filter('",
         "notice: the modification notice added after NVIDIA's license header"
       ]
     }
