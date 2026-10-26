@@ -93,8 +93,9 @@ def _ftgs(*args: object) -> int:
 def _scene(
     root: Path, *, test: bool = False, masks: bool = False, frames: int = 3, unit: str = "s"
 ) -> Path:
-    """Three 48×32 ring cameras (LPIPS-Alex needs 31 px) training at frames k/30 around a
-    random model; with `test`, a fourth camera is the test view."""
+    """Three 48×32 ring cameras training at frames k/30 around a random model; with `test`, a
+    fourth camera is the test view, whose masks' 24×32 left halves are usable dynamic regions
+    (Q-61, Q-257: at least 21 px on a side)."""
     cams = ring(4, radius=4.0, elevation=1.0, width_px=48, height_px=32, focal=44.0)
     gt = random_model(16, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
     images: list[Any] = [(cam, k / 30.0, "train") for k in range(frames) for cam in cams[:3]]
@@ -757,10 +758,11 @@ def test_train_refuses_a_partial_mask_set(
     assert not (tmp_path / "run").exists()
 
 
-@pytest.mark.weights
 def test_train_evaluates_the_test_split_at_the_end(tmp_path: Path) -> None:
     """§1.3 calendar ("Final checkpoint and evaluation"), Q-132, Q-136: with a test split, the
-    run directory gets METRICS.json naming the iteration, with a null model path."""
+    run directory gets METRICS.json naming the iteration, with a null model path; §2.1, Q-256:
+    version 2, its metrics psnr, ssim1, ssim2, dssim1, dssim2 and flip, in the scene means and
+    in every image's row."""
     scene = _scene(tmp_path / "scene", test=True)
     init = _init(tmp_path / "init.safetensors")
     cfg = _config_file(tmp_path / "cfg.json")
@@ -769,6 +771,11 @@ def test_train_evaluates_the_test_split_at_the_end(tmp_path: Path) -> None:
     report = json.loads((out / "METRICS.json").read_text())
     assert report["model"] == {"path": None, "iteration": ITERATIONS, "sha256": None}
     assert report["split"] == "test" and set(report["entire"]["scene"]) == set(METRIC_NAMES)
+    names = ["psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip"]
+    assert (report["version"], report["metrics"]) == (2, names)
+    assert "lpips_backbone" not in report
+    where = {"camera", "timestamp", "frame_index", "path"}
+    assert [set(row) - where for row in report["entire"]["images"]] == [set(names)] * 3
 
 
 # Periodic checkpoints (D-83; Q-149 to Q-152).
@@ -1129,7 +1136,7 @@ def test_eval_passes_a_checkpoints_frame_interval_as_the_bucket_width(
 ) -> None:
     """Q-174, Q-183: ftgs eval passes a checkpoint's Δt_f, through evaluate_images, to the
     render request of each timestamp, and None for an exchange model. (The render here stops
-    the command, as a render that isn't finite does, before any metric needs LPIPS weights.)"""
+    the command, as a render that isn't finite does, before anything is scored.)"""
     import openftgs.eval
 
     scene, checkpoint = _trained(tmp_path)
@@ -1200,8 +1207,8 @@ def test_eval_shards_only_over_two_or_more_visible_cuda_devices(
     """D-54, Q-175, Q-186 (as answered): `ftgs eval` on CUDA spreads the evaluation over the
     visible CUDA devices, `cuda:0` to `cuda:n−1`, with no option of its own, only when n ≥ 2;
     with one, or on the CPU (count 0: no CUDA), it passes None, so neither the model nor the
-    LPIPS networks are copied. (The evaluation here stops the command, as a render that isn't
-    finite does, before any metric needs LPIPS weights.)"""
+    evaluator is copied. (The evaluation here stops the command, as a render that isn't finite
+    does, before anything is scored.)"""
     import openftgs.eval
 
     scene, checkpoint = _trained(tmp_path)
@@ -1419,8 +1426,8 @@ def test_u26_cli_round_trips_for_each_sh_degree(tmp_path: Path, sh_degree: int) 
     init = _init(tmp_path / "init.safetensors")
     cfg = _config_file(tmp_path / "cfg.json", _cfg(50, sh_degree=sh_degree))
     out = tmp_path / "run"
-    # Training on a scene with a test split ends with an evaluation, which needs LPIPS weights:
-    # train on a copy of the manifest without the test split, and render the test views.
+    # Train on a copy of the manifest without the test split, so the run ends without an
+    # evaluation, and render the test views.
     data = json.loads(scene.read_text())
     data["images"] = [e for e in data["images"] if e["split"] == "train"]
     train_only = scene.parent / "train.json"
@@ -1483,7 +1490,6 @@ def _renders_dir(tmp_path: Path, checkpoint: Path, items: list[tuple[str, float,
     return directory
 
 
-@pytest.mark.weights
 def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Path) -> None:
     """§2.1, Q-63, Q-136: METRICS.json with every metric under `entire`, `dynamic` for a masked
     split (with no image missing a mask, Q-135), and the header: `model` = {path, iteration,
@@ -1499,8 +1505,11 @@ def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Pa
     assert report["manifest"]["sha256"] == hashlib.sha256(scene.read_bytes()).hexdigest()
     assert set(report["entire"]["scene"]) == set(METRIC_NAMES)
     assert len(report["entire"]["images"]) == 3
-    # The masks' 24-px halves are below Q-61's smallest region, so each image is skipped.
+    # Q-257: the masks' 24×32 halves are above Q-61's smallest side, 21 px, so none is skipped.
     assert report["dynamic"]["missing"] == 0 and len(report["dynamic"]["images"]) == 3
+    assert (report["dynamic"]["count"], report["dynamic"]["skipped"]) == (3, 0)
+    assert set(report["dynamic"]["scene"]) == set(METRIC_NAMES)
+    assert all(v is not None for v in report["dynamic"]["scene"].values())
     exchange = tmp_path / "m.safetensors"
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
     assert _ftgs("eval", exchange, scene, "--out", out) == 0
@@ -1673,7 +1682,6 @@ def test_eval_of_a_damaged_checkpoint_keeps_the_readers_message(
     assert not out.exists()
 
 
-@pytest.mark.weights
 def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) -> None:
     """D-84, Q-74: ftgs eval of a checkpoint renders against its configuration's background,
     so a white-background run's report body equals Trainer.evaluate's; its export records that
@@ -1702,7 +1710,6 @@ def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) ->
     _assert_close(_body(json.loads(exported.read_text())), _body(got))
 
 
-@pytest.mark.weights
 def test_eval_scores_supplied_renders_as_its_own(tmp_path: Path) -> None:
     """Q-137: ftgs render --backend reference then ftgs eval --renders-dir gives the body of
     ftgs eval without it; the header names what was scored."""
@@ -1750,7 +1757,6 @@ def _broken_first_render(
     return paths
 
 
-@pytest.mark.weights
 @pytest.mark.parametrize(
     ("part", "value"),
     [("rgb", math.nan), ("rgb", math.inf), ("rgb", -math.inf), ("alpha", math.nan)],
@@ -1784,7 +1790,6 @@ def test_eval_of_a_render_that_is_not_finite_is_exit_code_3(
     _assert_untouched(out, before)
 
 
-@pytest.mark.weights
 def test_a_render_that_is_not_finite_in_the_final_evaluation_is_exit_code_3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1803,11 +1808,10 @@ def test_a_render_that_is_not_finite_in_the_final_evaluation_is_exit_code_3(
     assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
 
 
-@pytest.mark.weights
 def test_eval_of_a_perfect_render_is_exit_code_0_with_a_null_psnr(tmp_path: Path) -> None:
     """Q-129, Q-63: supplied renders equal to the ground-truth images have an infinite PSNR,
     which is no failure: exit 0, PSNR null in the rows and the scene means, SSIM 1, DSSIM 0 and
-    every LPIPS 0 (a worked example: identical images)."""
+    ꟻLIP 0 (U-23's identical images, within its 1e-6)."""
     from openftgs.data import MultiViewVideo
 
     scene, checkpoint = _trained(tmp_path)
@@ -1834,7 +1838,7 @@ def test_eval_of_a_perfect_render_is_exit_code_0_with_a_null_psnr(tmp_path: Path
     assert all(row["psnr"] is None for row in entire["images"])
     scene_means = entire["scene"]
     assert scene_means["ssim1"] == pytest.approx(1.0) and scene_means["ssim2"] == pytest.approx(1.0)
-    for name in ("dssim1", "dssim2", "lpips_alex", "lpips_vgg", "lpips_vgg_raw"):
+    for name in ("dssim1", "dssim2", "flip"):
         assert scene_means[name] == pytest.approx(0.0, abs=1e-6), name
 
 
@@ -1893,17 +1897,17 @@ def test_eval_refuses_supplied_renders_that_do_not_match_the_split(tmp_path: Pat
 def test_unavailable_lpips_weights_are_exit_code_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Q-142: a download of the LPIPS weights that fails (an OSError) is an environment error,
-    in ftgs eval and in ftgs train's final evaluation, which runs after the checkpoint is saved
-    (Q-132)."""
+    """Q-142, Q-161: an OSError while ftgs train's final evaluation builds its evaluator is an
+    environment error, after the checkpoint is saved (Q-132). Since ꟻLIP (#387) the evaluator
+    downloads nothing, so ftgs eval no longer guards building it; Q-161's message for ftgs
+    train is #389's to change."""
     import openftgs.eval
 
     def offline(*args: Any, **kwargs: Any) -> None:
         raise OSError("no network")
 
     monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", offline)
-    scene, checkpoint = _trained(tmp_path)
-    assert _ftgs("eval", checkpoint, scene, "--out", tmp_path / "m.json") == 2
+    scene = _scene(tmp_path / "scene", test=True)
     init = _init(tmp_path / "again.safetensors")
     cfg = _config_file(tmp_path / "cfg.json")
     out = tmp_path / "run"
@@ -2792,7 +2796,6 @@ def test_out_of_memory_in_a_profile_window_writes_the_trace(
     assert json.loads((out / "profile" / "trace.json").read_text())["traceEvents"]
 
 
-@pytest.mark.weights
 def test_metrics_that_cannot_be_written_in_training_are_exit_code_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

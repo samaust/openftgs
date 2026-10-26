@@ -4,7 +4,8 @@ Calibration data table (D-10, D-18, D-44; Q-220; #317).
 
 Added tests, not §3 rows: the N trace and the cap from `train_log.jsonl` against a log written
 by hand; the opacity statistics against the checkpoints read directly; the metrics against the
-run's METRICS.json. The script runs as M17 runs it, in a process of its own.
+run's METRICS.json, of version 1 as M17's runs wrote it and of version 2 as `ftgs train` writes
+it since 549o (Q-256). The script runs as M17 runs it, in a process of its own.
 """
 
 import json
@@ -187,10 +188,11 @@ def test_summary_of_a_real_run_traces_n_and_finds_the_cap(tmp_path: Path) -> Non
 
 
 def test_summary_reads_metrics_and_the_wall_time(tmp_path: Path) -> None:
-    """The METRICS.json part (scene means over the entire images, the label, the dynamic and
-    fastest-10 blocks without their per-image rows) and the wall-time part, from a METRICS.json,
-    a `/usr/bin/time -v` report and `nvidia-smi` samples written by hand: 1:02:03.5 is 3,723.5 s;
-    the GPU peak is the largest sample."""
+    """The METRICS.json part (its version, scene means over the entire images, a version-1
+    file's LPIPS backbone label, the dynamic and fastest-10 blocks without their per-image rows;
+    Q-256) and the wall-time part, from a version-1 METRICS.json, a `/usr/bin/time -v` report
+    and `nvidia-smi` samples written by hand: 1:02:03.5 is 3,723.5 s; the GPU peak is the
+    largest sample."""
     run = tmp_path / "run"
     run.mkdir()
     (run / "config.json").write_text(json.dumps(config_to_dict(TrainConfig())))
@@ -218,6 +220,7 @@ def test_summary_reads_metrics_and_the_wall_time(tmp_path: Path) -> None:
     code, body, err = _summary(run, "--time", str(time_log), "--gpu-log", str(gpu_log))
     assert code == 0, err
     assert body["metrics"] == {
+        "version": 1,
         "split": "test",
         "lpips_backbone": "vgg",
         "count": 2,
@@ -236,10 +239,11 @@ def test_summary_reads_metrics_and_the_wall_time(tmp_path: Path) -> None:
 def test_summary_derives_the_fastest_10_means_from_the_per_image_rows(tmp_path: Path) -> None:
     """`--fastest N0:N1` (Q-222): the means over the images with N0 ≤ frame_index < N1, as
     `eval.metrics_report` writes `fastest_10` for a manifest that carries the range, from a
-    METRICS.json written by hand. Twelve images at frame indices 0 to 11, every metric equal to
-    the frame index; their dynamic rows 100 more, image 5's skipped (no values). Over 2:12 the
-    entire means are mean(2, …, 11) = 6.5 and the dynamic ones 100 + 60 / 9, image 5 left out; a
-    range of other than 10 frames, or no METRICS.json, exits 2."""
+    version-1 METRICS.json written by hand, over its own eight metrics (Q-256). Twelve images at
+    frame indices 0 to 11, every metric equal to the frame index; their dynamic rows 100 more,
+    image 5's skipped (no values). Over 2:12 the entire means are mean(2, …, 11) = 6.5 and the
+    dynamic ones 100 + 60 / 9, image 5 left out; a range of other than 10 frames, or no
+    METRICS.json, exits 2."""
     run = tmp_path / "run"
     run.mkdir()
     (run / "config.json").write_text(json.dumps(config_to_dict(TrainConfig())))
@@ -259,6 +263,7 @@ def test_summary_derives_the_fastest_10_means_from_the_per_image_rows(tmp_path: 
         "format": "ftgs-metrics",
         "version": 1,
         "split": "test",
+        "metrics": list(names),
         "lpips_backbone": "vgg",
         "entire": {"scene": dict.fromkeys(names, 5.5), "images": entire},
         "dynamic": {"mask_source": "m", "masks_approximate": False, "count": 11, "skipped": 1,
@@ -280,3 +285,74 @@ def test_summary_derives_the_fastest_10_means_from_the_per_image_rows(tmp_path: 
     (run / "METRICS.json").unlink()
     code, _, _ = _summary(run, "--fastest", "2:12")
     assert code == 2
+
+
+def _test_scene_run(tmp_path: Path) -> Path:
+    """A short CPU `ftgs train` run on a scene with a test camera, so that it ends with the
+    evaluation that writes METRICS.json (§1.3 calendar)."""
+    cams = ring(4, radius=4.0, elevation=1.0, width_px=48, height_px=32, focal=44.0)
+    gt = random_model(16, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
+    images = [(c, k / 30.0, "train") for k in range(3) for c in cams[:3]]
+    images += [(cams[3], k / 30.0, "test") for k in range(3)]
+    scene = write_scene(tmp_path / "scene", gt, images)
+    g = torch.Generator().manual_seed(1)
+    init = tmp_path / "init.safetensors"
+    points = InitPoints(
+        positions=(torch.rand(30, 3, generator=g) - 0.5) * 1.2,
+        colors=torch.full((30, 3), 0.5),
+        timestamps=torch.rand(30, generator=g, dtype=torch.float64) * TAU1,
+    )
+    write_init_points(points, init, time_unit="s", producer="openftgs tests")
+    base = TrainConfig(loss=LossConfig(lambda_perc=0.0), perf=PerfConfig(log_every=5))
+    config = tmp_path / "cfg.json"
+    config.write_text(json.dumps(config_to_dict(shortened_config(20, base))))
+    run = tmp_path / "run"
+    argv = ["train", scene, "--init", init, "--out", run, "--config", config]
+    assert main([str(a) for a in argv]) == 0
+    return run
+
+
+def test_summary_reads_the_version_2_file_a_run_writes(tmp_path: Path) -> None:
+    """Q-256: the METRICS.json a CPU `ftgs train` run writes is version 2 (§2.1: psnr, ssim1,
+    ssim2, dssim1, dssim2 and flip, no LPIPS backbone label); the summary says it read version
+    2, carries no label, and gives the file's scene means; `--fastest` averages the file's own
+    six metrics over the per-image rows in the range."""
+    run = _test_scene_run(tmp_path)
+    written = json.loads((run / "METRICS.json").read_text())
+    names = ["psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip"]
+    assert (written["version"], written["metrics"]) == (2, names)
+    rows = written["entire"]["images"]
+    assert [r["frame_index"] for r in rows] == [9, 10, 11]  # the test records' indices
+    code, body, err = _summary(run, "--fastest", "2:12")
+    assert code == 0, err
+    metrics = body["metrics"]
+    assert metrics["version"] == 2 and "lpips_backbone" not in metrics
+    assert metrics["count"] == 3
+    assert metrics["entire"] == written["entire"]["scene"]
+    derived = metrics["fastest_10_derived"]
+    assert derived["count"] == 3
+    assert set(derived["entire"]) == set(names)
+    for name in names:
+        expected = sum(r[name] for r in rows) / 3
+        assert derived["entire"][name] == pytest.approx(expected, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [{"format": "ftgs-metrics", "version": 3}, {"format": "another", "version": 2}, {}],
+    ids=["version-3", "another-format", "untagged"],
+)
+def test_summary_refuses_a_metrics_file_of_another_version(
+    tmp_path: Path, header: dict[str, Any]
+) -> None:
+    """Q-256: the script reads METRICS.json versions 1 and 2; a file of another version or
+    format, or without its tag, is exit 2, with nothing written."""
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "config.json").write_text(json.dumps(config_to_dict(TrainConfig())))
+    (run / "train_log.jsonl").write_text(json.dumps(_log_row(100, 10, 0.1, 0.5)) + "\n")
+    metrics = {**header, "split": "test", "entire": {"scene": {"psnr": 30.0}, "images": []}}
+    (run / "METRICS.json").write_text(json.dumps(metrics))
+    code, _, err = _summary(run)
+    assert code == 2 and "METRICS.json" in err
+    assert not (run / "SUMMARY.json").exists()

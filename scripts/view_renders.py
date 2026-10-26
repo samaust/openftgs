@@ -22,8 +22,14 @@ With `--compare`, it writes DIR/COMPARISON.json: per block of scene means (`enti
 null where either value is null), per block and metric the largest per-image difference, and as
 `findings` every scene mean or image value differing by more than 0.01 dB in PSNR or 10⁻⁴ in
 any other metric, every value null on one side only, and every block, metric and image path in
-one file only (#327, Q-224). The backend is gsplat unless `--backend reference`; on a
-machine without CUDA `ftgs render` refuses gsplat rather than falling back (Q-125).
+one file only (#327, Q-224); and under `versions` the METRICS.json version of each file. The
+given file may be of version 1 (M17's runs, LPIPS-Alex, LPIPS-VGG and lpips_vgg_raw) or 2
+(since 549o, ꟻLIP); a given file of another version or format is exit 2, before anything is run
+(Q-256). Between files of different versions, the metrics both versions hold (PSNR, SSIM₁,
+SSIM₂, DSSIM₁, DSSIM₂) are compared as above, and those one version holds alone are compared
+nowhere, listed once under `not_compared` by file, and are no finding (Q-266). The backend
+is gsplat unless `--backend reference`; on a machine without CUDA `ftgs render` refuses gsplat
+rather than falling back (Q-125).
 
 Exit 0 once written; 2 for an input that can't be read or matched; a failing ftgs command's own
 exit code otherwise.
@@ -47,6 +53,14 @@ if TYPE_CHECKING:
 _PSNR_FINDING_DB = 0.01
 _UNIT_FINDING = 1e-4
 _BLOCKS = ("entire", "dynamic")  # fastest_10 is out of #327's scope: no M17 manifest names it
+_FORMAT = "ftgs-metrics"  # Q-63: METRICS.json's format tag
+# Q-256: the metrics of each METRICS.json version read, version 1 (LPIPS) and version 2 (ꟻLIP,
+# since 549o), in their files' order (Q-63).
+_VERSION_METRICS = {
+    1: ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "lpips_alex", "lpips_vgg", "lpips_vgg_raw"),
+    2: ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip"),
+}
+_VERSIONS = tuple(_VERSION_METRICS)
 
 
 class InputError(Exception):
@@ -182,8 +196,28 @@ def _compare_values(
     return deltas
 
 
+def _not_compared(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, list[str]]:
+    """Q-266: between files of different versions, each file's metrics that the other's
+    version doesn't hold; none between files of one version."""
+    ours_v, theirs_v = ours.get("version"), theirs.get("version")
+    if ours_v == theirs_v or ours_v not in _VERSION_METRICS or theirs_v not in _VERSION_METRICS:
+        return {"this_run": [], "given": []}
+    mine, other = _VERSION_METRICS[ours_v], _VERSION_METRICS[theirs_v]
+    return {
+        "this_run": [name for name in mine if name not in other],
+        "given": [name for name in other if name not in mine],
+    }
+
+
+def _without(values: dict[str, Any], names: set[str]) -> dict[str, Any]:
+    return {name: value for name, value in values.items() if name not in names}
+
+
 def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
-    """#327, Q-224: this run's metrics minus the given METRICS.json's."""
+    """#327, Q-224: this run's metrics minus the given METRICS.json's; across versions, the
+    metrics one version holds alone are left out (Q-266)."""
+    not_compared = _not_compared(ours, theirs)
+    skip = {*not_compared["this_run"], *not_compared["given"]}  # Q-266
     blocks: dict[str, dict[str, float | None]] = {}
     largest: dict[str, dict[str, float]] = {}
     findings: list[str] = []
@@ -192,7 +226,8 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
     for block in _BLOCKS:
         if block not in ours or block not in theirs:
             continue
-        our_means, their_means = ours[block]["scene"], theirs[block]["scene"]
+        our_means = _without(ours[block]["scene"], skip)
+        their_means = _without(theirs[block]["scene"], skip)
         blocks[block] = _compare_values(f"{block}: scene", our_means, their_means, findings)
         metrics = list(dict.fromkeys([*their_means, *our_means]))  # a row's other keys aren't
         our_images = {row["path"]: row for row in ours[block].get("images", [])}
@@ -216,6 +251,9 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
             name: max(deltas, key=abs) for name, deltas in image_deltas.items() if deltas
         }
     return {
+        # Q-256: the version of each METRICS.json compared
+        "versions": {"this_run": ours.get("version"), "given": theirs.get("version")},
+        "not_compared": not_compared,  # Q-266
         "blocks": blocks,
         "largest_image_difference": largest,
         "largest_image_psnr_difference": {
@@ -223,6 +261,23 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
         },
         "findings": findings,
     }
+
+
+def _given_metrics(path: Path) -> dict[str, Any]:
+    """The METRICS.json `--compare` names, of version 1 or 2 (Q-256)."""
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise InputError(f"--compare {path}: {err}") from None
+    if not isinstance(body, dict):
+        raise InputError(f"--compare {path}: not a METRICS.json")
+    version = body.get("version")
+    if body.get("format") != _FORMAT or version not in _VERSIONS:
+        raise InputError(
+            f"--compare {path}: not a METRICS.json of version 1 or 2 (format "
+            f"{body.get('format')!r}, version {version!r})"
+        )
+    return body
 
 
 def _ftgs(*args: Path | str) -> None:
@@ -236,6 +291,7 @@ def run(
     model: Path, scene: Path, directory: Path, *, compare_with: Path | None, backend: str
 ) -> int:
     """#327's steps for one model; the number of PNGs written."""
+    theirs = None if compare_with is None else _given_metrics(compare_with)
     request, renders = directory / "request.json", directory / "renders.safetensors"
     write_request(model, scene, request)
     # Q-125: gsplat needs CUDA, and ftgs render refuses it without
@@ -244,11 +300,7 @@ def run(
     _ftgs("eval", model, scene, "--renders-dir", directory, "--out", metrics)
     count = write_pngs(directory, scene)
     renders.unlink()
-    if compare_with is not None:
-        try:
-            theirs = json.loads(compare_with.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as err:
-            raise InputError(f"--compare {compare_with}: {err}") from None
+    if theirs is not None:
         comparison = compare(json.loads(metrics.read_text(encoding="utf-8")), theirs)
         comparison["compared_with"] = str(compare_with)
         out = directory / "COMPARISON.json"
