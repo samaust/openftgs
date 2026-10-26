@@ -1157,6 +1157,47 @@ def test_bf16_is_refused_for_a_weight_free_network_when_the_trainer_is_built(
     assert _all_finite([Trainer(unweighted, video, _init_points(), device="cpu").step()])
 
 
+@pytest.mark.parametrize(
+    "net",
+    [pytest.param("vgg", marks=pytest.mark.weights), "flip", "haarpsi", *TRUNK_PARAMS],
+)
+def test_building_the_perceptual_network_draws_nothing_from_the_global_generator(
+    tmp_path: Path, net: str
+) -> None:
+    """Q-72: the trainer never draws from the global generators, also while it builds its
+    perceptual network, whose builder may initialize weights from torch's global CPU generator
+    before the publisher's are loaded (lpips's trunk, the vendored DINOv2 builders); and two
+    runs of one configuration, the second built after the first has trained, give the same
+    step logs, bitwise."""
+    video = _scene(tmp_path, scale=2)  # the DINO networks' 27 and 31 pixels (D-89; Q-265)
+    cfg = dataclasses.replace(_perceptual(net), optim=OptimConfig(iterations=3))
+    before = torch.get_rng_state()
+    first = Trainer(cfg, video, _init_points(), device="cpu")
+    assert torch.equal(torch.get_rng_state(), before)
+    logs = _run(first)
+    second = Trainer(cfg, video, _init_points(), device="cpu")
+    _assert_logs_equal(logs, _run(second))
+
+
+@pytest.mark.weights
+@needs_init
+@pytest.mark.parametrize("net", ["dinov2_s14", "dino_s16"])
+def test_a_checkpoint_holds_no_perceptual_network(tmp_path: Path, net: PercNet) -> None:
+    """§2.2, §2.3 (the trunks' weights are never redistributed): a DINO network's parameters
+    are in `PerceptualLoss.state_dict()`, but the trainer state, and so the checkpoint saved
+    from it, holds the model's nine stored tensors (§1.1), their Adam state and the gradient
+    statistics, never the loss's."""
+    trainer = Trainer(_perceptual(net), _scene(tmp_path, scale=2), _init_points(), device="cpu")
+    trainer.step()
+    state = trainer.state_dict()
+    assert set(state.params) == set(FreeTimeGaussians.PARAM_NAMES)
+    save_checkpoint(state, tmp_path / "ckpt")
+    _assert_states_equal(state, load_checkpoint(tmp_path / "ckpt"))
+    vit_tensors = sum(t.numel() for t in PerceptualLoss(net).state_dict().values())
+    saved = sum(path.stat().st_size for path in (tmp_path / "ckpt").rglob("*") if path.is_file())
+    assert saved < 4 * vit_tensors  # the ViT's float32 parameters alone would take more
+
+
 # With the LPIPS networks (weights; D-77, Q-74).
 
 

@@ -627,7 +627,12 @@ class Trainer:
         # D-77: one perceptual network, built when its weight is None or positive (Q-69, Q-249).
         self._perceptual: PerceptualLoss | LPIPSLoss | None = None
         if _builds_perceptual(cfg.loss):
-            perceptual = _perceptual_network(cfg).to(self._device)
+            # Q-72: lpips's trunk and the vendored DINOv2 builders initialize their weights from
+            # torch's global CPU generator before the publisher's are loaded; its state is
+            # restored, so the trainer draws nothing from it.
+            with torch.random.fork_rng(devices=[]):
+                perceptual = _perceptual_network(cfg)
+            perceptual = perceptual.to(self._device)
             if _CHANNELS_LAST_WEIGHTS:  # Q-173
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
