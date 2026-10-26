@@ -146,7 +146,7 @@ FILTER_SUPPORT: dict[str, object] = {
     "radius": 10,
     "pixels_per_degree": (
         "the published default, (0.7 * 3840 / 0.7) * pi / 180 = 67.02064327658226, and 67.0 "
-        "(E16), which give the same filters"
+        "(E16), which give filters of the same size, whose values differ"
     ),
     "filters": {
         "spatial (A, RG, BY)": "21 x 21: radius ceil(3 * sqrt(0.04 / (2 * pi^2)) * ppd) = 10",
