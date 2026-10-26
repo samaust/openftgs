@@ -2,7 +2,7 @@
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (D-88), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
-D-50, Q-13), B-4 (`bench losses`; D-52, D-89, Q-173, Q-190, Q-253, Q-T389.1, Q-T389.2),
+D-50, Q-13), B-4 (`bench losses`; D-52, D-89, Q-173, Q-190, Q-253, Q-269, Q-270),
 B-5 (`bench adam`; D-53, Q-188),
 B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), B-7 (`bench render`; D-55, Q-174, Q-194,
 Q-195, Q-239, Q-240), B-8 (`bench init` and `bench convert`; D-48,
@@ -1572,8 +1572,8 @@ def test__data_skips_the_gpu_placement_where_auto_would_not_choose_it(
     assert [b["case"] for b in body["budgets"]] == [want]
 
 
-# B-4, `ftgs bench losses` (§3.4, D-52, D-89; Q-42, Q-172, Q-173, Q-190, Q-253, Q-T389.1,
-# Q-T389.2): what it needs before it runs, and private tests of its input images and layouts, of
+# B-4, `ftgs bench losses` (§3.4, D-52, D-89; Q-42, Q-172, Q-173, Q-190, Q-253, Q-269,
+# Q-270): what it needs before it runs, and private tests of its input images and layouts, of
 # the deviation figures and of the gains its turn-on rule reads.
 
 TRUNKS = ("vgg16_oxford", "alexnet_bvlc", "dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
@@ -1597,7 +1597,7 @@ def test_bench_losses_without_a_trunks_weights_exits_2(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Q-253, Q-T389.2, Q-166: B-4 times all eight networks of D-89 and needs the six trunk
+    """Q-253, Q-270, Q-166: B-4 times all eight networks of D-89 and needs the six trunk
     networks' weights already in torch.hub's cache (Q-258's names); it never downloads them, so
     a missing one is exit 2, before anything runs, naming each missing file, with nothing
     downloaded and nothing written. A Caffe trunk counts as cached by its conversion alone.
@@ -1698,7 +1698,7 @@ def test__comparison_gives_the_median_gain_of_a_variant() -> None:
 def test__perceptual_inputs_reach_the_network_in_each_layout_without_a_copy(
     layout: str, memory: torch.memory_format
 ) -> None:
-    """Q-T389.1: a network gets B-4's images as `PerceptualLoss.forward` takes them, [1, H, W, 3]
+    """Q-269: a network gets B-4's images as `PerceptualLoss.forward` takes them, [1, H, W, 3]
     (Q-41), and the batch-first view it makes of them (`docs/modules/losses/terms-and-paths.md`,
     "Input layout") is contiguous NCHW for `nchw` and channels-last for `channels_last_inputs`
     (a render's layout), a view of the prediction's leaf itself, so no call copies an input;
@@ -1734,7 +1734,7 @@ def test_bench_losses_with_a_cached_weight_that_fails_its_check_exits_2(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Q-T389.2, Q-258, Q-142: B-4 builds every network before it measures anything, so a file
+    """Q-270, Q-258, Q-142: B-4 builds every network before it measures anything, so a file
     in torch.hub's cache under a publisher's name that isn't the publisher's (stand-ins of a few
     bytes here) is exit 2 naming it, with no download started, the file left as it was and
     nothing written."""
@@ -1767,7 +1767,7 @@ def test_bench_losses_with_a_cached_weight_that_fails_its_check_exits_2(
 
 def _fetch_trunk_weights() -> None:
     """The six trunk networks' files in torch.hub's cache, downloaded when they aren't, for the
-    `weights` tests of B-4 (Q-7), which never downloads them itself (Q-T389.2)."""
+    `weights` tests of B-4 (Q-7), which never downloads them itself (Q-270)."""
     from openftgs import _weights
 
     for net in TRUNKS:
@@ -1779,7 +1779,7 @@ def _fetch_trunk_weights() -> None:
 def test_bench_losses_with_a_dino_network_without_the_init_extra_exits_2(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-T389.2, Q-248, Q-142: with every weight in torch.hub's cache (fetched here when it
+    """Q-270, Q-248, Q-142: with every weight in torch.hub's cache (fetched here when it
     isn't, under `weights`), a DINO network without the [init] extra, its vendored DINOv2
     layers made unimportable, is exit 2 naming the extra, before anything is measured, with
     nothing written. PyTorch is made to see a CUDA device, which the check comes after."""
@@ -1801,7 +1801,7 @@ LOSS_SIZES = ((64, 48), (80, 64))
 LOSS_REPETITIONS = 3
 WEIGHT_FREE = ("flip", "haarpsi")
 LAYOUTS = ("nchw", "channels_last_inputs")
-COMPARISONS = {  # Q-T389.1: (baseline, variant) as (precision, layout, autotuning)
+COMPARISONS = {  # Q-269: (baseline, variant) as (precision, layout, autotuning)
     "autotuning": (("tf32", "channels_last_inputs", False), ("tf32", "channels_last_inputs", True)),
     "nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", False)),
     "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
@@ -1829,7 +1829,7 @@ def losses_bench_weight_free(scene: Path, tmp_path_factory: pytest.TempPathFacto
 
 @pytest.fixture(scope="module")
 def losses_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> Any:
-    _fetch_trunk_weights()  # B-4 never downloads them (Q-T389.2); its tests may, under weights
+    _fetch_trunk_weights()  # B-4 never downloads them (Q-270); its tests may, under weights
     return _losses_bench(scene, tmp_path_factory.mktemp("bench-losses") / "B-4.json", None)
 
 
@@ -1856,7 +1856,7 @@ def _timed_figures_are_consistent(figures: dict[str, Any]) -> None:
 
 
 def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) -> None:
-    """§3.4 B-4, Q-T389.1: each network's forward and the prediction's backward in each of its
+    """§3.4 B-4, Q-269: each network's forward and the prediction's backward in each of its
     precisions (IEEE float32 and TF32; bfloat16 for a trunk network) × {NCHW inputs, the
     render's channels-last view} × autotuning off and on, at each size, and nothing else; SSIM
     through fused-ssim, when it imports, and the PyTorch path with autotuning off and on."""
@@ -1901,7 +1901,7 @@ def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) ->
 
 
 def _assert_deviations_and_gains(body: dict[str, Any], networks: tuple[str, ...]) -> None:
-    """D-52, Q-173 (Q-190, Q-T389.1): per network and size, TF32's and, for a trunk network,
+    """D-52, Q-173 (Q-190, Q-269): per network and size, TF32's and, for a trunk network,
     bf16's deviation from IEEE float32 in value and gradient, reported whatever its size (#388
     measured bf16 gradients up to 152 % off in L2); per network, each comparison's gain,
     1 − variant / baseline of the medians, at each size, and whether its smallest gain reaches
@@ -1965,7 +1965,7 @@ def test__losses_times_the_weight_free_networks_and_both_ssim_paths(
 ) -> None:
     """A private test of `_losses` at reduced sizes (`_LOSS_SIZES`, `_LOSS_REPETITIONS` and
     `_LOSS_NETWORKS` patched to ꟻLIP and HaarPSI, which need no weights): §3.4 B-4 itself is the
-    recorded BENCH.json runs, not this test. D-52, D-89, Q-190, Q-T389.1: every case of each
+    recorded BENCH.json runs, not this test. D-52, D-89, Q-190, Q-269: every case of each
     network, IEEE float32 and TF32 only, and both SSIM paths, each autotuning setting in its own
     child process, since cuDNN's algorithm cache would carry one setting's picks into the
     other; nothing about the trunks' weights."""
@@ -1978,7 +1978,7 @@ def test__losses_records_the_weight_free_networks_deviations_and_gains(
     losses_bench_weight_free: dict[str, Any],
 ) -> None:
     """A private test of `_losses` at reduced sizes, as above: §3.4 B-4 itself is the recorded
-    BENCH.json runs. D-52, Q-173, Q-T389.1: TF32's deviation and every comparison but bf16's,
+    BENCH.json runs. D-52, Q-173, Q-269: TF32's deviation and every comparison but bf16's,
     for ꟻLIP and HaarPSI."""
     _assert_deviations_and_gains(losses_bench_weight_free, WEIGHT_FREE)
 
@@ -1992,9 +1992,9 @@ def test__losses_times_each_network_of_d89_with_bf16_for_the_trunks(
     """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
     patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. §3.4 B-4 ("each
     perceptual network of D-89 in IEEE float32, TF32 and, for the trunk networks, bfloat16, in
-    the layouts it accepts"), Q-T389.1: the eight networks of `PercNet`, in D-89's order, each
+    the layouts it accepts"), Q-269: the eight networks of `PercNet`, in D-89's order, each
     case of each, bf16's deviations and comparisons for the six trunks; the setup names the
-    cached file each trunk was built from (Q-T389.2)."""
+    cached file each trunk was built from (Q-270)."""
     import typing
 
     from openftgs.config import PercNet

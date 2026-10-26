@@ -389,7 +389,7 @@ DOWNLOADS: dict[str, Download] = {
 }
 
 
-# Q-253, Q-T389.2: B-4 never downloads, so it needs to know where a trunk is cached.
+# Q-253, Q-270: B-4 never downloads, so it needs to know where a trunk is cached.
 def trunk_files(name: str) -> tuple[pathlib.Path, ...]:
     """The files in torch.hub's cache, any one of which builds the trunk network `name` (one
     of `TRUNKS`) without a download, in the order `trunk_tensors` looks for them: a Caffe

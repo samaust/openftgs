@@ -4,8 +4,8 @@ BENCH.json.
 
 Spec: §2.1 (the `ftgs bench` line and the exit codes), §3.4, D-50, D-51, D-52, D-55, D-56,
 D-81, D-88 (`--model`), D-89 (B-4's networks). Q-166 (BENCH.json and the exit codes), Q-199 (a
-numerical failure in a run), Q-168 (the setups), Q-178 and Q-189 (B-6), Q-190, Q-253, Q-T389.1
-and Q-T389.2 (B-4), Q-174 (the index threshold T that B-7 sets), Q-194, Q-195, Q-239 and Q-240
+numerical failure in a run), Q-168 (the setups), Q-178 and Q-189 (B-6), Q-190, Q-253, Q-269
+and Q-270 (B-4), Q-174 (the index threshold T that B-7 sets), Q-194, Q-195, Q-239 and Q-240
 (B-7), Q-169, Q-192 and Q-193 (B-8).
 docs/modules/cli/benchmarks.md maps each subcommand to its B-n.
 
@@ -1704,7 +1704,7 @@ def _budget(
 
 
 # -- B-4: the perceptual networks' precisions and layouts, and SSIM's two paths (§3.4, D-52,
-# D-89; Q-42, Q-172, Q-173, Q-190, Q-253, Q-T389.1, Q-T389.2) ---------------------------------
+# D-89; Q-42, Q-172, Q-173, Q-190, Q-253, Q-269, Q-270) ---------------------------------
 
 _LOSS_SIZES: tuple[tuple[int, int], ...] = ((1352, 1014), (1920, 1080))  # §3.4 B-4: width, height
 # §3.4 B-4: each perceptual network of D-89, in its table's order (`config.PercNet`); the
@@ -1721,7 +1721,7 @@ _LOSS_NETWORKS: tuple[str, ...] = (
 )
 _WEIGHT_FREE = ("flip", "haarpsi")  # D-89: no pretrained weights, so no bfloat16 (Q-250)
 _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52; bfloat16 for the trunk networks only
-# Q-T389.1: the render's batch-first view as it comes, channels-last in memory, which every
+# Q-269: the render's batch-first view as it comes, channels-last in memory, which every
 # network takes in training until #394 sets each one's layout (Q-251); and a contiguous NCHW
 # input, the copy #394 may give a network instead. Channels-last weights left with LPIPS (Q-173).
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs")
@@ -1730,7 +1730,7 @@ _LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_C
 _LOSS_REPETITIONS = 30  # Q-190
 _LOSS_NOISE = 0.05  # Q-190: the prediction's seeded Gaussian noise
 _GAIN_THRESHOLD = 0.03  # Q-173: a gain is at least 3 % at both sizes
-# Q-T389.1: per network, the comparisons the turn-on rule reads (Q-173) and the others reported
+# Q-269: per network, the comparisons the turn-on rule reads (Q-173) and the others reported
 # beside them, each as (baseline, variant) cases `(precision, layout, autotuning)`; the baseline
 # is the network's plain path, the render's view without autotuning, as Q-190's was LPIPS-VGG's.
 # "bf16" applies to the trunk networks only.
@@ -1764,7 +1764,7 @@ def _precisions(net: str) -> tuple[str, ...]:
 
 
 def _cached_weights(networks: Sequence[str]) -> tuple[dict[str, str], list[str]]:
-    """Q-253, Q-T389.2: for each trunk network among `networks`, the file in torch.hub's cache
+    """Q-253, Q-270: for each trunk network among `networks`, the file in torch.hub's cache
     it will be built from, and, for one with none, its name and the publisher's file a build
     would download. Only whether the files are there is looked at."""
     from openftgs._weights import TRUNKS, trunk_files
@@ -1792,7 +1792,7 @@ def _perceptual_network(net: str) -> PerceptualLoss:
 
 
 def _built_networks(networks: Sequence[str]) -> dict[str, PerceptualLoss]:
-    """Q-T389.2: every network of B-4 built in the benchmark's process before anything is
+    """Q-270: every network of B-4 built in the benchmark's process before anything is
     measured, so that a cached file that fails its check (an OSError naming it, Q-258) and a
     DINO network without the [init] extra (an ImportError naming it, Q-248) are exit 2 before
     any child starts (Q-142, Q-166)."""
@@ -1876,7 +1876,7 @@ def _cudnn_flags(*, tf32: bool, autotuning: bool) -> Iterator[None]:
 
 def _perceptual_inputs(gt: Tensor, pred: Tensor, layout: str) -> tuple[Tensor, Tensor]:
     """The prediction, a leaf that requires its gradient, and the target, in the layout's
-    memory (Q-T389.1): for `channels_last_inputs` [1, H, W, 3] contiguous, as a render comes,
+    memory (Q-269): for `channels_last_inputs` [1, H, W, 3] contiguous, as a render comes,
     whose batch-first view `PerceptualLoss` takes is channels-last; for `nchw` [1, 3, H, W]
     contiguous, which the trainer would copy a render into, the copy itself left out (B-1 times
     the whole path)."""
@@ -1982,7 +1982,7 @@ def _fused_ssim_importable() -> bool:
 
 
 def _release_networks() -> None:
-    """Frees the last network's memory before the next is built (Q-T389.1): VGG16's autotuned
+    """Frees the last network's memory before the next is built (Q-269): VGG16's autotuned
     workspace and the ViT-B weights shouldn't sit in the allocator beside the next network."""
     import gc
 
@@ -2014,7 +2014,7 @@ def _losses_child(spec: str) -> None:
 
 def _measure_in_child(given: dict[str, Any]) -> list[dict[str, Any]]:
     """`_losses_child`'s measurements, from its parsed SPEC: the cases it prints. The benchmark
-    built and checked every network before starting the child (Q-T389.2)."""
+    built and checked every network before starting the child (Q-270)."""
     from openftgs.data import MultiViewVideo
 
     autotuning, repetitions = bool(given["autotuning"]), int(given["repetitions"])
@@ -2087,14 +2087,14 @@ _PerceptualKey = tuple[str, int, int, str, str, bool]
 def _perceptual_case(
     net: str, width: int, height: int, precision: str, layout: str, autotuning: bool
 ) -> dict[str, Any]:
-    """A perceptual network's case (Q-T389.1, Q-180)."""
+    """A perceptual network's case (Q-269, Q-180)."""
     case = {"loss": "perceptual", "network": net, "width": width, "height": height}
     return case | {"precision": precision, "layout": layout, "autotuning": autotuning}
 
 
 def _perceptual_deviations(net: str, network: Any, images: _Images) -> list[dict[str, Any]]:
     """Per size, TF32's and, for a trunk network, bf16's deviation from IEEE float32 in value
-    and in the prediction's gradient (Q-190, Q-T389.1), with the network as training runs it
+    and in the prediction's gradient (Q-190, Q-269), with the network as training runs it
     until #394 (the render's view, Q-251), autotuning off."""
     import torch
 
@@ -2119,7 +2119,7 @@ def _perceptual_deviations(net: str, network: Any, images: _Images) -> list[dict
 def _perceptual_timed(
     net: str, network: Any, images: _Images, *, autotuning: bool, repetitions: int
 ) -> dict[_PerceptualKey, dict[str, Any]]:
-    """Every case of the network `net` under one autotuning setting (Q-190, Q-T389.1): each
+    """Every case of the network `net` under one autotuning setting (Q-190, Q-269): each
     size, precision and layout."""
     timed: dict[_PerceptualKey, dict[str, Any]] = {}
     for (width, height), (gt, pred) in images.items():
@@ -2146,15 +2146,15 @@ def _losses(ctx: _Context) -> _Result:
     prediction's backward in IEEE float32, TF32 and, for the trunk networks, bfloat16, with
     NCHW inputs and the render's channels-last view, with cuDNN autotuning off and on; SSIM
     through fused-ssim and through the PyTorch path; TF32's and bf16's deviation from IEEE
-    float32 in value and gradient, per network; at 1352×1014 and 1920×1080 (Q-190, Q-T389.1).
+    float32 in value and gradient, per network; at 1352×1014 and 1920×1080 (Q-190, Q-269).
     The trunk networks' weights must be in torch.hub's cache already, and none is downloaded
-    (Q-253, Q-T389.2). Every network is built and the deviations and fused-ssim are measured in
+    (Q-253, Q-270). Every network is built and the deviations and fused-ssim are measured in
     this process; the timed cases in one child process per autotuning setting. The gains Q-173's
     rule reads are cases too; the rule's B-1 half is a rerun of B-1."""
     sizes = [(int(w), int(h)) for w, h in _LOSS_SIZES]
     networks = list(_LOSS_NETWORKS)
     weights, missing = _cached_weights(networks)
-    if missing:  # Q-253, Q-T389.2: before anything runs, and nothing downloaded
+    if missing:  # Q-253, Q-270: before anything runs, and nothing downloaded
         _fail(
             "B-4 needs the trunk networks' weights in torch.hub's cache and doesn't download "
             f"them; missing {', '.join(missing)} (building openftgs.losses.PerceptualLoss(net) "
