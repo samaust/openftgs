@@ -86,24 +86,35 @@ def test_output_faults_change_what_they_name(tmp_path: Path) -> None:
     assert _wrapped("info", faults=("exit=5",)) == 5
 
 
-def test_forward_faults_drop_answer_tensors_and_answer_without_lpips(tmp_path: Path) -> None:
-    """`lpips_off` answers `losses` as if its queries said `lpips` false, so no weights are
-    needed, and files the answers under the original queries; `drop_answer` removes the
-    tensors it names from every answer."""
+def test_forward_faults_drop_answer_tensors_or_answer_as_an_adapter_without_flip(
+    tmp_path: Path,
+) -> None:
+    """`drop_answer` removes the tensors it names from every answer; `no_flip` answers every
+    `losses` query `not_comparable`, with no tensors and a message naming ꟻLIP, as an adapter
+    without ꟻLIP answers (Q-255), and leaves the other kinds alone."""
     from ftgs_harness.formats import file_sha256, read_answers, write_queries
     from ftgs_harness.queries import generate
 
     queries = tmp_path / "losses.queries.safetensors"
-    batch = generate("losses", 1, seed=0, config={"loss": {"lambda_perc": 0.0}})
-    assert batch and all(q.params["lpips"] for q in batch)
+    batch = generate("losses", 1, seed=0, config={})
     write_queries(queries, "losses", batch)
     out = tmp_path / "losses.answers.safetensors"
-    faults = ("lpips_off", "drop_answer=l1,reg")
-    assert _wrapped("forward", queries, out, faults=faults) == 0
+    assert _wrapped("forward", queries, out, faults=("drop_answer=l1,reg",)) == 0
     answers = read_answers(out, kind="losses", queries_sha256=file_sha256(queries))
     assert answers.keys() == {q.id for q in batch}
     assert all(a.status == "ok" for a in answers.values())
-    assert all(set(a.tensors) == {"one_minus_ssim", "total"} for a in answers.values())
+    assert all(set(a.tensors) == {"one_minus_ssim", "flip", "total"} for a in answers.values())
+    assert _wrapped("forward", queries, out, faults=("no_flip",)) == 0
+    answers = read_answers(out, kind="losses", queries_sha256=file_sha256(queries))
+    assert answers.keys() == {q.id for q in batch}
+    for answer in answers.values():
+        assert answer.status == "not_comparable" and "ꟻLIP" in answer.message
+        assert not answer.tensors
+    other = tmp_path / "motion.queries.safetensors"
+    write_queries(other, "motion", generate("motion", 1, seed=0, config={}))
+    assert _wrapped("forward", other, out, faults=("no_flip",)) == 0
+    answers = read_answers(out, kind="motion", queries_sha256=file_sha256(other))
+    assert all(a.status == "ok" and "means_t" in a.tensors for a in answers.values())
 
 
 def test_info_faults(tmp_path: Path) -> None:

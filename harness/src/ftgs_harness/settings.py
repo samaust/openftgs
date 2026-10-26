@@ -62,12 +62,12 @@ class Settings:
     trained_models: tuple[Path, ...] = ()
     scenes: tuple[Scene, ...] = ()
     sizes: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SIZES))
-    l2_lpips: bool = True  # Q-212: LPIPS-VGG in L2's losses (off where weights can't download)
 
     @property
     def reduced(self) -> bool:
-        """Whether any case size is below §3.3's (Q-203) or L2 leaves LPIPS out (Q-212)."""
-        return sizes_reduced(self.sizes) or not self.l2_lpips
+        """Whether any case size is below §3.3's (Q-203), the only way a run is reduced since
+        Q-255 removed Q-212's `l2.lpips`."""
+        return sizes_reduced(self.sizes)
 
     def to_json(self) -> dict[str, Any]:
         out = asdict(self)
@@ -119,7 +119,7 @@ def load_settings(path: Path | None) -> Settings:
     for level, allowed in (
         ("l0", {"models", "trained_models"}),
         ("l1", {"items", "probe_items"}),
-        ("l2", {"queries", "lpips"}),
+        ("l2", {"queries"}),  # Q-255: no `lpips`, which Q-212 had
         ("l3", {"scenes"}),
     ):
         section = raw.get(level, {})
@@ -130,9 +130,6 @@ def load_settings(path: Path | None) -> Settings:
         level, name = key.split(".")
         if name in sections[level]:
             sizes[key] = _int(sections[level][name], key, 1)
-    l2_lpips = sections["l2"].get("lpips", True)
-    if not isinstance(l2_lpips, bool):
-        raise HarnessError(f"settings {path}: l2.lpips must be true or false")
     trained = sections["l0"].get("trained_models", [])
     if not isinstance(trained, list):
         raise HarnessError(f"settings {path}: l0.trained_models must be a list")
@@ -173,7 +170,6 @@ def load_settings(path: Path | None) -> Settings:
         trained_models=tuple(_path(p, "l0.trained_models", base) for p in trained),
         scenes=tuple(scenes),
         sizes=sizes,
-        l2_lpips=l2_lpips,
     )
 
 

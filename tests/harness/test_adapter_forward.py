@@ -26,7 +26,7 @@ from ftgs_harness.formats import (
 from openftgs.cli import _adapter
 from openftgs.config import LossConfig, TrainConfig, config_to_dict
 from openftgs.density import GradStats
-from openftgs.losses import l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.losses import PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.train import calendar_entry
@@ -128,16 +128,18 @@ def test_sh_color_is_e2_at_the_moved_mean(tmp_path: Path, degree: int | None) ->
 
 
 def test_losses_are_the_trainers_terms(tmp_path: Path) -> None:
-    """E7 to E9 without LPIPS (no download): L1, 1 − SSIM, L_reg at the query's time and the
-    total, against the direct calls; L1 also against its definition."""
+    """E7 to E9: L1, 1 − SSIM, ꟻLIP, L_reg at the query's time and the total, against the
+    direct calls; L1 also against its definition. With λ_perc = 0 the total holds no ꟻLIP, and
+    the answer still carries it (Q-207, Q-255)."""
     ex = _exchange()
     g = np.random.default_rng(3)
     pred = g.random((20, 24, 3), dtype=np.float32)
     gt = g.random((20, 24, 3), dtype=np.float32)
-    params, tensors = _with_model(ex, lpips=False, iteration=5, loss={"lambda_reg": 0.02})
+    loss = {"lambda_perc": 0.0, "lambda_reg": 0.02}
+    params, tensors = _with_model(ex, iteration=5, loss=loss)
     tensors.update({"pred": pred, "gt": gt, "t": np.array(6.0)})
     got = _ask(tmp_path, "losses", params, tensors).tensors
-    assert set(got) == {"l1", "one_minus_ssim", "reg", "total"}
+    assert set(got) == {"l1", "one_minus_ssim", "flip", "reg", "total"}
     assert float(got["l1"]) == pytest.approx(float(np.abs(pred - gt).mean()), rel=1e-6)
     model = FreeTimeGaussians.from_exchange(_openftgs(ex), device="cpu")
     t = (6.0 - TAU0) / (TAU1 - TAU0)
@@ -145,30 +147,32 @@ def test_losses_are_the_trainers_terms(tmp_path: Path) -> None:
     cfg = LossConfig(lambda_perc=0.0, lambda_reg=0.02)
     total, _ = total_loss(p, q, model, t, 5, cfg)
     assert float(got["one_minus_ssim"]) == pytest.approx(1.0 - float(ssim(p, q)), rel=1e-5)
+    assert float(got["flip"]) == pytest.approx(float(PerceptualLoss("flip")(p, q)), rel=1e-5)
     assert float(got["reg"]) == pytest.approx(float(reg4d_loss(model, t).detach()), rel=1e-5)
     assert float(got["total"]) == pytest.approx(float(total.detach()), rel=1e-5)
     assert float(l1_loss(p, q)) == pytest.approx(float(got["l1"]), rel=1e-6)
 
 
-@pytest.mark.weights
-def test_losses_with_lpips_vgg(tmp_path: Path) -> None:
-    """E7, D-9: with `lpips` the answer adds LPIPS-VGG on inputs mapped to [−1, 1], and the
-    total includes λ_perc times it; against the direct calls (§3.3 tolerance 1e-3)."""
-    from openftgs.losses import LPIPSLoss
-
+@pytest.mark.parametrize(("lambda_perc", "weight"), [(0.3, 0.3), (None, 0.415)])
+def test_losses_with_flip(tmp_path: Path, lambda_perc: float | None, weight: float) -> None:
+    """E7, E9, D-9, Q-255: the answer's `flip` is ꟻLIP on the image pair, against
+    `PerceptualLoss("flip")` (§3.3: 1e-5 relative), and the total is 0.8·L1 + 0.2·(1 − SSIM) +
+    λ_perc·ꟻLIP + λ_reg·L_reg of the answer's own terms; λ_perc = None is ꟻLIP's calibrated
+    0.415 (D-89, Q-249). No weights are downloaded."""
     ex = _exchange()
     g = np.random.default_rng(4)
     pred = g.random((40, 48, 3), dtype=np.float32)
     gt = g.random((40, 48, 3), dtype=np.float32)
-    params, tensors = _with_model(ex, lpips=True, iteration=1)
+    params, tensors = _with_model(ex, iteration=1, loss={"lambda_perc": lambda_perc})
     tensors.update({"pred": pred, "gt": gt, "t": np.array(3.0)})
-    got = _ask(tmp_path, "losses", params, tensors).tensors
+    got = {k: float(v) for k, v in _ask(tmp_path, "losses", params, tensors).tensors.items()}
     p, q = torch.from_numpy(pred)[None], torch.from_numpy(gt)[None]
-    vgg = LPIPSLoss("vgg")
-    assert float(got["lpips_vgg"]) == pytest.approx(float(vgg(p, q).detach()), abs=1e-3)
-    model = FreeTimeGaussians.from_exchange(_openftgs(ex), device="cpu")
-    total, _ = total_loss(p, q, model, 0.1, 1, LossConfig(), perceptual=vgg)
-    assert float(got["total"]) == pytest.approx(float(total.detach()), rel=1e-5)
+    assert got["flip"] == pytest.approx(float(PerceptualLoss("flip")(p, q)), rel=1e-5)
+    assert got["flip"] > 0.1  # independent random images differ visibly
+    expected = (
+        0.8 * got["l1"] + 0.2 * got["one_minus_ssim"] + weight * got["flip"] + 1e-2 * got["reg"]
+    )
+    assert got["total"] == pytest.approx(expected, rel=1e-5)
 
 
 def _openftgs(ex: Exchange) -> ExchangeModel:
@@ -263,14 +267,21 @@ def test_relocation_sampling_draws_in_proportion_to_the_scores(tmp_path: Path) -
     assert np.array_equal(again, counts)
 
 
-def test_grad_stats_is_one_training_steps_statistic(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "loss",
+    [LossConfig(lambda_perc=0.0), LossConfig(perc_net="flip", lambda_perc=None)],
+    ids=["no-perceptual", "flip-calibrated"],
+)
+def test_grad_stats_is_one_training_steps_statistic(tmp_path: Path, loss: LossConfig) -> None:
     """D-12: the NDC-scaled 2D-mean gradient norm of E9 for one step, and visibility, as the
-    trainer computes them on the reference backend."""
+    trainer computes them on the reference backend, with the configuration's perceptual
+    network and weight: none at λ_perc = 0; ꟻLIP at λ_perc = None, its calibrated weight
+    (Q-249), a term of the total."""
     ex = _exchange(n=10, sh_degree=1)
     ex.arrays["duration"] = np.full(10, 50.0)  # every primitive present at τ = 5
     cam = ring(1, radius=4.0, elevation=1.0, width_px=24, height_px=16, focal=20.0)[0]
     gt = np.random.default_rng(1).random((16, 24, 3), dtype=np.float32)
-    cfg = TrainConfig(sh_degree=1, loss=LossConfig(lambda_perc=0.0))
+    cfg = TrainConfig(sh_degree=1, loss=loss)
     config = config_to_dict(cfg)
     params, tensors = _with_model(ex, width=24, height=16, iteration=1500, config=config)
     tensors.update(
@@ -295,8 +306,11 @@ def test_grad_stats_is_one_training_steps_statistic(tmp_path: Path) -> None:
         return_aux=True,
         packed=False,
     )
-    loss, _ = total_loss(out.image, torch.from_numpy(gt)[None], model, t, 1500, cfg.loss)
-    torch.autograd.backward(loss)
+    perceptual = None if loss.lambda_perc == 0.0 else PerceptualLoss("flip")
+    image = torch.from_numpy(gt)[None]
+    total, terms = total_loss(out.image, image, model, t, 1500, cfg.loss, perceptual=perceptual)
+    assert ("perceptual" in terms) is (perceptual is not None)
+    torch.autograd.backward(total)
     stats = GradStats(10)
     assert out.means2d is not None and out.means2d.grad is not None and out.visible is not None
     stats.update(out.means2d.grad, width=24, height=16, visible=out.visible)
