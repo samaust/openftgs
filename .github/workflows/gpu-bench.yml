@@ -36,6 +36,7 @@ jobs:
           "$FTGS_PYTHON" - <<'PY'
           import fused_ssim, gsplat, lpips, torch  # B-4 needs fused-ssim for its fused case
           import openftgs
+          import einops, loguru, torchvision  # [init]: B-4's DINO networks (Q-248, Q-253)
           assert torch.cuda.is_available(), "no CUDA device"
           print(openftgs.__file__, torch.__version__, torch.cuda.get_device_name())
           PY
@@ -47,6 +48,8 @@ jobs:
           mkdir -p bench
           bench raster "$FTGS_SCENE/scene.json" --out bench/B-2-raster.json
           bench slice "$FTGS_SCENE/scene.json" --out bench/B-3-slice.json
+          # Q-253: B-4 times all eight networks of D-89 and never downloads the six trunks'
+          # weights, which the runner keeps in its torch.hub cache; a missing one is exit 2.
           bench losses "$FTGS_SCENE/scene.json" --out bench/B-4-losses.json
           bench adam "$FTGS_SCENE/scene.json" --out bench/B-5-adam.json
           bench data "$FTGS_SCENE/scene.json" --out bench/B-6-data.json
