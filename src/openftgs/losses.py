@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""L1, SSIM, the LPIPS wrapper, 4D regularization and the total loss.
+"""L1, SSIM, the perceptual networks (D-89), 4D regularization and the total loss; the LPIPS
+wrapper stays until the contract ticket of #380 (#392) removes it.
 
-Spec: E7, E8, E9. Band: Mechanics (§2.1).
+Spec: E7, E8, E9, D-89. Band: Mechanics (§2.1).
 """
 
 import functools
@@ -287,8 +288,12 @@ def _haarpsi(x: Tensor, y: Tensor) -> Tensor:
 
 
 class PerceptualLoss(torch.nn.Module):
-    """L_perc: the perceptual network `net` of D-89 on the render and the training image (E7,
-    D-9)."""
+    """L_perc: the perceptual network `net` of D-89 on the render and the training image, as the
+    mean over the batch (E7, D-9). `forward(pred, gt)` takes Q-41's [..., H, W, 3] images; the
+    reference gets no gradient. The network is frozen and stays in evaluation mode under
+    `.train()` (D-89). "flip" is the vendored LDR-ꟻLIP loss at 67.0 pixels per degree, on
+    float32 images; "haarpsi" is 1 − HaarPSI, the render clamped to [0, 1], on sides of at least
+    16 pixels (Q-T381.1). The six trunk networks are built by #385 and #386."""
 
     def __init__(self, net: PercNet = "flip") -> None:
         super().__init__()
@@ -343,7 +348,7 @@ class LPIPSLoss(torch.nn.Module):
             warnings.filterwarnings("ignore", "The parameter 'pretrained'", UserWarning)
             warnings.filterwarnings("ignore", "Arguments other than a weight enum", UserWarning)
             self._net: torch.nn.Module = lpips.LPIPS(net=net, verbose=False)
-        self._backbone = net
+        self._name = net  # the perc_net value it was built for, as PerceptualLoss's
         # lpips freezes only its trunk; the linear layers would stay trainable.
         self._net.requires_grad_(False)
         self._net.eval()
@@ -377,6 +382,35 @@ def reg4d_loss(model: FreeTimeGaussians, t: float) -> Tensor:
     return terms.mean() if terms.numel() > 0 else terms.sum()
 
 
+# D-89's table: each network's calibrated λ_perc, the weight `lambda_perc = None` stands for.
+_CALIBRATED_WEIGHTS = {
+    "flip": 0.415,
+    "haarpsi": 0.0617,
+    "vgg16_oxford": 0.00164,
+    "alexnet_bvlc": 0.00408,
+    "dinov2_s14": 0.00185,
+    "dinov2_b14": 0.00204,
+    "dino_s16": 0.00358,
+    "dino_b16": 0.00484,
+}
+
+
+# Q-249: a private resolver, so that no §2.1 addition is needed.
+def _resolve_lambda_perc(cfg: LossConfig) -> float:
+    """λ_perc as `total_loss` applies it: `cfg.lambda_perc`, or the calibrated weight of
+    `cfg.perc_net` when it is None (D-9, D-89)."""
+    if cfg.lambda_perc is not None:
+        return cfg.lambda_perc
+    if cfg.perc_net not in _CALIBRATED_WEIGHTS:
+        # #380's expand step: LPIPS's backbones, still accepted as perc_net until #392, have no
+        # calibrated weight.
+        _fail(
+            f"lambda_perc = None takes perc_net's calibrated weight in D-89's table, which has "
+            f"none for {cfg.perc_net!r}; set lambda_perc or choose one of {_PERC_NETS}"
+        )
+    return _CALIBRATED_WEIGHTS[cfg.perc_net]
+
+
 # D-77: the dict holds detached 0-d tensors, so the loss never syncs with the host (§2.4 rule 3),
 # and the perceptual network is passed in.
 def total_loss(
@@ -387,21 +421,27 @@ def total_loss(
     it: int,
     cfg: LossConfig,
     *,
-    perceptual: LPIPSLoss | None = None,
+    perceptual: PerceptualLoss | LPIPSLoss | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·LPIPS + λ_reg·L_reg(t) at iteration `it` (E7, E9,
-    D-37), and its unweighted terms with the total under "total". t is the training image's
-    normalized time (§1.4), as for `reg4d_loss`. A term whose λ is 0 is neither computed nor
-    reported. After `cfg.reg_until`, L_reg leaves the total but is still reported, computed
-    without a gradient, so the keys stay fixed for a run (D-10, Q-41)."""
+    """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·L_perc + λ_reg·L_reg(t) at iteration `it` (E7,
+    E9, D-37), and its unweighted terms with the total under "total". t is the training image's
+    normalized time (§1.4), as for `reg4d_loss`. λ_perc = None is the calibrated weight of
+    `cfg.perc_net` (D-89; Q-249). A term whose λ is 0 is neither computed nor reported. After
+    `cfg.reg_until`, L_reg leaves the total but is still reported, computed without a gradient,
+    so the keys stay fixed for a run (D-10, Q-41)."""
     # Q-41: iterations count from 1 (D-41).
     if isinstance(it, bool) or not isinstance(it, int) or it < 1:
         _fail(f"it must be an int >= 1, got {it!r}")
-    if cfg.lambda_perc > 0.0 and perceptual is None:
-        _fail("lambda_perc > 0 needs the perceptual network (perceptual=LPIPSLoss(...))")
-    # Q-41: a network passed in must be the backbone LossConfig names (D-9), whatever λ_perc.
-    if perceptual is not None and perceptual._backbone != cfg.perc_net:
-        _fail(f"perceptual uses {perceptual._backbone!r}, but cfg.perc_net is {cfg.perc_net!r}")
+    lambda_perc = _resolve_lambda_perc(cfg)
+    # D-77, Q-249: the resolved weight, not the configured one, asks for the network.
+    if lambda_perc > 0.0 and perceptual is None:
+        _fail(
+            f"lambda_perc {lambda_perc} (configured {cfg.lambda_perc!r}) needs the perceptual "
+            f"network (perceptual=PerceptualLoss({cfg.perc_net!r}))"
+        )
+    # Q-41: a network passed in must be the one LossConfig names (D-9), whatever λ_perc.
+    if perceptual is not None and perceptual._name != cfg.perc_net:
+        _fail(f"perceptual is {perceptual._name!r}, but cfg.perc_net is {cfg.perc_net!r}")
     _check_pair(pred, gt)
     terms: dict[str, Tensor] = {}
     weighted: list[Tensor] = []
@@ -417,10 +457,10 @@ def total_loss(
             )
             terms["one_minus_ssim"] = 1.0 - value
             weighted.append(cfg.lambda_ssim * terms["one_minus_ssim"])
-    if perceptual is not None and cfg.lambda_perc > 0.0:
+    if perceptual is not None and lambda_perc > 0.0:
         with stage("loss.perceptual"):
             terms["perceptual"] = perceptual(pred, gt)
-            weighted.append(cfg.lambda_perc * terms["perceptual"])
+            weighted.append(lambda_perc * terms["perceptual"])
     if cfg.lambda_reg > 0.0:
         with stage("loss.reg"):
             if cfg.reg_until is None or it <= cfg.reg_until:
