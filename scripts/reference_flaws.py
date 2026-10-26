@@ -48,7 +48,7 @@ frame and averaged over frames as E16 does, its PSNR as E16 computes it, and the
 pixels left once those flagged in FLAGS_DIR are removed (Q-233), for each flag alone, for their
 union, and for the union at ½ and 2 times the thresholds; with the PSNR over the flagged pixels,
 their mean error (render − reference, in levels: below 0 where the render is darker) and their
-share. SSIM and LPIPS have no kept-pixel form.
+share. SSIM and ꟻLIP have no kept-pixel form.
 
 These are diagnostics, not pass criteria: the spec defines no metric for them. Exit 0 once
 written; 2 for an input that can't be read or matched.
