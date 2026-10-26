@@ -487,6 +487,10 @@ TRUNK_NETWORKS = (  # D-89's table, written out: the networks built on pretraine
     "dino_b16",
 )
 WEIGHT_FREE_NETWORKS: tuple[PercNet, ...] = ("flip", "haarpsi")  # D-89: the two without weights
+# D-89's two Caffe trunks (#385), whose weights are downloaded at first use, hence `weights`
+# (Q-7); they compute in float32, their weights' dtype (Q-T385.1).
+CAFFE_NETWORKS: tuple[PercNet, ...] = ("vgg16_oxford", "alexnet_bvlc")
+CAFFE_PARAMS = [pytest.param(net, marks=pytest.mark.weights) for net in CAFFE_NETWORKS]
 
 
 @pytest.mark.parametrize("net", ["vgg", "alex", "lpips", "FLIP", ""])
@@ -497,12 +501,11 @@ def test_perceptual_loss_rejects_a_name_outside_d89(net: str) -> None:
         PerceptualLoss(net)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("net", TRUNK_NETWORKS)
+@pytest.mark.parametrize("net", [n for n in TRUNK_NETWORKS if n not in CAFFE_NETWORKS])
 def test_perceptual_loss_trunk_networks_are_not_built_yet(net: str) -> None:
-    """#381: the six trunk networks of D-89 are built by #385 (the Caffe trunks) and #386 (the
-    DINO networks); until then building one raises an error naming its ticket. Those tickets
-    replace this test."""
-    with pytest.raises(NotImplementedError, match="#385|#386"):
+    """#381: the four DINO networks of D-89 are built by #386; until then building one raises
+    an error naming its ticket. #386 replaces this test; #385 built the Caffe trunks."""
+    with pytest.raises(NotImplementedError, match="#386"):
         PerceptualLoss(net)  # type: ignore[arg-type]
 
 
@@ -536,7 +539,14 @@ def _pattern(shape: tuple[int, ...], phase: float) -> Tensor:
 
 # Q-262: ꟻLIP runs in float32 only (Q-261); HaarPSI's identity case runs in float64, where
 # its float32 rounding (the logit of float32's sigmoid(4.2)) doesn't reach U-9's bound.
-@pytest.mark.parametrize(("net", "dtype"), [("flip", F32), ("haarpsi", F64)])
+@pytest.mark.parametrize(
+    ("net", "dtype"),
+    [
+        ("flip", F32),
+        ("haarpsi", F64),
+        *(pytest.param(net, F32, marks=pytest.mark.weights) for net in CAFFE_NETWORKS),
+    ],
+)
 def test_u9_perceptual_network_of_an_image_with_itself(net: PercNet, dtype: torch.dtype) -> None:
     """U-9 (D-89): on identical images a network gives 0, or at most 10⁻⁵ of its value under
     Gaussian noise of σ = 16/255 (float32 rounding, ꟻLIP's stabilizer), on each of five images:
