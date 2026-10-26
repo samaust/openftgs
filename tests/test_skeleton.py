@@ -33,8 +33,14 @@ def _source_files() -> list[Path]:
     files: list[Path] = []
     for top in ("src", "harness/src", "tests", "scripts"):
         files.extend((ROOT / top).rglob("*.py"))
-    # D-65: the vendored RoMa keeps its upstream headers; openftgs._vendor's own __init__ doesn't.
-    return sorted(p for p in files if not p.is_relative_to(PACKAGE_DIR / "_vendor" / "romatch"))
+    # D-65: the vendored RoMa and ꟻLIP keep their upstream headers, and so does U-23's reference
+    # copy of ꟻLIP (Q-252); openftgs._vendor's own __init__ files don't.
+    upstream = (
+        PACKAGE_DIR / "_vendor" / "romatch",
+        PACKAGE_DIR / "_vendor" / "flip" / "flip_loss.py",
+        ROOT / "tests" / "reference" / "flip",
+    )
+    return sorted(p for p in files if not any(p.is_relative_to(u) for u in upstream))
 
 
 def _package_of(path: Path) -> list[str]:
