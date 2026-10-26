@@ -281,3 +281,19 @@ def test_init_extra_lists_no_fused_local_corr() -> None:
     assert isinstance(project, dict)
     init = project["optional-dependencies"]["init"]
     assert "fused-local-corr" not in {_requirement_name(r) for r in init}
+
+
+def test_core_names_neither_lpips_nor_the_init_packages() -> None:
+    """§2.3 since revision 549o (#393): lpips leaves the core, and tqdm, which only lpips
+    brought, with it; torchvision, einops and loguru are the `[init]` extra's alone, which the
+    four DINO networks need (Q-248); and torchmetrics leaves the dev set. No extra names lpips,
+    tqdm or torchmetrics."""
+    project = _pyproject(ROOT / "pyproject.toml")["project"]
+    assert isinstance(project, dict)
+    core = {_requirement_name(r) for r in project["dependencies"]}
+    assert core & {"lpips", "tqdm", "torchvision", "einops", "loguru", "torchmetrics"} == set()
+    extras = project["optional-dependencies"]
+    for name, extra in extras.items():
+        named = {_requirement_name(r) for r in extra}
+        assert named & {"lpips", "tqdm", "torchmetrics"} == set(), name
+    assert {"torchvision", "einops", "loguru"} <= {_requirement_name(r) for r in extras["init"]}
