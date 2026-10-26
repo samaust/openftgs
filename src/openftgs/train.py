@@ -412,6 +412,7 @@ def _check_perceptual(cfg: TrainConfig) -> None:
     `TrainConfig` stays valid on its own, so it can move to a trunk network. Without a network
     (λ_perc = 0) nothing would run in bfloat16, and nothing is refused (Q-T388.1)."""
     net = cfg.loss.perc_net
+    # Q-T388.1: refused only when the network is built.
     if cfg.perf.perc_precision == "bf16" and net in _WEIGHT_FREE and _builds_perceptual(cfg.loss):
         raise ValueError(
             f"perf.perc_precision 'bf16' runs a trunk network in bfloat16 (D-52), and "
