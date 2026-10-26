@@ -2442,8 +2442,7 @@ def _render(ctx: _Context) -> _Result:
     unit = video.manifest.time_unit
     if ctx.model is not None and ctx.model.model.time_unit != unit:
         _fail(f"the model's time unit {ctx.model.model.time_unit!r} isn't the scene's {unit!r}")
-    with _environment_error("LPIPS networks"):  # as `ftgs eval` builds them; found before the run
-        evaluator = Evaluator(device="cuda")
+    evaluator = Evaluator(device="cuda")  # as `ftgs eval` builds it; its ꟻLIP downloads nothing
     camera = _b7_camera(video)
     taus, chosen = _b7_times(video, camera)  # Q-194, Q-221
     count = len(taus)

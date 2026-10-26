@@ -2041,7 +2041,7 @@ def test_b8_init_times_matching_per_pair_and_gpu_triangulation_knn_and_the_run(
 
 # B-7, `ftgs bench render` (§3.4, D-55; Q-174, Q-194, Q-195), run once on the GPU for the
 # tests below on `tested_scene`: three distinct training times, so requests of 1, 2 and 3 times.
-# It builds the LPIPS networks for its evaluation figures, hence `weights`.
+# Its evaluation figures build the evaluator, whose ꟻLIP needs no weights (#387, #389).
 
 B7_MODELS = [(n, active) for n in (1_000_000, 3_000_000) for active in (0.01, 0.05, 0.2)]
 
@@ -2061,7 +2061,6 @@ def _b7_cases(body: dict[str, Any]) -> dict[tuple[Any, ...], dict[str, Any]]:
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_renders_every_training_time_with_and_without_the_index_on_both_devices(
     render_bench: dict[str, Any],
 ) -> None:
@@ -2091,7 +2090,6 @@ def test_b7_renders_every_training_time_with_and_without_the_index_on_both_devic
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, Any]) -> None:
     """B-7 (#231, Q-194 as answered, Q-195): per model, the index's build time is the
     one-time request with the index forced on less the same request forced off (outputs on the
@@ -2107,7 +2105,6 @@ def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, A
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_holds_the_synthesized_models_to_no_budget_and_sets_the_threshold(
     render_bench: dict[str, Any],
 ) -> None:
@@ -2129,7 +2126,6 @@ def test_b7_holds_the_synthesized_models_to_no_budget_and_sets_the_threshold(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_times_the_share_of_evaluation_spent_rendering(render_bench: dict[str, Any]) -> None:
     """PRD #220's rule for `evaluate_images` (Q-68, Q-194): per model, the evaluation of
     the test split (camera ring02 at 3 times) against the render requests it sends, one per
@@ -2146,7 +2142,6 @@ def test_b7_times_the_share_of_evaluation_spent_rendering(render_bench: dict[str
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
     """D-88, Q-194: with `--model`, B-7 times that model alone, its N in the cases and no
     active fraction; an exchange model carries no Δt_f, so the buckets take the scene's."""
@@ -2165,7 +2160,6 @@ def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__b7_floors_wire_one_budget_entry_on_the_index_on_request(
     tested_scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2201,28 +2195,6 @@ def test__b7_floors_wire_one_budget_entry_on_the_index_on_request(
     setup = body["setup"]
     assert (setup["floor_fps"], setup["floor_source"]) == (10.0, "n3dv/kitchen")
     assert setup["reference_fps"] == 450.0
-
-
-@pytest.mark.gpu
-def test_bench_render_without_the_lpips_weights_exits_2(
-    tested_scene: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Q-166, Q-142, Q-194: B-7's evaluation figures need the LPIPS networks, built as
-    `ftgs eval` builds them before anything is measured; when their weights can't be had (an
-    OSError of the download) it is exit 2, an invalid environment, with nothing written."""
-    import openftgs.eval
-
-    def offline(self: Any, **kwargs: Any) -> None:
-        raise OSError("no network")
-
-    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", offline)
-    out = tmp_path / "B-7.json"
-    assert _ftgs("bench", "render", tested_scene, "--out", out) == 2
-    assert "LPIPS networks" in capsys.readouterr().err
-    assert not out.exists()
 
 
 # A benchmark cut short (Q-166 as answered, #272; Q-199): out of GPU memory is exit 2 and a
@@ -2371,7 +2343,6 @@ def test__data_exits_3_when_training_diverges(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_bench_renders_that_are_not_finite_exit_3(
     tested_scene: Path,
     tmp_path: Path,
