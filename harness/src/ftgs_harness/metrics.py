@@ -3,17 +3,17 @@
 between A and B (§3.3 L3 step 3), written from E16 and E7's wording: renders clamped to [0, 1];
 PSNR = 10 log₁₀(1/MSE); SSIM_k with an 11×11 Gaussian window (σ = 1.5) over the valid region,
 C₁ = (0.01k)², C₂ = (0.03k)², per channel and averaged over the map and channels;
-DSSIM_k = (1 − SSIM_k)/2; LPIPS-Alex and LPIPS-VGG on inputs mapped from [0, 1] to [−1, 1]
-(D-68), through the [lpips] extra (Q-201)."""
+DSSIM_k = (1 − SSIM_k)/2; ꟻLIP (LDR) at 67.0 pixels per degree, the mean of its error map,
+through the harness's own vendored copy of NVIDIA's loss (Q-254), which needs torch, the
+harness's optional extra; the rest needs no torch (Q-201)."""
 
 import math
-import warnings
 from typing import Any
 
 import numpy as np
 import scipy.ndimage
 
-__all__ = ["FLIP_PIXELS_PER_DEGREE", "Lpips", "dssim", "flip", "psnr", "ssim"]
+__all__ = ["FLIP_PIXELS_PER_DEGREE", "dssim", "flip", "psnr", "ssim"]
 
 _WINDOW, _SIGMA = 11, 1.5
 # Q-T391.1: E16's and D-89's 67.0 pixels per degree, passed to ꟻLIP as written.
@@ -77,24 +77,3 @@ def flip(pred: np.ndarray, gt: np.ndarray) -> float:
     with torch.no_grad():
         value = LDRFLIPLoss()(nchw(_clamped(pred)), nchw(gt), FLIP_PIXELS_PER_DEGREE)
     return float(value)
-
-
-class Lpips:
-    """LPIPS with the AlexNet or VGG backbone (lpips 0.1.4), inputs mapped to [−1, 1] (D-68).
-    Needs the [lpips] extra; the network weights are downloaded on first use."""
-
-    def __init__(self, net: str) -> None:
-        import lpips
-        import torch
-
-        self._torch: Any = torch
-        with warnings.catch_warnings():  # torchvision's notes on lpips's backbone arguments
-            warnings.simplefilter("ignore", UserWarning)
-            self._model: Any = lpips.LPIPS(net=net, verbose=False).eval()
-
-    def __call__(self, pred: np.ndarray, gt: np.ndarray) -> float:
-        torch = self._torch
-        x = torch.from_numpy(_clamped(pred) * 2.0 - 1.0).float().permute(2, 0, 1)[None]
-        y = torch.from_numpy(gt.astype(np.float64) * 2.0 - 1.0).float().permute(2, 0, 1)[None]
-        with torch.no_grad():
-            return float(self._model(x, y).item())

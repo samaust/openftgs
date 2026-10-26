@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from ftgs_harness.metrics import Lpips, dssim, flip, psnr, ssim
+from ftgs_harness.metrics import dssim, flip, psnr, ssim
 from openftgs import eval as ev
 from openftgs._vendor.flip import LDRFLIPLoss
 
@@ -37,18 +37,6 @@ def test_psnr_and_ssim_agree_with_openftgs_eval(seed: int) -> None:
 def test_identical_images() -> None:
     _, gt = _pair(3)
     assert psnr(gt, gt) == float("inf") and ssim(gt, gt) == pytest.approx(1.0, abs=1e-12)
-
-
-@pytest.mark.weights
-@pytest.mark.parametrize("net", ["alex", "vgg"])
-def test_lpips_agrees_with_openftgs_eval(net: str) -> None:
-    """E16, D-68: inputs mapped to [−1, 1] for both backbones."""
-    from openftgs.losses import LPIPSLoss
-
-    pred, gt = _pair(4)
-    p, g = torch.from_numpy(np.clip(pred, 0, 1))[None], torch.from_numpy(gt)[None]
-    expected = float(LPIPSLoss(net)(p, g).detach())  # type: ignore[arg-type]
-    assert Lpips(net)(pred, gt) == pytest.approx(expected, abs=1e-5)
 
 
 def _nchw(image: np.ndarray) -> torch.Tensor:
