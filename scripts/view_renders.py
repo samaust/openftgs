@@ -22,7 +22,11 @@ With `--compare`, it writes DIR/COMPARISON.json: per block of scene means (`enti
 null where either value is null), per block and metric the largest per-image difference, and as
 `findings` every scene mean or image value differing by more than 0.01 dB in PSNR or 10⁻⁴ in
 any other metric, every value null on one side only, and every block, metric and image path in
-one file only (#327, Q-224). The backend is gsplat unless `--backend reference`; on a
+one file only (#327, Q-224); and under `versions` the METRICS.json version of each file. The
+given file may be of version 1 (M17's runs, LPIPS-Alex, LPIPS-VGG and lpips_vgg_raw) or 2
+(since 549o, ꟻLIP); against version 1, the metrics one version holds alone are findings, as
+any metric in one file only is. A given file of another version or format is exit 2, before
+anything is run (Q-256). The backend is gsplat unless `--backend reference`; on a
 machine without CUDA `ftgs render` refuses gsplat rather than falling back (Q-125).
 
 Exit 0 once written; 2 for an input that can't be read or matched; a failing ftgs command's own
@@ -47,6 +51,8 @@ if TYPE_CHECKING:
 _PSNR_FINDING_DB = 0.01
 _UNIT_FINDING = 1e-4
 _BLOCKS = ("entire", "dynamic")  # fastest_10 is out of #327's scope: no M17 manifest names it
+_FORMAT = "ftgs-metrics"  # Q-63: METRICS.json's format tag
+_VERSIONS = (1, 2)  # Q-256: version 1 (LPIPS) and version 2 (ꟻLIP, since 549o)
 
 
 class InputError(Exception):
@@ -216,6 +222,8 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
             name: max(deltas, key=abs) for name, deltas in image_deltas.items() if deltas
         }
     return {
+        # Q-256: the version of each METRICS.json compared
+        "versions": {"this_run": ours.get("version"), "given": theirs.get("version")},
         "blocks": blocks,
         "largest_image_difference": largest,
         "largest_image_psnr_difference": {
@@ -223,6 +231,23 @@ def compare(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
         },
         "findings": findings,
     }
+
+
+def _given_metrics(path: Path) -> dict[str, Any]:
+    """The METRICS.json `--compare` names, of version 1 or 2 (Q-256)."""
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise InputError(f"--compare {path}: {err}") from None
+    if not isinstance(body, dict):
+        raise InputError(f"--compare {path}: not a METRICS.json")
+    version = body.get("version")
+    if body.get("format") != _FORMAT or version not in _VERSIONS:
+        raise InputError(
+            f"--compare {path}: not a METRICS.json of version 1 or 2 (format "
+            f"{body.get('format')!r}, version {version!r})"
+        )
+    return body
 
 
 def _ftgs(*args: Path | str) -> None:
@@ -236,6 +261,7 @@ def run(
     model: Path, scene: Path, directory: Path, *, compare_with: Path | None, backend: str
 ) -> int:
     """#327's steps for one model; the number of PNGs written."""
+    theirs = None if compare_with is None else _given_metrics(compare_with)
     request, renders = directory / "request.json", directory / "renders.safetensors"
     write_request(model, scene, request)
     # Q-125: gsplat needs CUDA, and ftgs render refuses it without
@@ -244,11 +270,7 @@ def run(
     _ftgs("eval", model, scene, "--renders-dir", directory, "--out", metrics)
     count = write_pngs(directory, scene)
     renders.unlink()
-    if compare_with is not None:
-        try:
-            theirs = json.loads(compare_with.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as err:
-            raise InputError(f"--compare {compare_with}: {err}") from None
+    if theirs is not None:
         comparison = compare(json.loads(metrics.read_text(encoding="utf-8")), theirs)
         comparison["compared_with"] = str(compare_with)
         out = directory / "COMPARISON.json"

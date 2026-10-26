@@ -5,8 +5,9 @@
 Added tests, not §3 rows: the request it writes is matched record for record by `ftgs eval
 --renders-dir` (Q-137's rule); its background is the model's training background (D-84); the
 whole run leaves one 8-bit PNG per test record equal to the clamped render, a METRICS.json equal
-to the run's own, and no renders file; its comparison's findings follow Q-224's bounds. The
-script runs as #327 runs it, in a process of its own, here on the CPU (the reference backend).
+to the run's own, and no renders file; its comparison's findings follow Q-224's bounds, and it
+reads METRICS.json versions 1 and 2 and says which it read (Q-256). The script runs as #327 runs
+it, in a process of its own, here on the CPU (the reference backend).
 """
 
 import dataclasses
@@ -187,6 +188,7 @@ def test_run_leaves_pngs_metrics_and_no_renders(tmp_path: Path) -> None:
     for name, value in _scene_means(theirs).items():
         assert _scene_means(ours)[name] == pytest.approx(value, rel=1e-6, abs=1e-9)
     comparison = json.loads((out / "COMPARISON.json").read_text())
+    assert comparison["versions"] == {"this_run": 2, "given": 2}  # Q-256
     assert comparison["findings"] == []
     assert set(comparison["blocks"]["entire"]) == set(_scene_means(theirs))
     assert all(abs(d) < 1e-6 for d in comparison["blocks"]["entire"].values())
@@ -201,10 +203,10 @@ def _module() -> Any:
 
 
 def _metrics(**changes: float | None) -> dict[str, Any]:
-    """A METRICS.json body whose scene means and one image, in both blocks, hold the same
-    values; `changes` sets `<block>_<scene|image>_<metric>` to another value."""
-    base = {"psnr": 30.0, "ssim1": 0.9, "lpips_alex": 0.2}
-    body: dict[str, Any] = {}
+    """A version-2 METRICS.json body whose scene means and one image, in both blocks, hold the
+    same values; `changes` sets `<block>_<scene|image>_<metric>` to another value."""
+    base = {"psnr": 30.0, "ssim1": 0.9, "flip": 0.2}
+    body: dict[str, Any] = {"format": "ftgs-metrics", "version": 2}
     for block in ("entire", "dynamic"):
         scene = {k: changes.get(f"{block}_scene_{k}", v) for k, v in base.items()}
         values = {k: changes.get(f"{block}_image_{k}", v) for k, v in base.items()}
@@ -220,13 +222,13 @@ def _flagged(findings: list[str]) -> list[str]:
 @pytest.mark.parametrize("block", ["entire", "dynamic"])
 @pytest.mark.parametrize("level", ["scene", "image"])
 def test_comparison_bounds_are_q224s(block: str, level: str) -> None:
-    """Q-224: a difference above 0.01 dB in PSNR or 10⁻⁴ in SSIM and LPIPS is a finding, per
+    """Q-224: a difference above 0.01 dB in PSNR or 10⁻⁴ in SSIM and ꟻLIP is a finding, per
     scene mean and per image, in both blocks; 0.005 dB and 5·10⁻⁵ aren't. Every difference is
     written."""
     compare = _module().compare
     theirs = _metrics()
-    small = {"psnr": 30.005, "ssim1": 0.9 + 5e-5, "lpips_alex": 0.2 - 5e-5}
-    large = {"psnr": 30.02, "ssim1": 0.9 + 2e-4, "lpips_alex": 0.2 - 2e-4}
+    small = {"psnr": 30.005, "ssim1": 0.9 + 5e-5, "flip": 0.2 - 5e-5}
+    large = {"psnr": 30.02, "ssim1": 0.9 + 2e-4, "flip": 0.2 - 2e-4}
     quiet = compare(_metrics(**{f"{block}_{level}_{k}": v for k, v in small.items()}), theirs)
     assert quiet["findings"] == []
     loud = compare(_metrics(**{f"{block}_{level}_{k}": v for k, v in large.items()}), theirs)
@@ -238,7 +240,7 @@ def test_comparison_bounds_are_q224s(block: str, level: str) -> None:
             if level == "scene"
             else result["largest_image_difference"][block]
         )
-        expected = {"psnr": 30.0, "ssim1": 0.9, "lpips_alex": 0.2}
+        expected = {"psnr": 30.0, "ssim1": 0.9, "flip": 0.2}
         for k, v in values.items():
             assert written[k] == pytest.approx(v - expected[k], abs=1e-12)
     psnr = loud["largest_image_psnr_difference"][block]
@@ -271,15 +273,66 @@ def test_comparison_flags_what_one_file_holds_alone() -> None:
     assert compare(ours, theirs)["findings"] == ["block dynamic is only in the given METRICS.json"]
     assert compare(theirs, ours)["findings"] == ["block dynamic is only in this run's METRICS.json"]
     ours = _metrics()
-    del ours["entire"]["scene"]["lpips_alex"]
+    del ours["entire"]["scene"]["flip"]
     del theirs["dynamic"]["images"][0]["ssim1"]
     theirs["dynamic"]["images"].append({**theirs["dynamic"]["images"][0], "path": "b.png"})
     result = compare(ours, theirs)
     assert result["findings"] == [
-        "entire: scene metric lpips_alex is only in the given METRICS.json",
+        "entire: scene metric flip is only in the given METRICS.json",
         "dynamic: image b.png is only in the given METRICS.json",
         "dynamic: images/cam02/000000.png metric ssim1 is only in this run's METRICS.json",
     ]
     assert result["blocks"]["entire"] == {"psnr": 0.0, "ssim1": 0.0}
-    assert result["largest_image_difference"]["entire"]["lpips_alex"] == 0.0  # both rows hold it
-    assert result["largest_image_difference"]["dynamic"] == {"psnr": 0.0, "lpips_alex": 0.0}
+    assert result["largest_image_difference"]["entire"]["flip"] == 0.0  # both rows hold it
+    assert result["largest_image_difference"]["dynamic"] == {"psnr": 0.0, "flip": 0.0}
+
+
+def _version_1(body: dict[str, Any]) -> dict[str, Any]:
+    """A version-1 copy of a `_metrics` body, as M17's runs wrote it: LPIPS-Alex, LPIPS-VGG and
+    lpips_vgg_raw in place of ꟻLIP, and the backbone label (Q-62, Q-63)."""
+    old: dict[str, Any] = json.loads(json.dumps(body))
+    old["version"], old["lpips_backbone"] = 1, "vgg"
+    for block in ("entire", "dynamic"):
+        for values in (old[block]["scene"], *old[block]["images"]):
+            value = values.pop("flip")
+            values |= {"lpips_alex": value, "lpips_vgg": value, "lpips_vgg_raw": value}
+    return old
+
+
+def test_comparison_says_which_versions_it_read() -> None:
+    """Q-256, Q-224: a version-2 run compared with a version-1 file says which version each
+    holds; the metrics both hold (PSNR, SSIM₁ here) are compared as Q-224 compares them, and
+    each metric one version holds alone (ꟻLIP, the three LPIPS values) is a finding, as any
+    metric in one file only is."""
+    compare = _module().compare
+    ours = _metrics(entire_scene_psnr=30.02)
+    result = compare(ours, _version_1(_metrics()))
+    assert result["versions"] == {"this_run": 2, "given": 1}
+    assert result["blocks"]["entire"]["psnr"] == pytest.approx(0.02, abs=1e-9)
+    assert set(result["blocks"]["entire"]) == {"psnr", "ssim1"}
+    findings = result["findings"]
+    assert "entire: scene psnr differs by +0.02" in findings
+    for metric, side in [("flip", "this run's"), ("lpips_alex", "the given"),
+                         ("lpips_vgg", "the given"), ("lpips_vgg_raw", "the given")]:  # fmt: skip
+        assert f"entire: scene metric {metric} is only in {side} METRICS.json" in findings
+    assert compare(ours, ours)["versions"] == {"this_run": 2, "given": 2}
+
+
+@pytest.mark.parametrize(
+    "header",
+    [{"format": "ftgs-metrics", "version": 3}, {"format": "another", "version": 2}, {}],
+    ids=["version-3", "another-format", "untagged"],
+)
+def test_run_refuses_to_compare_with_another_version(
+    tmp_path: Path, header: dict[str, Any]
+) -> None:
+    """Q-256: `--compare` reads METRICS.json versions 1 and 2; a file of another version or
+    format, or without its tag, is exit 2, checked before anything is rendered or written."""
+    given = tmp_path / "given.json"
+    body = {key: value for key, value in _metrics().items() if key not in ("format", "version")}
+    given.write_text(json.dumps({**header, **body}))
+    out = tmp_path / "renders"
+    done = _script("run", tmp_path / "model.safetensors", tmp_path / "scene.json", out,
+                   "--compare", given, "--backend", "reference")  # fmt: skip
+    assert done.returncode == 2 and "--compare" in done.stderr
+    assert not out.exists()
