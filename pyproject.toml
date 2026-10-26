@@ -78,10 +78,10 @@ markers = [
 ]
 
 # Q-216: coverage of the CPU suite in CI, the ftgs and harness subprocesses included; the vendored
-# RoMa (D-65) is left out, as for ruff and mypy.
+# RoMa (D-65) is left out, as for ruff and mypy, and so are both copies of ꟻLIP (Q-254).
 [tool.coverage.run]
 source_pkgs = ["openftgs", "ftgs_harness"]
-omit = ["*/openftgs/_vendor/*"]
+omit = ["*/openftgs/_vendor/*", "*/ftgs_harness/_vendor/*"]
 branch = true
 relative_files = true
 patch = ["subprocess"]
@@ -92,13 +92,14 @@ skip_empty = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-# D-65: the vendored RoMa and ꟻLIP, and U-23's reference copy of ꟻLIP (Q-252), stay as upstream
-# wrote them.
+# D-65: the vendored RoMa and ꟻLIP, U-23's reference copy of ꟻLIP (Q-252) and the harness's
+# own copy (Q-254) stay as upstream wrote them.
 extend-exclude = [
     ".claude",
     "docs",
     "src/openftgs/_vendor/romatch",
     "src/openftgs/_vendor/flip/flip_loss.py",
+    "harness/src/ftgs_harness/_vendor/flip/flip_loss.py",
     "tests/reference/flip",
 ]
 
@@ -115,11 +116,12 @@ files = ["src/openftgs", "harness/src/ftgs_harness", "tests", "scripts"]
 exclude = [
     "^src/openftgs/_vendor/romatch/",
     "^src/openftgs/_vendor/flip/flip_loss\\.py$",
+    "^harness/src/ftgs_harness/_vendor/flip/flip_loss\\.py$",
     "^tests/reference/flip/",
 ]
 # D-65, D-89: the vendored ꟻLIP's classes are nn.Modules to mypy, but upstream's functions carry
-# no annotations; typed code may call them (#383).
-untyped_calls_exclude = ["openftgs._vendor.flip.flip_loss"]
+# no annotations; typed code may call them (#383), and so may the harness's copy's (Q-254).
+untyped_calls_exclude = ["openftgs._vendor.flip.flip_loss", "ftgs_harness._vendor.flip.flip_loss"]
 
 [[tool.mypy.overrides]]
 module = [

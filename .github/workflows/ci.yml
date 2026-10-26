@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
           # The test job imports the vendored RoMa (U-38, Q-117); the license job scans [init] (Q-4).
-          python -m pip install -e ".[dev${{ (matrix.job == 'test' || matrix.job == 'licenses') && ',init' || '' }}]" -e "harness[lpips]"
+          python -m pip install -e ".[dev${{ (matrix.job == 'test' || matrix.job == 'licenses') && ',init' || '' }}]" -e "harness[torch]"
       - name: Lint and type-check
         if: matrix.job == 'lint'
         run: |
@@ -81,9 +81,17 @@ jobs:
               for entry in record["licenses"] + record["files"]:
                   digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
                   assert digest == entry["sha256"], entry["path"]
-          names = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0]).namelist()
+          wheel = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0])
+          names = wheel.namelist()
           for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):
               assert any(n.endswith(required) for n in names), required
           assert not any(n.startswith("openftgs/") for n in names), "Q-5"
+          # Q-254 (#391): the harness's own ꟻLIP ships with its license and provenance record.
+          vendored = "ftgs_harness/_vendor/flip/"
+          record = json.loads(wheel.read(vendored + "VENDOR.json"))
+          assert [e["path"] for e in record["licenses"]] == ["LICENSE"]
+          for entry in record["licenses"] + record["files"]:
+              digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
+              assert digest == entry["sha256"], entry["path"]
           print("wheel contents ok")
           PY

@@ -15,12 +15,13 @@ authors = [{ name = "Samuel Austin" }]
 requires-python = ">=3.11"
 # Owner decision 2026-10-11 (docs/clean-room/milestones.md, M16): report plots use
 # matplotlib's Agg backend. Q-201: NumPy, SciPy and safetensors read the files and run the
-# statistics; the [lpips] extra holds what L3's LPIPS-Alex and LPIPS-VGG need (E16).
+# statistics; Q-254, Q-260: the [torch] extra holds torch alone, with which L3 computes ꟻLIP
+# through the harness's own vendored copy (E16).
 # Q-201: the floors are §2.3's (NumPy as openftgs declares it, Q-29).
 dependencies = ["numpy>=1.23.2", "scipy>=1.10", "safetensors>=0.4", "matplotlib"]
 
 [project.optional-dependencies]
-lpips = ["torch>=2.1", "lpips==0.1.4"]
+torch = ["torch>=2.1"]
 
 # §3.3: the command line; Q-203: the run options.
 [project.scripts]
@@ -31,3 +32,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 ftgs_harness = ["py.typed"]
+# Q-254 (#391): the harness's own vendored ꟻLIP ships with its BSD-3-Clause license and its
+# provenance record (D-65's pattern).
+"ftgs_harness._vendor.flip" = ["LICENSE", "VENDOR.json"]
