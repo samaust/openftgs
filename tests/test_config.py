@@ -6,7 +6,7 @@ Expected defaults are copied from the config blocks of spec §2.1 and §2.4.
 """
 
 import json
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
@@ -15,6 +15,7 @@ from openftgs.config import (
     InitConfig,
     LossConfig,
     OptimConfig,
+    PercNet,
     PerfConfig,
     RelocConfig,
     TrainConfig,
@@ -22,6 +23,15 @@ from openftgs.config import (
     config_to_dict,
     resume_conflicts,
 )
+
+# §2.1 `PercNet`, D-89's table: the eight perceptual networks `perc_net` selects.
+PERC_NETS: tuple[PercNet, ...] = (
+    "flip", "haarpsi", "vgg16_oxford", "alexnet_bvlc",
+    "dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16",
+)  # fmt: skip
+
+# #380's expand step: the names before revision 549o, accepted until the contract ticket (#392).
+LEGACY_PERC_NETS = ("vgg", "alex")
 
 # Dotted path → default, from spec §2.1 (openftgs.config) and §2.4 (PerfConfig).
 DEFAULTS: dict[str, Any] = {
@@ -35,6 +45,7 @@ DEFAULTS: dict[str, Any] = {
     "init.scale_floor": 1e-7,
     "loss.lambda_img": 0.8,
     "loss.lambda_ssim": 0.2,
+    # §2.1 gives None and "flip"; #380's expand step keeps the old defaults until #392.
     "loss.lambda_perc": 0.01,
     "loss.lambda_reg": 1e-2,
     "loss.reg_until": None,
@@ -130,10 +141,11 @@ def test_u26_sh_degree_rejected(degree: Any) -> None:
         config_from_dict({"sh_degree": degree})
 
 
-# Allowed values of every Literal field, from spec §2.1 and §2.4.
+# Allowed values of every Literal field, from spec §2.1 and §2.4; `perc_net` also takes the
+# legacy names during #380's expand step.
 LITERALS: dict[str, tuple[str, ...]] = {
     "loss.ssim_padding": ("valid", "same"),
-    "loss.perc_net": ("vgg", "alex"),
+    "loss.perc_net": PERC_NETS + LEGACY_PERC_NETS,
     "growth.mode": ("gradient", "score", "none"),
     "reloc.copy_position": ("sample", "stack"),
     "perf.slice_impl": ("auto", "eager", "compiled", "cuda"),
@@ -152,6 +164,35 @@ def test_literal_fields_take_exactly_their_spec_values(path: str, allowed: tuple
     for bad in ("not-a-choice", allowed[0].upper(), 1, None):
         with pytest.raises(ValueError, match=path.replace(".", r"\.")):
             config_from_dict(_with(path, bad))
+
+
+# The perceptual network and its weight (§2.1 `PercNet` and `LossConfig`, D-9, D-89).
+
+
+def test_perc_net_names_are_d89s_eight() -> None:
+    """§2.1, D-89: `PercNet` is exactly the eight networks of D-89's table."""
+    names = get_args(PercNet)
+    assert len(names) == 8
+    assert set(names) == set(PERC_NETS)
+
+
+@pytest.mark.parametrize("net", PERC_NETS)
+def test_each_perc_net_is_accepted(net: PercNet) -> None:
+    """§2.1 `LossConfig.perc_net`, D-89: each network's name is accepted, by the dataclass and
+    by the JSON reader, and written back as it was given (Q-10)."""
+    assert LossConfig(perc_net=net).perc_net == net
+    cfg = config_from_dict({"loss": {"perc_net": net}})
+    assert cfg.loss.perc_net == net
+    assert config_to_dict(cfg)["loss"]["perc_net"] == net
+
+
+@pytest.mark.parametrize("net", LEGACY_PERC_NETS)
+def test_expand_step_keeps_the_legacy_perc_nets_and_defaults(net: str) -> None:
+    """#380 (expand–contract), #382: "vgg" and "alex" are still accepted, and the defaults of
+    `perc_net` and `lambda_perc` stay "vgg" and 0.01, until the contract ticket (#392)."""
+    assert config_from_dict({"loss": {"perc_net": net}}).loss.perc_net == net
+    default = LossConfig()
+    assert (default.perc_net, default.lambda_perc) == ("vgg", 0.01)
 
 
 # Q-11: (dotted path, an accepted boundary value, a rejected value)
@@ -259,7 +300,7 @@ def _every_field_changed() -> TrainConfig:
             ssim_window=7,
             ssim_sigma=1.0,
             ssim_padding="same",
-            perc_net="alex",
+            perc_net="haarpsi",
         ),
         growth=GrowthConfig(
             mode="score",
