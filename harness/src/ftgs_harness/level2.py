@@ -2,8 +2,9 @@
 """L2 · forward behaviour on random inputs (§3.3 L2; Q-207, Q-208, Q-209): both
 implementations answer the same seeded queries, kind by kind, compared at §3.3's tolerances;
 `relocation_sampling` by χ² tests instead. A kind missing from an `info` reply is not
-comparable. A relative tolerance judges the signed `means_t` against the answer's largest
-magnitude and the positive answers with a floor of 1e-3 of it (Q-208)."""
+comparable, and so is a query an adapter answers `not_comparable`, as one without ꟻLIP answers
+its `losses` queries (Q-255). A relative tolerance judges the signed `means_t` against the
+answer's largest magnitude and the positive answers with a floor of 1e-3 of it (Q-208)."""
 
 from collections.abc import Mapping
 from typing import Any
@@ -14,7 +15,6 @@ from ftgs_harness.checks import Check, Status, close_absolute, relative_error
 from ftgs_harness.formats import (
     Answer,
     FormatError,
-    Query,
     file_sha256,
     read_answers,
     write_queries,
@@ -33,12 +33,12 @@ TOLERANCES: dict[str, dict[str, tuple[str, float]]] = {
     "temporal_opacity": {"sigma_t": ("absolute", 1e-6)},
     "effective_opacity": {"opacity_eff": ("absolute", 1e-6)},
     "sh_color": {"colors": ("absolute", 1e-5)},
-    "losses": {
+    "losses": {  # Q-255: ꟻLIP in every answer, at the row's 1e-5 relative
         "l1": ("relative", 1e-5),
         "one_minus_ssim": ("relative", 1e-5),
+        "flip": ("relative", 1e-5),
         "reg": ("relative", 1e-5),
         "total": ("relative", 1e-5),
-        "lpips_vgg": ("absolute", 1e-3),
     },
     "lr_schedule": {"rates": ("relative", 1e-9)},
     "relocation_math": {"opacity_new": ("relative", 1e-5), "scales_new": ("relative", 1e-5)},
@@ -75,15 +75,6 @@ _PATTERN = {
     "effective_opacity": "opacity saturation",
     "sh_color": "view-dependent color shift",
 }
-
-
-def _required(kind: str, query: Query) -> list[str]:
-    """The tensors an ok answer to `query` carries (Q-207): its kind's row, `lpips_vgg` only
-    when the query's `lpips` is true (Q-212)."""
-    names = list(TOLERANCES[kind])
-    if kind == "losses" and not query.params.get("lpips", True):
-        names.remove("lpips_vgg")
-    return names
 
 
 def _worst(kind: str, names: list[str], a: Answer, b: Answer) -> tuple[bool, str, float, str]:
@@ -275,8 +266,7 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
     folder = ctx.cases / "L2"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{kind}.queries.safetensors"
-    config = {**ctx.config, "_lpips": ctx.settings.l2_lpips}
-    queries = generate(kind, ctx.settings.sizes["l2.queries"], ctx.settings.seed, config)
+    queries = generate(kind, ctx.settings.sizes["l2.queries"], ctx.settings.seed, ctx.config)
     if not path.exists():
         write_queries(path, kind, queries)
     sha = file_sha256(path)
@@ -337,7 +327,7 @@ def _kind_checks(ctx: Context, kind: str) -> list[Check]:
             checks.append(_status_check(ctx, check_id, kind, bad, answers, query.id, inputs))
             continue
         assert a is not None and b is not None
-        names = _required(kind, query)
+        names = list(TOLERANCES[kind])  # Q-207: an ok answer carries its kind's row
         absent = {
             label: lacks
             for label, ans in (("A", a), ("B", b))
