@@ -1908,8 +1908,19 @@ def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) ->
     assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
     assert setup["layouts"] == list(LAYOUTS)
     assert setup["precisions"] == {net: list(_precisions(net)) for net in networks}
-    # Q-251: every network takes the render's view in training until #394
-    assert setup["training_layout"] == dict.fromkeys(networks, "channels_last_inputs")
+    # Q-273: what the trainer runs, per network, in an iteration that isn't deterministic:
+    # vgg16_oxford and alexnet_bvlc autotune, and get NCHW inputs where B-4 measured them faster.
+    assert setup["training_autotuning"] == {
+        net: net in ("vgg16_oxford", "alexnet_bvlc") for net in networks
+    }
+    nchw = {"vgg16_oxford": ("ieee", "tf32"), "alexnet_bvlc": ("ieee", "tf32", "bf16")}
+    assert setup["training_layout"] == {
+        net: {
+            p: "nchw" if p in nchw.get(net, ()) else "channels_last_inputs"
+            for p in _precisions(net)
+        }
+        for net in networks
+    }
     fused = importlib.util.find_spec("fused_ssim") is not None
     assert setup["fused_ssim"] == fused
     assert "one child process per autotuning setting" in setup["processes"]
