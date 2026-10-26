@@ -35,7 +35,7 @@ B-4 (#228, Calibration data) measured what fused-ssim gains: its forward and the
 - The YIQ matrix and the Haar filters are built once per device and dtype and kept, outside inference mode, as the vendored ꟻLIP keeps its constants. piq copied the matrix to the device at every call.
 - The pairs of Haar channels are strided slices rather than piq's tuple indices, which copy an index tensor to the device.
 
-So after one call on a device, a forward and backward pass make no synchronization. Two quirks come with piq's construction. HaarPSI of two flat images is infinite, because their weights are all zero. And in float32, 1 − HaarPSI(I, I) is a few 10⁻⁶ rather than 0, from rounding the logit of float32's sigmoid(4.2): up to 3.2·10⁻⁵ of its value under σ = 16/255 noise, above U-9's 10⁻⁵, which #381 reported to the owner. In float64 it is below 10⁻¹⁴.
+So after one call on a device, a forward and backward pass make no synchronization. Two quirks come with piq's construction. HaarPSI of two flat images is infinite, because their weights are all zero. And in float32, 1 − HaarPSI(I, I) is a few 10⁻⁶ rather than 0, from rounding the logit of float32's sigmoid(4.2): up to 3.2·10⁻⁵ of its value under σ = 16/255 noise, above U-9's 10⁻⁵. In float64 it is below 10⁻¹⁴, so U-9 checks HaarPSI's identity case in float64 (owner, Q-T381.2).
 
 **The trunk networks.** `vgg16_oxford` and `alexnet_bvlc` come with #385, and the four DINO networks, which need `[init]`, with #386. Until then `PerceptualLoss` raises NotImplementedError naming the ticket. Their weights are those of the next section, and their calibrated weights are already in the resolver's table (below).
 

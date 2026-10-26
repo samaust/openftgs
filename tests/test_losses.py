@@ -534,28 +534,14 @@ def _pattern(shape: tuple[int, ...], phase: float) -> Tensor:
     return image.reshape(shape)
 
 
-@pytest.mark.parametrize(
-    ("net", "dtype"),
-    [
-        ("flip", F32),
-        pytest.param(
-            "haarpsi",
-            F32,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="#381's question to the owner: in float32 HaarPSI's rounding can exceed "
-                "U-9's 10⁻⁵ (here 1 − HaarPSI(I, I) = −2.4·10⁻⁶ on the 64×96 uniform image, "
-                "2.0·10⁻⁵ of its value under the noise; up to 3.2·10⁻⁵ in source log T381.3)",
-            ),
-        ),
-        ("haarpsi", F64),
-    ],
-)
+# Q-T381.2: ꟻLIP runs in float32 only (Q-T381.1); HaarPSI's identity case runs in float64, where
+# its float32 rounding (the logit of float32's sigmoid(4.2)) doesn't reach U-9's bound.
+@pytest.mark.parametrize(("net", "dtype"), [("flip", F32), ("haarpsi", F64)])
 def test_u9_perceptual_network_of_an_image_with_itself(net: PercNet, dtype: torch.dtype) -> None:
     """U-9 (D-89): on identical images a network gives 0, or at most 10⁻⁵ of its value under
     Gaussian noise of σ = 16/255 (float32 rounding, ꟻLIP's stabilizer), on each of five images:
-    uniform noise and closed-form textures, one and two to an image batch. ꟻLIP runs in float32
-    only (Q-T381.1); HaarPSI is checked in float32 and in float64."""
+    uniform noise and closed-form textures, one and two to an image batch. ꟻLIP is checked in
+    float32, its only dtype (Q-T381.1), and HaarPSI in float64 (Q-T381.2)."""
     loss = PerceptualLoss(net)
     images = [
         _image_pair((2, 32, 40, 3), seed=40, correlated=False)[0],
@@ -722,9 +708,9 @@ def test_d89_haarpsi_on_cuda_is_one_minus_piq_haarpsi(
 @pytest.mark.gpu
 @pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
 def test_u9_perceptual_network_of_an_image_with_itself_on_the_gpu(net: PercNet) -> None:
-    """U-9 on CUDA, in float32 for ꟻLIP and float64 for HaarPSI: identical images give 0, or at
-    most 10⁻⁵ of the value under σ = 16/255 noise."""
-    dtype = F32 if net == "flip" else F64
+    """U-9 on CUDA, in float32 for ꟻLIP and float64 for HaarPSI (Q-T381.2): identical images
+    give 0, or at most 10⁻⁵ of the value under σ = 16/255 noise."""
+    dtype = F32 if net == "flip" else F64  # Q-T381.2
     loss = PerceptualLoss(net)
     image = _pattern((2, 64, 96, 3), 0.0).to("cuda", dtype)
     same = loss(image, image.clone())
