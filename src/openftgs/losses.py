@@ -408,7 +408,9 @@ class PerceptualLoss(torch.nn.Module):
     reference gets no gradient. The network is frozen and stays in evaluation mode under
     `.train()` (D-89). "flip" is the vendored LDR-ꟻLIP loss at 67.0 pixels per degree, on
     float32 images; "haarpsi" is 1 − HaarPSI, the render clamped to [0, 1], on sides of at least
-    16 pixels (Q-261). The six trunk networks are built by #385 and #386."""
+    16 pixels (Q-261). The DINO networks ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
+    take float32 images of sides from 27 or 31 pixels (Q-T386.1) and need the [init] extra: an
+    ImportError names it otherwise (Q-248). The Caffe trunks are built by #385."""
 
     def __init__(self, net: PercNet = "flip") -> None:
         super().__init__()
