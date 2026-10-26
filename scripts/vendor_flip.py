@@ -25,6 +25,14 @@ and caching only (D-89):
 - ``filters``: the filters built once per device and size (§2.4's perceptual-loss row):
   ``generate_spatial_filter`` is memoized, and the lines of ``feature_detection`` that build
   its filter move into ``generate_feature_filter``, memoized the same way.
+- ``constants``: the D65 illuminants and the RGB–XYZ matrices of ``color_space_transform``,
+  which it copied to the GPU at every call, copied once per device and kept by ``_constant``.
+- ``cmax``: the colour maximum, which ``compute_ldrflip`` read back to the host at every call,
+  computed once per device by ``_cmax`` and kept as a float (§2.4 rule 3).
+
+After the first call on a device, which builds and copies the filters and constants there and
+reads the colour maximum back once, LDR-ꟻLIP's forward and backward passes synchronize nowhere.
+HDR-ꟻLIP keeps its host read of the number of exposures, which sets its loop.
 
 The edits are exact substring replacements confined to one function each, located with ast
 and counted; lines added before a named line; and contiguous lines moved out of a function
@@ -77,10 +85,27 @@ CHANGES: dict[str, str] = {
     "device": (
         "Device-agnostic tensors in place of the CUDA-only ones: every .cuda() becomes "
         ".to(<image>.device) and every device='cuda' becomes device=<image>.device, where "
-        "<image> is the function's image argument; generate_spatial_filter takes the device "
-        "as a new last argument, which compute_ldrflip passes, and the two colours of the "
-        "colour maximum are made on the reference's device, where the published file's "
-        "color_space_transform moved them with .cuda()"
+        "<image> is the function's image argument, except for the colour transforms' "
+        "constants ('constants'); generate_spatial_filter takes the device as a new last "
+        "argument, which compute_ldrflip passes, and the two colours of the colour maximum "
+        "are made on the reference's device, where the published file's color_space_transform "
+        "moved them with .cuda()"
+    ),
+    "constants": (
+        "The colour transforms' constant tensors copied to a device once (§2.4 rule 3): the "
+        "D65 illuminant and its inverse, which color_space_transform built and copied at "
+        "every call, and the RGB-to-XYZ and XYZ-to-RGB matrices, which its linrgb2xyz and "
+        "xyz2linrgb branch copied at every call, are kept per device by _constant, under their "
+        "names and the transform's; the matrix is still built on the host at every call, as "
+        "published, and copied only once"
+    ),
+    "cmax": (
+        "The per-call host read of the colour maximum replaced by a cached constant (§2.4 rule "
+        "3): its three lines move out of compute_ldrflip into _cmax(qc, eps, device), memoized "
+        "by _once_per_device, which returns the published expression's .item(). It is computed "
+        "on the device it serves, with the published expressions, so the CUDA path keeps the "
+        "published value: in float32 the CPU gives 41.276100158691406 and CUDA "
+        "41.27609634399414 (RTX 4090, PyTorch 2.14.1), one ulp apart"
     ),
     "cache": (
         "The helper the caching changes share: _once_per_device memoizes a builder of tensors "
@@ -116,7 +141,10 @@ class _Sub:
 
 
 def _device(scope: str, image: str, count: int, old: str = ".cuda()") -> _Sub:
-    new = f".to({image}.device)" if old == ".cuda()" else f"device={image}.device"
+    if old == "device='cuda'":
+        new = f"device={image}.device"
+    else:
+        new = old.replace(".cuda()", f".to({image}.device)")
     return _Sub("device", scope, old, new, count)
 
 
@@ -146,7 +174,23 @@ SUBS: tuple[_Sub, ...] = (
     _device("hunt_adjustment", "img", 1, "device='cuda'"),
     _device("redistribute_errors", "power_deltaE_hyab", 1, "device='cuda'"),
     _device("feature_detection", "img_y", 1),
-    _device("color_space_transform", "input_color", 4),
+    _device("color_space_transform", "input_color", 1, "dim[2]*dim[3]).cuda()"),
+    *(
+        _Sub(
+            "constants",
+            "color_space_transform",
+            f"{T}{name} = torch.tensor(",
+            f"{T}{name} = _constant('{name}', input_color.device, lambda: torch.tensor(",
+        )
+        for name in ("reference_illuminant", "inv_reference_illuminant")
+    ),
+    _Sub("constants", "color_space_transform", "]]).cuda()", "]]))", 2),
+    _Sub(
+        "constants",
+        "color_space_transform",
+        "torch.matmul(A.cuda(), input_color)",
+        "torch.matmul(_constant(fromSpace2toSpace, input_color.device, lambda: A), input_color)",
+    ),
 )
 
 
@@ -178,6 +222,20 @@ INSERTS: tuple[_Insert, ...] = (
             f"{T}return functools.wraps(build)(cached)",
             "",
             "",
+            "# openftgs (cache): the tensor make() builds, copied to device once and kept under",
+            "# name, for the colour transforms' constants; copied outside inference mode, as",
+            "# above.",
+            "_CONSTANTS = {}",
+            "",
+            "",
+            "def _constant(name, device, make):",
+            f"{T}key = (name, device)",
+            f"{T}if key not in _CONSTANTS:",
+            f"{T}{T}with torch.inference_mode(False):",
+            f"{T}{T}{T}_CONSTANTS[key] = make().to(device, copy=True)",
+            f"{T}return _CONSTANTS[key]",
+            "",
+            "",
         ),
     ),
     _Insert(
@@ -192,7 +250,7 @@ INSERTS: tuple[_Insert, ...] = (
 class _Move:
     """Move the lines of the function ``scope`` from the one whose text starts with ``first``
     through the one that starts with ``last`` into a new top-level function, made of
-    ``header``, the moved lines with ``edits`` made in them (each exactly once) and ``footer``,
+    ``header``, the moved lines with ``edits`` (old, new, count) made in them and ``footer``,
     and added before the top-level function ``before``; ``left`` takes the lines' place."""
 
     change: str
@@ -202,11 +260,30 @@ class _Move:
     left: tuple[str, ...]
     header: tuple[str, ...]
     footer: tuple[str, ...]
-    edits: tuple[tuple[str, str], ...]
+    edits: tuple[tuple[str, str, int], ...]
     before: str
 
 
 MOVES: tuple[_Move, ...] = (
+    _Move(
+        "cmax",
+        "compute_ldrflip",
+        "hunt_adjusted_green = ",
+        "cmax = torch.pow(",
+        (f"{T}cmax = _cmax(qc, eps, reference.device)  # openftgs (cmax)",),
+        (
+            "# openftgs (cmax): the colour maximum, moved out of compute_ldrflip so that it is",
+            "# computed once per device and kept as a float, in place of a host read at every",
+            "# call (§2.4 rule 3). It is computed with the published expressions on the device",
+            "# it serves: on the CPU they give a float32 one ulp from CUDA's.",
+            "@_once_per_device",
+            "def _cmax(qc, eps, device):",
+            f'{T}""" openftgs (cmax): the exponentiated HyAB distance of green and blue """',
+        ),
+        (f"{T}return cmax  # openftgs (cmax)",),
+        (("reference.device", "device", 2),),
+        "tone_map",
+    ),
     _Move(
         "filters",
         "feature_detection",
@@ -227,7 +304,7 @@ MOVES: tuple[_Move, ...] = (
             ' + 1, and its radius """',
         ),
         (f"{T}return Gx, radius  # openftgs (filters)",),
-        (("img_y.device", "device"),),
+        (("img_y.device", "device", 1),),
         "feature_detection",
     ),
 )
@@ -334,9 +411,9 @@ def _move(
     if end < start:
         raise VendorError(f"{move.scope}: {move.last!r} comes before {move.first!r}")
     moved = "\n".join(line for unit in units[start : end + 1] for line in unit)
-    for old, new in move.edits:
-        if moved.count(old) != 1:
-            raise VendorError(f"{move.scope}: {moved.count(old)} of {old!r} in the moved lines")
+    for old, new, count in move.edits:
+        if moved.count(old) != count:
+            raise VendorError(f"{move.scope}: {moved.count(old)} of {old!r} moved, not {count}")
         moved = moved.replace(old, new)
     units[start] = list(move.left)
     for index in range(start + 1, end + 1):
@@ -344,12 +421,39 @@ def _move(
     function = [*move.header, *moved.split("\n"), *move.footer, "", ""]
     units[spans[move.before][0] - 1][:0] = function
     name = next(line for line in move.header if line.startswith("def ")).split("(")[0][4:]
-    replaced = ", ".join(f"{old!r} -> {new!r}" for old, new in move.edits)
+    replaced = ", ".join(f"{old!r} -> {new!r} {count}x" for old, new, count in move.edits)
     return (
         f"{move.change}: lines {start + 1}-{end + 1} of {move.scope} moved into a new function "
         f"{name}, added before {move.before} ({replaced} in them); in their place "
         f"{len(move.left)} line"
     )
+
+
+@dataclass(frozen=True)
+class _Span:
+    name: str
+    first: int
+    last: int
+
+
+def _spans_with(text: str, fragment: str) -> list[_Span]:
+    """The innermost functions (methods as ``Class.method``) whose lines hold ``fragment``, in
+    the order of the file, each once."""
+    spans = sorted(
+        (_Span(name, first, last) for name, (first, last) in _spans(ast.parse(text)).items()),
+        key=lambda s: (s.first, -s.last),
+    )
+    found: list[_Span] = []
+    for number, line in enumerate(text.split("\n"), start=1):
+        if fragment not in line:
+            continue
+        holding = [s for s in spans if s.first <= number <= s.last]
+        if not holding:
+            raise VendorError(f"{SOURCE}: {fragment!r} at line {number}, outside any function")
+        innermost = holding[-1]
+        if innermost not in found:
+            found.append(innermost)
+    return found
 
 
 def _line_starting(lines: Sequence[str], start: str, within: range | None = None) -> int:
@@ -369,6 +473,10 @@ def _check(before: str, after: str) -> None:
     for cuda in (".cuda(", "'cuda'", '"cuda"'):
         if cuda in after:
             raise VendorError(f"{SOURCE}: {cuda!r} is left")
+    # The host reads left: the colour maximum's, once per device, and HDR-ꟻLIP's exposures.
+    reads = [s.name for s in _spans_with(after, ".item()")]
+    if reads != ["HDRFLIPLoss.forward", "_cmax"]:
+        raise VendorError(f"{SOURCE}: .item() in {reads}")
     old, new = before.split("\n"), after.split("\n")
     matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
     for tag, _, _, first, last in matcher.get_opcodes():

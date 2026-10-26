@@ -14,7 +14,9 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -163,17 +165,39 @@ def test_vendored_flip_builds_its_filters_once_per_device_and_size() -> None:
         assert other is not first and other_radius < radius
 
 
-def test_vendored_flip_filters_first_built_in_inference_mode_serve_a_backward_pass() -> None:
-    """The caching changes (#383): tensors the copy keeps are made outside inference mode, so
-    a loss first evaluated under `torch.inference_mode()`, as a metric is, still trains: the
-    next call with a gradient saves the same filters for its backward pass."""
-    test, reference = _pair(3, (1, 3, 24, 24))
-    pixels_per_degree = 41.0  # no other test uses it, so the filters are first built here
-    with torch.inference_mode():
-        LDRFLIPLoss()(test, reference, pixels_per_degree=pixels_per_degree)
-    image = test.clone().requires_grad_(True)
-    LDRFLIPLoss()(image, reference, pixels_per_degree=pixels_per_degree).backward()
-    assert image.grad is not None and bool(torch.isfinite(image.grad).all())
+# Runs in a fresh process, so that every tensor the copy keeps is first made in inference mode.
+_INFERENCE_THEN_TRAINING = """
+import torch
+from openftgs._vendor.flip import LDRFLIPLoss
+
+generator = torch.Generator().manual_seed(3)
+reference = torch.rand((1, 3, 24, 24), generator=generator)
+test = reference + 0.1 * torch.randn((1, 3, 24, 24), generator=generator)
+with torch.inference_mode():
+    LDRFLIPLoss()(test, reference)
+image = test.clone().requires_grad_(True)
+LDRFLIPLoss()(image, reference).backward()
+assert image.grad is not None and bool(torch.isfinite(image.grad).all())
+print("trained")
+"""
+
+
+def test_vendored_flip_first_used_in_inference_mode_still_trains() -> None:
+    """The caching changes (#383): the tensors the copy keeps are made outside inference
+    mode, so a loss first evaluated under `torch.inference_mode()`, as a metric is, still
+    trains: the next call with a gradient saves the same filters and constants for its
+    backward pass."""
+    source_root = Path(openftgs.__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(source_root)}
+    result = subprocess.run(
+        [sys.executable, "-c", _INFERENCE_THEN_TRAINING],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "trained"
 
 
 @pytest.mark.gpu
@@ -209,6 +233,32 @@ def test_u23_vendored_flip_agrees_with_the_published_file_on_cuda(
     torch.testing.assert_close(values[1], values[0], rtol=0.0, atol=1e-6)
     torch.testing.assert_close(gradients[1], gradients[0], rtol=1e-5, atol=1e-9)
     assert 0.0 < float(values[0]) < 1.0  # the pair differs, and ꟻLIP is in [0, 1]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="the recorder needs sys.monitoring (Python 3.12)"
+)
+def test_vendored_flip_forward_and_backward_on_cuda_make_no_synchronization() -> None:
+    """§2.4 rule 3 (#383): after one call on a device, which builds and copies the filters and
+    constants there and reads the colour maximum back once, a forward and backward pass of
+    the vendored loss on CUDA make no host synchronization under
+    `torch.cuda.set_sync_debug_mode("warn")`, by any route the recorder sees."""
+    from sync_recorder import SyncRecorder, described
+
+    device = torch.device("cuda:0")
+    test, reference = (image.to(device) for image in _pair(4))
+    loss = LDRFLIPLoss()
+    warm_up = test.clone().requires_grad_(True)
+    loss(warm_up, reference).backward()
+    image = test.clone().requires_grad_(True)
+    torch.cuda.synchronize()
+    with SyncRecorder() as recorder:
+        loss(image, reference).backward()
+    torch.cuda.synchronize()
+    assert recorder.syncs == [], described(recorder.syncs, __file__)
+    assert recorder.unattributed == 0
+    assert image.grad is not None
 
 
 @pytest.mark.gpu

@@ -72,6 +72,20 @@ def _once_per_device(build):
 	return functools.wraps(build)(cached)
 
 
+# openftgs (cache): the tensor make() builds, copied to device once and kept under
+# name, for the colour transforms' constants; copied outside inference mode, as
+# above.
+_CONSTANTS = {}
+
+
+def _constant(name, device, make):
+	key = (name, device)
+	if key not in _CONSTANTS:
+		with torch.inference_mode(False):
+			_CONSTANTS[key] = make().to(device, copy=True)
+	return _CONSTANTS[key]
+
+
 class HDRFLIPLoss(nn.Module):
 	""" Class for computing HDR-FLIP """
 
@@ -216,9 +230,7 @@ def compute_ldrflip(test, reference, pixels_per_degree, qc, qf, pc, pt, eps):
 	# Color metric
 	deltaE_hyab = hyab(preprocessed_reference, preprocessed_test, eps)
 	power_deltaE_hyab = torch.pow(deltaE_hyab, qc)
-	hunt_adjusted_green = hunt_adjustment(color_space_transform(torch.tensor([[[0.0]], [[1.0]], [[0.0]]]).unsqueeze(0).to(reference.device), 'linrgb2lab'))  # openftgs (device)
-	hunt_adjusted_blue = hunt_adjustment(color_space_transform(torch.tensor([[[0.0]], [[0.0]], [[1.0]]]).unsqueeze(0).to(reference.device), 'linrgb2lab'))  # openftgs (device)
-	cmax = torch.pow(hyab(hunt_adjusted_green, hunt_adjusted_blue, eps), qc).item()
+	cmax = _cmax(qc, eps, reference.device)  # openftgs (cmax)
 	deltaE_c = redistribute_errors(power_deltaE_hyab, cmax, pc, pt)
 
 	# --- Feature pipeline ---
@@ -242,6 +254,19 @@ def compute_ldrflip(test, reference, pixels_per_degree, qc, qf, pc, pt, eps):
 
 	# --- Final error ---
 	return torch.pow(deltaE_c, 1 - deltaE_f)
+
+
+# openftgs (cmax): the colour maximum, moved out of compute_ldrflip so that it is
+# computed once per device and kept as a float, in place of a host read at every
+# call (§2.4 rule 3). It is computed with the published expressions on the device
+# it serves: on the CPU they give a float32 one ulp from CUDA's.
+@_once_per_device
+def _cmax(qc, eps, device):
+	""" openftgs (cmax): the exponentiated HyAB distance of green and blue """
+	hunt_adjusted_green = hunt_adjustment(color_space_transform(torch.tensor([[[0.0]], [[1.0]], [[0.0]]]).unsqueeze(0).to(device), 'linrgb2lab'))  # openftgs (device)
+	hunt_adjusted_blue = hunt_adjustment(color_space_transform(torch.tensor([[[0.0]], [[0.0]], [[1.0]]]).unsqueeze(0).to(device), 'linrgb2lab'))  # openftgs (device)
+	cmax = torch.pow(hyab(hunt_adjusted_green, hunt_adjusted_blue, eps), qc).item()
+	return cmax  # openftgs (cmax)
 
 
 def tone_map(img, tone_mapper, exposure):
@@ -608,8 +633,8 @@ def color_space_transform(input_color, fromSpace2toSpace):
 	dim = input_color.size()
 
 	# Assume D65 standard illuminant
-	reference_illuminant = torch.tensor([[[0.950428545]], [[1.000000000]], [[1.088900371]]]).to(input_color.device)  # openftgs (device)
-	inv_reference_illuminant = torch.tensor([[[1.052156925]], [[1.000000000]], [[0.918357670]]]).to(input_color.device)  # openftgs (device)
+	reference_illuminant = _constant('reference_illuminant', input_color.device, lambda: torch.tensor([[[0.950428545]], [[1.000000000]], [[1.088900371]]]))  # openftgs (constants)
+	inv_reference_illuminant = _constant('inv_reference_illuminant', input_color.device, lambda: torch.tensor([[[1.052156925]], [[1.000000000]], [[0.918357670]]]))  # openftgs (constants)
 
 	if fromSpace2toSpace == "srgb2linrgb":
 		limit = 0.04045
@@ -658,7 +683,7 @@ def color_space_transform(input_color, fromSpace2toSpace):
 
 		input_color = input_color.view(dim[0], dim[1], dim[2]*dim[3]).to(input_color.device)  # NC(HW)  # openftgs (device)
 
-		transformed_color = torch.matmul(A.to(input_color.device), input_color)  # openftgs (device)
+		transformed_color = torch.matmul(_constant(fromSpace2toSpace, input_color.device, lambda: A), input_color)  # openftgs (constants)
 		transformed_color = transformed_color.view(dim[0], dim[1], dim[2], dim[3])
 
 	elif fromSpace2toSpace == "xyz2ycxcz":
