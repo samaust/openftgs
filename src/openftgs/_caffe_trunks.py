@@ -7,6 +7,7 @@ Spec: D-89, §2.3's pretrained-trunk row. A private top-level module that import
 openftgs: `openftgs.losses` passes it the tensors and wraps it in `PerceptualLoss` (#385).
 """
 
+import functools
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -80,6 +81,14 @@ _MEAN_BGR = {
 # The two trunks, in D-89's table's order.
 CAFFE_TRUNKS: tuple[str, ...] = tuple(_STEPS)
 
+# D-89: lpips's `normalize_tensor` ε (source log 435).
+_EPS = 1e-10
+
+
+def _unit(features: Tensor) -> Tensor:
+    """Each feature vector (dim 1) divided by its norm plus ε, as lpips's `normalize_tensor`."""
+    return features / (features.pow(2).sum(dim=1, keepdim=True).sqrt() + _EPS)
+
 
 class CaffeTrunk(torch.nn.Module):
     """The Caffe trunk `name` (one of `CAFFE_TRUNKS`) on `tensors`, its convolutions'
@@ -143,19 +152,9 @@ class CaffeTrunk(torch.nn.Module):
         # D-89: the reference without a gradient.
         with torch.no_grad():
             reference = [_unit(tap) for tap in self.features(y)]
-        total: Tensor | None = None
-        for tap, unit_y in zip(self.features(x), reference, strict=True):
-            # Squared differences summed over channels, averaged over space.
-            layer = (_unit(tap) - unit_y).pow(2).sum(dim=1).mean(dim=(1, 2))
-            total = layer if total is None else total + layer
-        assert total is not None  # five taps
-        return total
-
-
-# D-89: lpips's `normalize_tensor` ε (source log 435).
-_EPS = 1e-10
-
-
-def _unit(features: Tensor) -> Tensor:
-    """Each feature vector (dim 1) divided by its norm plus ε, as lpips's `normalize_tensor`."""
-    return features / (features.pow(2).sum(dim=1, keepdim=True).sqrt() + _EPS)
+        # Per tap, the squared differences summed over channels and averaged over space.
+        layers = [
+            (_unit(tap) - unit_y).pow(2).sum(dim=1).mean(dim=(1, 2))
+            for tap, unit_y in zip(self.features(x), reference, strict=True)
+        ]
+        return functools.reduce(torch.add, layers)
