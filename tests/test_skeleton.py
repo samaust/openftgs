@@ -194,6 +194,16 @@ def test_shard_module_imports_nothing_from_openftgs() -> None:
     assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
 
 
+def test_weights_module_imports_nothing_from_openftgs() -> None:
+    """#384: the trunk networks' weights are a private top-level module that
+    `openftgs.losses` imports, of the same kind as the stage instrumentation, so it imports
+    nothing from openftgs itself (§2.1 bands) and nothing of the `[init]` extra (Q-248)."""
+    path = PACKAGE_DIR / "_weights.py"
+    assert path.is_file()
+    imported = {n.split(".")[0] for n in _imported_modules(path)}
+    assert imported & {"openftgs", "torchvision", "einops", "loguru"} == set()
+
+
 def test_harness_never_imports_openftgs() -> None:
     offenders = [
         str(p.relative_to(ROOT))
