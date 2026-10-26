@@ -20,7 +20,7 @@ A main case: the first trained model of the run settings, else a random one with
 
 ## L2 · forward behaviour
 
-`l2.queries` seeded queries per kind plus one edge query (durations from 10⁻⁶ to 10² × T_τ with |t − μt|/s up to 10⁴, opacities near 0 and 1, view directions along the axes, the D-44 cap with ties), compared at §3.3's tolerances. The queries take the run's configuration where a kind has settings (the loss weights, the optimizer's rates and length, the growth and relocation thresholds, the scene-scale factor). `relocation_sampling` uses 20 live targets and 50 × 200 draws; each implementation's pooled counts are tested by χ² against the scores, and A against B by homogeneity, all at p > 0.001.
+`l2.queries` seeded queries per kind plus one edge query (durations from 10⁻⁶ to 10² × T_τ with |t − μt|/s up to 10⁴, opacities near 0 and 1, view directions along the axes, the D-44 cap with ties), compared at §3.3's tolerances. The queries take the run's configuration where a kind has settings (the loss weights, the optimizer's rates and length, the growth and relocation thresholds, the scene-scale factor). `losses` always includes ꟻLIP, which is also its total's perceptual term at the configuration's λ_perc, whatever `perc_net` the configuration names; `grad_stats` takes the configuration's perceptual network and weight (Q-255). `relocation_sampling` uses 20 live targets and 50 × 200 draws; each implementation's pooled counts are tested by χ² against the scores, and A against B by homogeneity, all at p > 0.001.
 
 ## L3 · multi-seed statistics
 

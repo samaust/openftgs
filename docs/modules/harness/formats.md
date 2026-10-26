@@ -27,7 +27,7 @@ Answers: metadata `format` (`ftgs-forward-answers`), `version`, `kind`, `produce
 | temporal_opacity | model, `times` [K] | `sigma_t` [K,N] |
 | effective_opacity | model, `times` [K] | `opacity_eff` [K,N] |
 | sh_color | model, `times` [K], `centers` [K,3]; `sh_degree` | `colors` [K,N,3] |
-| losses | `pred`, `gt` [H,W,3]; model and `t` for L_reg; LossConfig fields, `iteration` | `l1`, `one_minus_ssim`, `lpips_vgg`, `reg`, `total` (float64 scalars) |
+| losses | `pred`, `gt` [H,W,3]; model and `t` for L_reg; LossConfig fields but `perc_net`, `iteration` | `l1`, `one_minus_ssim`, `flip` (ꟻLIP), `reg`, `total` (float64 scalars); the total's perceptual term is ꟻLIP at the query's λ_perc (Q-255) |
 | lr_schedule | `iterations` [M]; OptimConfig fields, `spatial_scale`, `frame_dt` | `rates` [M,9] float64; tensor names in the metadata |
 | relocation_math | `opacity` [k], `scales` [k,3], `n` [k] | `opacity_new`, `scales_new` (E11 with D-14's full clamp) |
 | velocity_init | `points` [N,3], `next_points` [M,3], `dt` | `velocities` [N,3] |
@@ -37,7 +37,7 @@ Answers: metadata `format` (`ftgs-forward-answers`), `version`, `kind`, `produce
 | spatial_scale | `world_to_camera` [C,4,4], `train` [C]; `factor` | `S` |
 | growth_decisions | `g` [N], `scales` [N,3]; `spatial_scale`, `grad_threshold`, `split_scale`, `n_max` | `clone`, `split` [N] bool |
 
-An `ok` answer carries every tensor of its kind's row, `lpips_vgg` only when the query's `lpips` is true (Q-212). One that lacks any fails its query as a schema violation, naming each adapter and the tensors it lacks; tensors outside the row are not compared.
+An `ok` answer carries every tensor of its kind's row, `losses`'s `flip` included (Q-207, Q-255). One that lacks any fails its query as a schema violation, naming each adapter and the tensors it lacks; tensors outside the row are not compared. An adapter without ꟻLIP answers its `losses` queries `not_comparable` (Q-255). Queries have no `lpips` parameter: Q-212's switch went with revision 549o.
 
 ## `train_log.jsonl`
 

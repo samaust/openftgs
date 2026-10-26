@@ -65,16 +65,11 @@ def _check_block(check: Mapping[str, Any]) -> list[str]:
 
 
 def _reduced_note(settings: Mapping[str, Any]) -> str:
-    """What makes the run reduced, for the header: case sizes below §3.3's (Q-203), LPIPS left
-    out of L2 (Q-212), or both."""
-    if not settings.get("reduced"):
+    """What makes the run reduced, for the header: case sizes below §3.3's (Q-203), the only
+    reduction since Q-255."""
+    if not settings.get("reduced") or not sizes_reduced(settings.get("sizes", {})):
         return ""
-    parts = []
-    if sizes_reduced(settings.get("sizes", {})):
-        parts.append("case sizes below §3.3's")
-    if settings.get("l2_lpips") is False:
-        parts.append("LPIPS left out of L2")
-    return f" (reduced: {'; '.join(parts)})"
+    return " (reduced: case sizes below §3.3's)"
 
 
 def render_markdown(report: Mapping[str, Any]) -> str:
