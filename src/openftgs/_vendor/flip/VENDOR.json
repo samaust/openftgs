@@ -55,5 +55,17 @@
     "cmax": "The per-call host read of the colour maximum replaced by a cached constant (§2.4 rule 3): its three lines move out of compute_ldrflip into _cmax(qc, eps, device), memoized by _once_per_device, which returns the published expression's .item(). It is computed on the device it serves, with the published expressions, so the CUDA path keeps the published value: in float32 the CPU gives 41.276100158691406 and CUDA 41.27609634399414 (RTX 4090, PyTorch 2.14.1), one ulp apart",
     "cache": "The helper the caching changes share: _once_per_device memoizes a builder of tensors whose last argument is their device (functools.lru_cache), so that they are built and copied to the device once, and builds them outside inference mode, so that a tensor first built while evaluating under torch.inference_mode() can still be saved for a backward pass",
     "filters": "The filters built once per device and size (§2.4's perceptual-loss row): generate_spatial_filter is memoized by _once_per_device, and the lines of feature_detection that build the edge and point filters move, unchanged but for the device change, into a new function generate_feature_filter(pixels_per_degree, feature_type, device), memoized the same way, which feature_detection calls. A filter's size is set by the pixels per degree alone, so the key is the pixels per degree, the channel or feature type and the device"
+  },
+  "first_call": "The first call of LDR-ꟻLIP on a device builds and copies there the five filters of its pixels per degree and the four colour constants, and reads the colour maximum back once; later calls on it copy and read nothing (§2.4 rule 3)",
+  "filter_support": {
+    "side": 21,
+    "radius": 10,
+    "pixels_per_degree": "the published default, (0.7 * 3840 / 0.7) * pi / 180 = 67.02064327658226, and 67.0 (E16), which give the same filters",
+    "filters": {
+      "spatial (A, RG, BY)": "21 x 21: radius ceil(3 * sqrt(0.04 / (2 * pi^2)) * ppd) = 10",
+      "feature (edge, point)": "19 x 19: radius ceil(3 * 0.5 * 0.082 * ppd) = 9"
+    },
+    "measured": "On a flat grey 96 x 96 pair (sRGB 0.5), a one-pixel chromatic difference (0.9, 0.2, 0.7) changes the error map within 10 px of it and no farther, all 21 x 21 pixels on this machine (the blue-yellow filter reaches that far); an achromatic one (0.6) within 9 px, through the feature filters, the achromatic filter's tail at 10 px being below float32's resolution",
+    "test": "tests/test_vendored_flip.py::test_flip_filter_support_at_67_pixels_per_degree"
   }
 }

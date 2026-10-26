@@ -143,6 +143,33 @@ def test_vendored_flip_runs_on_the_cpu() -> None:
     assert bool(torch.isfinite(test.grad).all())
 
 
+def test_vendored_flip_is_deterministic_on_the_cpu() -> None:
+    """#380: CPU tests that keep the default perceptual weight run ꟻLIP on the CPU, so two runs
+    on the same pair give bitwise the same value and gradient."""
+    test, reference = _pair(5)
+    runs = []
+    for _ in range(2):
+        image = test.clone().requires_grad_(True)
+        value = LDRFLIPLoss()(image, reference)
+        value.backward()
+        assert image.grad is not None
+        runs.append((value.detach(), image.grad))
+    assert torch.equal(runs[0][0], runs[1][0])
+    assert torch.equal(runs[0][1], runs[1][1])
+
+
+@pytest.mark.gpu
+def test_vendored_flip_on_the_cpu_agrees_with_cuda() -> None:
+    """The device-agnostic change (#383): the same pair on the CPU and on CUDA, in IEEE
+    float32, gives values within U-23's 1e-6."""
+    test, reference = _pair(6)
+    with _ieee_float32():
+        on_cpu = LDRFLIPLoss()(test, reference)
+        on_cuda = LDRFLIPLoss()(test.cuda(), reference.cuda())
+    assert on_cuda.device.type == "cuda"
+    torch.testing.assert_close(on_cuda.cpu(), on_cpu, rtol=0.0, atol=1e-6)
+
+
 def test_vendored_flip_builds_its_filters_once_per_device_and_size() -> None:
     """§2.4's perceptual-loss row (#383): ꟻLIP's spatial and feature filters are built once per
     device and size, the size being set by the pixels per degree alone: a second request
@@ -198,6 +225,66 @@ def test_vendored_flip_first_used_in_inference_mode_still_trains() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == "trained"
+
+
+def _footprint(pixels_per_degree: float, colour: tuple[float, float, float]) -> tuple[int, int]:
+    """The rows and columns, as (first, last) offsets from a one-pixel difference on a flat
+    grey pair, of the error-map pixels whose ꟻLIP changes, on the CPU; asserts the change is
+    centred."""
+    from openftgs._vendor.flip import flip_loss
+
+    loss = LDRFLIPLoss()
+    size, centre = 96, 48
+    reference = torch.full((1, 3, size, size), 0.5)
+    test = reference.clone()
+    test[0, :, centre, centre] = torch.tensor(colour)
+
+    def error_map(image: torch.Tensor) -> torch.Tensor:
+        test_opponent = flip_loss.color_space_transform(image, "srgb2ycxcz")
+        reference_opponent = flip_loss.color_space_transform(reference, "srgb2ycxcz")
+        errors: torch.Tensor = flip_loss.compute_ldrflip(
+            test_opponent,
+            reference_opponent,
+            pixels_per_degree,
+            loss.qc,
+            loss.qf,
+            loss.pc,
+            loss.pt,
+            loss.eps,
+        )
+        return errors[0, 0]
+
+    changed = error_map(test) != error_map(reference)
+    rows = changed.any(dim=1).nonzero().flatten() - centre
+    columns = changed.any(dim=0).nonzero().flatten() - centre
+    assert (int(rows.min()), int(rows.max())) == (int(columns.min()), int(columns.max()))
+    return int(rows.min()), int(rows.max())
+
+
+@pytest.mark.parametrize("pixels_per_degree", [(0.7 * 3840 / 0.7) * math.pi / 180, 67.0])
+def test_flip_filter_support_at_67_pixels_per_degree(pixels_per_degree: float) -> None:
+    """Q-257 (#383): ꟻLIP's filter support at 67.0 pixels per degree, measured with the copy,
+    is 21 px. Worked by hand: the spatial filters' radius is ceil(3·√(0.04/(2π²))·ppd) =
+    ceil(9.05) = 10, so they are 21 × 21, and the feature filters' is ceil(3·0.5·0.082·ppd) =
+    ceil(8.24) = 9, so 19 × 19, at the published default (67.02) as at 67.0. Measured: a
+    one-pixel chromatic difference on a flat grey pair changes ꟻLIP within 10 px of it and no
+    farther (the blue-yellow filter reaches that far), an achromatic one within 9 px (the
+    feature filters; the achromatic filter's tail at 10 px is below float32's resolution).
+    VENDOR.json records the 21 px, which #387 carries into Q-61."""
+    from openftgs._vendor.flip import flip_loss
+
+    cpu = torch.device("cpu")
+    for channel in ("A", "RG", "BY"):
+        weights, radius = flip_loss.generate_spatial_filter(pixels_per_degree, channel, cpu)
+        assert radius == 10 and tuple(weights.shape) == (1, 1, 21, 21)
+    for feature in ("edge", "point"):
+        weights, radius = flip_loss.generate_feature_filter(pixels_per_degree, feature, cpu)
+        assert radius == 9 and tuple(weights.shape) == (1, 1, 19, 19)
+    assert _footprint(pixels_per_degree, (0.9, 0.2, 0.7)) == (-10, 10)
+    assert _footprint(pixels_per_degree, (0.6, 0.6, 0.6)) == (-9, 9)
+    support = _vendor_json()["filter_support"]
+    assert (support["side"], support["radius"]) == (21, 10)
+    assert support["test"].endswith("::test_flip_filter_support_at_67_pixels_per_degree")
 
 
 @pytest.mark.gpu

@@ -125,6 +125,29 @@ CHANGES: dict[str, str] = {
     ),
 }
 
+# Q-257: ꟻLIP's filter support at 67.0 pixels per degree, measured with the copy on the CPU by
+# the test named here (#383); #387 carries it into Q-61.
+FILTER_SUPPORT: dict[str, object] = {
+    "side": 21,
+    "radius": 10,
+    "pixels_per_degree": (
+        "the published default, (0.7 * 3840 / 0.7) * pi / 180 = 67.02064327658226, and 67.0 "
+        "(E16), which give the same filters"
+    ),
+    "filters": {
+        "spatial (A, RG, BY)": "21 x 21: radius ceil(3 * sqrt(0.04 / (2 * pi^2)) * ppd) = 10",
+        "feature (edge, point)": "19 x 19: radius ceil(3 * 0.5 * 0.082 * ppd) = 9",
+    },
+    "measured": (
+        "On a flat grey 96 x 96 pair (sRGB 0.5), a one-pixel chromatic difference (0.9, 0.2, "
+        "0.7) changes the error map within 10 px of it and no farther, all 21 x 21 pixels on "
+        "this machine (the blue-yellow filter reaches that far); an achromatic one (0.6) "
+        "within 9 px, through the feature filters, the achromatic filter's tail at 10 px "
+        "being below float32's resolution"
+    ),
+    "test": "tests/test_vendored_flip.py::test_flip_filter_support_at_67_pixels_per_degree",
+}
+
 T = "\t"  # the published file indents with tabs
 
 
@@ -533,6 +556,12 @@ def build(reference: Path, out: Path) -> None:
             }
         ],
         "changes": CHANGES,
+        "first_call": (
+            "The first call of LDR-ꟻLIP on a device builds and copies there the five filters "
+            "of its pixels per degree and the four colour constants, and reads the colour "
+            "maximum back once; later calls on it copy and read nothing (§2.4 rule 3)"
+        ),
+        "filter_support": FILTER_SUPPORT,
     }
     (out / RECORD).write_bytes(_dump(record))
     newline = b"\n"
