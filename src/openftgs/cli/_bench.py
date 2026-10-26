@@ -27,6 +27,7 @@ import itertools
 import json
 import os
 import platform
+import shlex
 import statistics
 import subprocess
 import sys
@@ -1716,6 +1717,8 @@ _LOSS_NETWORKS: tuple[str, ...] = (
     "dino_b16",
 )
 _WEIGHT_FREE = ("flip", "haarpsi")  # D-89: no pretrained weights, so no bfloat16 (Q-250)
+# Q-248: the DINO networks, whose vendored DINOv2 layers need the [init] extra.
+_NEEDS_INIT = ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
 _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52; bfloat16 for the trunk networks only
 # Q-269: the render's batch-first view as it comes, channels-last in memory, which every
 # network takes in training until #394 sets each one's layout (Q-251); and a contiguous NCHW
@@ -1759,24 +1762,52 @@ def _precisions(net: str) -> tuple[str, ...]:
     return _LOSS_PRECISIONS[:2] if net in _WEIGHT_FREE else _LOSS_PRECISIONS
 
 
-def _cached_weights(networks: Sequence[str]) -> tuple[dict[str, str], list[str]]:
+def _cached_weights(networks: Sequence[str]) -> tuple[dict[str, str], dict[str, Path]]:
     """Q-253, Q-270: for each trunk network among `networks`, the file in torch.hub's cache
-    it will be built from, and, for one with none, its name and the publisher's file a build
-    would download. Only whether the files are there is looked at."""
+    it will be built from, and, for one with none, the publisher's file a build would download.
+    Only whether the files are there is looked at."""
     from openftgs._weights import TRUNKS, trunk_files
 
     found: dict[str, str] = {}
-    missing: list[str] = []
+    missing: dict[str, Path] = {}
     for net in networks:
         if net not in TRUNKS:
             continue
         files = trunk_files(net)
         cached = next((path for path in files if path.is_file()), None)
         if cached is None:
-            missing.append(f"{net} ({files[-1]})")
+            missing[net] = files[-1]
         else:
             found[net] = str(cached)
     return found, missing
+
+
+def _missing_weights(missing: Mapping[str, Path]) -> str:
+    """Q-270 (owner request, 2026-10-26): B-4's exit-2 message for trunk networks whose weights
+    aren't in torch.hub's cache, naming each with its publisher's file, then, on a line of its
+    own, a command that fetches exactly those with this Python, quoted for a POSIX shell:
+    building `PerceptualLoss(net)` downloads its file once from its publisher, checks it against
+    its pinned SHA-256 and caches it (Q-258). A DINO network needs the [init] extra first
+    (Q-248)."""
+    # Python's strings in double quotes, so that the code goes in one pair of single quotes.
+    names = json.dumps(list(missing))
+    code = f"from openftgs.losses import PerceptualLoss; [PerceptualLoss(n) for n in {names}]"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    listed = ", ".join(f"{net} ({path})" for net, path in missing.items())
+    lines = [
+        "B-4 needs the trunk networks' weights in torch.hub's cache and never downloads them "
+        f"(Q-270); missing {listed}. This command fetches them, each file downloaded once from "
+        "its publisher, checked against its pinned SHA-256 and cached, as the first `ftgs train` "
+        "with that loss.perc_net would:",
+        f"    {command}",
+    ]
+    dino = [net for net in missing if net in _NEEDS_INIT]
+    if dino:
+        lines.append(
+            f"The DINO networks among them ({', '.join(dino)}) need the [init] extra first: "
+            "pip install 'openftgs[init]' (Q-248)"
+        )
+    return "\n".join(lines)
 
 
 def _perceptual_network(net: str) -> PerceptualLoss:
@@ -2151,11 +2182,7 @@ def _losses(ctx: _Context) -> _Result:
     networks = list(_LOSS_NETWORKS)
     weights, missing = _cached_weights(networks)
     if missing:  # Q-253, Q-270: before anything runs, and nothing downloaded
-        _fail(
-            "B-4 needs the trunk networks' weights in torch.hub's cache and doesn't download "
-            f"them; missing {', '.join(missing)} (building openftgs.losses.PerceptualLoss(net) "
-            "once, as `ftgs train` does with that loss.perc_net, downloads its file)"
-        )
+        _fail(_missing_weights(missing))
     built = _built_networks(networks)  # exit 2 here, before anything is measured
     images = {size: _loss_images(ctx.video, *size, seed=_SEED, device="cuda") for size in sizes}
     cases: list[dict[str, Any]] = []

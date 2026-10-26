@@ -21,6 +21,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1596,9 +1597,14 @@ def test_bench_losses_without_a_trunks_weights_exits_2(
 ) -> None:
     """Q-253, Q-270, Q-166: B-4 times all eight networks of D-89 and needs the six trunk
     networks' weights already in torch.hub's cache (Q-258's names); it never downloads them, so
-    a missing one is exit 2, before anything runs, naming each missing file, with nothing
-    downloaded and nothing written. A Caffe trunk counts as cached by its conversion alone.
-    PyTorch is made to see a CUDA device, which the check comes after."""
+    a missing one is exit 2, before anything runs, naming each missing network and its file,
+    with nothing downloaded and nothing written. A Caffe trunk counts as cached by its
+    conversion alone. The message gives a command, ready to paste into a POSIX shell, that
+    fetches exactly the missing networks with this Python (each file downloaded once from its
+    publisher, checked against its SHA-256 and cached), and, when a DINO network is among them,
+    says those need the [init] extra first (Q-270, owner request); the command is run here
+    against a stand-in `PerceptualLoss`. PyTorch is made to see a CUDA device, which the check
+    comes after."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
 
     def no_download(*args: Any, **kwargs: Any) -> None:
@@ -1619,6 +1625,8 @@ def test_bench_losses_without_a_trunks_weights_exits_2(
     }
     for net, file in publishers.items():
         assert net in error and str(checkpoints / file) in error, net
+    assert _fetched_by(_fetch_command(error), monkeypatch) == list(publishers)
+    assert "SHA-256" in error and "pip install 'openftgs[init]'" in error
     assert not hub.exists() and not out.exists()
     # VGG16 cached as its conversion alone is no longer missing (a stand-in: B-4 stops at the
     # other five before it reads anything).
@@ -1627,8 +1635,41 @@ def test_bench_losses_without_a_trunks_weights_exits_2(
     assert _ftgs("bench", "losses", scene, "--out", out) == 2
     error = capsys.readouterr().err
     assert "vgg16_oxford" not in error and str(checkpoints / publishers["alexnet_bvlc"]) in error
+    assert _fetched_by(_fetch_command(error), monkeypatch) == list(publishers)[1:]
     assert sorted(p.name for p in checkpoints.iterdir()) == ["openftgs-vgg16_oxford.safetensors"]
+    # The DINO networks cached too (stand-ins): AlexNet alone is fetched, and [init] isn't named.
+    for net in ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16"):
+        (checkpoints / publishers[net]).write_bytes(b"stand-in")
+    assert _ftgs("bench", "losses", scene, "--out", out) == 2
+    error = capsys.readouterr().err
+    assert _fetched_by(_fetch_command(error), monkeypatch) == ["alexnet_bvlc"]
+    assert str(checkpoints / publishers["alexnet_bvlc"]) in error and "[init]" not in error
     assert not out.exists()
+
+
+def _fetch_command(error: str) -> list[str]:
+    """The fetch command of B-4's missing-weight message (Q-270), the line that starts with
+    this Python, split as a POSIX shell splits it."""
+    prefix = shlex.quote(sys.executable) + " -c "
+    [line] = [text.strip() for text in error.splitlines() if text.strip().startswith(prefix)]
+    return shlex.split(line)
+
+
+def _fetched_by(command: list[str], monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The networks B-4's fetch command builds, in order: its Python code run here, as
+    `python -c` would run it, against a stand-in `openftgs.losses` whose `PerceptualLoss`
+    records the network it is given and downloads nothing."""
+    import types
+
+    executable, flag, code = command
+    assert (executable, flag) == (sys.executable, "-c")
+    built: list[str] = []
+    stand_in = types.ModuleType("openftgs.losses")
+    stand_in.PerceptualLoss = built.append  # type: ignore[attr-defined]
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "openftgs.losses", stand_in)
+        exec(compile(code, "<B-4's fetch command>", "exec"), {"__name__": "__main__"})
+    return built
 
 
 def test__loss_images_resize_the_first_training_image_and_add_seeded_noise(scene: Path) -> None:
