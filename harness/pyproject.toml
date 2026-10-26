@@ -31,3 +31,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 ftgs_harness = ["py.typed"]
+# Q-254 (#391): the harness's own vendored ꟻLIP ships with its BSD-3-Clause license and its
+# provenance record (D-65's pattern).
+"ftgs_harness._vendor.flip" = ["LICENSE", "VENDOR.json"]

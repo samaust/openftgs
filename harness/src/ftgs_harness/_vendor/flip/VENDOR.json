@@ -1,0 +1,49 @@
+{
+  "upstream": "https://github.com/NVlabs/flip",
+  "commit": "d3ab02a4425eb167d8a4021b382a2bafc6e6c838",
+  "script": "scripts/vendor_flip.py --target harness",
+  "package": "ftgs_harness._vendor.flip",
+  "reference": "tests/reference/flip",
+  "licenses": [
+    {
+      "path": "LICENSE",
+      "project": "ꟻLIP",
+      "license": "BSD-3-Clause",
+      "source": "https://raw.githubusercontent.com/NVlabs/flip/d3ab02a4425eb167d8a4021b382a2bafc6e6c838/LICENSE",
+      "sha256": "13b955078ffb4a3215757038ab2e5fcf0cc66349d0990faec9adba8ad034e578"
+    }
+  ],
+  "files": [
+    {
+      "path": "flip_loss.py",
+      "upstream_path": "src/pytorch/flip_loss.py",
+      "source": "https://raw.githubusercontent.com/NVlabs/flip/d3ab02a4425eb167d8a4021b382a2bafc6e6c838/src/pytorch/flip_loss.py",
+      "upstream_sha256": "bf2b83aeb2427a960abe1143d4436d48609f1cc4f256e685daa08d86cc07c4fc",
+      "sha256": "4881e64009e43496c6fd3ad6b061e4858bcadc469f50294cf54b13011014773e",
+      "edits": [
+        "device: in HDRFLIPLoss.forward, '.cuda()' -> '.to(reference.device)', 3 times",
+        "device: in tone_map, '.cuda()' -> '.to(img.device)', 3 times",
+        "device: in compute_start_stop_exposures, '.cuda()' -> '.to(reference.device)', 6 times",
+        "device: in generate_spatial_filter, 'def generate_spatial_filter(pixels_per_degree, channel):' -> 'def generate_spatial_filter(pixels_per_degree, channel, device):', once",
+        "device: in generate_spatial_filter, '.cuda()' -> '.to(device)', once",
+        "device: in compute_ldrflip, \"pixels_per_degree, 'A')\" -> \"pixels_per_degree, 'A', reference.device)\", once",
+        "device: in compute_ldrflip, \"pixels_per_degree, 'RG')\" -> \"pixels_per_degree, 'RG', reference.device)\", once",
+        "device: in compute_ldrflip, \"pixels_per_degree, 'BY')\" -> \"pixels_per_degree, 'BY', reference.device)\", once",
+        "device: in compute_ldrflip, '.unsqueeze(0), ' -> '.unsqueeze(0).to(reference.device), ', 2 times",
+        "device: in spatial_filter, \"device='cuda'\" -> 'device=img.device', 2 times",
+        "device: in spatial_filter, '.cuda()' -> '.to(img.device)', 3 times",
+        "device: in hunt_adjustment, \"device='cuda'\" -> 'device=img.device', once",
+        "device: in redistribute_errors, \"device='cuda'\" -> 'device=power_deltaE_hyab.device', once",
+        "device: in feature_detection, '.cuda()' -> '.to(img_y.device)', once",
+        "device: in color_space_transform, 'dim[2]*dim[3]).cuda()' -> 'dim[2]*dim[3]).to(input_color.device)', once",
+        "device: in color_space_transform, ']]).cuda()' -> ']]).to(input_color.device)', 2 times",
+        "device: in color_space_transform, 'A.cuda()' -> 'A.to(input_color.device)', once",
+        "notice: the modification notice added after NVIDIA's license header"
+      ]
+    }
+  ],
+  "changes": {
+    "device": "Device-agnostic tensors in place of the CUDA-only ones, so that the harness computes ꟻLIP on the CPU (Q-254): every .cuda() becomes .to(<image>.device) and every device='cuda' becomes device=<image>.device, where <image> is the function's image argument, the colour transforms' constants included; generate_spatial_filter takes the device as a new last argument, which compute_ldrflip passes, and the two colours of the colour maximum are made on the reference's device, where the published file's color_space_transform moved them with .cuda(). Nothing is cached: the filters, the constants and the colour maximum are made at every call, as published"
+  },
+  "purpose": "The harness's own copy (Q-254): L3 computes ꟻLIP itself from the saved renders (§3.3 L3 step 3) and the harness never imports openftgs (§2.1); it runs on the CPU, so the L3 metric tests run in CPU CI"
+}
