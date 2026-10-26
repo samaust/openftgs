@@ -438,7 +438,7 @@ def total_loss(
     if lambda_perc > 0.0 and perceptual is None:
         _fail(
             f"lambda_perc {lambda_perc} (configured {cfg.lambda_perc!r}) needs the perceptual "
-            f"network (perceptual=PerceptualLoss({cfg.perc_net!r}))"
+            f"network of perc_net {cfg.perc_net!r}, passed as perceptual="
         )
     # Q-41: a network passed in must be the one LossConfig names (D-9), whatever λ_perc.
     if perceptual is not None and perceptual._name != cfg.perc_net:
