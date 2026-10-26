@@ -1,6 +1,6 @@
 # Loss terms and their paths in `openftgs.losses`
 
-How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the perceptual networks of D-89, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are the owner's answers recorded in `docs/clean-room/questions.md` (Q-41, Q-42); the networks' input checks are Q-261's and, for the Caffe trunks, Q-263's, and λ_perc = None is Q-249's. The signature of `total_loss` (D-77) and U-11's reading of the stop-gradient (D-78) entered the spec in revision 549c, and the perceptual networks (D-89) in revision 549o.
+How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the perceptual networks of D-89, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are the owner's answers recorded in `docs/clean-room/questions.md` (Q-41, Q-42); the networks' input checks are Q-261's and, for the Caffe trunks, Q-263's and, for the DINO networks, Q-265's, and λ_perc = None is Q-249's. The signature of `total_loss` (D-77) and U-11's reading of the stop-gradient (D-78) entered the spec in revision 549c, and the perceptual networks (D-89) in revision 549o.
 
 ## Input layout
 
@@ -50,7 +50,15 @@ So after one call on a device, a forward and backward pass make no synchronizati
 
 Oxford's weights are licensed under CC BY 4.0, so NOTICE attributes them to Simonyan and Zisserman's report, "Very Deep Convolutional Networks for Large-Scale Image Recognition" (arXiv:1409.1556), as §2.3's note asks. BVLC's AlexNet is released for unrestricted use.
 
-**The DINO networks**, the other four trunk networks, which need `[init]`, come with #386. Until then `PerceptualLoss` raises NotImplementedError naming the ticket. Their weights are those of the next section, and their calibrated weights are already in the resolver's table (below).
+**The DINO networks** (`dinov2_s14`, `dinov2_b14`, `dino_s16`, `dino_b16`) are trunk networks built as #374 tested them (D-89), adapted from its prototype with attribution (source log 452), on the DINOv2 layers of the vendored RoMa (D-65, `docs/modules/init/vendored-roma.md`):
+
+- **The trunk.** The vendored `vit_small` or `vit_base`, 12 blocks: patch 14 with DINOv2's layer scale, or patch 16 without it for DINO v1, whose weights load into the same layers. Each is built for the side its publisher's position embeddings were made for, 518 or 224 pixels, so that the state dict `openftgs._weights` returns loads as saved: DINOv2's whole, DINO's whole but for DINOv2's mask token, which the network never uses without masks. Any other mismatch is a RuntimeError, since the file has already passed its hash. The vendored model interpolates its position embeddings to the image with its own code.
+- **The input.** Each image at half resolution, bilinear and antialiased, a side halved to `round(side / 2)`, rounded half to even as the prototype rounds it (Q-265); centre-cropped to a multiple of the patch; standardized with ImageNet's mean and standard deviation. These two are buffers, so `.to(device)` moves them and no call copies them to the device.
+- **The distance.** The patch tokens after blocks 3, 6, 9 and 12, before the model's final norm and without the class token, each unit-normalized over its channels with lpips's ε = 10⁻¹⁰ (source log 435); their squared differences summed over channels, averaged over tokens and summed over the four blocks; the mean over the batch. The reference's tokens are computed under `torch.no_grad()`. On identical images the value is exactly 0 (U-9).
+- **The inputs refused** (Q-265), after Q-41's checks and before any work: images that aren't float32, the publishers' dtype, with a ValueError rather than a cast, as for ꟻLIP; and a side that halves to less than one patch, which would leave no token. The smallest height and width are 27 pixels for DINOv2 and 31 for DINO.
+- **`[init]`.** The vendored package's `__init__` modules import torchvision, einops and loguru, which only the `[init]` extra installs. `openftgs.losses` imports the layers only when a DINO network is built, so the module and the other four networks stay in the core. Without the extra, building a DINO network raises an ImportError naming it ("needs the [init] extra (pip install 'openftgs[init]')") before anything is downloaded, which the CLI turns into exit code 2 (Q-248, Q-142).
+
+The CPU tests build the DINO networks on stand-in tensors with the publishers' keys and shapes, so their construction is checked without a download: the trunk's input against D-89's, written out, and the value against the distance computed from each block's output. The `weights` tests (Q-7) load the publishers' files, check that they load whole and that the stand-ins have their shapes, and run U-9.
 
 ### LPIPSLoss, until the contract ticket
 
