@@ -5,7 +5,9 @@ the L1 tier, the exit codes and `rerun`. A stub adapter answers `info`, and a st
 module produces checks, so these tests don't depend on any real level."""
 
 import json
+import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ from ftgs_harness.info import choose_tier, info_problems
 from ftgs_harness.report import build_report, render_markdown
 
 HERE = Path(__file__).parent
+ROOT = HERE.parents[1]
 STUB = f"{sys.executable} {HERE / 'stub_adapter.py'}"
 
 # §3.3's example: the top-level keys of report.json and of a check.
@@ -364,16 +367,33 @@ def test_a_non_empty_run_directory_or_bad_settings_exit_2(tmp_path: Path) -> Non
     assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 2
 
 
-def test_l3_without_the_lpips_extra_is_exit_2(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _names(requirements: list[str]) -> list[str]:
+    """The distribution names of requirement strings."""
+    matches = [re.match(r"[A-Za-z0-9_.-]+", r) for r in requirements]
+    return [m.group(0) if m else "" for m in matches]
+
+
+def test_harness_extra_holds_torch_alone() -> None:
+    """Q-201, Q-254, Q-T391.2: the harness requires NumPy, SciPy, safetensors and matplotlib;
+    its one extra, `[torch]`, holds torch alone, for L3's ꟻLIP, and lpips is gone."""
+    project = tomllib.loads((ROOT / "harness" / "pyproject.toml").read_text(encoding="utf-8"))
+    names = _names(project["project"]["dependencies"])
+    assert names == ["numpy", "scipy", "safetensors", "matplotlib"]
+    extras = project["project"]["optional-dependencies"]
+    assert list(extras) == ["torch"]
+    assert _names(extras["torch"]) == ["torch"]
+
+
+def test_l3_without_the_torch_extra_is_exit_2_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-201: L3 computes LPIPS itself, so without torch and lpips it is a configuration
-    error, before any adapter runs."""
+    """Q-254, Q-T391.2: L3 computes ꟻLIP itself with torch, so without the `[torch]` extra it
+    is a configuration error, before any adapter runs, whose message names the extra."""
     import importlib.util
 
     real = importlib.util.find_spec
     monkeypatch.setattr(
-        importlib.util, "find_spec", lambda name, *a: None if name == "lpips" else real(name, *a)
+        importlib.util, "find_spec", lambda name, *a: None if name == "torch" else real(name, *a)
     )
     scene = tmp_path / "scene.json"
     scene.write_text("{}")
@@ -383,3 +403,4 @@ def test_l3_without_the_lpips_extra_is_exit_2(
     )
     assert _run(tmp_path, "--levels", "L3", "--settings", str(settings)) == 2
     assert not (tmp_path / "run" / "run.json").exists()
+    assert "ftgs-harness[torch]" in capsys.readouterr().err

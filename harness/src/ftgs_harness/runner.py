@@ -150,8 +150,11 @@ def _check_levels(text: str) -> tuple[str, ...]:
 def _check_l3(settings: Settings) -> None:
     if not settings.scenes:
         raise HarnessError("L3 needs scenes: set l3.scenes in the run settings (--settings)")
-    if not all(importlib.util.find_spec(m) for m in ("torch", "lpips")):
-        raise HarnessError("L3 needs the [lpips] extra (torch and lpips) for LPIPS (E16)")
+    if importlib.util.find_spec("torch") is None:  # Q-254, Q-T391.2
+        raise HarnessError(
+            "L3 needs the extra ftgs-harness[torch] (torch), with which the harness computes "
+            "ꟻLIP (E16): pip install 'ftgs-harness[torch]'"
+        )
 
 
 def _implementation(info: Any) -> dict[str, Any]:
