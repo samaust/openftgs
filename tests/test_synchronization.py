@@ -34,6 +34,7 @@ from openftgs.config import (
     GrowthConfig,
     LossConfig,
     OptimConfig,
+    PercNet,
     PerfConfig,
     RelocConfig,
     TrainConfig,
@@ -162,7 +163,7 @@ _BASE = PerfConfig(
 class _Case:
     perf: dict[str, Any] = field(default_factory=dict)
     lambda_perc: float | None = 0.0  # None: the network's calibrated weight (D-89; Q-249)
-    perc_net: str = "vgg"  # LPIPS-VGG, the default until #392; D-89's names otherwise
+    perc_net: PercNet = "flip"  # the default (§2.1 `LossConfig`, D-9)
     ssim_fallback: bool = False
     stage_clock: bool = False  # §3.4: the stages' CUDA events and gradient hooks (B-1)
 
@@ -174,7 +175,7 @@ _needs_init = pytest.mark.skipif(
     not all(importlib.util.find_spec(name) is not None for name in _INIT_PACKAGES),
     reason="needs the [init] extra (Q-248)",
 )
-_TRUNKS: dict[str, tuple[pytest.MarkDecorator, ...]] = {
+_TRUNKS: dict[PercNet, tuple[pytest.MarkDecorator, ...]] = {
     "vgg16_oxford": (),
     "alexnet_bvlc": (),
     "dinov2_s14": (_needs_init,),
@@ -195,10 +196,10 @@ _CASES = [
     pytest.param(_Case({"frame_cache": "mmap", "prefetch": 8}), id="mmap-prefetch-8"),
     pytest.param(_Case({"frame_cache": "mmap", "prefetch": 0}), id="mmap-prefetch-0"),
     pytest.param(_Case({"frame_cache": "off"}), id="cache-off"),
-    pytest.param(_Case(lambda_perc=0.01), id="lpips-vgg", marks=pytest.mark.weights),
-    # D-89's networks at their calibrated weights: ꟻLIP, the default from #392 on, and HaarPSI,
-    # which need no weights; each trunk network, and two of them under bfloat16 (Q-250).
-    pytest.param(_Case(perc_net="flip", lambda_perc=None), id="flip"),
+    # D-89's networks at their calibrated weights: ꟻLIP, the default loss (§2.1 `LossConfig`),
+    # and HaarPSI, which need no weights; each trunk network, and two of them under bfloat16
+    # (Q-250).
+    pytest.param(_Case(lambda_perc=None), id="flip"),
     pytest.param(_Case(perc_net="haarpsi", lambda_perc=None), id="haarpsi"),
     *(
         pytest.param(
@@ -247,7 +248,7 @@ def _config(case: _Case) -> TrainConfig:
     log_every); every SH band active from iteration 4."""
     return TrainConfig(
         sh_degree=3,
-        loss=LossConfig(perc_net=case.perc_net, lambda_perc=case.lambda_perc),  # type: ignore[arg-type]
+        loss=LossConfig(perc_net=case.perc_net, lambda_perc=case.lambda_perc),
         growth=GrowthConfig(start=_EVENT, stop=_EVENT, grad_threshold=1e-7, n_max=400),
         reloc=RelocConfig(every=_EVENT, start=_EVENT, stop=_EVENT, dead_opacity=0.2),
         optim=OptimConfig(iterations=100, sh_interval=1),

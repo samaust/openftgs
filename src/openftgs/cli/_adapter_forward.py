@@ -31,7 +31,7 @@ from openftgs.config import GrowthConfig, LossConfig, OptimConfig, RelocConfig, 
 from openftgs.data import spatial_scale
 from openftgs.density import GradStats, draw_targets, growth_masks, mcmc_split, sampling_score
 from openftgs.init import knn_velocities
-from openftgs.losses import LPIPSLoss, PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.losses import PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.motion import effective_opacity, moved_means, temporal_opacity
 from openftgs.optim import build_optimizer
@@ -227,16 +227,12 @@ def _relocation_sampling(
     return {"counts": torch.stack(counts).long()}
 
 
-def _perceptual(cfg: LossConfig) -> PerceptualLoss | LPIPSLoss | None:
+def _perceptual(cfg: LossConfig) -> PerceptualLoss | None:
     """The configuration's perceptual network, built as the trainer builds it when λ_perc is
-    None, its calibrated weight, or positive (D-77, Q-249); LPIPS's two backbones, still
-    accepted as perc_net until #392 (#380's expand step), as `LPIPSLoss`."""
+    None, its calibrated weight, or positive (D-77, Q-249)."""
     if cfg.lambda_perc is not None and cfg.lambda_perc <= 0.0:
         return None
-    net = cfg.perc_net
-    if net == "vgg" or net == "alex":
-        return LPIPSLoss(net)
-    return PerceptualLoss(net)
+    return PerceptualLoss(cfg.perc_net)
 
 
 def _grad_stats(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:

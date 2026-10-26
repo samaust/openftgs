@@ -216,6 +216,16 @@ def test_caffe_trunks_module_imports_nothing_from_openftgs() -> None:
     assert imported & {"openftgs", "torchvision", "einops", "loguru"} == set()
 
 
+def test_legacy_module_imports_nothing_from_openftgs() -> None:
+    """#392 (Q-247): the settings before revision 549o, which `openftgs.config` refuses and the
+    checkpoint readers of `io`, `model`, `train` and `cli` handle, are a private top-level
+    module of the same kind as the stage instrumentation, so it imports nothing from openftgs
+    itself (§2.1 bands)."""
+    path = PACKAGE_DIR / "_legacy.py"
+    assert path.is_file()
+    assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
+
+
 def test_harness_never_imports_openftgs() -> None:
     offenders = [
         str(p.relative_to(ROOT))

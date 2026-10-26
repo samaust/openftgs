@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from types import UnionType
 from typing import Any, ClassVar, Literal, Union, get_args, get_origin, get_type_hints
 
+from openftgs._legacy import LPIPS_BACKBONES
+
 __all__ = [
     "GrowthConfig",
     "InitConfig",
@@ -50,29 +52,31 @@ PercNet = Literal[
     "dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16",
 ]  # D-89  # fmt: skip
 
-# #380's expand step: LPIPS's two backbones, the names before revision 549o, stay accepted as
-# `perc_net` until the contract ticket (#392) narrows the field to `PercNet` (Q-247). Nested in a
-# Literal, which flattens, so the field's annotation stays one Literal for `_coerce`.
-_LegacyPercNet = Literal["vgg", "alex"]
-
 
 @dataclass
 class LossConfig:  # E7–E9
     lambda_img: float = 0.8  # P §3.3
     lambda_ssim: float = 0.2  # P §3.3
-    # D-9: None = perc_net's calibrated weight (D-89); 0.01 by default until #392 (#380's expand)
-    lambda_perc: float | None = 0.01
+    lambda_perc: float | None = None  # D-9: None = perc_net's calibrated weight (D-89)
     lambda_reg: float = 1e-2  # P §3.3
     reg_until: int | None = None  # D-10: last iteration with L_reg; None = whole run
     ssim_window: int = 11  # D-8
     ssim_sigma: float = 1.5  # D-8
     ssim_padding: Literal["valid", "same"] = "valid"  # D-8
-    # D-9, D-89; "vgg", the default, and "alex" until #392 (#380's expand step)
-    perc_net: Literal[PercNet, _LegacyPercNet] = "vgg"
+    perc_net: PercNet = "flip"  # D-9
 
     _prefix: ClassVar[str] = "loss."
 
     def __post_init__(self) -> None:
+        # #375 (decided item 3), Q-247: LPIPS's backbones, the names before 549o, are refused
+        # naming the revision, before the generic Literal check would.
+        if self.perc_net in LPIPS_BACKBONES:
+            _fail(
+                self,
+                "perc_net",
+                f"is one of LPIPS's backbones, which revision 549o of the spec retired (D-9, "
+                f"D-89): choose one of D-89's networks {get_args(PercNet)}, 'flip' by default",
+            )
         _check_types(self)
         # Q-11
         _check_non_negative(self, "lambda_img", "lambda_ssim", "lambda_reg")

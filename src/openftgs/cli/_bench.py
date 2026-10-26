@@ -654,13 +654,9 @@ def _train_step_config(n: int, *, sh_degree: int = 3) -> TrainConfig:
 
     base = TrainConfig()
     n_max = -(-(100 + _HEADROOM_PERCENT) * n // 100)  # ⌈1.02·N⌉ in integers, so never one over
-    # #380's expand step: ꟻLIP at its calibrated weight, set here until #392 makes them the
-    # defaults of `LossConfig`, when this line goes.
-    loss = dataclasses.replace(base.loss, perc_net="flip", lambda_perc=None)
     return dataclasses.replace(
         base,
         sh_degree=sh_degree,
-        loss=loss,
         growth=dataclasses.replace(base.growth, start=_EVENTS_FROM, n_max=n_max),
         reloc=dataclasses.replace(base.reloc, start=_EVENTS_FROM),
         optim=dataclasses.replace(base.optim, sh_interval=1),

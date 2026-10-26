@@ -1103,7 +1103,7 @@ def test_regularization_of_an_empty_model_is_zero() -> None:
 
 # U-10 and U-9: the total loss (E9, D-10, D-37, D-38, D-77; Q-41)
 
-NO_PERC = LossConfig(lambda_perc=0.0)  # E9 at its defaults, without the downloaded network
+NO_PERC = LossConfig(lambda_perc=0.0)  # E9 at its defaults, without the perceptual term
 T_IT = OptimConfig().iterations  # T_it, the default run length
 
 
@@ -1225,7 +1225,7 @@ def test_total_loss_needs_the_perceptual_network_when_its_weight_is_positive() -
     model = random_model(4, seed=0)
     pred, gt = _detached_pair(30, dtype=F32)
     with pytest.raises(ValueError):
-        total_loss(pred, gt, model, 0.5, 1, LossConfig())
+        total_loss(pred, gt, model, 0.5, 1, LossConfig(lambda_perc=0.5))
 
 
 def test_total_loss_skips_terms_whose_weight_is_zero() -> None:
@@ -1241,39 +1241,6 @@ def test_total_loss_skips_terms_whose_weight_is_zero() -> None:
         cfg = LossConfig(lambda_perc=0.0, lambda_reg=0.0, reg_until=100)
         _, terms = total_loss(pred, gt, model, 0.5, it, cfg)
         assert set(terms) == {"l1", "one_minus_ssim", "total"}
-
-
-@pytest.mark.weights
-def test_u9_total_loss_is_the_weighted_sum_of_its_terms(lpips_nets: dict[str, LPIPSLoss]) -> None:
-    """U-9 (E7, E9, D-37): L = 0.8·L1 + 0.2·(1 − SSIM) + 0.01·LPIPS-VGG + 0.01·L_reg, to 1e-6,
-    each term recomputed with the public functions."""
-    model = random_model(30, seed=32)
-    pred, gt = _detached_pair(33, dtype=F32)
-    perc = lpips_nets["vgg"]
-    loss, terms = total_loss(pred, gt, model, 0.6, 1, LossConfig(), perceptual=perc)
-    assert set(terms) == {"l1", "one_minus_ssim", "perceptual", "reg", "total"}
-    expected = (
-        0.8 * l1_loss(pred, gt).item()
-        + 0.2 * (1.0 - ssim(pred, gt).item())
-        + 0.01 * perc(pred, gt).item()
-        + 0.01 * reg4d_loss(model, 0.6).item()
-    )
-    torch.testing.assert_close(loss.item(), expected, rtol=0.0, atol=1e-6)
-    assert terms["perceptual"].item() == perc(pred, gt).item()
-
-
-@pytest.mark.weights
-def test_total_loss_needs_the_backbone_the_config_names(lpips_nets: dict[str, LPIPSLoss]) -> None:
-    """Q-41 (D-9): a perceptual network with another backbone than cfg.perc_net is a
-    ValueError, whatever λ_perc."""
-    model = random_model(4, seed=0)
-    pred, gt = _detached_pair(34, dtype=F32)
-    for cfg in (LossConfig(), NO_PERC):
-        with pytest.raises(ValueError):
-            total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=lpips_nets["alex"])
-    cfg = LossConfig(perc_net="alex")
-    _, terms = total_loss(pred, gt, model, 0.5, 1, cfg, perceptual=lpips_nets["alex"])
-    assert "perceptual" in terms
 
 
 # D-89's calibrated λ_perc of the two weight-free networks, the two Caffe trunks and the DINO
@@ -1330,14 +1297,15 @@ def test_total_loss_needs_the_perceptual_network_when_lambda_perc_is_none(net: P
     assert "perceptual" not in terms
 
 
-def test_u9_total_loss_with_flip_is_the_weighted_sum_of_its_terms() -> None:
-    """U-9 (E7, E9, D-37, D-89): at λ_perc = None, L = 0.8·L1 + 0.2·(1 − SSIM) + 0.415·ꟻLIP +
-    0.01·L_reg, to 1e-6, each term recomputed with the public functions; the terms are
-    detached 0-d tensors on the images' device and "total" is the loss's value (D-77)."""
+def test_u9_total_loss_is_the_weighted_sum_of_its_terms() -> None:
+    """U-9 (E7, E9, D-37, D-89) at the default configuration, ꟻLIP at λ_perc = None (§2.1
+    `LossConfig`): L = 0.8·L1 + 0.2·(1 − SSIM) + 0.415·ꟻLIP + 0.01·L_reg, to 1e-6, each term
+    recomputed with the public functions; the terms are detached 0-d tensors on the images'
+    device and "total" is the loss's value (D-77)."""
     model = random_model(30, seed=39)
     pred, gt = _detached_pair(40, dtype=F32)
-    perc = PerceptualLoss("flip")
-    cfg = LossConfig(perc_net="flip", lambda_perc=None)
+    perc = PerceptualLoss()
+    cfg = LossConfig()
     loss, terms = total_loss(pred.requires_grad_(), gt, model, 0.6, 1, cfg, perceptual=perc)
     assert set(terms) == {"l1", "one_minus_ssim", "perceptual", "reg", "total"}
     for value in terms.values():
@@ -1383,18 +1351,6 @@ def test__calibrated_weights_are_d89s_table() -> None:
         "dino_b16": 0.00484,
     }
     assert set(openftgs.losses._CALIBRATED_WEIGHTS) == set(get_args(PercNet))
-
-
-@pytest.mark.parametrize("net", ["vgg", "alex"])
-def test_total_loss_refuses_lambda_perc_none_for_an_lpips_backbone(net: str) -> None:
-    """#380's expand step (Q-249): LPIPS's backbones stay valid `perc_net` values until the
-    contract ticket (#392), but D-89's table gives them no calibrated weight, so λ_perc = None
-    with one of them is a ValueError naming D-89, raised before any network is used."""
-    model = random_model(4, seed=0)
-    pred, gt = _detached_pair(38, dtype=F32)
-    cfg = LossConfig(perc_net=net, lambda_perc=None)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="D-89"):
-        total_loss(pred, gt, model, 0.5, 1, cfg)
 
 
 # U-11: the full forward through the reference backend
