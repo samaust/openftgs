@@ -584,3 +584,5 @@ Each configuration's mean, over its three runs, of each candidate metric:
 ## 7. to 9.
 
 The recommendation, what adopting it would change, and the sources: #373's phase 4, after the results.
+
+**Closed by revision 549o.** The owner chose ꟻLIP on 2026-10-25, closing #373: spec revision 549o (#375) makes it the default perceptual network and the reported perceptual metric, with seven of the candidates tested here selectable at their calibrated weights (D-9, D-89), and retires D-68. PRD #380 implemented it; its kitchen run at seed 0, the package's parity check against F1-s0, is validation run 35 (`docs/clean-room/validation-runs.md`).
