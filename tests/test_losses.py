@@ -22,7 +22,7 @@ from torch import Tensor
 
 import openftgs.losses
 from openftgs.config import LossConfig, OptimConfig
-from openftgs.losses import LPIPSLoss, l1_loss, reg4d_loss, ssim, total_loss
+from openftgs.losses import LPIPSLoss, PerceptualLoss, l1_loss, reg4d_loss, ssim, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.render import render
 from openftgs.types import Camera
@@ -473,6 +473,113 @@ def test_u9_lpips_of_an_image_with_itself_is_zero_on_the_gpu() -> None:
     image, _ = _image_pair((2, 32, 40, 3), seed=13, correlated=False, dtype=F32)
     image = image.cuda()
     assert loss(image, image.clone()).item() == 0.0
+
+
+# U-9: the perceptual networks (E7, D-9, D-89; Q-41)
+
+TRUNK_NETWORKS = (  # D-89's table, written out: the networks built on pretrained weights
+    "vgg16_oxford",
+    "alexnet_bvlc",
+    "dinov2_s14",
+    "dinov2_b14",
+    "dino_s16",
+    "dino_b16",
+)
+
+
+@pytest.mark.parametrize("net", ["vgg", "alex", "lpips", "FLIP", ""])
+def test_perceptual_loss_rejects_a_name_outside_d89(net: str) -> None:
+    """§2.1, D-89: `PerceptualLoss(net)` takes one of D-89's eight names; LPIPS's backbones, the
+    names before revision 549o, are not among them."""
+    with pytest.raises(ValueError, match="D-89"):
+        PerceptualLoss(net)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("net", TRUNK_NETWORKS)
+def test_perceptual_loss_trunk_networks_are_not_built_yet(net: str) -> None:
+    """#381: the six trunk networks of D-89 are built by #385 (the Caffe trunks) and #386 (the
+    DINO networks); until then building one raises an error naming its ticket. Those tickets
+    replace this test."""
+    with pytest.raises(NotImplementedError, match="#385|#386"):
+        PerceptualLoss(net)  # type: ignore[arg-type]
+
+
+def _with_noise(image: Tensor, *, seed: int, sigma: float = 16 / 255) -> Tensor:
+    """The image plus seeded Gaussian noise of standard deviation σ, clipped to [0, 1]."""
+    gen = torch.Generator().manual_seed(seed)
+    noise = torch.randn(image.shape, generator=gen, dtype=F64)
+    return (image.double() + sigma * noise).clamp(0.0, 1.0).to(image.dtype)
+
+
+@pytest.mark.parametrize("net", ["flip"])
+def test_u9_perceptual_network_of_an_image_with_itself(net: str) -> None:
+    """U-9 (D-89): on identical images a network gives 0, or at most 10⁻⁵ of its value under
+    Gaussian noise of σ = 16/255 (float32 rounding, ꟻLIP's stabilizer), in float32."""
+    loss = PerceptualLoss(net)  # type: ignore[arg-type]
+    image, _ = _image_pair((2, 32, 40, 3), seed=40, correlated=False, dtype=F32)
+    same = loss(image, image.clone())
+    noise = loss(_with_noise(image, seed=41), image)
+    assert same.shape == () and same.dtype == F32
+    assert noise.item() > 0.0
+    assert same.item() == 0.0 or abs(same.item()) <= 1e-5 * noise.item()
+
+
+@pytest.mark.parametrize("net", ["flip"])
+def test_perceptual_loss_is_frozen_in_evaluation_mode_and_differentiates_only_the_render(
+    net: str,
+) -> None:
+    """D-89 (common to all, Q-41): the network is frozen and in evaluation mode, also after
+    `.train()`; the render gets a gradient and the reference none, even when it asks for one."""
+    loss = PerceptualLoss(net)  # type: ignore[arg-type]
+    loss.train()
+    assert not any(module.training for module in loss.modules())
+    assert all(not p.requires_grad for p in loss.parameters())
+    pred, gt = _image_pair((32, 40, 3), seed=42, correlated=True, dtype=F32)
+    pred.requires_grad_()
+    gt.requires_grad_()
+    loss(pred, gt).backward()
+    assert pred.grad is not None and bool(pred.grad.abs().sum() > 0)
+    assert gt.grad is None
+
+
+def test_d89_flip_is_the_vendored_ldr_flip_at_67_pixels_per_degree() -> None:
+    """D-89's `flip` row: NVIDIA's LDR-ꟻLIP loss (the vendored copy, #383) at 67.0 pixels per
+    degree, the mean of its error map over the batch, on the [B, 3, H, W] views of the images,
+    bitwise; a render above 1 gives the loss of the render clamped to [0, 1], since the loss
+    clamps both images. The published default, 67.02 pixels per degree, gives another value."""
+    from openftgs._vendor.flip import LDRFLIPLoss
+
+    pred, gt = _image_pair((2, 32, 40, 3), seed=44, correlated=True, dtype=F32)
+    pred[:, 4:12, 6:18] += 0.4
+    nchw = [x.permute(0, 3, 1, 2) for x in (pred, gt)]
+    reference = LDRFLIPLoss()
+    value = PerceptualLoss("flip")(pred, gt)
+    assert value.item() == reference(*nchw, pixels_per_degree=67.0).item()
+    assert value.item() != reference(*nchw).item()
+    assert value.item() == PerceptualLoss("flip")(pred.clamp(0.0, 1.0), gt).item()
+
+
+@pytest.mark.parametrize("dtype", [F64, torch.float16, torch.bfloat16])
+def test_flip_takes_float32_images_only(dtype: torch.dtype) -> None:
+    """Q-T381.1: NVIDIA's ꟻLIP loss computes with float32 constants, so `flip` refuses images
+    of another dtype with a ValueError, before any work, rather than casting them."""
+    image = torch.rand(16, 16, 3, generator=torch.Generator().manual_seed(45)).to(dtype)
+    with pytest.raises(ValueError, match="float32"):
+        PerceptualLoss("flip")(image, image.clone())
+
+
+@pytest.mark.parametrize("net", ["flip"])
+def test_u9_perceptual_network_gradient_is_finite_on_a_render_above_one(net: str) -> None:
+    """U-9 (E7: Î isn't clamped, so it can exceed 1): the gradient with respect to a render
+    with a raised patch, above 1 where the image is bright, is finite everywhere and nonzero."""
+    pred, gt = _image_pair((2, 32, 40, 3), seed=43, correlated=True, dtype=F32)
+    pred = pred.clone()
+    pred[:, 8:24, 10:30] += 0.3
+    assert bool((pred > 1.0).any())
+    pred.requires_grad_()
+    PerceptualLoss(net)(pred, gt).backward()  # type: ignore[arg-type]
+    assert pred.grad is not None
+    assert bool(torch.isfinite(pred.grad).all()) and bool(pred.grad.abs().sum() > 0)
 
 
 # U-10: the 4D regularization (E8, D-11)

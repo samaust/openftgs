@@ -7,18 +7,19 @@ Spec: E7, E8, E9. Band: Mechanics (§2.1).
 import functools
 import warnings
 from collections.abc import Callable
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, get_args
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from openftgs._stages import stage
-from openftgs.config import LossConfig
+from openftgs._vendor.flip import LDRFLIPLoss
+from openftgs.config import LossConfig, PercNet
 from openftgs.model import FreeTimeGaussians
 from openftgs.motion import reg4d_terms
 
-__all__ = ["LPIPSLoss", "l1_loss", "reg4d_loss", "ssim", "total_loss"]
+__all__ = ["LPIPSLoss", "PerceptualLoss", "l1_loss", "reg4d_loss", "ssim", "total_loss"]
 
 
 def _fail(reason: str) -> NoReturn:
@@ -141,6 +142,54 @@ def ssim(
         data_range=data_range,
         padding=padding,
     )
+
+
+# D-89: the eight networks `perc_net` selects, and the trunk networks among them.
+_PERC_NETS: tuple[str, ...] = get_args(PercNet)
+_TRUNK_TICKETS = {
+    "vgg16_oxford": "#385",
+    "alexnet_bvlc": "#385",
+    "dinov2_s14": "#386",
+    "dinov2_b14": "#386",
+    "dino_s16": "#386",
+    "dino_b16": "#386",
+}
+# D-89, E16: ꟻLIP's pixels per degree, a Python float, as the vendored copy's filter cache keys it.
+_FLIP_PIXELS_PER_DEGREE = 67.0
+
+
+class PerceptualLoss(torch.nn.Module):
+    """L_perc: the perceptual network `net` of D-89 on the render and the training image (E7,
+    D-9)."""
+
+    def __init__(self, net: PercNet = "flip") -> None:
+        super().__init__()
+        if net not in _PERC_NETS:
+            _fail(f"net must be one of D-89's perceptual networks {_PERC_NETS}, got {net!r}")
+        if net in _TRUNK_TICKETS:
+            # #381: the trunk networks come with #385 and #386.
+            raise NotImplementedError(
+                f"PerceptualLoss({net!r}) is not built yet: the trunk networks of D-89 come with "
+                f"{_TRUNK_TICKETS[net]}"
+            )
+        self._name = net
+        self._net = LDRFLIPLoss()
+        # D-89: frozen and in evaluation mode, whatever a parent module asks.
+        self.requires_grad_(False)
+        self.train(False)
+
+    def train(self, mode: bool = True) -> "PerceptualLoss":
+        # D-89: in evaluation mode, also when a parent module calls `.train()`.
+        return super().train(False)
+
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        _check_pair(pred, gt)
+        # Q-T381.1: the published loss's constants are float32, and other dtypes fail inside it.
+        if pred.dtype != torch.float32:
+            _fail(f"ꟻLIP takes float32 images, got {pred.dtype}")
+        x, y = _batch_first(pred), _batch_first(gt.detach())
+        out: Tensor = self._net(x, y, pixels_per_degree=_FLIP_PIXELS_PER_DEGREE)
+        return out
 
 
 class LPIPSLoss(torch.nn.Module):
