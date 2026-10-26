@@ -143,6 +143,7 @@ follow_imports = "skip"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-# D-65, D-89: the vendored ꟻLIP too (#383); read for its classes, its errors ignored.
-module = ["openftgs._vendor.flip.flip_loss"]
+# D-65, D-89: the vendored ꟻLIP too (#383); read for its classes, its errors ignored. So is the
+# harness's own copy (Q-254), which `exclude` alone leaves checked as an import of the metrics.
+module = ["openftgs._vendor.flip.flip_loss", "ftgs_harness._vendor.flip.flip_loss"]
 ignore_errors = true
