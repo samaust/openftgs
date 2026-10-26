@@ -206,6 +206,16 @@ def test_weights_module_imports_nothing_from_openftgs() -> None:
     assert imported & {"openftgs", "torchvision", "einops", "loguru"} == set()
 
 
+def test_caffe_trunks_module_imports_nothing_from_openftgs() -> None:
+    """#385: D-89's two Caffe trunks are a private top-level module that `openftgs.losses`
+    imports and passes the weights, of the same kind as `openftgs._weights`, so it imports
+    nothing from openftgs itself (§2.1 bands) and nothing of the `[init]` extra (Q-248)."""
+    path = PACKAGE_DIR / "_caffe_trunks.py"
+    assert path.is_file()
+    imported = {n.split(".")[0] for n in _imported_modules(path)}
+    assert imported & {"openftgs", "torchvision", "einops", "loguru"} == set()
+
+
 def test_harness_never_imports_openftgs() -> None:
     offenders = [
         str(p.relative_to(ROOT))

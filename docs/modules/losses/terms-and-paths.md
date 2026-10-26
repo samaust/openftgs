@@ -1,6 +1,6 @@
 # Loss terms and their paths in `openftgs.losses`
 
-How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the perceptual networks of D-89, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are the owner's answers recorded in `docs/clean-room/questions.md` (Q-41, Q-42); the networks' input checks are Q-261's, and λ_perc = None is Q-249's. The signature of `total_loss` (D-77) and U-11's reading of the stop-gradient (D-78) entered the spec in revision 549c, and the perceptual networks (D-89) in revision 549o.
+How `openftgs.losses` meets its §2.1 row for E7, E8 and E9: the three terms of the rendering loss L_render, the perceptual networks of D-89, the 4D regularization L_reg and the total loss L. The input layout, the API details §2.1 leaves open and the SSIM paths are the owner's answers recorded in `docs/clean-room/questions.md` (Q-41, Q-42); the networks' input checks are Q-261's and, for the Caffe trunks, Q-263's, and λ_perc = None is Q-249's. The signature of `total_loss` (D-77) and U-11's reading of the stop-gradient (D-78) entered the spec in revision 549c, and the perceptual networks (D-89) in revision 549o.
 
 ## Input layout
 
@@ -37,7 +37,20 @@ B-4 (#228, Calibration data) measured what fused-ssim gains: its forward and the
 
 So after one call on a device, a forward and backward pass make no synchronization. Two quirks come with piq's construction. HaarPSI of two flat images is infinite, because their weights are all zero. And in float32, 1 − HaarPSI(I, I) is a few 10⁻⁶ rather than 0, from rounding the logit of float32's sigmoid(4.2): up to 3.2·10⁻⁵ of its value under σ = 16/255 noise, above U-9's 10⁻⁵. In float64 it is below 10⁻¹⁴, so U-9 checks HaarPSI's identity case in float64 (owner, Q-262).
 
-**The trunk networks.** `vgg16_oxford` and `alexnet_bvlc` come with #385, and the four DINO networks, which need `[init]`, with #386. Until then `PerceptualLoss` raises NotImplementedError naming the ticket. Their weights are those of the next section, and their calibrated weights are already in the resolver's table (below).
+**The Caffe trunks** (`vgg16_oxford`, `alexnet_bvlc`) are lpips's uncalibrated distance, every channel weighted equally, on Oxford's VGG16 and BVLC's AlexNet, built as #374 tested them (D-89). They are trunk networks, the first two of the six. The private module `openftgs._caffe_trunks` builds them from the tensors `trunk_tensors` returns (next section); like `openftgs._weights`, it imports nothing from openftgs, and `PerceptualLoss` passes it the weights. The construction is adapted from #374's prototype (source log 449):
+
+- **The input** is Caffe's: the RGB render, unclamped, flipped to BGR, times 255, minus the release's mean pixel. Oxford's is (103.939, 116.779, 123.68). BVLC's is the per-channel mean of its mean image, which #374 subtracted to eight decimals and D-89's table rounds to three; the code keeps the eight (Q-264).
+- **VGG16's layers** are five blocks of 3×3 convolutions with padding 1, each followed by its ReLU, tapped after relu1_2, relu2_2, relu3_3, relu4_3 and relu5_3, with 2×2 max pooling of stride 2 between the blocks.
+- **AlexNet's layers** are conv1 (11×11, stride 4), conv2 (5×5, padding 2) and conv3 to conv5 (3×3, padding 1), with conv2, conv4 and conv5 in two groups, tapped after relu1 to relu5. After the first two taps come Caffe's local response normalization (5 channels, α = 10⁻⁴, β = 0.75, k = 1) and 3×3 max pooling of stride 2.
+- **The pooling** is Caffe's ceiling mode: a side n gives ⌈(n − k)/s⌉ + 1, a partial window at the bottom and right counting, as PyTorch's `ceil_mode=True` computes it. Nothing after the last tap is computed.
+- **The distance** divides each tap's feature vectors by their norm plus 10⁻¹⁰, lpips's ε, sums the squared differences over channels, averages them over space and sums the five taps; the loss is the mean over the batch. The reference's features are computed without a gradient. On identical images both trunks give exactly 0.
+- **The inputs refused** (Q-263): a trunk computes in its weights' dtype, float32 as converted, so images of another dtype are a ValueError, not cast, as for ꟻLIP. AlexNet refuses a height or width below 23 pixels, the smallest its layers take; VGG16 takes any size. Both checks read only shapes and dtypes, so they don't synchronize.
+- **The weights** are buffers left out of the `state_dict`: `.to()` moves and converts them, and nothing that saves the module carries them (§2.3: never redistributed). Building a trunk hashes its converted file, 59 MB for VGG16 and 9 MB for AlexNet (Q-258).
+- **The layout:** the render's batch-first view goes in as it comes, channels-last in memory, with no copy (#380's candidate 5). Contiguous NCHW copies and autotuning per network follow B-4 (#389). Under bfloat16 autocast, the way the trainer's opt-in bfloat16 runs LPIPS today (Q-172), the images still enter as float32, so the dtype check holds; extending that path to the trunk networks is the trainer's (Q-250).
+
+Oxford's weights are licensed under CC BY 4.0, so NOTICE attributes them to Simonyan and Zisserman's report, "Very Deep Convolutional Networks for Large-Scale Image Recognition" (arXiv:1409.1556), as §2.3's note asks. BVLC's AlexNet is released for unrestricted use.
+
+**The DINO networks**, the other four trunk networks, which need `[init]`, come with #386. Until then `PerceptualLoss` raises NotImplementedError naming the ticket. Their weights are those of the next section, and their calibrated weights are already in the resolver's table (below).
 
 ### LPIPSLoss, until the contract ticket
 
