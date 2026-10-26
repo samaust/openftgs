@@ -339,12 +339,14 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
 # Q-173: the training perceptual network's weights in channels-last memory, turned on only when
 # B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
 # at its two sizes (Calibration data, #228), with the inputs channels-last as `LPIPSLoss` views
-# a render's [..., H, W, 3] batch first; since #326 mostly NCHW (_perceptual_network, Q-223).
+# a render's [..., H, W, 3] batch first; since #326 mostly NCHW (_lpips_network, Q-223). D-89's
+# networks are measured by B-4's rerun (Q-251), which #394 reads.
 _CHANNELS_LAST_WEIGHTS = False
 
 
-# Q-173 (changed, #326), Q-223: B-4 measured NCHW inputs the fastest layout in IEEE float32, and
-# in TF32 with autotuning; slower in TF32 without it and in bfloat16, which keep the plain view.
+# Q-173 (changed, #326), Q-223: B-4 measured NCHW inputs the fastest layout for LPIPS-VGG in IEEE
+# float32, and in TF32 with autotuning; slower in TF32 without it and in bfloat16, which keep the
+# plain view. LPIPS's backbones only, until #392 removes them (#380's expand step).
 class _NCHWLPIPSLoss(LPIPSLoss):
     """LPIPS with its two images copied so that the network gets them as contiguous NCHW
     tensors: the trainer's network under `perc_precision` "ieee", and "tf32" with autotuning.
