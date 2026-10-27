@@ -10,7 +10,8 @@ pip install openftgs
 ```
 
 This installs the core dependencies of spec §2.3: PyTorch (≥ 2.1), gsplat 1.5.3, safetensors,
-lpips 0.1.4, PyYAML, Pillow, SciPy and NumPy.
+PyYAML, Pillow, SciPy and NumPy. The default perceptual network, ꟻLIP, is vendored in the package
+(D-65), and HaarPSI and the two Caffe trunks need nothing more.
 
 ### A CUDA build of PyTorch first
 
@@ -23,7 +24,7 @@ reference`) and for the tests that use it.
 
 ## Optional extras
 
-### `[init]`: RoMa initialization
+### `[init]`: RoMa initialization and the DINO networks
 
 ```bash
 pip install "openftgs[init]"
@@ -33,6 +34,11 @@ pip install "openftgs[init]"
 `openftgs._vendor.romatch` (D-65), with its license files. The extra adds the libraries that code
 imports (torchvision, einops and loguru) and requires torch ≥ 2.5.1. The matcher downloads its
 weights through `torch.hub` the first time it runs, and needs a CUDA device.
+
+The four DINO perceptual networks (`dinov2_s14`, `dinov2_b14`, `dino_s16` and `dino_b16` as
+`loss.perc_net`) run on the vendored RoMa's DINOv2 layers, so they need the extra too: without
+it, building one is an error that names it (Q-248). ꟻLIP, the default perceptual network,
+HaarPSI and the two Caffe trunks (`vgg16_oxford`, `alexnet_bvlc`) need no extra.
 
 RoMa's optional speed-up, [fused-local-corr](https://github.com/Parskatt/fused-local-corr) (MIT),
 isn't part of the extra (D-85): each of its releases since 0.3.27 requires one exact torch
@@ -76,9 +82,13 @@ openftgs calls two programs as separate processes; it neither bundles nor links 
 openftgs ships no weight file. Weights reach your machine at run time, from their projects' own
 hosts, into torch.hub's cache (spec §2.3):
 
-- the AlexNet and VGG16 ImageNet trunks of LPIPS, downloaded by torchvision at the first
-  evaluation (`ftgs eval`, or the evaluation at the end of `ftgs train`), and by training's
-  perceptual loss; LPIPS's own linear layers come inside the lpips wheel;
+- the weights of the six trunk perceptual networks, downloaded the first time `loss.perc_net`
+  selects one: Oxford's VGG16 and BVLC's AlexNet, as Caffe files that are converted once into a
+  safetensors file beside them, and DINOv2 ViT-S/14 and ViT-B/14 and DINO ViT-S/16 and ViT-B/16.
+  Each file is checked against its byte count and SHA-256 before every use; one that fails is
+  refused and left in place, never overwritten (Q-258). ꟻLIP, the default perceptual network and
+  the reported perceptual metric, and HaarPSI need no weights, so the default training run and
+  `ftgs eval` download nothing;
 - RoMa's outdoor model and its DINOv2 ViT-L/14 backbone, at the first `ftgs init roma`.
 
 Each weight's terms are recorded apart from the code licenses, in the release checklist kept with

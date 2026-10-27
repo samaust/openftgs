@@ -60,9 +60,10 @@ weights.
 ftgs train kitchen/scene.json --init kitchen-init.safetensors --out kitchen-run
 ```
 
-30,000 iterations. The primitive count grows from the 300,000 initial points to its cap of
-3,000,000, reached at iteration 3,600. 58 min 18 s, the evaluation of the test view included; a
-later run peaked at 23,492 MiB of GPU memory. The run directory holds `config.json`,
+30,000 iterations, with ꟻLIP as the perceptual loss at its calibrated weight (D-9, D-89). The
+primitive count grows from the 300,000 initial points to its cap of 3,000,000, reached at
+iteration 2,100. 14 min 22 s, the evaluation of the test view included, at a GPU memory peak of
+23,533 MiB. The run directory holds `config.json`,
 `train_log.jsonl`, `checkpoint/` and `METRICS.json`; Ctrl-C saves the checkpoint before stopping,
 and `--resume kitchen-run/checkpoint` continues the run. `--checkpoint-every N` also saves every N
 iterations (D-83).
@@ -75,9 +76,10 @@ ftgs export kitchen-run/checkpoint --format ftgs-if --out kitchen.safetensors
 ftgs render kitchen.safetensors --request request.json --out renders.safetensors
 ```
 
-- `ftgs eval` scores the test view: PSNR, SSIM and DSSIM at data ranges 1 and 2, LPIPS-Alex and
-  LPIPS-VGG (E16), per image and per scene. `ftgs train` already wrote the same file into the
-  run directory. The project's default run scored a PSNR of 27.33 dB on `cam00`.
+- `ftgs eval` scores the test view: PSNR, SSIM and DSSIM at data ranges 1 and 2, and ꟻLIP
+  (E16), per image and per scene. `ftgs train` already wrote the same file into the run
+  directory. The project's default run scored a PSNR of 28.32 dB and a ꟻLIP of 0.0900 on
+  `cam00`.
 - `ftgs export` writes the model as an exchange file (`ftgs-if`, §2.2): activated values in raw
   time units, which other implementations can read.
 - `ftgs render` answers a render request: a JSON file (`ftgs-render-request`, §2.2) that lists
