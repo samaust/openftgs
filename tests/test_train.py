@@ -1424,6 +1424,11 @@ B4_NCHW = {
     "vgg16_oxford": {("ieee", False), ("ieee", True), ("tf32", True)},
     "alexnet_bvlc": {(p, a) for p in ("ieee", "tf32", "bf16") for a in (False, True)},
 }
+# Q-269, Q-272, Q-273 (#380's review): per network, the (perc_precision, autotuned) pairs under
+# which the trainer's network holds its weights channels-last. B-4's two runs with channels-last
+# weights as a third layout for the Caffe trunks (Calibration data) found no pair where they
+# reach Q-272's 3 % over the render's view in both runs: none.
+B4_CHANNELS_LAST_WEIGHTS: dict[str, set[tuple[str, bool]]] = {}
 LAYOUT_CASES = [
     pytest.param(net, precision, marks=marks, id=f"{net}-{precision}")
     for net, marks in [
@@ -1443,6 +1448,19 @@ def _layout(image: torch.Tensor) -> str:
     return "channels_last" if image.is_contiguous() else "other"
 
 
+def _weights_layout(network: torch.nn.Module) -> str:
+    """How a network's four-dimensional parameters and buffers lie in memory, through
+    PyTorch's public `parameters()` and `buffers()` (a Caffe trunk holds its convolutions as
+    buffers, Q-263): "nchw" when every one is contiguous, a network without any included,
+    "channels_last" when every one is channels-last, else "mixed"."""
+    tensors = [t for t in (*network.parameters(), *network.buffers()) if t.dim() == 4]
+    if all(t.is_contiguous() for t in tensors):
+        return "nchw"
+    if all(t.is_contiguous(memory_format=torch.channels_last) for t in tensors):
+        return "channels_last"
+    return "mixed"
+
+
 @pytest.mark.parametrize("caller", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(("net", "precision"), LAYOUT_CASES)
@@ -1460,13 +1478,15 @@ def test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose(
     after laying them out) are contiguous NCHW exactly where Q-273's table puts them, and
     otherwise the render's channels-last view as it comes; and cuDNN autotuning is on while
     the network runs for the networks B-4 turned it on for, unless the step is deterministic,
-    which turns it off, while for the others the flag stays the caller's (Q-73)."""
+    which turns it off, while for the others the flag stays the caller's (Q-73). The network's
+    weights are channels-last exactly where B-4's runs with channels-last weights put them
+    (Q-269, Q-273; #380's review): nowhere, so they stay contiguous NCHW."""
     cudnn = torch.backends.cudnn
-    seen: list[tuple[str, str, bool]] = []
+    seen: list[tuple[str, str, bool, str]] = []
     original = PerceptualLoss.forward
 
     def recording(self: PerceptualLoss, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-        seen.append((_layout(pred), _layout(gt), cudnn.benchmark))
+        seen.append((_layout(pred), _layout(gt), cudnn.benchmark, _weights_layout(self)))
         return original(self, pred, gt)
 
     monkeypatch.setattr(PerceptualLoss, "forward", recording)
@@ -1483,7 +1503,9 @@ def test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose(
     autotuned = net in B4_AUTOTUNED and not deterministic
     layout = "nchw" if (precision, autotuned) in B4_NCHW.get(net, set()) else "channels_last"
     autotuning = False if deterministic else (True if net in B4_AUTOTUNED else caller)
-    assert seen == [(layout, layout, autotuning)]
+    on = (precision, autotuned) in B4_CHANNELS_LAST_WEIGHTS.get(net, set())
+    weights = "channels_last" if on else "nchw"
+    assert seen == [(layout, layout, autotuning, weights)]
 
 
 @pytest.mark.weights

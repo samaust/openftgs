@@ -366,9 +366,16 @@ def _perf_flags(perf: PerfConfig, *, autotune: bool) -> Iterator[None]:
         torch.set_float32_matmul_precision(matmul)
 
 
-# Q-173: the training perceptual network's weights in channels-last memory. Off, as §2.4's
-# perceptual-loss row leaves them: B-4 has measured no network with them since #389 (Q-269).
-_CHANNELS_LAST_WEIGHTS = False
+# Q-173, Q-269, Q-272, Q-273 (owner answer, 2026-10-26, during the #380 build's review): per
+# network, the (perc_precision, autotuned) pairs under which the trainer's network holds its
+# weights channels-last in memory. B-4's two runs with channels-last weights as a third layout for
+# the two Caffe trunks (Calibration data, #380's review) put them within −1.4 to +1.0 % of the
+# render's view with NCHW weights at every precision and autotuning, never Q-272's 3 % in both
+# runs. Against the plain path alexnet_bvlc's autotuning with them meets it (+6.1 to +9.9 %), as
+# autotuning alone does, below the autotuning with NCHW inputs it takes (+14.9 to +18.5 %). So no
+# network and no pair: every network keeps its weights as built, contiguous NCHW, as §2.4's
+# perceptual-loss row leaves them, now measured.
+_CHANNELS_LAST_WEIGHTS: dict[str, frozenset[tuple[str, bool]]] = {}
 
 # Q-273 (Q-223 as changed, #394): per network, the (perc_precision, autotuned) pairs under
 # which the trainer's network gets contiguous NCHW inputs, from B-4's recorded rerun (Calibration
@@ -677,7 +684,11 @@ class Trainer:
             with torch.random.fork_rng(devices=[]):
                 perceptual = _perceptual_network(cfg, self._device)
             perceptual = perceptual.to(self._device)
-            if _CHANNELS_LAST_WEIGHTS:  # Q-173
+            # Q-173, Q-269: channels-last weights where B-4 measured them faster, at the
+            # network's precision and autotuning (none since #380's review).
+            autotuned = _autotunes(cfg, self._device) and not cfg.perf.deterministic
+            pair = (cfg.perf.perc_precision, autotuned)
+            if pair in _CHANNELS_LAST_WEIGHTS.get(cfg.loss.perc_net, frozenset()):
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
         self._autotune = _autotunes(cfg, self._device)  # Q-273: per network, as B-4 measured
