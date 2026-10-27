@@ -1721,8 +1721,9 @@ _WEIGHT_FREE = ("flip", "haarpsi")  # D-89: no pretrained weights, so no bfloat1
 # Q-248: the DINO networks, whose vendored DINOv2 layers need the [init] extra.
 _NEEDS_INIT = ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
 _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52; bfloat16 for the trunk networks only
-# Q-269: the render's batch-first view as it comes, channels-last in memory; and a contiguous
-# NCHW input, the copy the trainer gives a network where B-4 measured it faster (Q-273).
+# Q-269: the render's batch-first view as it comes, channels-last in memory; and contiguous NCHW
+# inputs, copied from the render's layout inside the call as the trainer copies them where B-4
+# measured them faster (Q-273; Q-269 as changed, #427).
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs")
 # Q-269 (owner answer, 2026-10-26): the render's view with the network's weights channels-last
 # too, a copy converted with `to(memory_format=torch.channels_last)`, as LPIPS-VGG's B-4 timed it
@@ -1951,17 +1952,26 @@ def _cudnn_flags(*, tf32: bool, autotuning: bool) -> Iterator[None]:
         torch.set_float32_matmul_precision(matmul)
 
 
-def _perceptual_inputs(gt: Tensor, pred: Tensor, layout: str) -> tuple[Tensor, Tensor]:
-    """The prediction, a leaf that requires its gradient, and the target, in the layout's
-    memory (Q-269): for `channels_last_inputs`, and `channels_last_inputs_and_weights`, whose
-    network is a converted copy (`_channels_last_weights`), [1, H, W, 3] contiguous, as a render
-    comes, whose batch-first view `PerceptualLoss` takes is channels-last; for `nchw` [1, 3, H, W]
-    contiguous, which the trainer would copy a render into, the copy itself left out (B-1 times
-    the whole path)."""
-    if layout == "nchw":
-        x = pred[None].permute(0, 3, 1, 2).contiguous().requires_grad_()
-        return x, gt[None].permute(0, 3, 1, 2).contiguous()
+def _perceptual_inputs(gt: Tensor, pred: Tensor) -> tuple[Tensor, Tensor]:
+    """The prediction, a leaf that requires its gradient, and the target, in every layout as a
+    render comes (Q-269, as changed, #427): [1, H, W, 3] contiguous, whose batch-first view
+    `PerceptualLoss` takes is channels-last. The `nchw` cases copy them inside the timed call
+    (`_perceptual_forward`), as the trainer does."""
     return pred[None].clone().requires_grad_(), gt[None].clone()
+
+
+def _laid_out(x: Tensor, y: Tensor, layout: str) -> tuple[Tensor, Tensor]:
+    """The images the network gets in `layout`: for `nchw` both copied so that the batch-first
+    views `PerceptualLoss.forward` takes of them are contiguous NCHW, as the trainer copies them
+    (`train._NCHWPerceptualLoss`; Q-273), the copy exact; otherwise as they come."""
+    if layout != "nchw":
+        return x, y
+
+    def nchw(image: Tensor) -> Tensor:
+        # [1, H, W, 3] in memory whose batch-first view [1, 3, H, W] is contiguous
+        return image.movedim(-1, -3).contiguous().movedim(-3, -1)
+
+    return nchw(x), nchw(y)
 
 
 def _channels_last_weights(network: Any) -> Any:
@@ -1977,20 +1987,20 @@ def _channels_last_weights(network: Any) -> Any:
 def _perceptual_forward(
     network: Any, x: Tensor, y: Tensor, *, precision: str, layout: str
 ) -> Tensor:
-    """`network` on B-4's inputs as [1, H, W, 3] images (Q-41), an NCHW input through its
-    [1, H, W, 3] view, whose batch-first view is the contiguous input itself; for "bf16" under
-    bfloat16 autocast around the call, the images float32, the value cast to float32, as the
-    trainer runs a trunk network (`train._Bf16PerceptualLoss`; Q-172, Q-250)."""
+    """`network` on B-4's inputs as [1, H, W, 3] images (Q-41), laid out for `layout` inside
+    the call (`_laid_out`), so that the stage `loss.perceptual` times the trainer's copy to
+    NCHW and the prediction's gradient flows back through it in the stage `backward` (Q-269, as
+    changed, #427); for "bf16" under bfloat16 autocast around the copy and the call, the images
+    float32, the value cast to float32, as the trainer runs a trunk network
+    (`train._Bf16PerceptualLoss`, `train._Bf16NCHWPerceptualLoss`; Q-172, Q-250, Q-273)."""
     import torch
 
-    if layout == "nchw":
-        x, y = x.permute(0, 2, 3, 1), y.permute(0, 2, 3, 1)
     if precision == "bf16":
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            value = network(x, y)
+            value = network(*_laid_out(x, y, layout))
         out: Tensor = value.float()
         return out
-    plain: Tensor = network(x, y)
+    plain: Tensor = network(*_laid_out(x, y, layout))
     return plain
 
 
@@ -2003,7 +2013,7 @@ def _perceptual_call(
 
     from openftgs._stages import stage
 
-    x, y = _perceptual_inputs(gt, pred, layout)
+    x, y = _perceptual_inputs(gt, pred)
 
     def call() -> None:
         with stage("loss.perceptual"):
@@ -2190,7 +2200,7 @@ def _perceptual_deviations(net: str, network: Any, images: _Images) -> list[dict
     for (width, height), (gt, pred) in images.items():
         results: dict[str, tuple[Tensor, Tensor]] = {}
         for precision in _precisions(net):
-            x, y = _perceptual_inputs(gt, pred, _DEVIATION_LAYOUT)
+            x, y = _perceptual_inputs(gt, pred)
             with _cudnn_flags(tf32=precision != "ieee", autotuning=False):
                 value = _perceptual_forward(
                     network, x, y, precision=precision, layout=_DEVIATION_LAYOUT
@@ -2236,8 +2246,9 @@ def _ssim_fused_timed(images: _Images) -> dict[tuple[int, int], dict[str, Any]]:
 def _losses(ctx: _Context) -> _Result:
     """B-4 (§3.4, D-52, D-89): each perceptual network of D-89, its forward and the
     prediction's backward in IEEE float32, TF32 and, for the trunk networks, bfloat16, with
-    NCHW inputs and the render's channels-last view, and for the two Caffe trunks with
-    channels-last weights too, with cuDNN autotuning off and on; SSIM
+    NCHW inputs, the trainer's copy from the render's layout timed (Q-269, as changed, #427),
+    and the render's channels-last view, and for the two Caffe trunks with channels-last
+    weights too, with cuDNN autotuning off and on; SSIM
     through fused-ssim and through the PyTorch path; TF32's and bf16's deviation from IEEE
     float32 in value and gradient, per network; at 1352×1014 and 1920×1080 (Q-190, Q-269).
     The trunk networks' weights must be in torch.hub's cache already, and none is downloaded
@@ -2334,6 +2345,12 @@ def _losses(ctx: _Context) -> _Result:
             "to float32, as the trainer runs a trunk network (Q-172, Q-250); TF32 on"
         ),
         "layouts": {net: list(_layouts(net)) for net in networks},
+        "nchw": (
+            "nchw: both images laid out as a render comes and copied inside the timed forward so "
+            "that the batch-first views the network takes are contiguous NCHW, as the trainer "
+            "copies them, the prediction's gradient flowing back through the copy in backward; "
+            "under bf16 the copy inside the autocast (Q-269, Q-273)"
+        ),
         "channels_last_weights": (
             f"{_CHANNELS_LAST_WEIGHTS}: the render's view, with a copy of the network converted "
             "with to(memory_format=torch.channels_last), made once per network; the two Caffe "
