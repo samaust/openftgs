@@ -27,10 +27,13 @@ def _yaml(path: Path) -> Any:
 
 
 def _installs_cpu_torch_then_the_docs_group(commands: list[str]) -> None:
-    """Pip is upgraded (`--group` needs pip 25.1), CPU torch and torchvision come from the CPU
-    index, and only then the package with the docs group, so pip never fetches a CUDA torch."""
+    """Pip is upgraded (`--group` needs pip 25.1), CPU torch comes from the CPU index, and only
+    then the package with the docs group, so pip never fetches a CUDA torch. torchvision isn't
+    installed: no public module imports it since revision 549o (#432), and the site builds
+    without it."""
     torch = next(i for i, c in enumerate(commands) if CPU_INDEX in c)
-    assert "torch" in commands[torch].split() and "torchvision" in commands[torch].split()
+    assert "torch" in commands[torch].split()
+    assert not any("torchvision" in c for c in commands)
     docs = next(i for i, c in enumerate(commands) if "--group docs" in c)
     assert commands[docs].split()[-3:] == [".", "--group", "docs"]
     assert any("--upgrade pip" in c for c in commands[:torch])

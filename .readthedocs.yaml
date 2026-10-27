@@ -11,10 +11,12 @@ build:
     python: "3.11"
   jobs:
     # Replaces the default install step, which no longer upgrades pip; `--group` needs pip 25.1.
-    # Torch comes first, so that installing the package never pulls PyPI's CUDA build.
+    # Torch comes first, so that installing the package never pulls PyPI's CUDA build. No public
+    # module imports torchvision (the vendored RoMa and the DINO networks import it lazily), so
+    # the site builds without it (#432).
     install:
       - python -m pip install --upgrade pip
-      - python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+      - python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
       - python -m pip install . --group docs
 
 sphinx:
