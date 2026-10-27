@@ -1971,10 +1971,12 @@ def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) ->
     assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
     assert setup["layouts"] == {net: list(_layouts(net)) for net in networks}
     assert setup["precisions"] == {net: list(_precisions(net)) for net in networks}
-    # Q-273: what the trainer runs, per network, in an iteration that isn't deterministic:
-    # vgg16_oxford and alexnet_bvlc autotune, and get NCHW inputs where B-4 measured them faster.
+    # Q-273: what the trainer runs, per network and precision, in an iteration that isn't
+    # deterministic: vgg16_oxford autotunes under "tf32" and alexnet_bvlc under "tf32" and "bf16"
+    # (as changed, #428), and they get NCHW inputs where B-4 measured them faster.
+    autotuned = {"vgg16_oxford": ("tf32",), "alexnet_bvlc": ("tf32", "bf16")}
     assert setup["training_autotuning"] == {
-        net: net in ("vgg16_oxford", "alexnet_bvlc") for net in networks
+        net: {p: p in autotuned.get(net, ()) for p in _precisions(net)} for net in networks
     }
     nchw = {"vgg16_oxford": ("ieee", "tf32"), "alexnet_bvlc": ("ieee", "tf32", "bf16")}
     assert setup["training_layout"] == {
