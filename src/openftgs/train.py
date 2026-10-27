@@ -280,17 +280,27 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # Global PyTorch flags around a training iteration (Q-73).
 
-# §2.4's perceptual-loss row, D-52; Q-173 (changed, #394), Q-272, Q-273: the perceptual
-# networks whose training iterations autotune cuDNN unless deterministic, those for which B-4's
-# recorded rerun (Calibration data, #394) measured autotuning with NCHW inputs at least 3 % faster
-# than the plain path at both sizes in both runs: vgg16_oxford +4.7 % / +4.7 % on the CI scene and
-# +3.4 % / +3.0 % on kitchen, alexnet_bvlc +15.0 % / +18.5 % and +15.4 % / +16.7 %. B-4 measured no
-# such gain for the other six, whose iterations leave the flag as the caller set it (Q-73), unless
-# SSIM runs through its PyTorch fallback on CUDA (`_ssim_fallback_on_cuda`), which autotuning made
-# 7 to 11 % faster in both runs (Q-273, owner answer): then every network's iteration autotunes.
-# With no perceptual network the only cuDNN convolutions are the SSIM fallback's, so such an
-# iteration autotunes, as every one did since #326.
-_AUTOTUNED_NETWORKS = frozenset({"vgg16_oxford", "alexnet_bvlc"})
+# §2.4's perceptual-loss row, D-52; Q-173 (changed, #394), Q-272, Q-273 (changed, #428): per
+# perceptual network, the precisions under which its training iterations autotune cuDNN unless
+# deterministic, read from B-4's recorded rerun (#394; the figures in Q-273's row, the "tf32"
+# ones also in the Calibration data) as the layout is: where
+# autotuning is at least 3 % faster than the same layout without it at both sizes in both runs,
+# the layout being the one the network takes at that precision. Under "tf32" it is Q-272's
+# adopted option, autotuning with NCHW inputs, against the plain path: vgg16_oxford +4.7 % /
+# +4.7 % on the CI scene and +3.4 % / +3.0 % on kitchen, alexnet_bvlc +15.0 % / +18.5 % and
+# +15.4 % / +16.7 %. Under "bf16", alexnet_bvlc with NCHW inputs, +82.9 % / +4.5 % and +83.0 % /
+# +4.5 %. Not under "ieee" (vgg16_oxford +1.2 % / +1.2 % and −3.3 % / −3.0 %, alexnet_bvlc −3.0 % /
+# +5.5 % and +9.7 % / −2.0 %), nor vgg16_oxford under "bf16" (+1.6 % / +0.7 % and −2.0 % /
+# +0.6 %), and B-4 measured no such gain for the other six networks. Those networks and
+# precisions leave the flag as the caller set it (Q-73), unless SSIM runs through its PyTorch
+# fallback on CUDA (`_ssim_fallback_on_cuda`), which autotuning made 7 to 11 % faster in both
+# runs (Q-273, owner answer): then every network's iteration autotunes. With no perceptual
+# network the only cuDNN convolutions are the SSIM fallback's, so such an iteration autotunes,
+# as every one did since #326.
+_AUTOTUNED_PRECISIONS: dict[str, frozenset[str]] = {
+    "vgg16_oxford": frozenset({"tf32"}),
+    "alexnet_bvlc": frozenset({"tf32", "bf16"}),
+}
 # Q-42: the window and σ fused-ssim hardcodes (E7's); `losses.ssim` takes its PyTorch fallback for
 # any other.
 _FUSED_SSIM_WINDOW = (11, 1.5)
@@ -383,7 +393,10 @@ _CHANNELS_LAST_WEIGHTS: dict[str, frozenset[tuple[str, bool]]] = {}
 # where it was at least 3 % faster than the render's view at both sizes in both runs, at that
 # precision and autotuning: vgg16_oxford under "ieee" (+10 to +16 %), not under "bf16" (−7 to
 # −12 %) nor in a deterministic "tf32" run (−1 to −5 %); alexnet_bvlc everywhere (+3.5 to +88 %).
-# Every other network and pair takes the render's channels-last view as it comes.
+# Every other network and pair takes the render's channels-last view as it comes. Where
+# `_AUTOTUNED_PRECISIONS` leaves the flag to the caller, vgg16_oxford under "ieee" and "bf16" and
+# alexnet_bvlc under "ieee", both pairs of the precision agree, so the layout is the same whether
+# the caller's flag or the SSIM fallback autotunes or not (Q-273, as changed, #428).
 _NCHW_INPUTS: dict[str, frozenset[tuple[str, bool]]] = {
     "vgg16_oxford": frozenset({("ieee", False), ("ieee", True), ("tf32", True)}),
     "alexnet_bvlc": frozenset(
@@ -436,11 +449,12 @@ def _builds_perceptual(loss: LossConfig) -> bool:
 
 def _autotunes(cfg: TrainConfig, device: torch.device) -> bool:
     """Q-273: whether a training iteration of `cfg` on `device` that isn't deterministic
-    autotunes cuDNN: for the networks B-4 turned it on for, without a perceptual network, and
-    whenever SSIM runs through its PyTorch fallback on CUDA (the owner's answer)."""
+    autotunes cuDNN: for the networks and precisions B-4 turned it on for (as changed, #428),
+    without a perceptual network, and whenever SSIM runs through its PyTorch fallback on CUDA
+    (the owner's answer). Otherwise the iteration leaves the flag as the caller set it (Q-73)."""
     return (
         not _builds_perceptual(cfg.loss)
-        or cfg.loss.perc_net in _AUTOTUNED_NETWORKS
+        or cfg.perf.perc_precision in _AUTOTUNED_PRECISIONS.get(cfg.loss.perc_net, frozenset())
         or _ssim_fallback_on_cuda(cfg.loss, device)
     )
 
@@ -465,9 +479,10 @@ def _check_perceptual(cfg: TrainConfig) -> None:
 
 def _perceptual_network(cfg: TrainConfig, device: torch.device) -> PerceptualLoss:
     """The trainer's perceptual network for `cfg`, on the CPU: with NCHW inputs where
-    `_NCHW_INPUTS` puts them for its precision and its autotuning on `device`, otherwise the
-    render's view as it comes (Q-273); a trunk network under bfloat16 autocast when asked
-    (Q-250; `_check_perceptual` refuses bf16 for the weight-free ones)."""
+    `_NCHW_INPUTS` puts them for its precision and its autotuning on `device`, the autotuning
+    `_autotunes` turns on at that precision, otherwise the render's view as it comes (Q-273);
+    a trunk network under bfloat16 autocast when asked (Q-250; `_check_perceptual` refuses bf16
+    for the weight-free ones)."""
     net, precision = cfg.loss.perc_net, cfg.perf.perc_precision
     autotuned = _autotunes(cfg, device) and not cfg.perf.deterministic
     nchw = (precision, autotuned) in _NCHW_INPUTS.get(net, frozenset())
@@ -691,7 +706,8 @@ class Trainer:
             if pair in _CHANNELS_LAST_WEIGHTS.get(cfg.loss.perc_net, frozenset()):
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
-        self._autotune = _autotunes(cfg, self._device)  # Q-273: per network, as B-4 measured
+        # Q-273: per network and precision, as B-4 measured
+        self._autotune = _autotunes(cfg, self._device)
         self._evaluator: Evaluator | None = None
         self._frames: Prefetcher | None = None  # D-51: training images through the frame cache
         self._placement_wait: _PlacementWait | None = None  # "auto" pending on CUDA (Q-232)
