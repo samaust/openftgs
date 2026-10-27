@@ -791,9 +791,13 @@ def _dino_stand_in(net: str, *, seed: int) -> dict[str, Tensor]:
     return state
 
 
+# The seed of the stand-in tensors `_built_on_stand_in` hands the network.
+DINO_STAND_IN_SEED = 50
+
+
 def _built_on_stand_in(net: PercNet, monkeypatch: pytest.MonkeyPatch) -> PerceptualLoss:
     """`PerceptualLoss(net)` with `openftgs._weights` handing it the stand-in tensors."""
-    stand_in = _dino_stand_in(net, seed=50)
+    stand_in = _dino_stand_in(net, seed=DINO_STAND_IN_SEED)
 
     def trunk_tensors(name: str) -> dict[str, Tensor]:
         assert name == net
@@ -806,7 +810,8 @@ def _built_on_stand_in(net: PercNet, monkeypatch: pytest.MonkeyPatch) -> Percept
 def _d89_trunk_input(image: Tensor, patch: int) -> Tensor:
     """D-89's DINO input, from [..., H, W, 3]: at half resolution, bilinear and antialiased, the
     halved sides rounded half to even (Q-265); centre-cropped to a multiple of the patch;
-    standardized with ImageNet's mean and standard deviation. [B, 3, h, w]."""
+    standardized with ImageNet's mean and standard deviation, rounded to float32 as a network
+    built in float32 holds them, converted or not (Q-265). [B, 3, h, w]."""
     nchw = image.reshape(-1, *image.shape[-3:]).permute(0, 3, 1, 2)
     h, w = nchw.shape[-2:]
     half = (round(h / 2), round(w / 2))
@@ -814,8 +819,8 @@ def _d89_trunk_input(image: Tensor, patch: int) -> Tensor:
     crop_h, crop_w = half[0] // patch * patch, half[1] // patch * patch
     top, left = (half[0] - crop_h) // 2, (half[1] - crop_w) // 2
     cropped = small[..., top : top + crop_h, left : left + crop_w]
-    mean = torch.tensor(IMAGENET_MEAN, dtype=image.dtype).view(1, 3, 1, 1)
-    std = torch.tensor(IMAGENET_STD, dtype=image.dtype).view(1, 3, 1, 1)
+    mean = torch.tensor(IMAGENET_MEAN, dtype=F32).to(image.dtype).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=F32).to(image.dtype).view(1, 3, 1, 1)
     return (cropped - mean) / std
 
 
@@ -833,19 +838,25 @@ def _d89_dino_distance(blocks_x: list[Tensor], blocks_y: list[Tensor]) -> float:
     return total.item()
 
 
-# Q-265: as built in float32, at its rounding; converted to float64, at the Caffe trunks'
-# float64 tolerance (Q-263), which holds openftgs's own part of the path to the oracle.
-DINO_DTYPES = [pytest.param(F32, 1e-5, id="float32"), pytest.param(F64, 1e-10, id="float64")]
+# Q-265: per dtype, the tolerances of the trunk's input and of the value. As built in float32,
+# at its rounding; converted to float64, at the Caffe trunks' float64 tolerance (Q-263), which
+# holds openftgs's own part of the path, the halving, the crop, the standardization and the
+# distance over the tokens, to D-89's row.
+DINO_DTYPE_TOLERANCES = [
+    pytest.param(F32, 1e-6, 1e-5, id="float32"),
+    pytest.param(F64, 1e-10, 1e-10, id="float64"),
+]
 
 
 @needs_init
-@pytest.mark.parametrize(("dtype", "rtol"), DINO_DTYPES)
+@pytest.mark.parametrize(("dtype", "input_tol", "rtol"), DINO_DTYPE_TOLERANCES)
 @pytest.mark.parametrize("shape", [(2, 60, 90, 3), (1, 61, 91, 3)])
 @pytest.mark.parametrize("net", DINO_NETWORKS)
 def test__dino_distance_is_built_as_its_d89_row(
     net: PercNet,
     shape: tuple[int, ...],
     dtype: torch.dtype,
+    input_tol: float,
     rtol: float,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -863,7 +874,7 @@ def test__dino_distance_is_built_as_its_d89_row(
     assert vit.patch_embed.proj.stride == (patch, patch)
     assert len(vit.blocks) == 12
     loaded = dict(vit.named_buffers())  # Q-265: the weights are buffers
-    for key, value in _dino_stand_in(net, seed=50).items():
+    for key, value in _dino_stand_in(net, seed=DINO_STAND_IN_SEED).items():
         assert torch.equal(loaded[key], value), key
     loss.to(dtype)
 
@@ -887,7 +898,8 @@ def test__dino_distance_is_built_as_its_d89_row(
         matches = [
             i
             for i, seen in enumerate(inputs)
-            if seen.shape == expected.shape and torch.allclose(seen, expected, rtol=1e-6, atol=1e-6)
+            if seen.shape == expected.shape
+            and torch.allclose(seen, expected, rtol=input_tol, atol=input_tol)
         ]
         assert len(matches) == 1, (name, [tuple(seen.shape) for seen in inputs])
         calls[name] = matches[0]
@@ -935,7 +947,7 @@ def test__dino_network_keeps_its_weights_out_of_the_state_dict(
     assert loss.state_dict() == {}
     assert list(loss.parameters()) == []
     buffers = dict(loss._dino._vit.named_buffers())
-    for key, value in _dino_stand_in(net, seed=50).items():
+    for key, value in _dino_stand_in(net, seed=DINO_STAND_IN_SEED).items():
         assert torch.equal(buffers[key], value), key
     gt = _pattern((40, 48, 3), 0.0).float()
     pred = _pattern((40, 48, 3), 0.6).float().requires_grad_()
@@ -958,10 +970,10 @@ def test_dino_networks_take_images_of_their_weights_dtype_only(
     loss = _built_on_stand_in(net, monkeypatch)
     image = torch.rand(40, 48, 3, generator=torch.Generator().manual_seed(51))
     for dtype in (F64, torch.float16, torch.bfloat16):
-        with pytest.raises(ValueError, match=rf"takes torch.float32 images, got {dtype}"):
+        with pytest.raises(ValueError, match=rf"takes torch\.float32 images, got {dtype}"):
             loss(image.to(dtype), image.to(dtype))
     loss.to(F64)
-    with pytest.raises(ValueError, match=r"takes torch.float64 images, got torch.float32"):
+    with pytest.raises(ValueError, match=r"takes torch\.float64 images, got torch\.float32"):
         loss(image, image.clone())
 
 

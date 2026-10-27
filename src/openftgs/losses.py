@@ -336,7 +336,8 @@ class _DinoDistance(torch.nn.Module):
     to a multiple of the patch and standardized; the patch tokens after blocks 3, 6, 9 and 12,
     unit-normalized, their squared differences summed over channels, averaged over tokens and
     summed over the blocks. The position embeddings are interpolated by the vendored model's
-    own code."""
+    own code. It computes in its weights' dtype, float32 as built, and holds them as buffers
+    that no `state_dict` carries and `.to()` converts, as the Caffe trunks (Q-263, Q-265)."""
 
     _mean: Tensor
     _std: Tensor
@@ -368,8 +369,9 @@ class _DinoDistance(torch.nn.Module):
         self._vit: Any = vit
         self._net = net
         self._patch = patch
-        mean = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
-        std = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
+        dtype = vit.patch_embed.proj.weight.dtype  # Q-265: the weights' dtype, float32 as built
+        mean = torch.tensor(_IMAGENET_MEAN, dtype=dtype).view(1, 3, 1, 1)
+        std = torch.tensor(_IMAGENET_STD, dtype=dtype).view(1, 3, 1, 1)
         # Buffers, so that `.to(device)` moves them and no call copies them to the device.
         self.register_buffer("_mean", mean, persistent=False)
         self.register_buffer("_std", std, persistent=False)
