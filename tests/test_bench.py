@@ -1730,21 +1730,24 @@ def test__comparison_gives_the_median_gain_of_a_variant() -> None:
 
 
 @pytest.mark.parametrize(
-    ("layout", "memory"),
+    ("layout", "memory", "copied"),
     [
-        ("nchw", torch.contiguous_format),
-        ("channels_last_inputs", torch.channels_last),
-        ("channels_last_inputs_and_weights", torch.channels_last),
+        ("nchw", torch.contiguous_format, True),
+        ("channels_last_inputs", torch.channels_last, False),
+        ("channels_last_inputs_and_weights", torch.channels_last, False),
     ],
 )
-def test__perceptual_inputs_reach_the_network_in_each_layout_without_a_copy(
-    layout: str, memory: torch.memory_format
+def test__perceptual_inputs_reach_the_network_as_training_gives_them(
+    layout: str, memory: torch.memory_format, copied: bool
 ) -> None:
-    """Q-269: a network gets B-4's images as `PerceptualLoss.forward` takes them, [1, H, W, 3]
-    (Q-41), and the batch-first view it makes of them (`docs/modules/losses/terms-and-paths.md`,
-    "Input layout") is contiguous NCHW for `nchw` and channels-last for `channels_last_inputs`
-    (a render's layout), a view of the prediction's leaf itself, so no call copies an input;
-    the gradient is the leaf's."""
+    """Q-269 (as changed, #427), Q-273: in every layout B-4's images are laid out as a render
+    comes, the prediction a contiguous [1, H, W, 3] leaf, and a network gets them as
+    `PerceptualLoss.forward` takes them (Q-41). With the render's view, the batch-first view it
+    makes of them (`docs/modules/losses/terms-and-paths.md`, "Input layout") is channels-last, a
+    view of the inputs themselves; for `nchw` both are copied inside the call, as the trainer
+    copies them, so that the batch-first views are contiguous NCHW. The prediction's gradient,
+    through the copy where there is one, is in the leaf's layout, and is the gradient of the
+    function the network computes."""
     from openftgs.cli._bench import _perceptual_forward, _perceptual_inputs
 
     g = torch.Generator().manual_seed(0)
@@ -1756,7 +1759,10 @@ def test__perceptual_inputs_reach_the_network_in_each_layout_without_a_copy(
         seen.extend((x, y))
         return (x - y).square().mean()
 
-    x, y = _perceptual_inputs(gt, pred, layout)
+    x, y = _perceptual_inputs(gt, pred)
+    for image, values in ((x, pred), (y, gt)):
+        assert image.shape == (1, 6, 10, 3) and image.is_contiguous()  # a render's layout
+        assert torch.equal(image[0], values)
     assert x.requires_grad and x.is_leaf and not y.requires_grad
     value = _perceptual_forward(network, x, y, precision="tf32", layout=layout)
     for image, source, values in zip(seen, (x, y), (pred, gt), strict=True):
@@ -1764,9 +1770,44 @@ def test__perceptual_inputs_reach_the_network_in_each_layout_without_a_copy(
         assert torch.equal(image[0], values)
         batch_first = image.movedim(-1, -3)  # [B, 3, H, W], as PerceptualLoss views [B, H, W, 3]
         assert batch_first.is_contiguous(memory_format=memory)
-        assert batch_first.data_ptr() == source.data_ptr()
+        assert (batch_first.data_ptr() != source.data_ptr()) is copied
     (grad,) = torch.autograd.grad(value, x)
-    assert grad.shape == x.shape
+    assert grad.shape == x.shape and grad.is_contiguous()
+    torch.testing.assert_close(grad, 2.0 * (x - y).detach() / x.numel(), rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("net", ["vgg16_oxford", "alexnet_bvlc"])
+def test__an_nchw_case_is_within_rounding_of_the_renders_view_on_cuda(
+    net: Literal["vgg16_oxford", "alexnet_bvlc"], precision: str
+) -> None:
+    """Q-269 (as changed, #427), Q-273, §2.4 rule 2: on CUDA, a `nchw` case of B-4, whose copy
+    to NCHW is exact, gives the value and the prediction's gradient of the `channels_last_inputs`
+    case within Q-273's bounds for the trainer's NCHW term: the value within 1e-5 relative and
+    the gradient within 1e-3 in relative L2 in IEEE float32, 1e-3 and 0.1 in TF32, which rounds
+    to 10 mantissa bits (Q-223); the two Caffe trunks, the networks the trainer gives NCHW
+    inputs, with B-4's flags and autotuning off."""
+    from openftgs.cli._bench import _cudnn_flags, _perceptual_forward, _perceptual_inputs
+    from openftgs.losses import PerceptualLoss
+
+    g = torch.Generator().manual_seed(427)
+    gt = torch.rand(96, 128, 3, generator=g)
+    pred = (gt + 0.05 * torch.randn(96, 128, 3, generator=g)).clamp(0.0, 1.0)
+    network = PerceptualLoss(net).to("cuda")
+    results: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    with _cudnn_flags(tf32=precision == "tf32", autotuning=False):
+        for layout in ("nchw", "channels_last_inputs"):
+            x, y = _perceptual_inputs(gt.to("cuda"), pred.to("cuda"))
+            value = _perceptual_forward(network, x, y, precision=precision, layout=layout)
+            (grad,) = torch.autograd.grad(value, x)
+            results[layout] = (value.detach(), grad)
+    (value, grad), (value_view, grad_view) = results["nchw"], results["channels_last_inputs"]
+    rtol, gtol = (1e-3, 0.1) if precision == "tf32" else (1e-5, 1e-3)
+    torch.testing.assert_close(value, value_view, rtol=rtol, atol=0.0)
+    difference = torch.linalg.vector_norm((grad - grad_view).double())
+    assert float(difference) <= gtol * float(torch.linalg.vector_norm(grad_view.double()))
 
 
 def test__channels_last_weights_copies_the_network_with_its_4d_tensors_channels_last() -> None:
@@ -1970,6 +2011,8 @@ def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) ->
     assert setup["sizes"] == [list(size) for size in LOSS_SIZES]
     assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
     assert setup["layouts"] == {net: list(_layouts(net)) for net in networks}
+    # Q-269 (as changed, #427): the nchw cases time the trainer's copy
+    assert "copied inside the timed forward" in setup["nchw"]
     assert setup["precisions"] == {net: list(_precisions(net)) for net in networks}
     # Q-273: what the trainer runs, per network, in an iteration that isn't deterministic:
     # vgg16_oxford and alexnet_bvlc autotune, and get NCHW inputs where B-4 measured them faster.
