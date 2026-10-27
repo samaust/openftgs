@@ -593,6 +593,32 @@ def test_flip_takes_float32_images_only(dtype: torch.dtype) -> None:
         PerceptualLoss("flip")(image, image.clone())
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("net", ["flip", "haarpsi"])
+def test_weight_free_networks_compute_in_the_images_dtype_under_autocast(
+    net: PercNet, dtype: torch.dtype
+) -> None:
+    """Q-275 (#430): under a caller's `torch.autocast`, `flip` and `haarpsi` still compute in
+    their images' dtype (Q-261), float32 here: the value is float32, and it and the render's
+    gradient are bitwise those of the call without autocast."""
+    pred, gt = _image_pair((1, 64, 96, 3), seed=47, correlated=True, dtype=F32)
+    loss = PerceptualLoss(net)
+
+    def value_and_gradient(autocast: bool) -> tuple[Tensor, Tensor]:
+        image = pred.clone().requires_grad_(True)
+        with torch.autocast("cpu", dtype=dtype, enabled=autocast):
+            value = loss(image, gt)
+        value.backward()
+        assert image.grad is not None
+        return value.detach(), image.grad
+
+    plain_value, plain_gradient = value_and_gradient(autocast=False)
+    value, gradient = value_and_gradient(autocast=True)
+    assert value.dtype == F32
+    assert torch.equal(value, plain_value)
+    assert torch.equal(gradient, plain_gradient)
+
+
 @pytest.mark.parametrize("net", [*WITH_DINO, *CAFFE_PARAMS])
 def test_u9_perceptual_network_gradient_is_finite_on_a_render_above_one(net: PercNet) -> None:
     """U-9 (E7: Î isn't clamped, so it can exceed 1): the gradient with respect to a render
