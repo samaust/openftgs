@@ -21,8 +21,8 @@ The backend follows the device: gsplat on a CUDA device, which D-76 requires of 
 `step()` runs inside the range `iteration`, which B-1 times as the whole iteration, and its stages run inside that range, in order (§3.4; the fixed list of names is `openftgs._stages.STAGES`):
 
 - `data`: taking the image, the data wait of B-6;
-- `slice`, in `at_time`: `slice.kernel` around the temporal slice's call (never inside the compiled function, D-50), then `slice.sh_concat`;
-- `raster.forward`, in `render` after the slice, compaction included; on gsplat it holds `raster.forward.projection`, `raster.forward.sh`, `raster.forward.isect` and `raster.forward.rasterize`;
+- `slice`, in `render`: `slice.kernel` around the temporal slice's call (never inside the compiled function, D-50); on the reference backend the slice is `at_time`'s, and `slice.sh_concat` follows, the SH coefficients of every row;
+- `raster.forward`, in `render` after the slice, compaction included; on gsplat it holds `raster.forward.projection`, `raster.forward.sh_gather`, `raster.forward.sh`, `raster.forward.isect` and `raster.forward.rasterize`. `raster.forward.sh_gather` gathers `sh0` and `shN`, cut to the requested degree, for the rows the SH evaluation receives and concatenates them: the visible rows packed, every row (the kept ones after compaction) unpacked. Since #423 a gsplat iteration builds no concat over every row (Q-274);
 - `loss.l1`, `loss.ssim`, `loss.perceptual` and `loss.reg`, in `total_loss`, each only when its λ is above 0;
 - `backward`, `statistics`, `adam`, `events` and `log`.
 
