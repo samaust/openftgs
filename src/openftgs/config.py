@@ -18,11 +18,14 @@ from dataclasses import dataclass, field
 from types import UnionType
 from typing import Any, ClassVar, Literal, Union, get_args, get_origin, get_type_hints
 
+from openftgs._legacy import LPIPS_BACKBONES
+
 __all__ = [
     "GrowthConfig",
     "InitConfig",
     "LossConfig",
     "OptimConfig",
+    "PercNet",
     "PerfConfig",
     "RelocConfig",
     "TrainConfig",
@@ -73,6 +76,20 @@ class InitConfig:  # §1.3 Initialization
         _check_positive(self, "scale_floor")
 
 
+PercNet = Literal[
+    "flip", "haarpsi", "vgg16_oxford", "alexnet_bvlc",
+    "dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16",
+]  # D-89  # fmt: skip
+"""The names of D-89's eight perceptual networks, which ``LossConfig.perc_net`` selects (D-9).
+
+``"flip"``, the default, is NVIDIA's LDR-ꟻLIP and ``"haarpsi"`` is 1 − HaarPSI, both without
+weights. ``"vgg16_oxford"`` and ``"alexnet_bvlc"`` are lpips's uncalibrated distance on Oxford's
+VGG16 and BVLC's AlexNet, and ``"dinov2_s14"``, ``"dinov2_b14"``, ``"dino_s16"`` and
+``"dino_b16"`` compare DINOv2's and DINO's patch tokens; these six trunk networks download their
+weights at first use (§2.3; Q-258). See :class:`openftgs.losses.PerceptualLoss`.
+"""
+
+
 @dataclass
 class LossConfig:  # E7–E9
     """Weights and forms of the training loss (E7–E9).
@@ -84,7 +101,9 @@ class LossConfig:  # E7–E9
     lambda_ssim
         The weight λ_ssim of the SSIM loss 1 − SSIM, ≥ 0 [P §3.3].
     lambda_perc
-        The weight λ_perc of the perceptual loss, LPIPS, ≥ 0 [P §3.3].
+        The weight λ_perc of the perceptual loss, ≥ 0, or None, the default, for the
+        calibrated weight of ``perc_net`` (0.415 for ``"flip"``); 0 trains without a perceptual
+        term [D-9, D-89; Q-249].
     lambda_reg
         The weight λ_reg of the 4D regularization, ≥ 0; 0 turns it off [P §3.3].
     reg_until
@@ -97,33 +116,46 @@ class LossConfig:  # E7–E9
         ``"valid"`` evaluates SSIM only where the window fits inside the image, ``"same"`` pads
         with zeros [D-8].
     perc_net
-        The perceptual loss's LPIPS backbone, VGG or AlexNet [D-9].
+        The perceptual network, one of :data:`PercNet`'s eight names; ``"flip"``, LDR-ꟻLIP, by
+        default [D-9, D-89].
 
     Raises
     ------
     ValueError
         If a field has the wrong type or lies outside its range, naming its dotted path (Q-10,
         Q-11). An int is accepted for a float field and converted; a bool is refused for a
-        numeric field.
+        numeric field. ``perc_net`` "vgg" or "alex", the backbones of the perceptual loss
+        before revision 549o, is refused with a message naming 549o (D-89; Q-247).
     """
 
     lambda_img: float = 0.8  # P §3.3
     lambda_ssim: float = 0.2  # P §3.3
-    lambda_perc: float = 0.01  # P §3.3
+    lambda_perc: float | None = None  # D-9: None = perc_net's calibrated weight (D-89)
     lambda_reg: float = 1e-2  # P §3.3
     reg_until: int | None = None  # D-10: last iteration with L_reg; None = whole run
     ssim_window: int = 11  # D-8
     ssim_sigma: float = 1.5  # D-8
     ssim_padding: Literal["valid", "same"] = "valid"  # D-8
-    perc_net: Literal["vgg", "alex"] = "vgg"  # D-9
+    perc_net: PercNet = "flip"  # D-9
 
     _prefix: ClassVar[str] = "loss."
 
     def __post_init__(self) -> None:
         """Check the fields' types and ranges (Q-10, Q-11)."""
+        # #375 (decided item 3), Q-247: LPIPS's backbones, the names before 549o, are refused
+        # naming the revision, before the generic Literal check would.
+        if self.perc_net in LPIPS_BACKBONES:
+            _fail(
+                self,
+                "perc_net",
+                f"is one of LPIPS's backbones, which revision 549o of the spec retired (D-9, "
+                f"D-89): choose one of D-89's networks {get_args(PercNet)}, 'flip' by default",
+            )
         _check_types(self)
         # Q-11
-        _check_non_negative(self, "lambda_img", "lambda_ssim", "lambda_perc", "lambda_reg")
+        _check_non_negative(self, "lambda_img", "lambda_ssim", "lambda_reg")
+        if self.lambda_perc is not None:
+            _check_non_negative(self, "lambda_perc")
         if self.reg_until is not None:
             _check_non_negative(self, "reg_until")
         _check_count(self, "ssim_window")
@@ -379,7 +411,9 @@ class PerfConfig:  # §2.4 Settings
         (§2.4 rule 3; Q-69); untagged in §2.4.
     perc_precision
         The precision of the perceptual loss: ``"tf32"``, ``"ieee"`` float32, or ``"bf16"``,
-        which is approximate [D-52].
+        which is approximate and for the six trunk networks only: a :class:`TrainConfig` with
+        ``"bf16"`` and ``loss.perc_net`` ``"flip"`` or ``"haarpsi"`` is valid, but the trainer
+        refuses it when it builds the network [D-52; Q-250, Q-267].
     adam
         Adam's implementation: PyTorch's ``"fused"`` or ``"foreach"``, or gsplat's
         ``"selective"``, which is approximate [D-53].

@@ -20,11 +20,13 @@ METRICS.json when present, and writes, as JSON (default `RUN_DIR/SUMMARY.json`):
 - `checkpoints`: per checkpoint, in order of iteration, its iteration, N, the mean base opacity
   σ = sigmoid(opacity logit), its histogram in 10 equal bins of [0, 1] and the share σ > 0.9:
   D-10's opacity trace, where a cutoff of the regularization shows as a rise in mean opacity;
-- `metrics`: METRICS.json's split, LPIPS backbone label and scene means over the entire images,
-  and its `dynamic` and `fastest_10` blocks without their per-image rows; null without one. With
-  `--fastest N0:N1`, a range of 10 frames, also `fastest_10_derived`: the means over the
-  per-image rows with N0 ≤ frame_index < N1, entire and dynamic, as `ftgs eval` writes
-  `fastest_10` for a manifest that carries the range, for a scene whose manifest has none
+- `metrics`: METRICS.json's version, split and scene means over the entire images, a version-1
+  file's LPIPS backbone label, and its `dynamic` and `fastest_10` blocks without their per-image
+  rows; null without one. Versions 1 (M17's runs, LPIPS) and 2 (since 549o, ꟻLIP) are read, and
+  `version` says which; a file of another version or format is exit 2 (Q-256). With
+  `--fastest N0:N1`, a range of 10 frames, also `fastest_10_derived`: the means of the file's own
+  metrics over the per-image rows with N0 ≤ frame_index < N1, entire and dynamic, as `ftgs eval`
+  writes `fastest_10` for a manifest that carries the range, for a scene whose manifest has none
   (studio's, Q-222);
 - `wall`: with `--time`, the elapsed wall time in seconds and the peak resident memory in KiB
   from `/usr/bin/time -v`'s report; with `--gpu-log`, the peak of the MiB values that
@@ -45,12 +47,14 @@ from typing import Any
 
 import torch
 
-from openftgs.eval import METRIC_NAMES, average_metrics
+from openftgs.eval import average_metrics
 from openftgs.io import load_checkpoint
 
 _BINS = 10  # Q-220: D-10's opacity trace as a 10-bin histogram of σ over [0, 1]
 _HIGH = 0.9  # Q-220: the share of primitives above it, as S-5 counts them
 _FASTEST_COUNT = 10  # D-69: the range holds the 10 fastest frames
+_FORMAT = "ftgs-metrics"  # Q-63: METRICS.json's format tag
+_VERSIONS = (1, 2)  # Q-256: version 1 (LPIPS, with its backbone label) and version 2 (ꟻLIP)
 
 
 def _n_trace(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
@@ -105,18 +109,20 @@ def _checkpoint(directory: Path) -> dict[str, Any]:
     }
 
 
-def _fastest_means(rows: list[dict[str, Any]], fastest: tuple[int, int]) -> dict[str, Any]:
+def _fastest_means(
+    rows: list[dict[str, Any]], fastest: tuple[int, int], names: list[str]
+) -> dict[str, Any]:
     # Q-222: the means eval.metrics_report gives a fastest_10 range, over the rows inside it
-    # that carry values (a skipped dynamic row has none).
+    # that carry values (a skipped dynamic row has none); Q-256: of the file's own metrics.
     n0, n1 = fastest
     inside = [
-        {name: float(r[name]) for name in METRIC_NAMES}
+        {name: float(r[name]) for name in names}
         for r in rows
         if r.get("frame_index") is not None
         and n0 <= int(r["frame_index"]) < n1
-        and all(r.get(name) is not None for name in METRIC_NAMES)
+        and all(r.get(name) is not None for name in names)
     ]
-    return average_metrics(inside) if inside else dict.fromkeys(METRIC_NAMES)
+    return average_metrics(inside) if inside else dict.fromkeys(names)
 
 
 def _metrics(path: Path, fastest: tuple[int, int] | None = None) -> dict[str, Any] | None:
@@ -125,18 +131,23 @@ def _metrics(path: Path, fastest: tuple[int, int] | None = None) -> dict[str, An
             raise ValueError(f"--fastest needs the run's METRICS.json, and {path} isn't a file")
         return None
     body = json.loads(path.read_text())
-    out: dict[str, Any] = {
-        "split": body["split"],
-        "lpips_backbone": body["lpips_backbone"],
-        "count": len(body["entire"]["images"]),
-        "entire": body["entire"]["scene"],
-    }
+    version = body.get("version")
+    if body.get("format") != _FORMAT or version not in _VERSIONS:  # Q-256
+        raise ValueError(
+            f"{path} isn't a METRICS.json of version 1 or 2: format {body.get('format')!r}, "
+            f"version {version!r}"
+        )
+    out: dict[str, Any] = {"version": version, "split": body["split"]}
+    if version == 1:  # Q-62: version 1 labels the backbone the paper reports
+        out["lpips_backbone"] = body["lpips_backbone"]
+    out |= {"count": len(body["entire"]["images"]), "entire": body["entire"]["scene"]}
     if "dynamic" in body:
         out["dynamic"] = {k: v for k, v in body["dynamic"].items() if k != "images"}
     if "fastest_10" in body:
         out["fastest_10"] = body["fastest_10"]
     if fastest is not None:
         n0, n1 = fastest
+        names = [str(name) for name in body["metrics"]]  # Q-63: the file's metric names
         entire = body["entire"]["images"]
         derived: dict[str, Any] = {
             "range": [n0, n1],
@@ -145,10 +156,10 @@ def _metrics(path: Path, fastest: tuple[int, int] | None = None) -> dict[str, An
                 for r in entire
                 if r.get("frame_index") is not None and n0 <= int(r["frame_index"]) < n1
             ),
-            "entire": _fastest_means(entire, fastest),
+            "entire": _fastest_means(entire, fastest, names),
         }
         if "dynamic" in body:
-            derived["dynamic"] = _fastest_means(body["dynamic"]["images"], fastest)
+            derived["dynamic"] = _fastest_means(body["dynamic"]["images"], fastest, names)
         derived["source"] = "derived from METRICS.json's per-image rows (Q-222)"
         out["fastest_10_derived"] = derived
     return out

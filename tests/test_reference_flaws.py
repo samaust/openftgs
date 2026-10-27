@@ -21,7 +21,7 @@ from typing import Any, Literal
 import numpy as np
 import pytest
 import torch
-from builders import look_at, model_from_rows, pinhole
+from builders import look_at, model_from_rows, pinhole, pre_549o_checkpoint
 from exr_writer import write_exr
 from PIL import Image
 
@@ -317,6 +317,25 @@ def test_run_reports_psnr_with_and_without_the_flagged_pixels(
     overall = result["overall"]
     assert overall["frames"] == _FRAMES
     assert overall["psnr"] == pytest.approx(np.mean([f["psnr"] for f in result["frames"]]))
+
+
+def test_run_reads_a_checkpoint_saved_before_549o(tmp_path: Path) -> None:
+    """Q-271 (Q-247): a checkpoint whose configuration names LPIPS-VGG, as those saved
+    before revision 549o do, is scored as the same checkpoint at 549o's configuration: the
+    script reads only its model, its SH degree and the background it trained against."""
+    scene, gt, checkpoint = _flawed_scene(tmp_path)
+    legacy = pre_549o_checkpoint(checkpoint, tmp_path / "legacy")
+    module = _module()
+    flags = tmp_path / "reference"
+    assert module.main(["scene", str(scene), str(gt), "--out", str(flags)]) == 0
+    results = []
+    for model in (checkpoint, legacy):
+        out = tmp_path / f"{model.name}.json"
+        assert module.main(["run", str(model), str(scene), str(flags / "flags"),
+                            "--out", str(out), "--backend", "reference"]) == 0  # fmt: skip
+        results.append(json.loads(out.read_text()))
+    now, before = results
+    assert (before["frames"], before["overall"]) == (now["frames"], now["overall"])
 
 
 def test_scene_leaves_out_what_the_other_camera_doesnt_see(tmp_path: Path) -> None:

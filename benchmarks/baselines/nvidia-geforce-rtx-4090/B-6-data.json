@@ -8,7 +8,7 @@
   "data",
   "/home/auss/datasets/openftgs-m15/ci-scene/scene.json",
   "--out",
-  "/home/auss/datasets/openftgs-m15/bench/ci-369-2/B-6-data.json"
+  "/tmp/claude-1000/-home-auss-git-repos-samaust-openftgs/1b5982bb-363c-4bde-8cc3-ea14bf605e75/scratchpad/impl-394/bench-394/B-6-data.json"
  ],
  "environment": {
   "gpu": {
@@ -24,7 +24,7 @@
   "python": "3.14.9",
   "openftgs": "0.1.0.dev0",
   "cpu": "12th Gen Intel(R) Core(TM) i9-12900",
-  "commit": "4cd737d1da5d405195c08676b3c7fef200b88c66",
+  "commit": "12e715d8de8f2c0a124061beca93bb0a5d92b4b1",
   "dirty": false
  },
  "scene": {
@@ -35,7 +35,7 @@
   "width": 1352,
   "height": 1014
  },
- "date": "2026-10-23T04:04:31+00:00",
+ "date": "2026-10-26T19:23:56+00:00",
  "setup": {
   "model": "synthesized (Q-168, Q-181)",
   "seed": 0,
@@ -67,7 +67,7 @@
     null
    ]
   ],
-  "configuration": "B-1's (#226): the default, LPIPS-VGG included, except growth.start = reloc.start = 100, growth.n_max = \u23081.02\u00b7N\u2309 and optim.sh_interval = 1; with the case's perf.frame_cache and perf.prefetch",
+  "configuration": "B-1's (#226): the default, \ua7fbLIP included at its calibrated weight, except growth.start = reloc.start = 100, growth.n_max = \u23081.02\u00b7N\u2309 and optim.sh_interval = 1; with the case's perf.frame_cache and perf.prefetch",
   "frame_cache": "built before timing",
   "gpu": "measured where \"auto\" would place the cache on the GPU (Q-99, Q-225, Q-232): a trainer decoding PNGs runs until the iteration that follows the first at the last training image size to appear (the second for one size), and the free memory, the working memory that iteration left reserved and growth are read after it",
   "warmup": 120,
@@ -94,16 +94,16 @@
      "n": 1000000,
      "placement": "gpu"
     },
-    "reason": "\"auto\" would memory-map the cache (Q-99, Q-225): its 23.44 GB exceed half the 23.58 GB free after a warm-up iteration less its 5.71 GB of working memory, less growth's 0.021 GB",
+    "reason": "\"auto\" would memory-map the cache (Q-99, Q-225): its 23.44 GB exceed half the 23.04 GB free after a warm-up iteration less its 0.74 GB of working memory, less growth's 0.021 GB",
     "estimate": {
-     "auto_free_bytes": 23584433664,
+     "auto_free_bytes": 23038738944,
      "auto_growth_bytes": 20640000,
-     "auto_allocated_bytes": 835983872,
-     "auto_reserved_bytes": 6541017088,
+     "auto_allocated_bytes": 796900864,
+     "auto_reserved_bytes": 1537212416,
      "auto_total_bytes": 25249579008,
-     "auto_outside_bytes": 829161472,
+     "auto_outside_bytes": 1413939200,
      "cache_bytes": 23442868800,
-     "auto_limit_bytes": 8919060224.0
+     "auto_limit_bytes": 11128573696.0
     }
    },
    {
@@ -111,16 +111,16 @@
      "n": 3000000,
      "placement": "gpu"
     },
-    "reason": "\"auto\" would memory-map the cache (Q-99, Q-225): its 23.44 GB exceed half the 22.00 GB free after a warm-up iteration less its 5.96 GB of working memory, less growth's 0.062 GB",
+    "reason": "\"auto\" would memory-map the cache (Q-99, Q-225): its 23.44 GB exceed half the 21.47 GB free after a warm-up iteration less its 2.29 GB of working memory, less growth's 0.062 GB",
     "estimate": {
-     "auto_free_bytes": 21995126272,
+     "auto_free_bytes": 21468888064,
      "auto_growth_bytes": 61920000,
-     "auto_allocated_bytes": 2395931136,
-     "auto_reserved_bytes": 8355053568,
+     "auto_allocated_bytes": 2345780224,
+     "auto_reserved_bytes": 4632608768,
      "auto_total_bytes": 25249579008,
-     "auto_outside_bytes": 858521600,
+     "auto_outside_bytes": 1434910720,
      "cache_bytes": 23442868800,
-     "auto_limit_bytes": 7956081920.0
+     "auto_limit_bytes": 9529109760.0
     }
    }
   ]
@@ -133,16 +133,16 @@
     "prefetch": 8
    },
    "figures": {
-    "data_share": 0.00036675072932506865,
-    "data_mean_s": 3.6643436239710684e-05,
-    "data_median_s": 3.662109375035527e-05,
-    "iteration_mean_s": 0.09991373788716275,
+    "data_share": 0.0021079228792919512,
+    "data_mean_s": 3.681133947491391e-05,
+    "data_median_s": 3.686523437496092e-05,
+    "iteration_mean_s": 0.017463323652181617,
     "iterations": 198,
-    "data_host_mean_s": 5.425067413880518e-05,
-    "iteration_host_mean_s": 0.09803875447650713,
+    "data_host_mean_s": 6.0099856739844936e-05,
+    "iteration_host_mean_s": 0.017186286694586578,
     "host_iterations": 99,
-    "peak_allocated_bytes": 6587269120,
-    "peak_reserved_bytes": 6878658560
+    "peak_allocated_bytes": 1866613760,
+    "peak_reserved_bytes": 2181038080
    }
   },
   {
@@ -152,16 +152,16 @@
     "prefetch": 0
    },
    "figures": {
-    "data_share": 0.00046311058599091717,
-    "data_mean_s": 4.625522355189602e-05,
-    "data_median_s": 3.6132812500255795e-05,
-    "iteration_mean_s": 0.0998794347421875,
+    "data_share": 0.0026464265714037745,
+    "data_mean_s": 4.5645794262065495e-05,
+    "data_median_s": 3.686523437496092e-05,
+    "iteration_mean_s": 0.017248086440521594,
     "iterations": 198,
-    "data_host_mean_s": 0.0004431523048704622,
-    "iteration_host_mean_s": 0.09797588590240915,
+    "data_host_mean_s": 0.0004378526361019473,
+    "iteration_host_mean_s": 0.017032517346017288,
     "host_iterations": 99,
-    "peak_allocated_bytes": 6552023552,
-    "peak_reserved_bytes": 6891241472
+    "peak_allocated_bytes": 1833303552,
+    "peak_reserved_bytes": 2160066560
    }
   },
   {
@@ -170,16 +170,16 @@
     "placement": "off"
    },
    "figures": {
-    "data_share": 0.02073318524143122,
-    "data_mean_s": 0.002115932523719774,
-    "data_median_s": 0.0017673339843757851,
-    "iteration_mean_s": 0.1020553522809171,
+    "data_share": 0.6354495577758635,
+    "data_mean_s": 0.031809882880578906,
+    "data_median_s": 0.03299438476562466,
+    "iteration_mean_s": 0.05005886382534697,
     "iterations": 198,
-    "data_host_mean_s": 0.036298025766919095,
-    "iteration_host_mean_s": 0.10033716565595394,
+    "data_host_mean_s": 0.03832371932139263,
+    "iteration_host_mean_s": 0.04591272928460379,
     "host_iterations": 99,
-    "peak_allocated_bytes": 6551486464,
-    "peak_reserved_bytes": 6870269952
+    "peak_allocated_bytes": 1834108928,
+    "peak_reserved_bytes": 2139095040
    }
   }
  ],
@@ -192,7 +192,7 @@
    },
    "figure": "data_share",
    "limit": 0.01,
-   "value": 0.00036675072932506865,
+   "value": 0.0021079228792919512,
    "pass": true,
    "kind": "budget"
   },
@@ -204,7 +204,7 @@
    },
    "figure": "data_share",
    "limit": 0.01,
-   "value": 0.00046311058599091717,
+   "value": 0.0026464265714037745,
    "pass": true,
    "kind": "budget"
   }

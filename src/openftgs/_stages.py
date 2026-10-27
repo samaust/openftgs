@@ -39,11 +39,12 @@ STAGES: tuple[str, ...] = (
     # A training iteration (`Trainer.step`; §3.4 B-1, B-6), timed on CUDA events.
     "iteration",
     "data",  # the data wait (B-6)
-    "slice",  # the temporal slice and the SH concat (`at_time`)
+    "slice",  # the temporal slice, with the SH concat on the reference backend (`at_time`)
     "slice.kernel",
     "slice.sh_concat",
     "raster.forward",  # pre-culling by compaction included (D-57)
     "raster.forward.projection",
+    "raster.forward.sh_gather",  # the SH of the rows the SH evaluation receives (Q-274, #423)
     "raster.forward.sh",
     "raster.forward.isect",
     "raster.forward.rasterize",

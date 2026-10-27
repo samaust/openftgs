@@ -2,7 +2,8 @@
 """`ftgs bench` (§2.1 CLI line and exit codes; §3.4): the subcommands and their B-n, the exit
 codes and BENCH.json (Q-166), `--model` on `train-step` and `render` (D-88), B-1 (`bench
 train-step`; D-49, D-50, Q-185), B-2 (`bench raster`; D-57, U-8, Q-187), B-3 (`bench slice`;
-D-50, Q-13), B-4 (`bench losses`; D-52, Q-173, Q-190), B-5 (`bench adam`; D-53, Q-188),
+D-50, Q-13), B-4 (`bench losses`; D-52, D-89, Q-173, Q-190, Q-253, Q-269, Q-270),
+B-5 (`bench adam`; D-53, Q-188),
 B-6 (`bench data`; D-51, Q-99, Q-178, Q-189), B-7 (`bench render`; D-55, Q-174, Q-194,
 Q-195, Q-239, Q-240), B-8 (`bench init` and `bench convert`; D-48,
 D-56, D-81, Q-169, Q-192, Q-193), the seeded model synthesizer of the benchmark
@@ -20,6 +21,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -58,6 +60,8 @@ SUBCOMMANDS = (
     "init",
     "convert",
 )
+# The [init] extra: the DINO networks (Q-248) and `bench init` (Q-192) need it.
+has_init_extra = all(importlib.util.find_spec(m) for m in ("einops", "loguru", "torchvision"))
 
 
 @pytest.fixture(autouse=True)
@@ -839,9 +843,11 @@ def test_bench_slice_refuses_a_single_timestamp_scene_and_an_unwritable_out(
 
 
 def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> None:
-    """#226: the default configuration, LPIPS-VGG included, except that growth and relocation
-    start at iteration 100, n_max = ⌈1.02·N⌉ and sh_interval = 1; so the timed iterations 121 to
-    420 hold exactly the events at 200, 300 and 400, all at SH degree 3."""
+    """#226, #389 (Q-168): the default configuration, ꟻLIP included at its calibrated weight
+    (D-89; `perc_net` "flip" and `lambda_perc` None, `LossConfig`'s defaults since #392),
+    except that growth and relocation start at iteration 100, n_max = ⌈1.02·N⌉ and
+    sh_interval = 1; so the timed iterations 121 to 420 hold exactly the events at 200, 300 and
+    400, all at SH degree 3."""
     from openftgs.cli._bench import _train_step_config
     from openftgs.config import TrainConfig
     from openftgs.train import calendar_entry
@@ -853,9 +859,9 @@ def test__train_step_config_starts_events_at_100_with_2_percent_headroom() -> No
     assert _train_step_config(3_000_000).growth.n_max == 3_060_000
     assert _train_step_config(101).growth.n_max == 104  # ⌈103.02⌉
     assert _train_step_config(100).growth.n_max == 102  # exactly 102: no rounding up
-    assert (cfg.loss.lambda_perc, cfg.loss.perc_net) == (0.01, "vgg")
+    assert (cfg.loss.lambda_perc, cfg.loss.perc_net) == (None, "flip")
     assert cfg.sh_degree == 3 and _train_step_config(10, sh_degree=1).sh_degree == 1
-    # Everything else is the default.
+    # Everything else is the default, the loss included.
     assert cfg.loss == default.loss and cfg.perf == default.perf and cfg.init == default.init
     assert cfg.growth.stop == default.growth.stop and cfg.reloc.stop == default.reloc.stop
     assert cfg.optim.iterations == default.optim.iterations
@@ -938,18 +944,20 @@ def test__training_bound_counts_the_default_calendars_iterations_and_events() ->
 
 
 # B-1 run on the small scene with reduced sizes (#226: "a test on a small scene, with reduced
-# sizes, checks the layout"): two synthesized models, and once with `--model`. The default
-# configuration holds LPIPS-VGG, so these need its weights.
+# sizes, checks the layout"): two synthesized models, and once with `--model`. The configuration
+# holds ꟻLIP, which needs no weights (#389).
 
 TRAIN_STEP_CASES = ((300, 0.2), (400, 0.05))
+# Q-274 (#423): the gsplat backend's SH gather of the rows its SH evaluation receives, in place
+# of the slice's concat over every row, which a training iteration no longer runs.
 TRAINING_STAGES = (
     "iteration",
     "data",
     "slice",
     "slice.kernel",
-    "slice.sh_concat",
     "raster.forward",
     "raster.forward.projection",
+    "raster.forward.sh_gather",
     "raster.forward.sh",
     "raster.forward.isect",
     "raster.forward.rasterize",
@@ -991,7 +999,6 @@ def _cases_by(body: dict[str, Any]) -> dict[tuple[tuple[str, Any], ...], dict[st
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__train_step_times_every_stage_and_bounds_a_training_run(
     train_step_bench: dict[str, Any],
 ) -> None:
@@ -1014,6 +1021,8 @@ def test__train_step_times_every_stage_and_bounds_a_training_run(
     assert (setup["training_iterations"], setup["default_events"]) == (30_000, 246)
     cases = _cases_by(body)
     for n, active in TRAIN_STEP_CASES:
+        # Q-274 (#423): no training iteration concatenates the SH of every row
+        assert (("active", active), ("n", n), ("stage", "slice.sh_concat")) not in cases
         for name in TRAINING_STAGES + BACKWARD_PARTS:
             figures = cases[(("active", active), ("n", n), ("stage", name))]
             assert set(figures) == {"mean_s", "median_s", "share", "count"}, name
@@ -1064,7 +1073,6 @@ def test__train_step_times_every_stage_and_bounds_a_training_run(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b1_takes_a_model(train_step_model_bench: dict[str, Any]) -> None:
     """D-88, #226: with `--model`, B-1 times that model, at its SH degree, as its one case,
     which carries the bound."""
@@ -1452,7 +1460,7 @@ def test__data_budgets_hold_the_cache_placements_under_1_percent() -> None:
 
 # B-6 run on the small scene with reduced sizes, as B-1's tests (#226): every placement at 300
 # rows and the GPU cache at 400 for Q-99's note; then with a cache too large for "auto" to place
-# on the GPU. The default configuration holds LPIPS-VGG, so these need its weights.
+# on the GPU. B-1's configuration holds ꟻLIP, which needs no weights (#389).
 
 DATA_N, MEMORY_N = 300, 400
 
@@ -1469,7 +1477,6 @@ def data_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[st
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) -> None:
     """A private test of `_data` at reduced sizes (`_DATA_N` and `_MEMORY_N` patched): §3.4 B-6
     itself is the recorded BENCH.json runs, not this test. D-51 (#232, Q-189): with B-1's
@@ -1536,7 +1543,6 @@ def test__data_shares_the_data_wait_per_placement(data_bench: dict[str, Any]) ->
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__data_skips_the_gpu_placement_where_auto_would_not_choose_it(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1568,8 +1574,106 @@ def test__data_skips_the_gpu_placement_where_auto_would_not_choose_it(
     assert [b["case"] for b in body["budgets"]] == [want]
 
 
-# B-4, `ftgs bench losses` (§3.4, D-52; Q-42, Q-172, Q-173, Q-190): private tests of its
-# input images, of bf16's deviation figures and of the gains its turn-on rule reads.
+# B-4, `ftgs bench losses` (§3.4, D-52, D-89; Q-42, Q-172, Q-173, Q-190, Q-253, Q-269,
+# Q-270): what it needs before it runs, and private tests of its input images and layouts, of
+# the deviation figures and of the gains its turn-on rule reads.
+
+TRUNKS = ("vgg16_oxford", "alexnet_bvlc", "dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
+
+
+@pytest.fixture
+def hub(tmp_path: Path) -> Any:
+    """torch.hub's directory moved to an empty folder for one test, as the weights tests do."""
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(tmp_path / "hub"))
+    try:
+        yield tmp_path / "hub"
+    finally:
+        torch.hub.set_dir(previous)
+
+
+def test_bench_losses_without_a_trunks_weights_exits_2(
+    scene: Path,
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-253, Q-270, Q-166: B-4 times all eight networks of D-89 and needs the six trunk
+    networks' weights already in torch.hub's cache (Q-258's names); it never downloads them, so
+    a missing one is exit 2, before anything runs, naming each missing network and its file,
+    with nothing downloaded and nothing written. A Caffe trunk counts as cached by its
+    conversion alone. The message gives a command, ready to paste into a POSIX shell, that
+    fetches exactly the missing networks with this Python (each file downloaded once from its
+    publisher, checked against its SHA-256 and cached), and, when a DINO network is among them,
+    says those need the [init] extra first (Q-270, owner request); the command is run here
+    against a stand-in `PerceptualLoss`. PyTorch is made to see a CUDA device, which the check
+    comes after."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
+
+    def no_download(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("a download started")
+
+    monkeypatch.setattr(torch.hub, "download_url_to_file", no_download)
+    out = tmp_path / "B-4.json"
+    assert _ftgs("bench", "losses", scene, "--out", out) == 2
+    error = capsys.readouterr().err
+    checkpoints = hub / "checkpoints"
+    publishers = {
+        "vgg16_oxford": "VGG_ILSVRC_16_layers.caffemodel",
+        "alexnet_bvlc": "bvlc_alexnet.caffemodel",
+        "dinov2_s14": "dinov2_vits14_pretrain.pth",
+        "dinov2_b14": "dinov2_vitb14_pretrain.pth",
+        "dino_s16": "dino_deitsmall16_pretrain.pth",
+        "dino_b16": "dino_vitbase16_pretrain.pth",
+    }
+    for net, file in publishers.items():
+        assert net in error and str(checkpoints / file) in error, net
+    assert _fetched_by(_fetch_command(error), monkeypatch) == list(publishers)
+    assert "SHA-256" in error and "pip install 'openftgs[init]'" in error
+    assert not hub.exists() and not out.exists()
+    # VGG16 cached as its conversion alone is no longer missing (a stand-in: B-4 stops at the
+    # other five before it reads anything).
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "openftgs-vgg16_oxford.safetensors").write_bytes(b"stand-in")
+    assert _ftgs("bench", "losses", scene, "--out", out) == 2
+    error = capsys.readouterr().err
+    assert "vgg16_oxford" not in error and str(checkpoints / publishers["alexnet_bvlc"]) in error
+    assert _fetched_by(_fetch_command(error), monkeypatch) == list(publishers)[1:]
+    assert sorted(p.name for p in checkpoints.iterdir()) == ["openftgs-vgg16_oxford.safetensors"]
+    # The DINO networks cached too (stand-ins): AlexNet alone is fetched, and [init] isn't named.
+    for net in ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16"):
+        (checkpoints / publishers[net]).write_bytes(b"stand-in")
+    assert _ftgs("bench", "losses", scene, "--out", out) == 2
+    error = capsys.readouterr().err
+    assert _fetched_by(_fetch_command(error), monkeypatch) == ["alexnet_bvlc"]
+    assert str(checkpoints / publishers["alexnet_bvlc"]) in error and "[init]" not in error
+    assert not out.exists()
+
+
+def _fetch_command(error: str) -> list[str]:
+    """The fetch command of B-4's missing-weight message (Q-270), the line that starts with
+    this Python, split as a POSIX shell splits it."""
+    prefix = shlex.quote(sys.executable) + " -c "
+    [line] = [text.strip() for text in error.splitlines() if text.strip().startswith(prefix)]
+    return shlex.split(line)
+
+
+def _fetched_by(command: list[str], monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The networks B-4's fetch command builds, in order: its Python code run here, as
+    `python -c` would run it, against a stand-in `openftgs.losses` whose `PerceptualLoss`
+    records the network it is given and downloads nothing."""
+    import types
+
+    executable, flag, code = command
+    assert (executable, flag) == (sys.executable, "-c")
+    built: list[str] = []
+    stand_in = types.ModuleType("openftgs.losses")
+    stand_in.PerceptualLoss = built.append  # type: ignore[attr-defined]
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "openftgs.losses", stand_in)
+        exec(compile(code, "<B-4's fetch command>", "exec"), {"__name__": "__main__"})
+    return built
 
 
 def test__loss_images_resize_the_first_training_image_and_add_seeded_noise(scene: Path) -> None:
@@ -1629,43 +1733,261 @@ def test__comparison_gives_the_median_gain_of_a_variant() -> None:
     assert slower["gain"] == pytest.approx(-0.25, rel=1e-12)
 
 
-# B-4 itself, at two small sizes (VGG takes 16 px and more, source log 67; SSIM's valid window
-# 11) and 3 repetitions, so the test runs in seconds.
+@pytest.mark.parametrize(
+    ("layout", "memory", "copied"),
+    [
+        ("nchw", torch.contiguous_format, True),
+        ("channels_last_inputs", torch.channels_last, False),
+        ("channels_last_inputs_and_weights", torch.channels_last, False),
+    ],
+)
+def test__perceptual_inputs_reach_the_network_as_training_gives_them(
+    layout: str, memory: torch.memory_format, copied: bool
+) -> None:
+    """Q-269 (as changed, #427), Q-273: in every layout B-4's images are laid out as a render
+    comes, the prediction a contiguous [1, H, W, 3] leaf, and a network gets them as
+    `PerceptualLoss.forward` takes them (Q-41). With the render's view, the batch-first view it
+    makes of them (`docs/modules/losses/terms-and-paths.md`, "Input layout") is channels-last, a
+    view of the inputs themselves; for `nchw` both are copied inside the call, as the trainer
+    copies them, so that the batch-first views are contiguous NCHW. The prediction's gradient,
+    through the copy where there is one, has the leaf's shape and is the gradient of the
+    function the network computes, in float64 to its rounding."""
+    from openftgs.cli._bench import _perceptual_forward, _perceptual_inputs
+
+    g = torch.Generator().manual_seed(0)
+    gt = torch.rand(6, 10, 3, generator=g, dtype=torch.float64)
+    pred = torch.rand(6, 10, 3, generator=g, dtype=torch.float64)
+    seen: list[torch.Tensor] = []
+
+    def network(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        seen.extend((x, y))
+        return (x - y).square().mean()
+
+    x, y = _perceptual_inputs(gt, pred)
+    for image, values in ((x, pred), (y, gt)):
+        assert image.shape == (1, 6, 10, 3) and image.is_contiguous()  # a render's layout
+        assert torch.equal(image[0], values)
+    assert x.requires_grad and x.is_leaf and not y.requires_grad
+    value = _perceptual_forward(network, x, y, precision="tf32", layout=layout)
+    for image, source, values in zip(seen, (x, y), (pred, gt), strict=True):
+        assert image.shape == (1, 6, 10, 3)
+        assert torch.equal(image[0], values)
+        batch_first = image.movedim(-1, -3)  # [B, 3, H, W], as PerceptualLoss views [B, H, W, 3]
+        assert batch_first.is_contiguous(memory_format=memory)
+        assert (batch_first.data_ptr() != source.data_ptr()) is copied
+    (grad,) = torch.autograd.grad(value, x)
+    assert grad.shape == x.shape
+    torch.testing.assert_close(grad, 2.0 * (x - y).detach() / x.numel(), rtol=1e-12, atol=0.0)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("net", ["vgg16_oxford", "alexnet_bvlc"])
+def test__perceptual_forward_nchw_is_within_rounding_of_the_renders_view_on_cuda(
+    net: Literal["vgg16_oxford", "alexnet_bvlc"], precision: str
+) -> None:
+    """Q-269 (as changed, #427), Q-273, §2.4 rule 2: on CUDA, a `nchw` case of B-4, whose copy
+    to NCHW is exact, gives the value and the prediction's gradient of the `channels_last_inputs`
+    case within Q-273's bounds for the trainer's NCHW term: the value within 1e-5 relative and
+    the gradient within 1e-3 in relative L2 in IEEE float32, 1e-3 and 0.1 in TF32, which rounds
+    to 10 mantissa bits (Q-223); the two Caffe trunks, the networks the trainer gives NCHW
+    inputs, with B-4's flags and autotuning off."""
+    from openftgs.cli._bench import _cudnn_flags, _perceptual_forward, _perceptual_inputs
+    from openftgs.losses import PerceptualLoss
+
+    g = torch.Generator().manual_seed(427)
+    gt = torch.rand(96, 128, 3, generator=g)
+    pred = (gt + 0.05 * torch.randn(96, 128, 3, generator=g)).clamp(0.0, 1.0)
+    network = PerceptualLoss(net).to("cuda")
+    results: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    with _cudnn_flags(tf32=precision == "tf32", autotuning=False):
+        for layout in ("nchw", "channels_last_inputs"):
+            x, y = _perceptual_inputs(gt.to("cuda"), pred.to("cuda"))
+            value = _perceptual_forward(network, x, y, precision=precision, layout=layout)
+            (grad,) = torch.autograd.grad(value, x)
+            results[layout] = (value.detach(), grad)
+    (value, grad), (value_view, grad_view) = results["nchw"], results["channels_last_inputs"]
+    rtol, gtol = (1e-3, 0.1) if precision == "tf32" else (1e-5, 1e-3)
+    torch.testing.assert_close(value, value_view, rtol=rtol, atol=0.0)
+    difference = torch.linalg.vector_norm((grad - grad_view).double())
+    assert float(difference) <= gtol * float(torch.linalg.vector_norm(grad_view.double()))
+
+
+def test__channels_last_weights_copies_the_network_with_its_4d_tensors_channels_last() -> None:
+    """§3.4 B-4 ("in the layouts it accepts"), Q-269 (owner answer, 2026-10-26: channels-last
+    weights as a third layout for the two Caffe trunks): the `channels_last_inputs_and_weights`
+    cases run a copy of the network whose four-dimensional tensors, parameters and buffers alike
+    (a Caffe trunk holds its convolutions as buffers, Q-263), are channels-last in memory, as
+    `Module.to(memory_format=torch.channels_last)` lays them out; the network the other layouts
+    run is left as it was, and the copy computes the same values."""
+    from openftgs.cli._bench import _channels_last_weights
+
+    class Network(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            g = torch.Generator().manual_seed(0)
+            self.conv = torch.nn.Conv2d(3, 4, 3, padding=1)
+            self.register_buffer("kernel", torch.randn(4, 4, 3, 3, generator=g), persistent=False)
+
+        def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            def features(image: torch.Tensor) -> torch.Tensor:
+                batch_first = image.movedim(-1, -3)
+                hidden = self.conv(batch_first)
+                return torch.nn.functional.conv2d(hidden, self.get_buffer("kernel"), padding=1)
+
+            return (features(x) - features(y)).square().mean()
+
+    def four_d(module: torch.nn.Module) -> list[torch.Tensor]:
+        return [t for t in (*module.parameters(), *module.buffers()) if t.dim() == 4]
+
+    network = Network()
+    copy = _channels_last_weights(network)
+    assert copy is not network
+    assert len(four_d(network)) == len(four_d(copy)) == 2
+    assert all(t.is_contiguous() for t in four_d(network))
+    for tensor in four_d(copy):
+        assert tensor.is_contiguous(memory_format=torch.channels_last)
+        assert not tensor.is_contiguous()  # so the layouts differ
+    g = torch.Generator().manual_seed(1)
+    x, y = torch.rand(1, 6, 10, 3, generator=g), torch.rand(1, 6, 10, 3, generator=g)
+    torch.testing.assert_close(copy(x, y), network(x, y), rtol=1e-6, atol=0.0)
+
+
+def test_bench_losses_with_a_cached_weight_that_fails_its_check_exits_2(
+    scene: Path,
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-270, Q-258, Q-142: B-4 builds every network before it measures anything, so a file
+    in torch.hub's cache under a publisher's name that isn't the publisher's (stand-ins of a few
+    bytes here) is exit 2 naming it, with no download started, the file left as it was and
+    nothing written."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # past the device check
+
+    def no_download(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("a download started")
+
+    monkeypatch.setattr(torch.hub, "download_url_to_file", no_download)
+    checkpoints = hub / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    names = (
+        "VGG_ILSVRC_16_layers.caffemodel",
+        "bvlc_alexnet.caffemodel",
+        "dinov2_vits14_pretrain.pth",
+        "dinov2_vitb14_pretrain.pth",
+        "dino_deitsmall16_pretrain.pth",
+        "dino_vitbase16_pretrain.pth",
+    )
+    for name in names:
+        (checkpoints / name).write_bytes(b"a stand-in")
+    out = tmp_path / "B-4.json"
+    assert _ftgs("bench", "losses", scene, "--out", out) == 2
+    error = capsys.readouterr().err
+    assert "vgg16_oxford" in error and str(checkpoints / names[0]) in error  # the first trunk
+    assert sorted(p.name for p in checkpoints.iterdir()) == sorted(names)
+    assert all((checkpoints / name).read_bytes() == b"a stand-in" for name in names)
+    assert not out.exists()
+
+
+def _fetch_trunk_weights() -> None:
+    """The six trunk networks' files in torch.hub's cache, downloaded when they aren't, for the
+    `weights` tests of B-4 (Q-7), which never downloads them itself (Q-270)."""
+    from openftgs import _weights
+
+    for net in TRUNKS:
+        _weights.fetch(_weights.DOWNLOADS[net])
+
+
+@pytest.mark.weights
+@pytest.mark.skipif(not has_init_extra, reason="the weights tests fetch DINO's files with it")
+def test_bench_losses_with_a_dino_network_without_the_init_extra_exits_2(
+    scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-270, Q-248, Q-142: with every weight in torch.hub's cache (fetched here when it
+    isn't, under `weights`), a DINO network without the [init] extra, its vendored DINOv2
+    layers made unimportable, is exit 2 naming the extra, before anything is measured, with
+    nothing written. PyTorch is made to see a CUDA device, which the check comes after."""
+    _fetch_trunk_weights()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.transformer.dinov2", None)
+    out = tmp_path / "B-4.json"
+    assert _ftgs("bench", "losses", scene, "--out", out) == 2
+    error = capsys.readouterr().err
+    assert "[init]" in error and "dinov2_s14" in error
+    assert not out.exists()
+
+
+# B-4 itself, at two small sizes (AlexNet takes sides of 23 px and more, Q-263, and the DINO
+# networks 27 and 31, Q-265; SSIM's valid window 11) and 3 repetitions, so the tests run in
+# seconds: once with the weight-free networks alone, which needs no weights, and once with all
+# eight, under `weights`.
 LOSS_SIZES = ((64, 48), (80, 64))
 LOSS_REPETITIONS = 3
-PRECISIONS = ("ieee", "tf32", "bf16")
-LAYOUTS = ("nchw", "channels_last_inputs", "channels_last_inputs_and_weights")
-COMPARISONS = {  # Q-190: (baseline, variant) as (precision, layout, autotuning)
+WEIGHT_FREE = ("flip", "haarpsi")
+LAYOUTS = ("nchw", "channels_last_inputs")
+# Q-269 (owner answer, 2026-10-26): the two Caffe trunks also run with channels-last weights, the
+# option LPIPS-VGG's B-4 measured (Q-190), which they accept.
+CAFFE_TRUNKS = ("vgg16_oxford", "alexnet_bvlc")
+CHANNELS_LAST_WEIGHTS = "channels_last_inputs_and_weights"
+COMPARISONS = {  # Q-269: (baseline, variant) as (precision, layout, autotuning)
     "autotuning": (("tf32", "channels_last_inputs", False), ("tf32", "channels_last_inputs", True)),
-    "channels_last_weights": (
-        ("tf32", "channels_last_inputs", False),
-        ("tf32", "channels_last_inputs_and_weights", False),
-    ),
-    "autotuning_and_channels_last_weights": (
-        ("tf32", "channels_last_inputs", False),
-        ("tf32", "channels_last_inputs_and_weights", True),
-    ),
-    # Q-223: the path Q-173's change adopted (#326) against training's earlier one
+    "nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", False)),
     "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
+    "channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", CHANNELS_LAST_WEIGHTS, False),
+    ),
+    "autotuning_and_channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", CHANNELS_LAST_WEIGHTS, True),
+    ),
 }
 
 
-@pytest.fixture(scope="module")
-def losses_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-    out = tmp_path_factory.mktemp("bench-losses") / "B-4.json"
+def _losses_bench(scene: Path, out: Path, networks: tuple[str, ...] | None) -> dict[str, Any]:
+    """`ftgs bench losses` at B-4's reduced sizes, with `networks` in place of D-89's eight."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("openftgs.cli._bench._LOSS_SIZES", LOSS_SIZES)
         patch.setattr("openftgs.cli._bench._LOSS_REPETITIONS", LOSS_REPETITIONS)
+        if networks is not None:
+            patch.setattr("openftgs.cli._bench._LOSS_NETWORKS", networks)
         assert _ftgs("bench", "losses", scene, "--out", out) == 0
     body: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
     return body
 
 
-def _lpips_case(width: int, height: int, precision: str, layout: str, autotuning: bool) -> Any:
-    case = {"loss": "lpips_vgg", "width": width, "height": height, "precision": precision}
-    case |= {"layout": layout, "autotuning": autotuning}
+@pytest.fixture(scope="module")
+def losses_bench_weight_free(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> Any:
+    return _losses_bench(scene, tmp_path_factory.mktemp("bench-losses") / "B-4.json", WEIGHT_FREE)
+
+
+@pytest.fixture(scope="module")
+def losses_bench(scene: Path, tmp_path_factory: pytest.TempPathFactory) -> Any:
+    _fetch_trunk_weights()  # B-4 never downloads them (Q-270); its tests may, under weights
+    return _losses_bench(scene, tmp_path_factory.mktemp("bench-losses") / "B-4.json", None)
+
+
+def _precisions(net: str) -> tuple[str, ...]:
+    """§3.4 B-4: IEEE float32 and TF32 for every network, and bfloat16 for the trunk ones."""
+    return ("ieee", "tf32") if net in WEIGHT_FREE else ("ieee", "tf32", "bf16")
+
+
+def _layouts(net: str) -> tuple[str, ...]:
+    """§3.4 B-4 ("in the layouts it accepts"), Q-269: NCHW inputs and the render's view for every
+    network, and channels-last weights beside them for the two Caffe trunks."""
+    return (*LAYOUTS, CHANNELS_LAST_WEIGHTS) if net in CAFFE_TRUNKS else LAYOUTS
+
+
+def _perceptual_case(
+    net: str, width: int, height: int, precision: str, layout: str, autotuning: bool
+) -> Any:
+    case = {"loss": "perceptual", "network": net, "width": width, "height": height}
+    case |= {"precision": precision, "layout": layout, "autotuning": autotuning}
     return tuple(sorted(case.items()))
 
 
@@ -1678,46 +2000,62 @@ def _timed_figures_are_consistent(figures: dict[str, Any]) -> None:
     assert figures["peak_memory_bytes"] > 0
 
 
-@pytest.mark.gpu
-@pytest.mark.weights
-def test__losses_times_every_lpips_variant_and_both_ssim_paths(
-    losses_bench: dict[str, Any],
-) -> None:
-    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
-    patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. D-52; Q-190:
-    LPIPS-VGG's forward and the prediction's backward for each of
-    {IEEE, TF32, bf16} × {NCHW, channels-last inputs, channels-last inputs and weights} ×
-    autotuning off and on; SSIM through fused-ssim, when it imports, and through the PyTorch
-    path, timed where fused-ssim can't be imported (PRD #220), with autotuning off and on; at
-    each size. Each autotuning setting runs in its own child process, since cuDNN's algorithm
-    cache would carry one setting's picks into the other. B-4 has no budget (§3.4: it sets
-    D-52's defaults)."""
+def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) -> None:
+    """§3.4 B-4, Q-269: each network's forward and the prediction's backward in each of its
+    precisions (IEEE float32 and TF32; bfloat16 for a trunk network) × {NCHW inputs, the
+    render's channels-last view, and for the two Caffe trunks channels-last inputs and weights}
+    × autotuning off and on, at each size, and nothing else; SSIM through fused-ssim, when it
+    imports, and the PyTorch path with autotuning off and on."""
     import importlib.util
 
-    body = losses_bench
-    assert body["benchmark"] == "B-4" and body["budgets"] == []
+    assert body["benchmark"] == "B-4" and body["budgets"] == []  # §3.4: it sets D-52's defaults
     assert body["command"][:3] == ["ftgs", "bench", "losses"]
     setup = body["setup"]
+    assert setup["networks"] == list(networks)
     assert setup["sizes"] == [list(size) for size in LOSS_SIZES]
     assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
-    assert setup["precisions"] == list(PRECISIONS) and setup["layouts"] == list(LAYOUTS)
-    # Q-223: training's layout per precision since #326
+    assert setup["layouts"] == {net: list(_layouts(net)) for net in networks}
+    # Q-269 (as changed, #427): the nchw cases time the trainer's copy
+    assert "copied inside the timed forward" in setup["nchw"]
+    assert setup["precisions"] == {net: list(_precisions(net)) for net in networks}
+    # Q-273: what the trainer runs, per network and precision, in an iteration that isn't
+    # deterministic: vgg16_oxford autotunes under "tf32", alexnet_bvlc under "tf32" and "bf16"
+    # (as changed, #428) and dinov2_b14 under "bf16" (as changed, #427), and the two Caffe trunks
+    # get NCHW inputs where B-4 measured them faster.
+    autotuned = {
+        "vgg16_oxford": ("tf32",),
+        "alexnet_bvlc": ("tf32", "bf16"),
+        "dinov2_b14": ("bf16",),
+    }
+    assert setup["training_autotuning"] == {
+        net: {p: p in autotuned.get(net, ()) for p in _precisions(net)} for net in networks
+    }
+    nchw = {"vgg16_oxford": ("ieee", "tf32"), "alexnet_bvlc": ("ieee", "tf32", "bf16")}
     assert setup["training_layout"] == {
-        "ieee": "nchw",
-        "tf32": "nchw",
-        "bf16": "channels_last_inputs",
+        net: {
+            p: "nchw" if p in nchw.get(net, ()) else "channels_last_inputs"
+            for p in _precisions(net)
+        }
+        for net in networks
     }
     fused = importlib.util.find_spec("fused_ssim") is not None
     assert setup["fused_ssim"] == fused
     assert "one child process per autotuning setting" in setup["processes"]
     assert "fused_ssim can't be imported" in setup["processes"]
     cases = _cases_by(body)
+    perceptual = [c["case"] for c in body["cases"] if c["case"].get("loss") == "perceptual"]
+    expected = [
+        _perceptual_case(net, width, height, precision, layout, autotuning)
+        for net in networks
+        for width, height in LOSS_SIZES
+        for precision in _precisions(net)
+        for layout in _layouts(net)
+        for autotuning in (False, True)
+    ]
+    assert sorted(tuple(sorted(c.items())) for c in perceptual) == sorted(expected)
+    for key in expected:
+        _timed_figures_are_consistent(cases[key])
     for width, height in LOSS_SIZES:
-        for precision in PRECISIONS:
-            for layout in LAYOUTS:
-                for autotuning in (False, True):
-                    key = _lpips_case(width, height, precision, layout, autotuning)
-                    _timed_figures_are_consistent(cases[key])
         for autotuning in (False, True):
             torch_case = {"loss": "ssim", "width": width, "height": height, "path": "torch"}
             torch_case |= {"precision": "tf32", "autotuning": autotuning}
@@ -1728,50 +2066,60 @@ def test__losses_times_every_lpips_variant_and_both_ssim_paths(
             _timed_figures_are_consistent(cases[fused_key])
 
 
-@pytest.mark.gpu
-@pytest.mark.weights
-def test__losses_records_bf16s_deviation_and_the_gains_of_its_comparisons(
-    losses_bench: dict[str, Any],
-) -> None:
-    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
-    patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. D-52, Q-173
-    (Q-190): bf16's and TF32's deviation from IEEE float32 in value
-    and gradient at each size, bf16's within the 5e-2 the bf16 step test allows; each
-    comparison's gain, 1 − variant / baseline of the medians, at each size, and whether its
-    smallest gain reaches Q-173's 3 %; fused-ssim's gain over the PyTorch path."""
+def _assert_deviations_and_gains(body: dict[str, Any], networks: tuple[str, ...]) -> None:
+    """D-52, Q-173 (Q-190, Q-269): per network and size, TF32's and, for a trunk network,
+    bf16's deviation from IEEE float32 in value and gradient, reported whatever its size (#388
+    measured bf16 gradients up to 152 % off in L2); per network, each comparison's gain,
+    1 − variant / baseline of the medians, at each size, and whether its smallest gain reaches
+    Q-173's 3 %, bf16's for the trunk networks only; fused-ssim's gain over the PyTorch path."""
     import importlib.util
 
-    cases = _cases_by(losses_bench)
-    for width, height in LOSS_SIZES:
-        for precision in ("tf32", "bf16"):
-            key = (("deviation", precision), ("height", height), ("width", width))
-            figures = cases[key]
-            assert figures["value_ieee"] > 0.0
-            for name in ("value_relative", "gradient_relative_l2", "gradient_max_relative"):
-                assert 0.0 <= figures[name] < float("inf"), name
-        bf16 = cases[(("deviation", "bf16"), ("height", height), ("width", width))]
-        assert 0.0 < bf16["value_relative"] < 5e-2
-    for name, (base, variant) in COMPARISONS.items():
-        gains = []
+    cases = _cases_by(body)
+    for net in networks:
         for width, height in LOSS_SIZES:
-            figures = cases[(("comparison", name), ("height", height), ("width", width))]
-            expected_base = cases[_lpips_case(width, height, *base)]["forward_backward_s"]
-            expected_variant = cases[_lpips_case(width, height, *variant)]["forward_backward_s"]
-            assert (figures["baseline_s"], figures["variant_s"]) == (
-                expected_base,
-                expected_variant,
-            )
-            assert figures["gain"] == pytest.approx(1.0 - expected_variant / expected_base)
-            gains.append(figures["gain"])
-        summary = cases[(("comparison", name),)]
-        assert summary["smallest_gain"] == min(gains)
-        assert summary["meets_gain_threshold"] == (min(gains) >= 0.03)
-    # Q-173 (changed, #326), Q-223: the adopted combination replaces autotuning alone
-    assert losses_bench["setup"]["turn_on"] == [
+            deviations = [p for p in ("tf32", "bf16") if p in _precisions(net)]
+            for precision in ("tf32", "bf16"):
+                case = {"deviation": precision, "network": net, "width": width, "height": height}
+                key = tuple(sorted(case.items()))
+                assert (key in cases) == (precision in deviations), (net, precision)
+                if key not in cases:
+                    continue
+                figures = cases[key]
+                assert figures["value_ieee"] > 0.0
+                for name in ("value_relative", "gradient_relative_l2", "gradient_max_relative"):
+                    assert 0.0 <= figures[name] < float("inf"), (net, name)
+        for name, (base, variant) in COMPARISONS.items():
+            summary_key = (("comparison", name), ("network", net))
+            if variant[0] not in _precisions(net) or variant[1] not in _layouts(net):
+                assert summary_key not in cases, (net, name)
+                continue
+            gains = []
+            for width, height in LOSS_SIZES:
+                key = (("comparison", name), ("height", height), ("network", net))
+                figures = cases[(*key, ("width", width))]
+                expected_base = cases[_perceptual_case(net, width, height, *base)]
+                expected_variant = cases[_perceptual_case(net, width, height, *variant)]
+                assert (figures["baseline_s"], figures["variant_s"]) == (
+                    expected_base["forward_backward_s"],
+                    expected_variant["forward_backward_s"],
+                )
+                ratio = expected_variant["forward_backward_s"] / expected_base["forward_backward_s"]
+                assert figures["gain"] == pytest.approx(1.0 - ratio)
+                gains.append(figures["gain"])
+            summary = cases[summary_key]
+            assert summary["smallest_gain"] == min(gains)
+            assert summary["meets_gain_threshold"] == (min(gains) >= 0.03)
+    setup = body["setup"]
+    assert setup["comparisons"] == {n: [list(b), list(v)] for n, (b, v) in COMPARISONS.items()}
+    # Q-173's rule decides these per network, which #394 applies (Q-251)
+    assert setup["turn_on"] == [
+        "autotuning",
+        "nchw_inputs",
         "autotuning_and_nchw_inputs",
         "channels_last_weights",
+        "autotuning_and_channels_last_weights",
     ]
-    assert losses_bench["setup"]["gain_threshold"] == 0.03
+    assert setup["gain_threshold"] == 0.03
     if importlib.util.find_spec("fused_ssim") is not None:
         for width, height in LOSS_SIZES:
             figures = cases[(("comparison", "fused_ssim"), ("height", height), ("width", width))]
@@ -1781,6 +2129,56 @@ def test__losses_records_bf16s_deviation_and_the_gains_of_its_comparisons(
             fused_key = (("height", height), ("loss", "ssim"), ("path", "fused"), ("width", width))
             assert figures["baseline_s"] == cases[torch_key]["forward_backward_s"]
             assert figures["variant_s"] == cases[fused_key]["forward_backward_s"]
+
+
+@pytest.mark.gpu
+def test__losses_times_the_weight_free_networks_and_both_ssim_paths(
+    losses_bench_weight_free: dict[str, Any],
+) -> None:
+    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES`, `_LOSS_REPETITIONS` and
+    `_LOSS_NETWORKS` patched to ꟻLIP and HaarPSI, which need no weights): §3.4 B-4 itself is the
+    recorded BENCH.json runs, not this test. D-52, D-89, Q-190, Q-269: every case of each
+    network, IEEE float32 and TF32 only, and both SSIM paths, each autotuning setting in its own
+    child process, since cuDNN's algorithm cache would carry one setting's picks into the
+    other; nothing about the trunks' weights."""
+    _assert_every_case_timed(losses_bench_weight_free, WEIGHT_FREE)
+    assert losses_bench_weight_free["setup"]["weights"] == {}
+
+
+@pytest.mark.gpu
+def test__losses_records_the_weight_free_networks_deviations_and_gains(
+    losses_bench_weight_free: dict[str, Any],
+) -> None:
+    """A private test of `_losses` at reduced sizes, as above: §3.4 B-4 itself is the recorded
+    BENCH.json runs. D-52, Q-173, Q-269: TF32's deviation and every comparison but bf16's,
+    for ꟻLIP and HaarPSI."""
+    _assert_deviations_and_gains(losses_bench_weight_free, WEIGHT_FREE)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(not has_init_extra, reason="the DINO networks need the [init] extra")
+def test__losses_times_each_network_of_d89_with_bf16_for_the_trunks(
+    losses_bench: dict[str, Any],
+) -> None:
+    """A private test of `_losses` at reduced sizes (`_LOSS_SIZES` and `_LOSS_REPETITIONS`
+    patched): §3.4 B-4 itself is the recorded BENCH.json runs, not this test. §3.4 B-4 ("each
+    perceptual network of D-89 in IEEE float32, TF32 and, for the trunk networks, bfloat16, in
+    the layouts it accepts"), Q-269: the eight networks of `PercNet`, in D-89's order, each
+    case of each, bf16's deviations and comparisons for the six trunks; the setup names the
+    cached file each trunk was built from (Q-270)."""
+    import typing
+
+    from openftgs.config import PercNet
+
+    networks = typing.get_args(PercNet)
+    assert networks[:2] == WEIGHT_FREE and networks[2:] == TRUNKS
+    _assert_every_case_timed(losses_bench, networks)
+    _assert_deviations_and_gains(losses_bench, networks)
+    weights = losses_bench["setup"]["weights"]
+    assert sorted(weights) == sorted(TRUNKS)
+    for net, path in weights.items():
+        assert Path(path).parent == Path(torch.hub.get_dir()) / "checkpoints", net
 
 
 # B-8, `ftgs bench convert` (§3.4, D-48, D-81; Q-169): the scene's recorded converter rerun from
@@ -1956,8 +2354,6 @@ def test_b8_convert_with_and_without_hardware_decoding(tmp_path: Path, scratch: 
 
 # B-8, `ftgs bench init` (§3.4, D-56, D-58; Q-106, Q-192): `roma_init` on the wall clock.
 
-has_init_extra = all(importlib.util.find_spec(m) for m in ("einops", "loguru", "torchvision"))
-
 
 def test_b8_init_without_the_init_extra_or_the_weights_exits_2(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -2040,7 +2436,7 @@ def test_b8_init_times_matching_per_pair_and_gpu_triangulation_knn_and_the_run(
 
 # B-7, `ftgs bench render` (§3.4, D-55; Q-174, Q-194, Q-195), run once on the GPU for the
 # tests below on `tested_scene`: three distinct training times, so requests of 1, 2 and 3 times.
-# It builds the LPIPS networks for its evaluation figures, hence `weights`.
+# Its evaluation figures build the evaluator, whose ꟻLIP needs no weights (#387, #389).
 
 B7_MODELS = [(n, active) for n in (1_000_000, 3_000_000) for active in (0.01, 0.05, 0.2)]
 
@@ -2060,7 +2456,6 @@ def _b7_cases(body: dict[str, Any]) -> dict[tuple[Any, ...], dict[str, Any]]:
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_renders_every_training_time_with_and_without_the_index_on_both_devices(
     render_bench: dict[str, Any],
 ) -> None:
@@ -2090,7 +2485,6 @@ def test_b7_renders_every_training_time_with_and_without_the_index_on_both_devic
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, Any]) -> None:
     """B-7 (#231, Q-194 as answered, Q-195): per model, the index's build time is the
     one-time request with the index forced on less the same request forced off (outputs on the
@@ -2106,7 +2500,6 @@ def test_b7_reports_the_index_build_and_the_break_even(render_bench: dict[str, A
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_holds_the_synthesized_models_to_no_budget_and_sets_the_threshold(
     render_bench: dict[str, Any],
 ) -> None:
@@ -2128,7 +2521,6 @@ def test_b7_holds_the_synthesized_models_to_no_budget_and_sets_the_threshold(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_times_the_share_of_evaluation_spent_rendering(render_bench: dict[str, Any]) -> None:
     """PRD #220's rule for `evaluate_images` (Q-68, Q-194): per model, the evaluation of
     the test split (camera ring02 at 3 times) against the render requests it sends, one per
@@ -2145,7 +2537,6 @@ def test_b7_times_the_share_of_evaluation_spent_rendering(render_bench: dict[str
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
     """D-88, Q-194: with `--model`, B-7 times that model alone, its N in the cases and no
     active fraction; an exchange model carries no Δt_f, so the buckets take the scene's."""
@@ -2164,7 +2555,41 @@ def test_b7_times_the_model_given(tested_scene: Path, tmp_path: Path) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
+def test_b7_times_a_checkpoint_saved_before_549o(tested_scene: Path, tmp_path: Path) -> None:
+    """Q-247: `ftgs bench render --model` reads a checkpoint whose stored configuration names
+    LPIPS-VGG ("vgg"), as those saved before revision 549o do, M17's among them, whose B-7
+    floors Q-239 records: B-7 times its model, its N in the cases, with the checkpoint's Δt_f
+    as the buckets' width (D-55)."""
+    from openftgs.config import TrainConfig, config_to_dict
+    from openftgs.io import save_checkpoint
+    from openftgs.types import TrainerState
+
+    model = random_model(32, seed=1, sh_degree=1, time=TIME)
+    config = config_to_dict(TrainConfig(sh_degree=1))
+    config["loss"] |= {"perc_net": "vgg", "lambda_perc": 0.01}  # M17's defaults
+    state = TrainerState(
+        iteration=10,
+        config=config,
+        time=TIME,
+        spatial_scale=1.0,
+        frame_dt=0.25,
+        params={name: getattr(model, name).detach() for name in PARAM_NAMES},
+        optim={},
+        stats={},
+        rng={},
+        sampler={},
+    )
+    checkpoint = save_checkpoint(state, tmp_path / "legacy")
+    out = tmp_path / "B-7.json"
+    assert _ftgs("bench", "render", tested_scene, "--out", out, "--model", checkpoint) == 0
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["setup"]["model"] == f"given: {checkpoint}"
+    assert body["setup"]["frame_dt"] == pytest.approx(0.25)
+    models = {(c["case"].get("n"), c["case"].get("active")) for c in body["cases"]}
+    assert models == {(32, None), (None, None)}
+
+
+@pytest.mark.gpu
 def test__b7_floors_wire_one_budget_entry_on_the_index_on_request(
     tested_scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2200,28 +2625,6 @@ def test__b7_floors_wire_one_budget_entry_on_the_index_on_request(
     setup = body["setup"]
     assert (setup["floor_fps"], setup["floor_source"]) == (10.0, "n3dv/kitchen")
     assert setup["reference_fps"] == 450.0
-
-
-@pytest.mark.gpu
-def test_bench_render_without_the_lpips_weights_exits_2(
-    tested_scene: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Q-166, Q-142, Q-194: B-7's evaluation figures need the LPIPS networks, built as
-    `ftgs eval` builds them before anything is measured; when their weights can't be had (an
-    OSError of the download) it is exit 2, an invalid environment, with nothing written."""
-    import openftgs.eval
-
-    def offline(self: Any, **kwargs: Any) -> None:
-        raise OSError("no network")
-
-    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", offline)
-    out = tmp_path / "B-7.json"
-    assert _ftgs("bench", "render", tested_scene, "--out", out) == 2
-    assert "LPIPS networks" in capsys.readouterr().err
-    assert not out.exists()
 
 
 # A benchmark cut short (Q-166 as answered, #272; Q-199): out of GPU memory is exit 2 and a
@@ -2269,7 +2672,6 @@ def _diverging_in_iteration_3(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_bench_out_of_gpu_memory_in_a_benchmark_exits_2(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2314,14 +2716,15 @@ def test_bench_out_of_gpu_memory_reading_the_model_exits_2(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_bench_out_of_gpu_memory_in_b4s_child_process_exits_2(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Q-166 (as answered), Q-190: B-4 measures in child processes, and one that runs out of
     GPU memory, for real here under a memory limit that only the child sets (a `sitecustomize`
     on its PYTHONPATH), is exit 2 as in the benchmark's own process, naming B-4 and the child's
-    error, with nothing written."""
+    error, with nothing written. ꟻLIP alone (`_LOSS_NETWORKS` patched), which needs no weights:
+    the benchmark passes its networks to the child."""
+    monkeypatch.setattr("openftgs.cli._bench._LOSS_NETWORKS", ("flip",))
     limit = tmp_path / "limit"
     limit.mkdir()
     (limit / "sitecustomize.py").write_text(
@@ -2338,7 +2741,6 @@ def test_bench_out_of_gpu_memory_in_b4s_child_process_exits_2(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_bench_divergence_in_training_exits_3(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2355,7 +2757,6 @@ def test_bench_divergence_in_training_exits_3(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test__data_exits_3_when_training_diverges(
     scene: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2373,7 +2774,6 @@ def test__data_exits_3_when_training_diverges(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_bench_renders_that_are_not_finite_exit_3(
     tested_scene: Path,
     tmp_path: Path,
@@ -2404,5 +2804,5 @@ def test__child_cases_keep_a_runtime_error_for_any_other_failure(tmp_path: Path)
     from openftgs.cli._bench import _child_cases
 
     with pytest.raises(RuntimeError, match="B-4's child process failed") as failure:
-        _child_cases(tmp_path / "absent.json", [(48, 32)], autotuning=False)
+        _child_cases(tmp_path / "absent.json", [(48, 32)], networks=["flip"], autotuning=False)
     assert not isinstance(failure.value, torch.OutOfMemoryError)
