@@ -1,6 +1,7 @@
 docs/paper/
 .claude/settings.local.json
 .claude/clean-room-guard.log
+/.claude/worktrees/
 CLAUDE.local.md
 .scratch/
 
