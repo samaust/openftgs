@@ -1793,17 +1793,22 @@ def _layouts(net: str) -> tuple[str, ...]:
 
 def _training_paths(networks: Sequence[str]) -> dict[str, dict[str, Any]]:
     """The setup's record of what the trainer runs for each network in an iteration that isn't
-    deterministic (Q-273): `training_autotuning`, whether it autotunes cuDNN, and
-    `training_layout`, the layout it gives the network per precision."""
-    from openftgs.train import _AUTOTUNED_NETWORKS, _NCHW_INPUTS
+    deterministic (Q-273), per precision: `training_autotuning`, whether it autotunes cuDNN
+    (as changed, #428), and `training_layout`, the layout it gives the network with that
+    autotuning."""
+    from openftgs.train import _AUTOTUNED_PRECISIONS, _NCHW_INPUTS
+
+    def autotuned(net: str, precision: str) -> bool:
+        return precision in _AUTOTUNED_PRECISIONS.get(net, frozenset())
 
     def layout(net: str, precision: str) -> str:
-        autotuned = net in _AUTOTUNED_NETWORKS
-        nchw = (precision, autotuned) in _NCHW_INPUTS.get(net, frozenset())
+        nchw = (precision, autotuned(net, precision)) in _NCHW_INPUTS.get(net, frozenset())
         return "nchw" if nchw else "channels_last_inputs"
 
     return {
-        "training_autotuning": {net: net in _AUTOTUNED_NETWORKS for net in networks},
+        "training_autotuning": {
+            net: {p: autotuned(net, p) for p in _precisions(net)} for net in networks
+        },
         "training_layout": {net: {p: layout(net, p) for p in _precisions(net)} for net in networks},
     }
 
