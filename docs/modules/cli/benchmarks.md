@@ -243,7 +243,7 @@ Comparing the kitchen run with the new baseline as the GPU job would, 4 of its 1
 
 ## B-4 with channels-last weights: the rerun of #380's review
 
-Q-269 had left channels-last weights out, so the trainer's choice for the two Caffe trunks, which accept them, rested on no measurement. Since #380's review B-4 times them as a third layout for those two, at every precision and with autotuning off and on (Q-269, the owner's answer of 2026-10-26). It was recorded twice at 1f4c451, alone on the RTX 4090, as #394's run was: on the CI scene (7 min 56 s, 363 cases, now the stored baseline) and on kitchen right after (7 min 57 s), as supporting evidence (Calibration data, #380's review).
+Q-269 had left channels-last weights out, so the trainer's choice for the two Caffe trunks, which accept them, rested on no measurement. Since #380's review B-4 times them as a third layout for those two, at every precision and with autotuning off and on (Q-269, the owner's answer of 2026-10-26). It was recorded twice at 1f4c451, alone on the RTX 4090, as #394's run was: on the CI scene (7 min 56 s, 363 cases, the stored baseline until #427) and on kitchen right after (7 min 57 s), as supporting evidence (Calibration data, #380's review).
 
 Channels-last weights reach 3 % nowhere, so every network keeps its weights as built, contiguous NCHW (`docs/modules/train/trainer.md`). With the render's channels-last view, every convolution already runs channels-last, so converting the weights saves only their per-call conversion: −1.4 to +1.0 % against the render's view with NCHW weights, at every precision and autotuning, in both runs. Against the plain path, `channels_last_weights` gains +0.3 to +0.7 %. `autotuning_and_channels_last_weights` meets 3 % for alexnet_bvlc (+6.4 / +9.8 % on the CI scene, +6.1 / +9.9 % on kitchen), as autotuning alone does, but stays below the autotuning with NCHW inputs it takes (+15.3 / +18.3 % and +14.9 / +18.5 %). For vgg16_oxford it reaches +2.0 % at most. Wherever the trainer gives these networks NCHW inputs, channels-last weights are slower than them, by 2.9 to 16.2 % for vgg16_oxford and 3.4 to 31.8 % for alexnet_bvlc, and they leave alexnet_bvlc's slow IEEE kernel at 1920×1080 without autotuning in place (131.0 ms against 15.95 with NCHW inputs).
 
@@ -255,6 +255,27 @@ Channels-last weights reach 3 % nowhere, so every network keeps its weights as b
 | `alexnet_bvlc`, autotuning on | 9.23 / 15.60 | 8.30 / 14.08 | 9.16 / 15.55 |
 
 #394's figures repeat: on the CI scene every other network's plain path within 0.5 % of #394's but haarpsi's and ꟻLIP's at 1352×1014 (1.66 against 1.46 ms, 10.50 against 10.10), vgg16_oxford's autotuning with NCHW inputs +4.8 / +4.7 % and +4.7 / +4.6 %, and SSIM's fallback 11.0 / 10.3 % faster with autotuning. Compared with #394's baseline before the refresh, the run failed only on its 24 new cases, which had no baseline, and on two haarpsi cases at 1352×1014 of 1.5 ms, 13.7 % and 16.8 % slower, as #394's kitchen run found such small cases noisy (Q-170); the other 182 timed medians moved by −6.3 to +5.7 %. Against the refreshed baseline, the kitchen run passes, its timed medians within −11.0 to +4.7 %.
+
+## B-4 with the trainer's copy: #427's reruns
+
+Since #427 the `nchw` cases time the copy the trainer makes to give a network NCHW inputs (Q-269 as changed), and the trainer autotunes per network and precision (#428). B-4 was recorded twice at 7fbe8bb, alone on the RTX 4090: on the CI scene (7 min 54 s, 363 cases, now the stored baseline) and on kitchen right after (7 min 55 s), as supporting evidence (Calibration data, #427).
+
+The copy adds about 0.05 ms to the Caffe trunks' NCHW cases, so Q-272's outcomes stand. vgg16_oxford's autotuning with NCHW inputs gains +4.63 / +4.63 % on the CI scene and +4.67 / +4.56 % on kitchen; #394's +3.03 % at 1920×1080 on kitchen came from a plain path of 149.59 ms, which #380's runs and these put at 144.2 to 144.3 ms. alexnet_bvlc's autotuning with NCHW inputs gains +14.28 / +17.81 % and +14.60 / +17.73 %. No option reaches 3 % for the other six. Q-273's layouts and the Caffe trunks' channels-last weights read as before at every precision and autotuning.
+
+| Caffe trunk, TF32, ms (1352×1014 / 1920×1080) | Render's view | NCHW inputs, the copy timed |
+| --- | --- | --- |
+| `vgg16_oxford`, autotuning off | 96.21 / 144.18 | 100.78 / 145.42 |
+| `vgg16_oxford`, autotuning on | 94.85 / 143.59 | 91.75 / 137.51 |
+| `alexnet_bvlc`, autotuning off | 9.76 / 17.25 | 9.31 / 15.48 |
+| `alexnet_bvlc`, autotuning on | 9.23 / 15.62 | 8.36 / 14.18 |
+
+Two of Q-273's autotuning readings per precision change on these two runs, and go to the owner (#427) before the trainer or Q-273's row does:
+- **alexnet_bvlc under IEEE** (NCHW inputs): +3.14 / +5.82 % and +3.10 / +5.32 %. That is 3 % in both runs, after −3.00 / +5.53 % and +9.69 / −2.00 % at #394, and +3.03 / +5.24 % and +3.03 / +5.36 % at #380.
+- **dinov2_b14 under bf16** (the render's view): +4.62 / +4.91 % and +4.64 / +5.00 %, after +1.92 / +0.44 % and +0.94 / +4.92 % on kitchen at #394 and #380.
+
+Until the owner decides, the trainer leaves the flag to the caller there, as Q-273 answered on #422.
+
+Against the stored baseline of #380's review, the CI run passes: its 206 timed medians are within −6.1 to +6.4 %, its NCHW cases, now with the copy, within −3.8 to +6.4 %. Against the refreshed baseline, the kitchen run passes too, its timed medians within −7.8 to +5.8 %.
 
 ## B-4 with LPIPS-VGG (until revision 549o)
 
