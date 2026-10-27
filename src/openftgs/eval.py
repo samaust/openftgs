@@ -45,9 +45,11 @@ __all__ = [
 # §2.1 CLI paragraph: the metrics METRICS.json reports, in this order (Q-60).
 METRIC_NAMES = ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip")
 
-# Q-61, Q-257: the smallest side of a dynamic region every metric accepts, the larger of SSIM's
-# valid window, 11 px, and ꟻLIP's filters at 67.0 pixels per degree, 21 px (three 21×21
-# spatial filters; `filter_support` in openftgs/_vendor/flip/VENDOR.json, #383).
+# Q-61, Q-257: the smallest side of a dynamic region that holds every metric's window, the larger
+# of SSIM's valid window, 11 px, and ꟻLIP's filters at 67.0 pixels per degree, 21 px (three
+# 21×21 spatial filters; `filter_support` in openftgs/_vendor/flip/VENDOR.json, #383). ꟻLIP
+# pads and gives a value at any size, so its bound is a choice: below 21 px every pixel of its
+# error map would be computed partly from copied border pixels.
 _MIN_REGION_SIDE = 21
 _MASK_THRESHOLD = 0.5  # D-67: soft masks are binarized at 0.5; Q-61: 0.5 counts as dynamic
 
@@ -136,8 +138,8 @@ def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tens
     """The pair a dynamic-region metric compares (App. B.1, D-67): the render clamped to
     [0, 1], then both images set to black outside the mask and cropped to the mask's bounding
     box. `mask` is [H, W] or [H, W, 1], bool or floating, binarized at 0.5 (≥ 0.5 is dynamic).
-    None, with a warning, for an empty mask or a box narrower than 21 px on a side, which some
-    metric can't evaluate (Q-61, Q-257)."""
+    None, with a warning, for an empty mask or a box narrower than 21 px on a side, too small to
+    hold SSIM's window or ꟻLIP's filters (Q-61, Q-257)."""
     if pred.dim() != 3:
         raise ValueError(f"dynamic_region takes one image pair [H, W, 3], got {list(pred.shape)}")
     _check_pair(pred, gt)
