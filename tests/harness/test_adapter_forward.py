@@ -5,6 +5,7 @@ the FTGS-IF arrays (E1 to E4, E11, E12, E13, E15, D-13, D-27, D-44), or, for the
 answer is the trainer's own computation (losses, grad_stats), from the direct library calls."""
 
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -438,6 +439,85 @@ def test_grad_stats_names_an_unhonored_setting_of_its_config_subset(tmp_path: Pa
     answer = _answer(tmp_path, "grad_stats", params, tensors)
     assert answer.status == "not_comparable"
     assert "loss.not_a_field" in answer.message
+
+
+def _grad_stats_query(tmp_path: Path, net: str) -> Path:
+    """A grad_stats queries file whose configuration trains with the perceptual network `net` at
+    its calibrated weight (λ_perc None, D-89), otherwise as the grad_stats test's query."""
+    cam = ring(1, radius=4.0, elevation=1.0, width_px=24, height_px=16, focal=20.0)[0]
+    config = {"loss": {"perc_net": net, "lambda_perc": None}}
+    params, tensors = _with_model(_exchange(), width=24, height=16, iteration=1, config=config)
+    tensors.update(
+        {
+            "K": cam.K.double().numpy(),
+            "world_to_camera": cam.world_to_camera.double().numpy(),
+            "t": np.array(5.0),
+            "gt": np.random.default_rng(1).random((16, 24, 3), dtype=np.float32),
+        }
+    )
+    queries = tmp_path / "grad_stats.q.safetensors"
+    write_queries(queries, "grad_stats", [Query("q0", params, tensors)])
+    return queries
+
+
+@pytest.fixture
+def hub(tmp_path: Path) -> Any:
+    """torch.hub's directory moved to an empty folder for one test, as the weights tests do."""
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(tmp_path / "hub"))
+    try:
+        yield tmp_path / "hub"
+    finally:
+        torch.hub.set_dir(previous)
+
+
+def _no_download(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Every download raises `error`, as an unreachable host does (or as a test whose download
+    must not start wants)."""
+
+    def offline(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(torch.hub, "download_url_to_file", offline)
+
+
+def test_grad_stats_with_a_trunk_weight_that_cannot_be_downloaded_is_exit_code_2(
+    tmp_path: Path,
+    hub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (#389), Q-270: grad_stats builds its configuration's perceptual network as the
+    trainer does, so a trunk weight that can't be downloaded at first use (§2.3), here VGG16's
+    from an unreachable host, is an invalid environment, exit 2 with a message naming the file,
+    as `ftgs train` and `ftgs bench` give, not a traceback; no answers are written."""
+    _no_download(monkeypatch, OSError("no network (stood in for)"))
+    queries = _grad_stats_query(tmp_path, "vgg16_oxford")
+    out = tmp_path / "a.safetensors"
+    assert _adapter.main(["--backend", "gsplat", "forward", str(queries), str(out)]) == 2
+    err = capsys.readouterr().err
+    assert "VGG_ILSVRC_16_layers.caffemodel" in err and "no network (stood in for)" in err
+    assert "vgg16_oxford" in err
+    assert not out.exists()
+
+
+def test_grad_stats_with_a_dino_network_without_the_init_extra_is_exit_code_2(
+    tmp_path: Path,
+    hub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142, Q-248: a DINO network without the [init] extra, its vendored DINOv2 layers made
+    unimportable, is exit 2 with a message naming the extra and the network, before anything is
+    downloaded, as `ftgs train` and `ftgs bench` give; no answers are written."""
+    monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.transformer.dinov2", None)
+    _no_download(monkeypatch, AssertionError("a download started"))
+    queries = _grad_stats_query(tmp_path, "dinov2_s14")
+    out = tmp_path / "a.safetensors"
+    assert _adapter.main(["--backend", "gsplat", "forward", str(queries), str(out)]) == 2
+    err = capsys.readouterr().err
+    assert "[init]" in err and "dinov2_s14" in err
+    assert not hub.exists() and not out.exists()
 
 
 @pytest.mark.parametrize(("version", "read"), [("1.1", True), ("2", False)])

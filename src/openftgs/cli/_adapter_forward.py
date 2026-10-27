@@ -229,10 +229,18 @@ def _relocation_sampling(
 
 def _perceptual(cfg: LossConfig) -> PerceptualLoss | None:
     """The configuration's perceptual network, built as the trainer builds it when λ_perc is
-    None, its calibrated weight, or positive (D-77, Q-249)."""
+    None, its calibrated weight, or positive (D-77, Q-249). A trunk weight that can't be
+    downloaded or fails its check (an OSError naming the file, Q-258) and a DINO network
+    without the [init] extra (an ImportError naming it, Q-248) are an invalid environment,
+    exit 2, as `ftgs train` and `ftgs bench` give them (Q-142, #389; Q-270)."""
     if cfg.lambda_perc is not None and cfg.lambda_perc <= 0.0:
         return None
-    return PerceptualLoss(cfg.perc_net)
+    what = f"grad_stats's perceptual network {cfg.perc_net!r}"
+    try:
+        with cli._environment(what):
+            return PerceptualLoss(cfg.perc_net)
+    except ImportError as error:
+        cli._fail(f"{what}: {error}")
 
 
 def _grad_stats(params: Mapping[str, Any], tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:
