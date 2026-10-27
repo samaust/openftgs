@@ -1731,7 +1731,11 @@ def test__comparison_gives_the_median_gain_of_a_variant() -> None:
 
 @pytest.mark.parametrize(
     ("layout", "memory"),
-    [("nchw", torch.contiguous_format), ("channels_last_inputs", torch.channels_last)],
+    [
+        ("nchw", torch.contiguous_format),
+        ("channels_last_inputs", torch.channels_last),
+        ("channels_last_inputs_and_weights", torch.channels_last),
+    ],
 )
 def test__perceptual_inputs_reach_the_network_in_each_layout_without_a_copy(
     layout: str, memory: torch.memory_format
@@ -1763,6 +1767,46 @@ def test__perceptual_inputs_reach_the_network_in_each_layout_without_a_copy(
         assert batch_first.data_ptr() == source.data_ptr()
     (grad,) = torch.autograd.grad(value, x)
     assert grad.shape == x.shape
+
+
+def test__channels_last_weights_copies_the_network_with_its_4d_tensors_channels_last() -> None:
+    """§3.4 B-4 ("in the layouts it accepts"), Q-269 (owner answer, 2026-10-26: channels-last
+    weights as a third layout for the two Caffe trunks): the `channels_last_inputs_and_weights`
+    cases run a copy of the network whose four-dimensional tensors, parameters and buffers alike
+    (a Caffe trunk holds its convolutions as buffers, Q-263), are channels-last in memory, as
+    `Module.to(memory_format=torch.channels_last)` lays them out; the network the other layouts
+    run is left as it was, and the copy computes the same values."""
+    from openftgs.cli._bench import _channels_last_weights
+
+    class Network(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            g = torch.Generator().manual_seed(0)
+            self.conv = torch.nn.Conv2d(3, 4, 3, padding=1)
+            self.register_buffer("kernel", torch.randn(4, 4, 3, 3, generator=g), persistent=False)
+
+        def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            def features(image: torch.Tensor) -> torch.Tensor:
+                batch_first = image.movedim(-1, -3)
+                hidden = self.conv(batch_first)
+                return torch.nn.functional.conv2d(hidden, self.get_buffer("kernel"), padding=1)
+
+            return (features(x) - features(y)).square().mean()
+
+    def four_d(module: torch.nn.Module) -> list[torch.Tensor]:
+        return [t for t in (*module.parameters(), *module.buffers()) if t.dim() == 4]
+
+    network = Network()
+    copy = _channels_last_weights(network)
+    assert copy is not network
+    assert len(four_d(network)) == len(four_d(copy)) == 2
+    assert all(t.is_contiguous() for t in four_d(network))
+    for tensor in four_d(copy):
+        assert tensor.is_contiguous(memory_format=torch.channels_last)
+        assert not tensor.is_contiguous()  # so the layouts differ
+    g = torch.Generator().manual_seed(1)
+    x, y = torch.rand(1, 6, 10, 3, generator=g), torch.rand(1, 6, 10, 3, generator=g)
+    torch.testing.assert_close(copy(x, y), network(x, y), rtol=1e-6, atol=0.0)
 
 
 def test_bench_losses_with_a_cached_weight_that_fails_its_check_exits_2(
@@ -1839,12 +1883,24 @@ LOSS_SIZES = ((64, 48), (80, 64))
 LOSS_REPETITIONS = 3
 WEIGHT_FREE = ("flip", "haarpsi")
 LAYOUTS = ("nchw", "channels_last_inputs")
+# Q-269 (owner answer, 2026-10-26): the two Caffe trunks also run with channels-last weights, the
+# option LPIPS-VGG's B-4 measured (Q-190), which they accept.
+CAFFE_TRUNKS = ("vgg16_oxford", "alexnet_bvlc")
+CHANNELS_LAST_WEIGHTS = "channels_last_inputs_and_weights"
 COMPARISONS = {  # Q-269: (baseline, variant) as (precision, layout, autotuning)
     "autotuning": (("tf32", "channels_last_inputs", False), ("tf32", "channels_last_inputs", True)),
     "nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", False)),
     "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
+    "channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", CHANNELS_LAST_WEIGHTS, False),
+    ),
+    "autotuning_and_channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", CHANNELS_LAST_WEIGHTS, True),
+    ),
 }
 
 
@@ -1876,6 +1932,12 @@ def _precisions(net: str) -> tuple[str, ...]:
     return ("ieee", "tf32") if net in WEIGHT_FREE else ("ieee", "tf32", "bf16")
 
 
+def _layouts(net: str) -> tuple[str, ...]:
+    """§3.4 B-4 ("in the layouts it accepts"), Q-269: NCHW inputs and the render's view for every
+    network, and channels-last weights beside them for the two Caffe trunks."""
+    return (*LAYOUTS, CHANNELS_LAST_WEIGHTS) if net in CAFFE_TRUNKS else LAYOUTS
+
+
 def _perceptual_case(
     net: str, width: int, height: int, precision: str, layout: str, autotuning: bool
 ) -> Any:
@@ -1896,8 +1958,9 @@ def _timed_figures_are_consistent(figures: dict[str, Any]) -> None:
 def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) -> None:
     """§3.4 B-4, Q-269: each network's forward and the prediction's backward in each of its
     precisions (IEEE float32 and TF32; bfloat16 for a trunk network) × {NCHW inputs, the
-    render's channels-last view} × autotuning off and on, at each size, and nothing else; SSIM
-    through fused-ssim, when it imports, and the PyTorch path with autotuning off and on."""
+    render's channels-last view, and for the two Caffe trunks channels-last inputs and weights}
+    × autotuning off and on, at each size, and nothing else; SSIM through fused-ssim, when it
+    imports, and the PyTorch path with autotuning off and on."""
     import importlib.util
 
     assert body["benchmark"] == "B-4" and body["budgets"] == []  # §3.4: it sets D-52's defaults
@@ -1906,7 +1969,7 @@ def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) ->
     assert setup["networks"] == list(networks)
     assert setup["sizes"] == [list(size) for size in LOSS_SIZES]
     assert setup["repetitions"] == LOSS_REPETITIONS and setup["warmup"] == 10
-    assert setup["layouts"] == list(LAYOUTS)
+    assert setup["layouts"] == {net: list(_layouts(net)) for net in networks}
     assert setup["precisions"] == {net: list(_precisions(net)) for net in networks}
     # Q-273: what the trainer runs, per network, in an iteration that isn't deterministic:
     # vgg16_oxford and alexnet_bvlc autotune, and get NCHW inputs where B-4 measured them faster.
@@ -1932,7 +1995,7 @@ def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) ->
         for net in networks
         for width, height in LOSS_SIZES
         for precision in _precisions(net)
-        for layout in LAYOUTS
+        for layout in _layouts(net)
         for autotuning in (False, True)
     ]
     assert sorted(tuple(sorted(c.items())) for c in perceptual) == sorted(expected)
@@ -1973,7 +2036,7 @@ def _assert_deviations_and_gains(body: dict[str, Any], networks: tuple[str, ...]
                     assert 0.0 <= figures[name] < float("inf"), (net, name)
         for name, (base, variant) in COMPARISONS.items():
             summary_key = (("comparison", name), ("network", net))
-            if variant[0] not in _precisions(net):
+            if variant[0] not in _precisions(net) or variant[1] not in _layouts(net):
                 assert summary_key not in cases, (net, name)
                 continue
             gains = []
@@ -1995,7 +2058,13 @@ def _assert_deviations_and_gains(body: dict[str, Any], networks: tuple[str, ...]
     setup = body["setup"]
     assert setup["comparisons"] == {n: [list(b), list(v)] for n, (b, v) in COMPARISONS.items()}
     # Q-173's rule decides these per network, which #394 applies (Q-251)
-    assert setup["turn_on"] == ["autotuning", "nchw_inputs", "autotuning_and_nchw_inputs"]
+    assert setup["turn_on"] == [
+        "autotuning",
+        "nchw_inputs",
+        "autotuning_and_nchw_inputs",
+        "channels_last_weights",
+        "autotuning_and_channels_last_weights",
+    ]
     assert setup["gain_threshold"] == 0.03
     if importlib.util.find_spec("fused_ssim") is not None:
         for width, height in LOSS_SIZES:
