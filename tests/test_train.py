@@ -34,6 +34,7 @@ from builders import (
     write_scene,
 )
 
+import openftgs.losses
 import openftgs.render
 from openftgs.config import (
     GrowthConfig,
@@ -866,10 +867,13 @@ def test_cudnn_autotuning_is_on_whenever_the_ssim_fallback_runs_on_cuda(
     the window isn't fused-ssim's, and otherwise leaves the flag as the caller set it; a
     deterministic one never autotunes. fused-ssim is stood in for, or made unimportable, so the
     test doesn't depend on whether it is installed (Q-2). Every flag is the caller's again
-    after the step."""
+    after the step. `openftgs.losses` caches its import of fused-ssim, so the cache is cleared
+    before and after the step: hygiene, so that the step's SSIM sees the module this test sets
+    and later tests don't keep the stand-in, not a check of the cache."""
     monkeypatch.setitem(sys.modules, "fused_ssim", _fused_ssim_stand_in() if fused else None)
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    openftgs.losses._fused_ssim.cache_clear()
     try:
         cudnn.benchmark = caller
         cfg = TrainConfig(
@@ -884,6 +888,7 @@ def test_cudnn_autotuning_is_on_whenever_the_ssim_fallback_runs_on_cuda(
         assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (caller, *saved[1:])
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+        openftgs.losses._fused_ssim.cache_clear()
 
 
 # Resuming another run's state (§2.2; Q-46, Q-69, Q-70, Q-72).
