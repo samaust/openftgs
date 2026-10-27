@@ -2,11 +2,14 @@
 """The harness's E16 metrics against openftgs.eval's: two implementations written separately
 from E16 and E7, each checking the other (§3.3 L3 step 3). The harness's ꟻLIP runs its own
 vendored copy on the CPU (Q-254), checked against openftgs's copy, which U-23 checks against
-NVIDIA's file as published."""
+NVIDIA's file as published, and, on a GPU, against that file directly."""
 
+import importlib.util
 import os
 import subprocess
 import sys
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -79,6 +82,53 @@ def test_flip_clamps_the_render_first() -> None:
     pred, gt = _pair(8)
     assert pred.max() > 1.0 and pred.min() < 0.0
     assert flip(pred, gt) == flip(np.clip(pred, 0.0, 1.0), gt)
+
+
+# Q-252: NVIDIA's flip_loss.py at d3ab02a as published, kept beside the tests.
+_PUBLISHED_FLIP = Path(__file__).resolve().parents[1] / "reference" / "flip" / "flip_loss.py"
+
+
+def _published_flip() -> Any:
+    """NVIDIA's LDR-ꟻLIP loss as published, loaded from the reference copy under a name of its
+    own (Q-252); the file runs on CUDA only."""
+    spec = importlib.util.spec_from_file_location("flip_published_for_harness", _PUBLISHED_FLIP)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.LDRFLIPLoss()
+
+
+@pytest.mark.gpu
+def test_flip_on_the_cpu_agrees_with_the_published_file_on_cuda() -> None:
+    """E16, §3.3 L3 step 3, U-23's tolerance (Q-254, Q-252, Q-259; #424): on a fixed pair whose
+    render leaves [0, 1] in places, the harness's ꟻLIP on the CPU is NVIDIA's LDR-ꟻLIP as
+    published, run on CUDA in IEEE float32 (D-52) on the clamped render against the ground
+    truth at 67.0 pixels per degree, within 1e-6. It pins the CPU path of the harness's device
+    change to the published CUDA path directly, with no openftgs between them; 67.0 is written
+    here, not read from the harness, whose constant would pass with the published default,
+    67.02, about 3·10⁻⁵ away."""
+    g = np.random.default_rng(424)
+    gt: np.ndarray = g.random((96, 128, 3)).astype(np.float32)
+    pred: np.ndarray = (gt + g.normal(scale=0.12, size=gt.shape)).astype(np.float32)
+    pred[:6] += 0.6
+    pred[-5:, :9] -= 0.4
+    assert pred.max() > 1.0 and pred.min() < 0.0
+    value = flip(pred, gt)
+
+    def nchw(image: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))[None].cuda()
+
+    saved = (torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision())
+    try:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        with torch.no_grad():
+            expected = float(_published_flip()(nchw(np.clip(pred, 0.0, 1.0)), nchw(gt), 67.0))
+    finally:
+        torch.backends.cudnn.allow_tf32 = saved[0]
+        torch.set_float32_matmul_precision(saved[1])
+    assert 0.0 < value < 1.0 and 0.0 < expected < 1.0
+    assert value == pytest.approx(expected, abs=1e-6)
 
 
 _IMPORT_WITHOUT_TORCH = """
