@@ -617,7 +617,7 @@ _GSPLAT_STAGES = {
     [
         pytest.param(_TRAINING_STAGES, False, id="cpu"),
         pytest.param(
-            _TRAINING_STAGES - {"slice.sh_concat"} | _GSPLAT_STAGES,
+            (_TRAINING_STAGES - {"slice.sh_concat"}) | _GSPLAT_STAGES,
             True,
             id="gpu",
             marks=pytest.mark.gpu,

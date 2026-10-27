@@ -21,7 +21,7 @@ from torch import Tensor
 
 from openftgs import _shards
 from openftgs._stages import point, stage
-from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
+from openftgs.model import FreeTimeGaussians, GaussiansAtTime, _check_sh_degree, covariance
 from openftgs.motion import TemporalSlice, temporal_slice
 from openftgs.sh import sh_to_color
 from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders
@@ -111,11 +111,13 @@ def render(
     t = _normalized_time(model, timestamp, time_units)
     g: GaussiansAtTime | TemporalSlice
     if backend == "gsplat":
-        # #423: the temporal slice without at_time's concat over all N rows (§1.1); the backend
-        # concatenates sh0 and shN for the rows its SH evaluation receives, which gives the same
-        # bits (§2.4 rule 2).
-        sh = _ShParts(model.sh0, model.shN[:, : (_active_degree(model, sh_degree) + 1) ** 2 - 1])
-        g = _temporal(model, t)
+        # Q-274, #423: the temporal slice without at_time's concat over all N rows (§1.1); the
+        # backend concatenates sh0 and shN for the rows its SH evaluation receives, the same
+        # values (§2.4 rule 2). at_time's check of the requested degree, with its message (Q-26).
+        degree = model.sh_degree if sh_degree is None else sh_degree
+        degree = _check_sh_degree(degree, tuple(range(model.sh_degree + 1)))
+        sh = _ShParts(model.sh0, model.shN[:, : (degree + 1) ** 2 - 1])
+        g, _ = _temporal(model, t)
     else:
         g = model.at_time(t, sh_degree=sh_degree)
     # §3.4: with a stage clock active, the moved means' gradient marks where the rasterization's
@@ -327,7 +329,7 @@ def _take_rows(g: _PerTime, rows: Tensor) -> _PerTime:
 @dataclass(frozen=True)
 class _ShParts:
     """§1.1's per-time SH coefficients as the two stored tensors they concatenate, `sh0`
-    [N, 1, 3] and `shN` cut to the active degree [N, (L′+1)² − 1, 3] (D-3), with, after
+    [N, 1, 3] and `shN` cut to the requested degree L′ [N, (L′+1)² − 1, 3] (D-3), with, after
     compaction, the model rows of the per-time arrays (Q-31). The gsplat backend concatenates
     them only for the rows its SH evaluation receives (#423)."""
 
@@ -486,19 +488,13 @@ def _bucket_width(frame_dt: float | None, times: Sequence[float]) -> float:
     return max(width, _INDEX_MIN_WIDTH)
 
 
-def _active_degree(model: FreeTimeGaussians, sh_degree: int | None) -> int:
-    """The SH degree a render uses, the model's by default (D-3); `at_time`'s check of it."""
+def _sh_concat(model: FreeTimeGaussians, sh_degree: int | None) -> Tensor:
+    """The SH coefficients of every row cut to the request's degree, as `at_time` concatenates
+    them (Q-20), built once per request (Q-174); `at_time`'s check of the degree."""
     degree = model.sh_degree if sh_degree is None else sh_degree
     allowed = tuple(range(model.sh_degree + 1))
     if isinstance(degree, bool) or not isinstance(degree, int) or degree not in allowed:
         raise ValueError(f"sh_degree must be one of {allowed}, got {degree!r}")
-    return degree
-
-
-def _sh_concat(model: FreeTimeGaussians, sh_degree: int | None) -> Tensor:
-    """The SH coefficients of every row cut to the request's degree, as `at_time` concatenates
-    them (Q-20), built once per request (Q-174)."""
-    degree = _active_degree(model, sh_degree)
     return torch.cat([model.sh0, model.shN[:, : (degree + 1) ** 2 - 1]], dim=1)
 
 
@@ -565,16 +561,21 @@ class _TemporalIndex:
         return torch.sort(torch.cat([listed, self._long])).values
 
 
-def _temporal(model: FreeTimeGaussians, t: float, rows: Tensor | None = None) -> TemporalSlice:
+def _temporal(
+    model: FreeTimeGaussians, t: float, rows: Tensor | None = None, sh: Tensor | None = None
+) -> tuple[TemporalSlice, Tensor | None]:
     """The temporal slice of `at_time`, for every row or only for `rows`, which are gathered
-    first, without the SH coefficients (Q-174, #423): the stages `slice` and `slice.kernel`."""
+    first, with them a request's SH concat `sh` (Q-174), in the stage `slice`; not
+    `at_time`'s concat over every row, which the gsplat backend makes for the rows it
+    evaluates (Q-274, #423)."""
     with stage("slice"):
         arrays = [getattr(model, name) for name in _SLICE_INPUTS]
         if rows is not None:
             arrays = [array[rows] for array in arrays]
+            sh = None if sh is None else sh[rows]
         means, times, log_durations, velocities, log_scales, quats, opacity_logits = arrays
         with stage("slice.kernel"):
-            return temporal_slice(
+            s = temporal_slice(
                 means,
                 times,
                 log_durations,
@@ -585,6 +586,7 @@ def _temporal(model: FreeTimeGaussians, t: float, rows: Tensor | None = None) ->
                 t,
                 impl=model.slice_impl,
             )
+    return s, sh
 
 
 def _slice(
@@ -592,15 +594,14 @@ def _slice(
 ) -> GaussiansAtTime:
     """The per-time arrays of `at_time`, from the request's SH concat `sh`, for every row or
     only for `rows`, which are gathered first (Q-174)."""
-    s = _temporal(model, t, rows)
-    if rows is not None:
-        sh = sh[rows]
+    s, gathered = _temporal(model, t, rows, sh)
+    assert gathered is not None
     return GaussiansAtTime(
         means_t=s.means_t,
         opacities_t=s.opacities_t,
         quats_n=s.quats_n,
         scales=s.scales,
-        sh=sh,
+        sh=gathered,
         opacities=s.opacities,
         reg_terms=s.reg_terms,
         passes_cull=s.passes_cull,
@@ -1055,7 +1056,7 @@ def _render_gsplat(
             coeffs = coeffs.expand(num_cams, *coeffs.shape)
     with stage("raster.forward.sh"):
         # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; the
-        # bands above the active degree are already cut (D-3).
+        # bands above the requested degree are already cut (D-3).
         degree = math.isqrt(coeffs.shape[-2]) - 1
         colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=passed_visible)
         colors = torch.clamp_min(colors + _SH_OFFSET, 0.0)
@@ -1132,8 +1133,8 @@ def _empty_gsplat_render(
     with weight zero on the 2D means, which depend with weight zero on every per-time array, so
     every stored tensor and the 2D means get an exactly zero gradient (U-8, D-57)."""
     num_cams = background.shape[0]
-    parts = (sh.sh0, sh.shN) if isinstance(sh, _ShParts) else (sh,)
-    arrays = (g.means_t, g.opacities_t, g.quats_n, g.scales, *parts)
+    # The SH coefficients of no row: the stored tensors' rows that compaction kept, none.
+    arrays = (g.means_t, g.opacities_t, g.quats_n, g.scales, _coefficients(sh, None))
     zero = sum((array.sum() for array in arrays), start=g.means_t.new_zeros(())) * 0.0
     means2d = zero.expand(0, 2) if packed else zero.expand(num_cams, num_rows, 2)
     through = means2d.sum() * 0.0  # the outputs read the 2D means, as compositing does
