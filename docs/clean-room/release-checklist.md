@@ -354,7 +354,10 @@ The one scheme-less hit, "the zju3dv family" of YAML layouts in `docs/modules/da
 | PyTorch (and torch.hub, NVTX, the profiler) | package, scripts, tests, harness | Appendix A #13, #21; rows 8, 15, 17–19, 50, 131, 153, 161, 175–178 |
 | gsplat 1.5.3 | `render`, `optim`, tests | Appendix A #8, #9, #23, #38, #40; rows 6, 10, 13, 22, 27–31, 55–57, 158, 184 |
 | safetensors | `io`, harness, tests | Appendix A #22, #35; rows 11, 148, 194 |
-| lpips 0.1.4, with torchvision's AlexNet and VGG trunks | `losses`, `eval`, harness | Appendix A #10, #34; rows 43, 44, 67, 174 |
+| ꟻLIP at d3ab02a (BSD-3-Clause), vendored with marked changes as `openftgs._vendor.flip`, its unmodified reference in `tests/reference/flip` (Q-252) and the harness's copy (Q-254), built by `scripts/vendor_flip.py` (#432) | `losses`, `eval`, harness, NOTICE | rows 425, 444, 445; research rows 361 to 365 |
+| piq 0.8.0's HaarPSI (Apache-2.0), adapted in `openftgs.losses`, not imported (#432) | `losses`, NOTICE | rows 430, 434 (research), 446 to 448 |
+| Caffe's `caffe.proto` field numbers, for the wire-format reader of `openftgs._weights` (BSD-2-Clause) (#432) | `_weights.py` | rows 422, 441 |
+| The six trunk networks' weights: Oxford's VGG16 (CC BY 4.0), BVLC's AlexNet, DINOv2 ViT-S/14 and ViT-B/14, DINO ViT-S/16 and ViT-B/16 (#432; Pretrained weights' terms, above) | `_weights.py`, `_caffe_trunks.py`, `losses`, NOTICE | rows 424, 438 to 443 |
 | PyYAML; Pillow; SciPy; NumPy | package, scripts, tests | rows 88, 89; rows 74, 183; rows 7, 61, 127, 194; rows 15, 20, 102, 194 |
 | fused-ssim (optional) | `losses`, `train` | rows 45, 73 |
 | RoMa at 77f8d68, vendored, with what it imports: torchvision, einops, loguru, kornia (inside one helper), xformers (optional), fused-local-corr (`local_corr`) | `src/openftgs/_vendor/romatch`, `openftgs.init` | Appendix A #10, #15, #26, #32, #33; rows 106–126, 139, 156; fused-local-corr row 3 |
@@ -364,7 +367,7 @@ The one scheme-less hit, "the zju3dv family" of YAML layouts in `docs/modules/da
 | hypothesis (MPL-2.0, documentation only) | tests | row 7 |
 | ruff, mypy | `pyproject.toml`, CI | rows 76, 82, 84, 275 |
 | pip-licenses | `scripts/license_scan.py`, CI | rows 1, 5 |
-| scikit-image, opencv-python-headless and torchmetrics, the tests' oracles | tests | row 46; rows 89, 188; rows 66, 68, 69 |
+| scikit-image and opencv-python-headless, the tests' oracles (torchmetrics, an oracle until revision 549o, left with #393; rows 66, 68, 69) | tests | row 46; rows 89, 188 |
 | matplotlib | harness | row 194 |
 | setuptools as the build backend; GitHub Actions | both `pyproject.toml` files; `.github/workflows/` | new row 277; row 182 (`gpu-bench.yml`) and 277 (`ci.yml`) |
 | ffmpeg and ffprobe; COLMAP; nvidia-smi; git | `openftgs.data`, `openftgs.cli`, scripts | rows 95, 101, 179, 180; Appendix A #28, rows 92, 100; row 162; row 164 and rows 115, 116 |
@@ -420,6 +423,45 @@ Nothing else in the scope needed a row: every other URL, project and attribution
 - Q-239 and Q-240 moved from inside the Calibration data table into the Q-n table, after Q-238 and before Q-241 (PRD #355, owner decision 6; commit 071788e). The two rows are 4,332 bytes with SHA-256 `926d2b7637c513c198f1fc4d0f7730626afaf4f6b67269d1fcdae33764b9b4a8` before and after; `questions.md` keeps its size and its lines, and with the two rows taken out the old and new files are identical. The Calibration data table now holds only its own rows.
 - Row 276 records the owner's decision on row 273 (commit 6f42859).
 - The glossary's "Spec revision" entry already read revision 549n, word for word as the PRD gives it (5288b72); it was checked, not changed.
+
+### Rerun over rows 334 to 467 (#432)
+
+Ticket #432, 2026-10-27, on `ticket-432-after-380` at 747d6e7: `main` at 0efc6b2 (PRD #380 and its follow-ups, #396 to #431) merged into `prd-355-release`. The records matched against are source-log rows 334 to 467, `main`'s, word for word the same on this tree, and spec Appendix A #45, which points at rows 334 to 436 (#373's and #374's research); rows 437 to 467 are #380's build rows, after that export. The branch's own rows 275 to 333 (#356 to #369) are recorded by the sections of this checklist that cite them and were not audited again here. The searches are those above, run on tracked files only (`git grep`, `git ls-files`, `main`'s tree through `git archive`); the vendored RoMa, `scripts/vendor_roma.py` and its test are unchanged since 7e1faf0.
+
+**URLs.** 29 distinct URLs in the scope are new since the table above: 22 from `main`'s work and 7 from the documentation site. Each has a row, an Appendix A entry, or a reason it needs none:
+
+| Distinct URLs | Where | Record |
+| --- | --- | --- |
+| ꟻLIP's repository, its `LICENSE` and `src/pytorch/flip_loss.py` at d3ab02a, and `scripts/vendor_flip.py`'s template of the raw address (4) | NOTICE, both ꟻLIP copies' `__init__.py` and `VENDOR.json`, `scripts/vendor_flip.py` | rows 361 to 363, 425, 444; the script only writes the address into `VENDOR.json` and opens no connection |
+| Links in NVIDIA's own text: three NVIDIA Research publication pages, a tone-mapping page, an ACES curve article, an sRGB–CIEXYZ conversion page (6) | the three copies of `flip_loss.py` | none needed: upstream text carried unchanged, byte-identical in all three copies and in no edit of `VENDOR.json`; none was opened |
+| piq's repository (1) | NOTICE, `src/openftgs/losses.py` | rows 357, 359, 446 |
+| The Apache-2.0 license's https address (1) | NOTICE | none needed: the license's own address |
+| Oxford VGG's model page; CC BY 4.0's deed (2) | NOTICE | rows 340, 419; row 450 |
+| The six trunk weights' URLs, Oxford's and BVLC's Caffe files and the four DINO checkpoints (6) | `src/openftgs/_weights.py`, `tests/test_weights.py` | rows 419, 421, 440 (the URLs), 424 (sizes and SHA-256, which match the code), 443 |
+| The test's local server and an unreachable address (2) | `tests/test_weights.py` | none needed: `127.0.0.1`, never outside the machine |
+| The Read the Docs badge; the site; the project's repository (3) | `README.md`, `pyproject.toml`, `docs/index.md`, `tests/test_docs_and_ci_config.py` | row 315; the project's own site (Q-244) and repository |
+| openftgs-synth's repository and its README anchor (2) | `docs/datasets.md`, `docs/quickstart.md` | row 307 |
+| Neural3DV's repository (1) | `docs/datasets.md` | Appendix A #11 |
+| The paper on arXiv (1) | `docs/index.md`, `docs/method.md` | Appendix A #3; row 309 |
+
+PyTorch's CPU index and install page, fused-local-corr and fused-ssim now also appear in the docs install and `docs/installation.md` (rows 3, 45, 73, 277, 314, 321). `docs/conf.py`'s intersphinx inventories are row 295.
+
+**Upstream projects.** New: NVIDIA's ꟻLIP, piq's HaarPSI, Caffe's field numbers and the six weights (the table above); #374's prototype `converters.py` and `candidates.py`, the owner's uncommitted Apache-2.0 research code read in place (rows 438, 439, 449, 452; the allowance recorded in row 463); lpips as a source of facts only, its ε and its uncalibrated distance (rows 343, 349, 350, 435); PyTorch's torch.hub, safetensors' errors and protobuf's wire format as general knowledge (rows 441, 454, 456, 457, 465, 466); tools used for their output (rows 437, 459 to 461). Gone: lpips 0.1.4 with torchvision's trunks, and torchmetrics. An AST walk of every tracked Python file outside the vendored RoMa finds no import of lpips, torchmetrics, piq or torchvision; their remaining mentions are the ε's and distance's source in comments and docstrings, the handling of the retired `perc_net` names (Q-247: `_legacy.py`, `config`, `io`, `eval`, `train`, `cli/_bench.py`), and the checks that they are absent (`tests/test_skeleton.py`, `ci.yml`'s wheel check, the harness's settings and tests).
+
+**Attribution comments.** New: `_caffe_trunks.py` and `_weights.py` (adapted from the prototype; `caffe.proto`), `losses.py` (HaarPSI from piq 0.8.0 between its start and end markers; the DINO networks from the prototype), the vendored ꟻLIP's modification notices and package docstrings, and NOTICE's ꟻLIP, piq and VGG16 sections. The only SPDX lines other than Apache-2.0 are NVIDIA's `BSD-3-Clause` in the three ꟻLIP copies. The code now cites the source log on 81 lines of `src/`, `scripts/` and `tests/` (15 of them `scripts/license_signoff.json`'s entries, row 331), 29 of them rows 334 or later, and the module docs on 24 lines, 9 of them rows 334 or later. Every comment citing a row of 334 or later was checked against the row, and all match but one, in part: `_caffe_trunks.py`'s comment on BVLC's mean pixel cites row 426 for the means "to eight decimals", which row 426 records to three; the eight-decimal values are in row 449.
+
+**Rows 334 to 467.** Rows 334 to 436 are #373's and #374's research (Appendix A #45): the screened-out candidates, the papers the owner accepted after the fact (row 436), torchvision's terms for LPIPS's trunks, and the reads behind the code that stayed (ꟻLIP, piq, Caffe, the VGG, AlexNet, DINOv2 and DINO terms). Rows 437 to 467 are #380's build: the trunk weights (438 to 443), the vendored ꟻLIP (444, 445), HaarPSI (446 to 448), the Caffe trunks (449 to 451), the DINO networks (452 to 454), the trainer, the benchmark, the dependency removal and the reviews (455 to 467). No row is marked **Incident**, and none records reading the source code of a copyleft, non-commercial or unlicensed project: the closed-class projects the research met (pyiqa, PieAPP, Watson-DFT, LASI, DINOv3, ST-LPIPS, R-LPIPS; GPL and LGPL system tools in row 437) were read as license files, READMEs, papers or tool output only.
+
+**Forbidden names**, over rows 334 to 467 and the 105 files `main` changed since 7e70ed7, and the site's pages: the guard's pattern finds the package's own class, the paper's name as the project's subject and rule text, and the framework named only in rule text and D-63 ("left unopened"); the other closed names of the search above appear only in CLAUDE.md and the spec, as before. The closed-class candidates appear only in rows 358 to 436 and in `docs/research/perceptual-alternatives.md`, as survey entries with their licenses. tqdm appears only where it is removed or checked absent. The guard blocked no search.
+
+**For the owner's attention** (findings, nothing changed):
+- the harness's copy of ꟻLIP (`harness/src/ftgs_harness/_vendor/flip`, Q-254, #391) has no source-log row of its own (row 444 names `openftgs._vendor.flip`; the copy was made by the same script from the same reference copy, with no new outside source), NOTICE names openftgs's copy and `tests/reference/flip` but not the harness's, and the harness's wheel ships ꟻLIP's BSD-3-Clause `LICENSE` as package data with no NOTICE of its own; the harness is a separate distribution this release doesn't publish (Q-5);
+- row 420 read the README and the deploy prototxt of a gist without a license file, for the VGG16 model's layer names, facts about the model, nothing copied;
+- the comment on BVLC's mean pixel above.
+
+**New rows**: T432.1 (Debian's copyright file for libdrm, License scan above) and T432.2 (the tools run for #432's checks).
+
+**Housekeeping (#432).** At the merge of `main` (9dc5ce30): the glossary's "Spec revision" entry now reads revision 549o (revision 549, amended fifteen times in the repository in the owner's name, as 549a to 549o); Q-239 and Q-240 stay after Q-238, unchanged, where #368 moved them, and are not repeated inside `main`'s Calibration data table; every Q-n and source-log row of both sides is kept, `main`'s numbers final, with no renumbering.
 
 ## Benchmark baselines
 
