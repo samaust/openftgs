@@ -447,7 +447,8 @@ class PerceptualLoss(torch.nn.Module):
             return distance
         if self._name == "haarpsi":
             # Q-261: computed in the images' dtype, never a cast; float16 overflows to a NaN and
-            # bfloat16 was never measured. The dtype only, so no synchronization.
+            # bfloat16 is an approximation B-4 never measured. The dtype only, so nothing
+            # synchronizes.
             if pred.dtype not in (torch.float32, torch.float64):
                 _fail(f"HaarPSI takes float32 or float64 images, got {pred.dtype}")
             # D-89: 1 − HaarPSI, Î clamped to [0, 1].
