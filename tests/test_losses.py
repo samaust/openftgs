@@ -570,6 +570,18 @@ def test_haarpsi_checks_no_values() -> None:
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_haarpsi_takes_float32_and_float64_images_only(dtype: torch.dtype) -> None:
+    """Q-261 (#425): `haarpsi` computes in its images' dtype, float32 or float64, and refuses
+    any other with a ValueError naming both, rather than casting it: in float16 the squared
+    Haar coefficients overflow to a NaN, and bfloat16 gives an approximation B-4 never
+    measured."""
+    image = _pattern((32, 40, 3), 0.0).to(dtype)
+    with pytest.raises(ValueError, match=r"float32.*float64") as refused:
+        PerceptualLoss("haarpsi")(image, image.clone())
+    assert str(dtype) in str(refused.value)
+
+
 @pytest.mark.parametrize("dtype", [F64, torch.float16, torch.bfloat16])
 def test_flip_takes_float32_images_only(dtype: torch.dtype) -> None:
     """Q-261: NVIDIA's ꟻLIP loss computes with float32 constants, so `flip` refuses images
