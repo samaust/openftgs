@@ -1312,8 +1312,8 @@ def test_building_the_perceptual_network_draws_nothing_from_the_global_generator
 @needs_init
 @pytest.mark.parametrize("net", ["dinov2_s14", "dino_s16"])
 def test_a_checkpoint_holds_no_perceptual_network(tmp_path: Path, net: PercNet) -> None:
-    """§2.2, §2.3 (the trunks' weights are never redistributed): a DINO network's parameters
-    are in `PerceptualLoss.state_dict()`, but the trainer state, and so the checkpoint saved
+    """§2.2, §2.3 (the trunks' weights are never redistributed): a DINO network's weights are
+    buffers no `state_dict` carries (Q-265), and the trainer state, and so the checkpoint saved
     from it, holds the model's nine stored tensors (§1.1), their Adam state and the gradient
     statistics, never the loss's."""
     trainer = Trainer(_perceptual(net), _scene(tmp_path, scale=2), _init_points(), device="cpu")
@@ -1322,9 +1322,11 @@ def test_a_checkpoint_holds_no_perceptual_network(tmp_path: Path, net: PercNet) 
     assert set(state.params) == set(FreeTimeGaussians.PARAM_NAMES)
     save_checkpoint(state, tmp_path / "ckpt")
     _assert_states_equal(state, load_checkpoint(tmp_path / "ckpt"))
-    vit_tensors = sum(t.numel() for t in PerceptualLoss(net).state_dict().values())
+    loss = PerceptualLoss(net)
+    assert loss.state_dict() == {}  # Q-265
+    vit_tensors = sum(t.numel() for t in loss.buffers())
     saved = sum(path.stat().st_size for path in (tmp_path / "ckpt").rglob("*") if path.is_file())
-    assert saved < 4 * vit_tensors  # the ViT's float32 parameters alone would take more
+    assert saved < 4 * vit_tensors  # the ViT's float32 weights alone would take more
 
 
 # The default configuration's perceptual network, ꟻLIP at its calibrated weight (D-9, D-77).
@@ -1455,9 +1457,10 @@ def _layout(image: torch.Tensor) -> str:
 
 def _weights_layout(network: torch.nn.Module) -> str:
     """How a network's four-dimensional parameters and buffers lie in memory, through
-    PyTorch's public `parameters()` and `buffers()` (a Caffe trunk holds its convolutions as
-    buffers, Q-263): "nchw" when every one is contiguous, a network without any included,
-    "channels_last" when every one is channels-last, else "mixed"."""
+    PyTorch's public `parameters()` and `buffers()` (the Caffe trunks and the DINO networks
+    hold their weights as buffers, Q-263, Q-265): "nchw" when every one is contiguous, a
+    network without any included, "channels_last" when every one is channels-last, else
+    "mixed"."""
     tensors = [t for t in (*network.parameters(), *network.buffers()) if t.dim() == 4]
     if all(t.is_contiguous() for t in tensors):
         return "nchw"

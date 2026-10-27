@@ -336,7 +336,8 @@ class _DinoDistance(torch.nn.Module):
     to a multiple of the patch and standardized; the patch tokens after blocks 3, 6, 9 and 12,
     unit-normalized, their squared differences summed over channels, averaged over tokens and
     summed over the blocks. The position embeddings are interpolated by the vendored model's
-    own code."""
+    own code. It computes in its weights' dtype, float32 as built, and holds them as buffers
+    that no `state_dict` carries and `.to()` converts, as the Caffe trunks (Q-263, Q-265)."""
 
     _mean: Tensor
     _std: Tensor
@@ -358,11 +359,19 @@ class _DinoDistance(torch.nn.Module):
                 f"the publisher's state dict of {net} doesn't fit the vendored {builder}: "
                 f"missing {loaded.missing_keys}, unexpected {loaded.unexpected_keys}"
             )
+        # Q-265: the weights as buffers no `state_dict` carries, as the Caffe trunks (Q-263;
+        # §2.3: never redistributed), which `.to()` still moves and converts. The vendored
+        # layers read them as attributes, so their files stay unchanged (D-65).
+        for module in vit.modules():
+            for name, parameter in list(module.named_parameters(recurse=False)):
+                delattr(module, name)
+                module.register_buffer(name, parameter.detach(), persistent=False)
         self._vit: Any = vit
         self._net = net
         self._patch = patch
-        mean = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
-        std = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
+        dtype = vit.patch_embed.proj.weight.dtype  # Q-265: the weights' dtype, float32 as built
+        mean = torch.tensor(_IMAGENET_MEAN, dtype=dtype).view(1, 3, 1, 1)
+        std = torch.tensor(_IMAGENET_STD, dtype=dtype).view(1, 3, 1, 1)
         # Buffers, so that `.to(device)` moves them and no call copies them to the device.
         self.register_buffer("_mean", mean, persistent=False)
         self.register_buffer("_std", std, persistent=False)
@@ -383,10 +392,15 @@ class _DinoDistance(torch.nn.Module):
         return list(self._vit.get_intermediate_layers(image, n=_DINO_BLOCKS, norm=False))
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
-        # Q-265: the publishers' float32, never a cast; at least one patch at half
-        # resolution, 2p − 1 pixels for an even patch p. Shapes and dtypes only.
-        if x.dtype != torch.float32:
-            _fail(f"PerceptualLoss({self._net!r}) takes float32 images, got {x.dtype}")
+        # Q-265: the weights' dtype, float32 as built, never a cast, as the Caffe trunks
+        # (Q-263); at least one patch at half resolution, 2p − 1 pixels for an even patch p.
+        # Shapes and dtypes only.
+        dtype = self._mean.dtype
+        if x.dtype != dtype:
+            _fail(
+                f"PerceptualLoss({self._net!r}) computes in its weights' dtype {dtype}, so it "
+                f"takes {dtype} images, got {x.dtype}"
+            )
         if min(_halved(x)) < self._patch:
             _fail(
                 f"PerceptualLoss({self._net!r}) needs H and W >= {2 * self._patch - 1}, one "
@@ -408,9 +422,11 @@ class PerceptualLoss(torch.nn.Module):
     float32 images; "haarpsi" is 1 − HaarPSI, the render clamped to [0, 1], on float32 or
     float64 images of sides of at least 16 pixels (Q-261). "vgg16_oxford" and "alexnet_bvlc"
     are lpips's uncalibrated distance on the Caffe trunks, their weights fetched at first use,
-    on float32 images, AlexNet's sides of at least 23 pixels (Q-263). The DINO networks
-    ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16") take float32 images of sides from 27
-    or 31 pixels (Q-265) and need the [init] extra: an ImportError names it otherwise (Q-248)."""
+    AlexNet's sides of at least 23 pixels (Q-263). The DINO networks ("dinov2_s14",
+    "dinov2_b14", "dino_s16", "dino_b16") take sides from 27 or 31 pixels (Q-265) and need the
+    [init] extra: an ImportError names it otherwise (Q-248). These six trunk networks compute
+    in their weights' dtype, float32 as built, and refuse images of another; their weights are
+    buffers no `state_dict` carries, which `.to()` moves and converts (Q-263, Q-265)."""
 
     def __init__(self, net: PercNet = "flip") -> None:
         super().__init__()

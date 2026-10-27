@@ -413,9 +413,9 @@ class _NCHWPerceptualLoss(PerceptualLoss):
 class _Bf16PerceptualLoss(PerceptualLoss):
     """D-52's approximate option, `perc_precision = "bf16"`, for a trunk network: the network
     runs under bfloat16 autocast on the images' device, the CPU included (Q-191), and returns
-    float32. The images enter as float32, as the networks require (Q-263, Q-265), and the
-    module keeps its float32 weights and constants; only the operations autocast covers run
-    in bfloat16. The evaluator's networks stay float32."""
+    float32. The images enter as float32, the dtype of the networks' weights as built (Q-263,
+    Q-265), and the module keeps its float32 weights and constants; only the operations
+    autocast covers run in bfloat16. The evaluator's networks stay float32."""
 
     def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
         with torch.autocast(pred.device.type, dtype=torch.bfloat16):
