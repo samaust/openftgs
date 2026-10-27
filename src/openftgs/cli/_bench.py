@@ -1961,9 +1961,10 @@ def _perceptual_inputs(gt: Tensor, pred: Tensor, layout: str) -> tuple[Tensor, T
 
 def _channels_last_weights(network: Any) -> Any:
     """Q-269 (owner answer, 2026-10-26): a copy of `network` whose four-dimensional parameters
-    and buffers, a Caffe trunk's convolutions among them (Q-263), are channels-last in memory,
-    as `Module.to(memory_format=torch.channels_last)` lays them out, for the
-    `channels_last_inputs_and_weights` cases; `network` is left as it was."""
+    and buffers, a Caffe trunk's convolutions and a DINO network's patch embedding among them
+    (Q-263, Q-265), are channels-last in memory, as `Module.to(memory_format=torch.channels_last)`
+    lays them out, for the `channels_last_inputs_and_weights` cases; `network` is left as it
+    was."""
     import torch
 
     return copy.deepcopy(network).to(memory_format=torch.channels_last)

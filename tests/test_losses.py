@@ -428,8 +428,9 @@ def _pattern(shape: tuple[int, ...], phase: float) -> Tensor:
 
 
 # Q-262: ꟻLIP runs in float32 only (Q-261); HaarPSI's identity case runs in float64, where
-# its float32 rounding (the logit of float32's sigmoid(4.2)) doesn't reach U-9's bound; the DINO
-# networks run in float32 only (Q-265).
+# its float32 rounding (the logit of float32's sigmoid(4.2)) doesn't reach U-9's bound; the
+# Caffe trunks and the DINO networks run in float32, their weights' dtype as built (Q-263,
+# Q-265).
 @pytest.mark.parametrize(
     ("net", "dtype"),
     [
@@ -444,7 +445,8 @@ def test_u9_perceptual_network_of_an_image_with_itself(net: PercNet, dtype: torc
     Gaussian noise of σ = 16/255 (float32 rounding, ꟻLIP's stabilizer), on each of five images:
     uniform noise and closed-form textures, one and two to an image batch. ꟻLIP is checked in
     float32, its only dtype (Q-261), HaarPSI in float64 (Q-262), and the two Caffe trunks and
-    the four DINO networks, under `weights` (Q-7), in float32 (Q-263, Q-265)."""
+    the four DINO networks, under `weights` (Q-7), in float32, their weights' dtype as built
+    (Q-263, Q-265)."""
     loss = PerceptualLoss(net)
     images = [
         _image_pair((2, 32, 40, 3), seed=40, correlated=False)[0],
@@ -646,8 +648,8 @@ def test_perceptual_loss_forward_and_backward_on_cuda_make_no_synchronization(ne
     constants and filters there (and, for ꟻLIP, reads its colour maximum back once), a
     forward and backward pass of the network on a render-sized pair make no host
     synchronization under `torch.cuda.set_sync_debug_mode("warn")`, by any route the recorder
-    sees. The Caffe trunks' weights and the DINO networks' parameters and buffers are moved to the
-    device with the module."""
+    sees. The Caffe trunks' and the DINO networks' weights and constants, buffers, are moved to
+    the device with the module."""
     from sync_recorder import SyncRecorder, described
 
     loss = PerceptualLoss(net).to("cuda")
