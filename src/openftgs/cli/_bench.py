@@ -1795,10 +1795,10 @@ def _training_paths(networks: Sequence[str]) -> dict[str, dict[str, Any]]:
     deterministic (Q-273), per precision: `training_autotuning`, whether it autotunes cuDNN
     (as changed, #428), and `training_layout`, the layout it gives the network with that
     autotuning."""
-    from openftgs.train import _AUTOTUNED, _NCHW_INPUTS
+    from openftgs.train import _AUTOTUNED_PRECISIONS, _NCHW_INPUTS
 
     def autotuned(net: str, precision: str) -> bool:
-        return precision in _AUTOTUNED.get(net, frozenset())
+        return precision in _AUTOTUNED_PRECISIONS.get(net, frozenset())
 
     def layout(net: str, precision: str) -> str:
         nchw = (precision, autotuned(net, precision)) in _NCHW_INPUTS.get(net, frozenset())

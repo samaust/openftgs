@@ -282,7 +282,8 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # §2.4's perceptual-loss row, D-52; Q-173 (changed, #394), Q-272, Q-273 (changed, #428): per
 # perceptual network, the precisions under which its training iterations autotune cuDNN unless
-# deterministic, read from B-4's recorded rerun (Calibration data, #394) as the layout is: where
+# deterministic, read from B-4's recorded rerun (#394; the figures in Q-273's row, the "tf32"
+# ones also in the Calibration data) as the layout is: where
 # autotuning is at least 3 % faster than the same layout without it at both sizes in both runs,
 # the layout being the one the network takes at that precision. Under "tf32" it is Q-272's
 # adopted option, autotuning with NCHW inputs, against the plain path: vgg16_oxford +4.7 % /
@@ -296,7 +297,7 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 # runs (Q-273, owner answer): then every network's iteration autotunes. With no perceptual
 # network the only cuDNN convolutions are the SSIM fallback's, so such an iteration autotunes,
 # as every one did since #326.
-_AUTOTUNED: dict[str, frozenset[str]] = {
+_AUTOTUNED_PRECISIONS: dict[str, frozenset[str]] = {
     "vgg16_oxford": frozenset({"tf32"}),
     "alexnet_bvlc": frozenset({"tf32", "bf16"}),
 }
@@ -393,7 +394,7 @@ _CHANNELS_LAST_WEIGHTS: dict[str, frozenset[tuple[str, bool]]] = {}
 # precision and autotuning: vgg16_oxford under "ieee" (+10 to +16 %), not under "bf16" (−7 to
 # −12 %) nor in a deterministic "tf32" run (−1 to −5 %); alexnet_bvlc everywhere (+3.5 to +88 %).
 # Every other network and pair takes the render's channels-last view as it comes. Where
-# `_AUTOTUNED` leaves the flag to the caller, vgg16_oxford under "ieee" and "bf16" and
+# `_AUTOTUNED_PRECISIONS` leaves the flag to the caller, vgg16_oxford under "ieee" and "bf16" and
 # alexnet_bvlc under "ieee", both pairs of the precision agree, so the layout is the same whether
 # the caller's flag or the SSIM fallback autotunes or not (Q-273, as changed, #428).
 _NCHW_INPUTS: dict[str, frozenset[tuple[str, bool]]] = {
@@ -453,7 +454,7 @@ def _autotunes(cfg: TrainConfig, device: torch.device) -> bool:
     (the owner's answer). Otherwise the iteration leaves the flag as the caller set it (Q-73)."""
     return (
         not _builds_perceptual(cfg.loss)
-        or cfg.perf.perc_precision in _AUTOTUNED.get(cfg.loss.perc_net, frozenset())
+        or cfg.perf.perc_precision in _AUTOTUNED_PRECISIONS.get(cfg.loss.perc_net, frozenset())
         or _ssim_fallback_on_cuda(cfg.loss, device)
     )
 

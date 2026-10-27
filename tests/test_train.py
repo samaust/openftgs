@@ -1488,9 +1488,9 @@ def test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose(
     otherwise the render's channels-last view as it comes; and cuDNN autotuning is on while
     the network runs for the networks and precisions B-4 turned it on for (as changed, #428),
     unless the step is deterministic, which turns it off, while for the others the flag stays
-    the caller's (Q-73). The network's
-    weights are channels-last exactly where B-4's runs with channels-last weights put them
-    (Q-269, Q-273; #380's review): nowhere, so they stay contiguous NCHW."""
+    the caller's (Q-73). The network's weights are channels-last exactly where B-4's runs with
+    channels-last weights put them (Q-269, Q-273; #380's review): nowhere, so they stay
+    contiguous NCHW."""
     cudnn = torch.backends.cudnn
     seen: list[tuple[str, str, bool, str]] = []
     original = PerceptualLoss.forward
@@ -1519,6 +1519,20 @@ def test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose(
     assert seen == [(layout, layout, autotuning, weights)]
 
 
+def test__nchw_inputs_dont_depend_on_a_flag_the_trainer_leaves_to_the_caller() -> None:
+    """Q-273 (as changed, #428): `_perceptual_network` chooses the layout from the autotuning
+    `_autotunes` turns on, while where `_AUTOTUNED_PRECISIONS` leaves the flag to the caller, the
+    caller's flag or the SSIM fallback may still autotune the iteration. So at every such network
+    and precision, `_NCHW_INPUTS` gives the layout B-4 chose both with autotuning and without."""
+    from openftgs.train import _AUTOTUNED_PRECISIONS, _NCHW_INPUTS
+
+    for net, pairs in _NCHW_INPUTS.items():
+        for precision in ("ieee", "tf32", "bf16"):
+            if precision not in _AUTOTUNED_PRECISIONS.get(net, frozenset()):
+                both = ((precision, False) in pairs, (precision, True) in pairs)
+                assert both[0] == both[1], (net, precision)
+
+
 @pytest.mark.weights
 @pytest.mark.parametrize("precision", ["ieee", "tf32"])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -1528,18 +1542,18 @@ def test_a_float32_steps_nchw_perceptual_term_is_within_rounding_of_the_renders_
 ) -> None:
     """§2.4 rule 2, D-52; Q-273 (Q-223 as changed, #394): where the trainer gives a network
     NCHW inputs (vgg16_oxford and alexnet_bvlc under "ieee", where autotuning is the caller's
-    flag (as changed, #428), and under "tf32" with autotuning), a training step's perceptual
-    term equals, bitwise, a direct call of a separately built plain
-    `PerceptualLoss` on the same two images laid out so that their batch-first views are
-    contiguous NCHW, so float32 and the same network; and that NCHW path's value and the
-    prediction's gradient are within rounding of the render's channels-last view, the copy
-    being exact. The direct calls are made at the same moment, under the global flags the step
-    sets. Tolerances (Q-273): the value within 1e-5 relative and the gradient within 1e-3
-    in relative L2 in IEEE float32, which the CPU always computes, since on this step's dim
-    render each layout's float32 gradient of vgg16_oxford lies up to 1.6e-4 from float64's;
-    TF32 on CUDA rounds to 10 mantissa bits, so two TF32 kernels are held to 1e-3 and 0.1
-    (Q-223). The images are caught by a global forward hook, PyTorch's public
-    `register_module_forward_hook`."""
+    flag unless SSIM runs through its PyTorch fallback on CUDA (as changed, #428), and under
+    "tf32" with autotuning), a training step's perceptual term equals, bitwise, a direct call of
+    a separately built plain `PerceptualLoss` on the same two images laid out so that their
+    batch-first views are contiguous NCHW, so float32 and the same network; and that NCHW
+    path's value and the prediction's gradient are within rounding of the render's
+    channels-last view, the copy being exact. The direct calls are made at the same moment,
+    under the global flags the step sets. Tolerances (Q-273): the value within 1e-5 relative
+    and the gradient within 1e-3 in relative L2 in IEEE float32, which the CPU always computes,
+    since on this step's dim render each layout's float32 gradient of vgg16_oxford lies up to
+    1.6e-4 from float64's; TF32 on CUDA rounds to 10 mantissa bits, so two TF32 kernels are
+    held to 1e-3 and 0.1 (Q-223). The images are caught by a global forward hook, PyTorch's
+    public `register_module_forward_hook`."""
     from torch.nn.modules.module import register_module_forward_hook
 
     def nchw(image: torch.Tensor) -> torch.Tensor:
