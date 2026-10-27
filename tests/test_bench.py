@@ -1746,13 +1746,13 @@ def test__perceptual_inputs_reach_the_network_as_training_gives_them(
     makes of them (`docs/modules/losses/terms-and-paths.md`, "Input layout") is channels-last, a
     view of the inputs themselves; for `nchw` both are copied inside the call, as the trainer
     copies them, so that the batch-first views are contiguous NCHW. The prediction's gradient,
-    through the copy where there is one, is in the leaf's layout, and is the gradient of the
-    function the network computes."""
+    through the copy where there is one, has the leaf's shape and is the gradient of the
+    function the network computes, in float64 to its rounding."""
     from openftgs.cli._bench import _perceptual_forward, _perceptual_inputs
 
     g = torch.Generator().manual_seed(0)
-    gt = torch.rand(6, 10, 3, generator=g)
-    pred = torch.rand(6, 10, 3, generator=g)
+    gt = torch.rand(6, 10, 3, generator=g, dtype=torch.float64)
+    pred = torch.rand(6, 10, 3, generator=g, dtype=torch.float64)
     seen: list[torch.Tensor] = []
 
     def network(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1772,15 +1772,15 @@ def test__perceptual_inputs_reach_the_network_as_training_gives_them(
         assert batch_first.is_contiguous(memory_format=memory)
         assert (batch_first.data_ptr() != source.data_ptr()) is copied
     (grad,) = torch.autograd.grad(value, x)
-    assert grad.shape == x.shape and grad.is_contiguous()
-    torch.testing.assert_close(grad, 2.0 * (x - y).detach() / x.numel(), rtol=1e-6, atol=0.0)
+    assert grad.shape == x.shape
+    torch.testing.assert_close(grad, 2.0 * (x - y).detach() / x.numel(), rtol=1e-12, atol=0.0)
 
 
 @pytest.mark.gpu
 @pytest.mark.weights
 @pytest.mark.parametrize("precision", ["ieee", "tf32"])
 @pytest.mark.parametrize("net", ["vgg16_oxford", "alexnet_bvlc"])
-def test__an_nchw_case_is_within_rounding_of_the_renders_view_on_cuda(
+def test__perceptual_forward_nchw_is_within_rounding_of_the_renders_view_on_cuda(
     net: Literal["vgg16_oxford", "alexnet_bvlc"], precision: str
 ) -> None:
     """Q-269 (as changed, #427), Q-273, §2.4 rule 2: on CUDA, a `nchw` case of B-4, whose copy

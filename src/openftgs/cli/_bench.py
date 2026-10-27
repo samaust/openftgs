@@ -2246,8 +2246,9 @@ def _ssim_fused_timed(images: _Images) -> dict[tuple[int, int], dict[str, Any]]:
 def _losses(ctx: _Context) -> _Result:
     """B-4 (§3.4, D-52, D-89): each perceptual network of D-89, its forward and the
     prediction's backward in IEEE float32, TF32 and, for the trunk networks, bfloat16, with
-    NCHW inputs and the render's channels-last view, and for the two Caffe trunks with
-    channels-last weights too, with cuDNN autotuning off and on; SSIM
+    NCHW inputs, the trainer's copy from the render's layout timed (Q-269, as changed, #427),
+    and the render's channels-last view, and for the two Caffe trunks with channels-last
+    weights too, with cuDNN autotuning off and on; SSIM
     through fused-ssim and through the PyTorch path; TF32's and bf16's deviation from IEEE
     float32 in value and gradient, per network; at 1352×1014 and 1920×1080 (Q-190, Q-269).
     The trunk networks' weights must be in torch.hub's cache already, and none is downloaded
