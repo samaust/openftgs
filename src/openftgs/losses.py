@@ -522,8 +522,9 @@ class PerceptualLoss(torch.nn.Module):
           mean of its error map; it clamps both images to [0, 1] (Q-259);
         - ``"haarpsi"``: 1 − HaarPSI at 3 scales, subsampled, c = 30, α = 4.2, the render
           clamped to [0, 1];
-        - ``"vgg16_oxford"``, ``"alexnet_bvlc"``: lpips's uncalibrated distance on the Caffe
-          releases of Oxford's VGG16 and BVLC's AlexNet, at full resolution;
+        - ``"vgg16_oxford"``, ``"alexnet_bvlc"``: the distance between unit-normalized
+          features of five layers of the Caffe releases of Oxford's VGG16 and BVLC's AlexNet,
+          every channel weighted equally, at full resolution;
         - ``"dinov2_s14"``, ``"dinov2_b14"``, ``"dino_s16"``, ``"dino_b16"``: the distance
           between the patch tokens of DINOv2's or DINO's blocks 3, 6, 9 and 12, at half
           resolution.

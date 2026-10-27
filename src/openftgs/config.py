@@ -83,7 +83,7 @@ PercNet = Literal[
 """The names of D-89's eight perceptual networks, which ``LossConfig.perc_net`` selects (D-9).
 
 ``"flip"``, the default, is NVIDIA's LDR-ꟻLIP and ``"haarpsi"`` is 1 − HaarPSI, both without
-weights. ``"vgg16_oxford"`` and ``"alexnet_bvlc"`` are lpips's uncalibrated distance on Oxford's
+weights. ``"vgg16_oxford"`` and ``"alexnet_bvlc"`` compare unit-normalized features of Oxford's
 VGG16 and BVLC's AlexNet, and ``"dinov2_s14"``, ``"dinov2_b14"``, ``"dino_s16"`` and
 ``"dino_b16"`` compare DINOv2's and DINO's patch tokens; these six trunk networks download their
 weights at first use (§2.3; Q-258). See :class:`openftgs.losses.PerceptualLoss`.
