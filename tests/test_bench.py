@@ -2019,9 +2019,14 @@ def _assert_every_case_timed(body: dict[str, Any], networks: tuple[str, ...]) ->
     assert "copied inside the timed forward" in setup["nchw"]
     assert setup["precisions"] == {net: list(_precisions(net)) for net in networks}
     # Q-273: what the trainer runs, per network and precision, in an iteration that isn't
-    # deterministic: vgg16_oxford autotunes under "tf32" and alexnet_bvlc under "tf32" and "bf16"
-    # (as changed, #428), and they get NCHW inputs where B-4 measured them faster.
-    autotuned = {"vgg16_oxford": ("tf32",), "alexnet_bvlc": ("tf32", "bf16")}
+    # deterministic: vgg16_oxford autotunes under "tf32", alexnet_bvlc under "tf32" and "bf16"
+    # (as changed, #428) and dinov2_b14 under "bf16" (as changed, #427), and the two Caffe trunks
+    # get NCHW inputs where B-4 measured them faster.
+    autotuned = {
+        "vgg16_oxford": ("tf32",),
+        "alexnet_bvlc": ("tf32", "bf16"),
+        "dinov2_b14": ("bf16",),
+    }
     assert setup["training_autotuning"] == {
         net: {p: p in autotuned.get(net, ()) for p in _precisions(net)} for net in networks
     }

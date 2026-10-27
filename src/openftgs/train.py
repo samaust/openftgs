@@ -280,10 +280,10 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # Global PyTorch flags around a training iteration (Q-73).
 
-# §2.4's perceptual-loss row, D-52; Q-173 (changed, #394), Q-272, Q-273 (changed, #428): per
-# perceptual network, the precisions under which its training iterations autotune cuDNN unless
-# deterministic, read from B-4's recorded rerun (#394; the figures in Q-273's row, the "tf32"
-# ones also in the Calibration data) as the layout is: where
+# §2.4's perceptual-loss row, D-52; Q-173 (changed, #394), Q-272, Q-273 (changed, #428, #427):
+# per perceptual network, the precisions under which its training iterations autotune cuDNN
+# unless deterministic, read from B-4's recorded rerun (#394; the figures in Q-273's row, the
+# "tf32" ones also in the Calibration data) as the layout is: where
 # autotuning is at least 3 % faster than the same layout without it at both sizes in both runs,
 # the layout being the one the network takes at that precision. Under "tf32" it is Q-272's
 # adopted option, autotuning with NCHW inputs, against the plain path: vgg16_oxford +4.7 % /
@@ -291,15 +291,20 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 # +15.4 % / +16.7 %. Under "bf16", alexnet_bvlc with NCHW inputs, +82.9 % / +4.5 % and +83.0 % /
 # +4.5 %. Not under "ieee" (vgg16_oxford +1.2 % / +1.2 % and −3.3 % / −3.0 %, alexnet_bvlc −3.0 % /
 # +5.5 % and +9.7 % / −2.0 %), nor vgg16_oxford under "bf16" (+1.6 % / +0.7 % and −2.0 % /
-# +0.6 %), and B-4 measured no such gain for the other six networks. Those networks and
-# precisions leave the flag as the caller set it (Q-73), unless SSIM runs through its PyTorch
-# fallback on CUDA (`_ssim_fallback_on_cuda`), which autotuning made 7 to 11 % faster in both
-# runs (Q-273, owner answer): then every network's iteration autotunes. With no perceptual
-# network the only cuDNN convolutions are the SSIM fallback's, so such an iteration autotunes,
-# as every one did since #326.
+# +0.6 %), and B-4 measured no such gain for the other six networks. #427's runs, which time the
+# trainer's copy, add dinov2_b14 under "bf16" with the render's view, +4.6 % / +4.9 % and +4.6 % /
+# +5.0 %, never slower than without autotuning in six runs and at the same peak memory (the
+# owner's answer on #427), while alexnet_bvlc under "ieee", +3.1 % / +5.8 % and +3.1 % / +5.3 %
+# there, stays off: about 0.3 ms at 1352×1014 for a peak of 12.5 GiB allocated against 0.7 GiB.
+# Every other network and precision leaves the flag as the caller set it (Q-73), unless SSIM
+# runs through its PyTorch fallback on CUDA (`_ssim_fallback_on_cuda`), which autotuning made 7
+# to 11 % faster in both runs (Q-273, owner answer): then every network's iteration autotunes.
+# With no perceptual network the only cuDNN convolutions are the SSIM fallback's, so such an
+# iteration autotunes, as every one did since #326.
 _AUTOTUNED_PRECISIONS: dict[str, frozenset[str]] = {
     "vgg16_oxford": frozenset({"tf32"}),
     "alexnet_bvlc": frozenset({"tf32", "bf16"}),
+    "dinov2_b14": frozenset({"bf16"}),
 }
 # Q-42: the window and σ fused-ssim hardcodes (E7's); `losses.ssim` takes its PyTorch fallback for
 # any other.
@@ -449,7 +454,7 @@ def _builds_perceptual(loss: LossConfig) -> bool:
 
 def _autotunes(cfg: TrainConfig, device: torch.device) -> bool:
     """Q-273: whether a training iteration of `cfg` on `device` that isn't deterministic
-    autotunes cuDNN: for the networks and precisions B-4 turned it on for (as changed, #428),
+    autotunes cuDNN: for the networks and precisions B-4 turned it on for (as changed, #428, #427),
     without a perceptual network, and whenever SSIM runs through its PyTorch fallback on CUDA
     (the owner's answer). Otherwise the iteration leaves the flag as the caller set it (Q-73)."""
     return (
