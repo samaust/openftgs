@@ -288,10 +288,11 @@ def test_flip_filter_support_at_67_pixels_per_degree(pixels_per_degree: float) -
 
 
 @pytest.mark.gpu
-def test_u23_vendored_flip_agrees_with_the_published_file_on_cuda(
+def test_vendored_flip_agrees_with_the_published_file_on_cuda(
     record_property: Callable[[str, object], None],
 ) -> None:
-    """U-23 (D-89; Q-252): on a fixed image pair on CUDA, the vendored LDR-ꟻLIP and NVIDIA's
+    """A private test of the vendored copy (D-89; Q-252), whose public case is U-23's
+    (`tests/test_eval.py`): on a fixed image pair on CUDA, the vendored LDR-ꟻLIP and NVIDIA's
     file as published, loaded from the reference copy, agree within 1e-6, and so do their
     gradients with respect to the test image, to 1e-5 relative: the copy's changes are device
     and caching only. Both run in IEEE float32, as reported metrics do (D-52). The values were
@@ -316,7 +317,7 @@ def test_u23_vendored_flip_agrees_with_the_published_file_on_cuda(
         "gradient": float((gradients[1] - gradients[0]).abs().max()),
     }
     record_property("max_abs_differences", json.dumps(differences))
-    print(f"U-23 ꟻLIP oracle: largest differences {differences}")
+    print(f"vendored ꟻLIP against the published file: largest differences {differences}")
     torch.testing.assert_close(values[1], values[0], rtol=0.0, atol=1e-6)
     torch.testing.assert_close(gradients[1], gradients[0], rtol=1e-5, atol=1e-9)
     assert 0.0 < float(values[0]) < 1.0  # the pair differs, and ꟻLIP is in [0, 1]

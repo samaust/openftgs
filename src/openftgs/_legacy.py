@@ -16,13 +16,13 @@ instrumentation (PRD #220).
 from collections.abc import Mapping
 from typing import Any
 
-__all__ = ["LPIPS_BACKBONES", "legacy_perc_net", "resume_refusal", "with_current_loss"]
+__all__ = ["LPIPS_BACKBONES", "resume_refusal", "with_current_loss"]
 
 # #375 (decided item 3): LPIPS's backbones, the `perc_net` values revision 549o retired.
 LPIPS_BACKBONES = ("vgg", "alex")
 
 
-def legacy_perc_net(config: Mapping[str, Any]) -> str | None:
+def _legacy_perc_net(config: Mapping[str, Any]) -> str | None:
     """The `loss.perc_net` of a stored TrainConfig dict when it is one of LPIPS's backbones,
     else None (another value, valid or not, or none)."""
     loss = config.get("loss")
@@ -36,7 +36,7 @@ def with_current_loss(config: Mapping[str, Any]) -> dict[str, Any]:
     `loss.perc_net` and its `loss.lambda_perc` left out, so they take 549o's defaults (ꟻLIP at
     its calibrated weight, D-9); every other key, and any other dict, as it is."""
     out = dict(config)
-    if legacy_perc_net(config) is not None:
+    if _legacy_perc_net(config) is not None:
         loss = config["loss"]
         out["loss"] = {k: v for k, v in loss.items() if k not in ("perc_net", "lambda_perc")}
     return out
@@ -45,7 +45,7 @@ def with_current_loss(config: Mapping[str, Any]) -> dict[str, Any]:
 def resume_refusal(config: Mapping[str, Any], where: str) -> str | None:
     """Q-247: why the run that `where` (a checkpoint, say) stores can't be resumed, when its
     configuration names LPIPS's backbone; else None."""
-    net = legacy_perc_net(config)
+    net = _legacy_perc_net(config)
     if net is None:
         return None
     return (

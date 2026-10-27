@@ -13,6 +13,8 @@ import dataclasses
 import importlib.util
 import json
 import math
+import sys
+import types
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
@@ -32,6 +34,7 @@ from builders import (
     write_scene,
 )
 
+import openftgs.losses
 import openftgs.render
 from openftgs.config import (
     GrowthConfig,
@@ -819,6 +822,75 @@ def test_cudnn_autotuning_during_a_step_is_on_unless_deterministic(
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
 
 
+def _fused_ssim_stand_in() -> types.ModuleType:
+    """A module that imports as `fused_ssim`, so that fused-ssim counts as installed whether or
+    not it is (Q-2). Its function is differentiable in its first image, as fused-ssim's is; its
+    value is no SSIM, which no test using it reads."""
+    module = types.ModuleType("fused_ssim")
+
+    def fused_ssim(img1: torch.Tensor, img2: torch.Tensor, padding: str, train: bool) -> Any:
+        return 1.0 - (img1 - img2).square().mean()
+
+    module.fused_ssim = fused_ssim  # type: ignore[attr-defined]
+    return module
+
+
+# Q-273 (owner answer, 2026-10-26): (fused-ssim installed, LossConfig) → whether SSIM runs
+# through its PyTorch fallback on CUDA. The fallback runs where fused-ssim doesn't import, or
+# for a window or σ other than the ones fused-ssim hardcodes (Q-42); with λ_ssim = 0 SSIM
+# doesn't run at all.
+SSIM_FALLBACK_CASES = [
+    pytest.param(True, LossConfig(), False, id="fused-ssim"),
+    pytest.param(False, LossConfig(), True, id="no-fused-ssim"),
+    pytest.param(True, LossConfig(ssim_window=7), True, id="fused-ssim-window-7"),
+    pytest.param(False, LossConfig(lambda_ssim=0.0), False, id="no-fused-ssim-no-ssim"),
+]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("caller", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize(("fused", "loss", "fallback"), SSIM_FALLBACK_CASES)
+def test_cudnn_autotuning_is_on_whenever_the_ssim_fallback_runs_on_cuda(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fused: bool,
+    loss: LossConfig,
+    fallback: bool,
+    deterministic: bool,
+    caller: bool,
+) -> None:
+    """§2.4 rule 2, D-52; Q-73, Q-273 (owner answer, 2026-10-26: B-4 measured the SSIM fallback
+    7 to 11 % faster with autotuning in both runs): with ꟻLIP, a network B-4 turned autotuning
+    on for nowhere, a training iteration on CUDA that isn't deterministic autotunes cuDNN
+    whenever SSIM runs through its PyTorch fallback, here because fused-ssim doesn't import or
+    the window isn't fused-ssim's, and otherwise leaves the flag as the caller set it; a
+    deterministic one never autotunes. fused-ssim is stood in for, or made unimportable, so the
+    test doesn't depend on whether it is installed (Q-2). Every flag is the caller's again
+    after the step. `openftgs.losses` caches its import of fused-ssim, so the cache is cleared
+    before and after the step: hygiene, so that the step's SSIM sees the module this test sets
+    and later tests don't keep the stand-in, not a check of the cache."""
+    monkeypatch.setitem(sys.modules, "fused_ssim", _fused_ssim_stand_in() if fused else None)
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    openftgs.losses._fused_ssim.cache_clear()
+    try:
+        cudnn.benchmark = caller
+        cfg = TrainConfig(
+            loss=dataclasses.replace(loss, perc_net="flip"),
+            perf=PerfConfig(deterministic=deterministic, frame_cache="off"),
+        )
+        trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device="cuda")
+        seen: list[bool] = []
+        trainer.model.means.register_hook(lambda _: seen.append(cudnn.benchmark))  # type: ignore[no-untyped-call]
+        trainer.step()
+        assert seen == [False if deterministic else (True if fallback else caller)]
+        assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (caller, *saved[1:])
+    finally:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+        openftgs.losses._fused_ssim.cache_clear()
+
+
 # Resuming another run's state (§2.2; Q-46, Q-69, Q-70, Q-72).
 
 
@@ -1357,6 +1429,11 @@ B4_NCHW = {
     "vgg16_oxford": {("ieee", False), ("ieee", True), ("tf32", True)},
     "alexnet_bvlc": {(p, a) for p in ("ieee", "tf32", "bf16") for a in (False, True)},
 }
+# Q-269, Q-272, Q-273 (#380's review): per network, the (perc_precision, autotuned) pairs under
+# which the trainer's network holds its weights channels-last. B-4's two runs with channels-last
+# weights as a third layout for the Caffe trunks (Calibration data) found no pair where they
+# reach Q-272's 3 % over the render's view in both runs: none.
+B4_CHANNELS_LAST_WEIGHTS: dict[str, set[tuple[str, bool]]] = {}
 LAYOUT_CASES = [
     pytest.param(net, precision, marks=marks, id=f"{net}-{precision}")
     for net, marks in [
@@ -1376,6 +1453,19 @@ def _layout(image: torch.Tensor) -> str:
     return "channels_last" if image.is_contiguous() else "other"
 
 
+def _weights_layout(network: torch.nn.Module) -> str:
+    """How a network's four-dimensional parameters and buffers lie in memory, through
+    PyTorch's public `parameters()` and `buffers()` (a Caffe trunk holds its convolutions as
+    buffers, Q-263): "nchw" when every one is contiguous, a network without any included,
+    "channels_last" when every one is channels-last, else "mixed"."""
+    tensors = [t for t in (*network.parameters(), *network.buffers()) if t.dim() == 4]
+    if all(t.is_contiguous() for t in tensors):
+        return "nchw"
+    if all(t.is_contiguous(memory_format=torch.channels_last) for t in tensors):
+        return "channels_last"
+    return "mixed"
+
+
 @pytest.mark.parametrize("caller", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(("net", "precision"), LAYOUT_CASES)
@@ -1393,13 +1483,15 @@ def test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose(
     after laying them out) are contiguous NCHW exactly where Q-273's table puts them, and
     otherwise the render's channels-last view as it comes; and cuDNN autotuning is on while
     the network runs for the networks B-4 turned it on for, unless the step is deterministic,
-    which turns it off, while for the others the flag stays the caller's (Q-73)."""
+    which turns it off, while for the others the flag stays the caller's (Q-73). The network's
+    weights are channels-last exactly where B-4's runs with channels-last weights put them
+    (Q-269, Q-273; #380's review): nowhere, so they stay contiguous NCHW."""
     cudnn = torch.backends.cudnn
-    seen: list[tuple[str, str, bool]] = []
+    seen: list[tuple[str, str, bool, str]] = []
     original = PerceptualLoss.forward
 
     def recording(self: PerceptualLoss, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-        seen.append((_layout(pred), _layout(gt), cudnn.benchmark))
+        seen.append((_layout(pred), _layout(gt), cudnn.benchmark, _weights_layout(self)))
         return original(self, pred, gt)
 
     monkeypatch.setattr(PerceptualLoss, "forward", recording)
@@ -1416,7 +1508,9 @@ def test_each_perceptual_network_takes_the_layout_and_autotuning_b4_chose(
     autotuned = net in B4_AUTOTUNED and not deterministic
     layout = "nchw" if (precision, autotuned) in B4_NCHW.get(net, set()) else "channels_last"
     autotuning = False if deterministic else (True if net in B4_AUTOTUNED else caller)
-    assert seen == [(layout, layout, autotuning)]
+    on = (precision, autotuned) in B4_CHANNELS_LAST_WEIGHTS.get(net, set())
+    weights = "channels_last" if on else "nchw"
+    assert seen == [(layout, layout, autotuning, weights)]
 
 
 @pytest.mark.weights

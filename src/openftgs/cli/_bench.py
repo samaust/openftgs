@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import importlib
 import importlib.metadata
@@ -1722,8 +1723,12 @@ _NEEDS_INIT = ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16")
 _LOSS_PRECISIONS = ("ieee", "tf32", "bf16")  # D-52; bfloat16 for the trunk networks only
 # Q-269: the render's batch-first view as it comes, channels-last in memory; and a contiguous
 # NCHW input, the copy the trainer gives a network where B-4 measured it faster (Q-273).
-# Channels-last weights left with LPIPS (Q-173).
 _LOSS_LAYOUTS = ("nchw", "channels_last_inputs")
+# Q-269 (owner answer, 2026-10-26): the render's view with the network's weights channels-last
+# too, a copy converted with `to(memory_format=torch.channels_last)`, as LPIPS-VGG's B-4 timed it
+# (Q-190); for the two Caffe trunks, the convolutional networks that accept it.
+_CHANNELS_LAST_WEIGHTS = "channels_last_inputs_and_weights"
+_CAFFE = ("vgg16_oxford", "alexnet_bvlc")
 # Q-190, Q-269: the deviations' layout, the render's view, with autotuning off.
 _DEVIATION_LAYOUT = "channels_last_inputs"
 _LOSS_AUTOTUNING = (False, True)  # cuDNN autotuning, one child process each (_CHILD)
@@ -1740,9 +1745,25 @@ _PERCEPTUAL_COMPARISONS: dict[str, tuple[tuple[str, str, bool], tuple[str, str, 
     "autotuning_and_nchw_inputs": (("tf32", "channels_last_inputs", False), ("tf32", "nchw", True)),
     "tf32": (("ieee", "channels_last_inputs", False), ("tf32", "channels_last_inputs", False)),
     "bf16": (("tf32", "channels_last_inputs", False), ("bf16", "channels_last_inputs", False)),
+    # Q-269 (owner answer, 2026-10-26): the Caffe trunks only, as LPIPS-VGG's were (Q-190).
+    "channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", _CHANNELS_LAST_WEIGHTS, False),
+    ),
+    "autotuning_and_channels_last_weights": (
+        ("tf32", "channels_last_inputs", False),
+        ("tf32", _CHANNELS_LAST_WEIGHTS, True),
+    ),
 }
-# The exact options Q-173's rule decides for each network, which #394 applies (Q-251).
-_TURN_ON = ("autotuning", "nchw_inputs", "autotuning_and_nchw_inputs")
+# The exact options Q-173's rule decides for each network, which #394 applies (Q-251), and the
+# channels-last weights of the Caffe trunks (Q-269, owner answer, 2026-10-26).
+_TURN_ON = (
+    "autotuning",
+    "nchw_inputs",
+    "autotuning_and_nchw_inputs",
+    "channels_last_weights",
+    "autotuning_and_channels_last_weights",
+)
 # The child process of one autotuning setting (Q-190). cuDNN caches the algorithm it picked
 # for a configuration and looks there first whatever `cudnn.benchmark` says, so autotuning off
 # and on can't be compared in one process. `fused_ssim` can't be imported there, so
@@ -1761,6 +1782,12 @@ _CHILD_OUT_OF_MEMORY = 75
 def _precisions(net: str) -> tuple[str, ...]:
     """§3.4 B-4: IEEE float32 and TF32 for every network, and bfloat16 for the trunk ones."""
     return _LOSS_PRECISIONS[:2] if net in _WEIGHT_FREE else _LOSS_PRECISIONS
+
+
+def _layouts(net: str) -> tuple[str, ...]:
+    """§3.4 B-4 ("in the layouts it accepts"), Q-269: NCHW inputs and the render's view for
+    every network, and channels-last weights beside them for the two Caffe trunks."""
+    return (*_LOSS_LAYOUTS, _CHANNELS_LAST_WEIGHTS) if net in _CAFFE else _LOSS_LAYOUTS
 
 
 def _training_paths(networks: Sequence[str]) -> dict[str, dict[str, Any]]:
@@ -1921,14 +1948,25 @@ def _cudnn_flags(*, tf32: bool, autotuning: bool) -> Iterator[None]:
 
 def _perceptual_inputs(gt: Tensor, pred: Tensor, layout: str) -> tuple[Tensor, Tensor]:
     """The prediction, a leaf that requires its gradient, and the target, in the layout's
-    memory (Q-269): for `channels_last_inputs` [1, H, W, 3] contiguous, as a render comes,
-    whose batch-first view `PerceptualLoss` takes is channels-last; for `nchw` [1, 3, H, W]
+    memory (Q-269): for `channels_last_inputs`, and `channels_last_inputs_and_weights`, whose
+    network is a converted copy (`_channels_last_weights`), [1, H, W, 3] contiguous, as a render
+    comes, whose batch-first view `PerceptualLoss` takes is channels-last; for `nchw` [1, 3, H, W]
     contiguous, which the trainer would copy a render into, the copy itself left out (B-1 times
     the whole path)."""
     if layout == "nchw":
         x = pred[None].permute(0, 3, 1, 2).contiguous().requires_grad_()
         return x, gt[None].permute(0, 3, 1, 2).contiguous()
     return pred[None].clone().requires_grad_(), gt[None].clone()
+
+
+def _channels_last_weights(network: Any) -> Any:
+    """Q-269 (owner answer, 2026-10-26): a copy of `network` whose four-dimensional parameters
+    and buffers, a Caffe trunk's convolutions among them (Q-263), are channels-last in memory,
+    as `Module.to(memory_format=torch.channels_last)` lays them out, for the
+    `channels_last_inputs_and_weights` cases; `network` is left as it was."""
+    import torch
+
+    return copy.deepcopy(network).to(memory_format=torch.channels_last)
 
 
 def _perceptual_forward(
@@ -2165,12 +2203,16 @@ def _perceptual_timed(
     net: str, network: Any, images: _Images, *, autotuning: bool, repetitions: int
 ) -> dict[_PerceptualKey, dict[str, Any]]:
     """Every case of the network `net` under one autotuning setting (Q-190, Q-269): each
-    size, precision and layout."""
+    size, precision and layout; the channels-last weights' cases on a converted copy of the
+    network, made once."""
     timed: dict[_PerceptualKey, dict[str, Any]] = {}
+    layouts = _layouts(net)
+    converted = _channels_last_weights(network) if _CHANNELS_LAST_WEIGHTS in layouts else None
     for (width, height), (gt, pred) in images.items():
         for precision in _precisions(net):
-            for layout in _LOSS_LAYOUTS:
-                call = _perceptual_call(network, gt, pred, precision=precision, layout=layout)
+            for layout in layouts:
+                runs = converted if layout == _CHANNELS_LAST_WEIGHTS else network
+                call = _perceptual_call(runs, gt, pred, precision=precision, layout=layout)
                 with _cudnn_flags(tf32=precision != "ieee", autotuning=autotuning):
                     figures = _call_figures(call, "loss.perceptual", repetitions)
                 timed[(net, width, height, precision, layout, autotuning)] = figures
@@ -2189,7 +2231,8 @@ def _ssim_fused_timed(images: _Images) -> dict[tuple[int, int], dict[str, Any]]:
 def _losses(ctx: _Context) -> _Result:
     """B-4 (§3.4, D-52, D-89): each perceptual network of D-89, its forward and the
     prediction's backward in IEEE float32, TF32 and, for the trunk networks, bfloat16, with
-    NCHW inputs and the render's channels-last view, with cuDNN autotuning off and on; SSIM
+    NCHW inputs and the render's channels-last view, and for the two Caffe trunks with
+    channels-last weights too, with cuDNN autotuning off and on; SSIM
     through fused-ssim and through the PyTorch path; TF32's and bf16's deviation from IEEE
     float32 in value and gradient, per network; at 1352×1014 and 1920×1080 (Q-190, Q-269).
     The trunk networks' weights must be in torch.hub's cache already, and none is downloaded
@@ -2245,7 +2288,8 @@ def _losses(ctx: _Context) -> _Result:
 
     for net in networks:
         for name, (base, variant) in _PERCEPTUAL_COMPARISONS.items():
-            if variant[0] not in _precisions(net):  # bf16: the trunk networks only
+            # bf16: the trunk networks only; channels-last weights: the Caffe trunks only
+            if variant[0] not in _precisions(net) or variant[1] not in _layouts(net):
                 continue
             pairs = [(timed[(net, *size, *base)], timed[(net, *size, *variant)]) for size in sizes]
             compare(name, pairs, net)
@@ -2284,7 +2328,12 @@ def _losses(ctx: _Context) -> _Result:
             "bfloat16 autocast around the network's call, the images float32 and the value cast "
             "to float32, as the trainer runs a trunk network (Q-172, Q-250); TF32 on"
         ),
-        "layouts": list(_LOSS_LAYOUTS),
+        "layouts": {net: list(_layouts(net)) for net in networks},
+        "channels_last_weights": (
+            f"{_CHANNELS_LAST_WEIGHTS}: the render's view, with a copy of the network converted "
+            "with to(memory_format=torch.channels_last), made once per network; the two Caffe "
+            "trunks only (Q-269)"
+        ),
         **_training_paths(networks),
         "autotuning": list(_LOSS_AUTOTUNING),
         "processes": (

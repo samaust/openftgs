@@ -8,6 +8,7 @@ Spec: §1.3, §2.2 (Full checkpoint), §2.4 rule 3, D-26, D-45. Band: Orchestrat
 import contextlib
 import dataclasses
 import hashlib
+import importlib
 import math
 import random
 import warnings
@@ -284,10 +285,33 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 # recorded rerun (Calibration data, #394) measured autotuning with NCHW inputs at least 3 % faster
 # than the plain path at both sizes in both runs: vgg16_oxford +4.7 % / +4.7 % on the CI scene and
 # +3.4 % / +3.0 % on kitchen, alexnet_bvlc +15.0 % / +18.5 % and +15.4 % / +16.7 %. B-4 measured no
-# such gain for the other six, whose iterations leave the flag as the caller set it (Q-73). With
-# no perceptual network the only cuDNN convolutions are the SSIM fallback's, which autotuning made
-# 7 to 11 % faster in both runs, so such an iteration autotunes, as every one did since #326.
+# such gain for the other six, whose iterations leave the flag as the caller set it (Q-73), unless
+# SSIM runs through its PyTorch fallback on CUDA (`_ssim_fallback_on_cuda`), which autotuning made
+# 7 to 11 % faster in both runs (Q-273, owner answer): then every network's iteration autotunes.
+# With no perceptual network the only cuDNN convolutions are the SSIM fallback's, so such an
+# iteration autotunes, as every one did since #326.
 _AUTOTUNED_NETWORKS = frozenset({"vgg16_oxford", "alexnet_bvlc"})
+# Q-42: the window and σ fused-ssim hardcodes (E7's); `losses.ssim` takes its PyTorch fallback for
+# any other.
+_FUSED_SSIM_WINDOW = (11, 1.5)
+
+
+def _fused_ssim_imports() -> bool:
+    """Q-2: whether fused-ssim imports in this process, as `losses.ssim` tries it on CUDA."""
+    try:
+        importlib.import_module("fused_ssim")
+    except ImportError:
+        return False
+    return True
+
+
+def _ssim_fallback_on_cuda(loss: LossConfig, device: torch.device) -> bool:
+    """Q-273 (owner answer, 2026-10-26): whether a training iteration's SSIM runs through its
+    PyTorch fallback on CUDA, a CUDA device's training image computed with λ_ssim > 0, where
+    fused-ssim doesn't import or the window and σ aren't the ones it hardcodes (Q-42)."""
+    if device.type != "cuda" or loss.lambda_ssim <= 0.0:
+        return False
+    return (loss.ssim_window, loss.ssim_sigma) != _FUSED_SSIM_WINDOW or not _fused_ssim_imports()
 
 
 class _PlacementWait:
@@ -342,9 +366,16 @@ def _perf_flags(perf: PerfConfig, *, autotune: bool) -> Iterator[None]:
         torch.set_float32_matmul_precision(matmul)
 
 
-# Q-173: the training perceptual network's weights in channels-last memory. Off, as §2.4's
-# perceptual-loss row leaves them: B-4 has measured no network with them since #389 (Q-269).
-_CHANNELS_LAST_WEIGHTS = False
+# Q-173, Q-269, Q-272, Q-273 (owner answer, 2026-10-26, during the #380 build's review): per
+# network, the (perc_precision, autotuned) pairs under which the trainer's network holds its
+# weights channels-last in memory. B-4's two runs with channels-last weights as a third layout for
+# the two Caffe trunks (Calibration data, #380's review) put them within −1.4 to +1.0 % of the
+# render's view with NCHW weights at every precision and autotuning, never Q-272's 3 % in both
+# runs. Against the plain path alexnet_bvlc's autotuning with them meets it (+6.1 to +9.9 %), as
+# autotuning alone does, below the autotuning with NCHW inputs it takes (+14.9 to +18.5 %). So no
+# network and no pair: every network keeps its weights as built, contiguous NCHW, as §2.4's
+# perceptual-loss row leaves them, now measured.
+_CHANNELS_LAST_WEIGHTS: dict[str, frozenset[tuple[str, bool]]] = {}
 
 # Q-273 (Q-223 as changed, #394): per network, the (perc_precision, autotuned) pairs under
 # which the trainer's network gets contiguous NCHW inputs, from B-4's recorded rerun (Calibration
@@ -403,10 +434,15 @@ def _builds_perceptual(loss: LossConfig) -> bool:
     return loss.lambda_perc is None or loss.lambda_perc > 0.0
 
 
-def _autotunes(cfg: TrainConfig) -> bool:
-    """Q-273: whether a training iteration of `cfg` that isn't deterministic autotunes cuDNN:
-    for the networks B-4 turned it on for, and without a perceptual network."""
-    return not _builds_perceptual(cfg.loss) or cfg.loss.perc_net in _AUTOTUNED_NETWORKS
+def _autotunes(cfg: TrainConfig, device: torch.device) -> bool:
+    """Q-273: whether a training iteration of `cfg` on `device` that isn't deterministic
+    autotunes cuDNN: for the networks B-4 turned it on for, without a perceptual network, and
+    whenever SSIM runs through its PyTorch fallback on CUDA (the owner's answer)."""
+    return (
+        not _builds_perceptual(cfg.loss)
+        or cfg.loss.perc_net in _AUTOTUNED_NETWORKS
+        or _ssim_fallback_on_cuda(cfg.loss, device)
+    )
 
 
 # Q-250: D-89's networks without trained weights, which have no bfloat16 path (B-4 measures
@@ -427,13 +463,13 @@ def _check_perceptual(cfg: TrainConfig) -> None:
         )
 
 
-def _perceptual_network(cfg: TrainConfig) -> PerceptualLoss:
+def _perceptual_network(cfg: TrainConfig, device: torch.device) -> PerceptualLoss:
     """The trainer's perceptual network for `cfg`, on the CPU: with NCHW inputs where
-    `_NCHW_INPUTS` puts them for its precision and autotuning, otherwise the render's view as it
-    comes (Q-273); a trunk network under bfloat16 autocast when asked (Q-250;
-    `_check_perceptual` refuses bf16 for the weight-free ones)."""
+    `_NCHW_INPUTS` puts them for its precision and its autotuning on `device`, otherwise the
+    render's view as it comes (Q-273); a trunk network under bfloat16 autocast when asked
+    (Q-250; `_check_perceptual` refuses bf16 for the weight-free ones)."""
     net, precision = cfg.loss.perc_net, cfg.perf.perc_precision
-    autotuned = _autotunes(cfg) and not cfg.perf.deterministic
+    autotuned = _autotunes(cfg, device) and not cfg.perf.deterministic
     nchw = (precision, autotuned) in _NCHW_INPUTS.get(net, frozenset())
     if precision == "bf16":
         return _Bf16NCHWPerceptualLoss(net) if nchw else _Bf16PerceptualLoss(net)
@@ -646,12 +682,16 @@ class Trainer:
             # CPU generator before the publisher's are loaded; its state is restored, so the
             # trainer draws nothing from it.
             with torch.random.fork_rng(devices=[]):
-                perceptual = _perceptual_network(cfg)
+                perceptual = _perceptual_network(cfg, self._device)
             perceptual = perceptual.to(self._device)
-            if _CHANNELS_LAST_WEIGHTS:  # Q-173
+            # Q-173, Q-269: channels-last weights where B-4 measured them faster, at the
+            # network's precision and autotuning (none since #380's review).
+            autotuned = _autotunes(cfg, self._device) and not cfg.perf.deterministic
+            pair = (cfg.perf.perc_precision, autotuned)
+            if pair in _CHANNELS_LAST_WEIGHTS.get(cfg.loss.perc_net, frozenset()):
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
-        self._autotune = _autotunes(cfg)  # Q-273: per network, as B-4 measured
+        self._autotune = _autotunes(cfg, self._device)  # Q-273: per network, as B-4 measured
         self._evaluator: Evaluator | None = None
         self._frames: Prefetcher | None = None  # D-51: training images through the frame cache
         self._placement_wait: _PlacementWait | None = None  # "auto" pending on CUDA (Q-232)
