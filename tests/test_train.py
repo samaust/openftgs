@@ -13,6 +13,8 @@ import dataclasses
 import importlib.util
 import json
 import math
+import sys
+import types
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
@@ -814,6 +816,71 @@ def test_cudnn_autotuning_during_a_step_is_on_unless_deterministic(
         trainer.model.means.register_hook(lambda _: seen.append(cudnn.benchmark))  # type: ignore[no-untyped-call]
         trainer.step()
         assert seen == [not deterministic]
+        assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (caller, *saved[1:])
+    finally:
+        cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
+
+
+def _fused_ssim_stand_in() -> types.ModuleType:
+    """A module that imports as `fused_ssim`, so that fused-ssim counts as installed whether or
+    not it is (Q-2). Its function is differentiable in its first image, as fused-ssim's is; its
+    value is no SSIM, which no test using it reads."""
+    module = types.ModuleType("fused_ssim")
+
+    def fused_ssim(img1: torch.Tensor, img2: torch.Tensor, padding: str, train: bool) -> Any:
+        return 1.0 - (img1 - img2).square().mean()
+
+    module.fused_ssim = fused_ssim  # type: ignore[attr-defined]
+    return module
+
+
+# Q-273 (owner answer, 2026-10-26): (fused-ssim installed, LossConfig) → whether SSIM runs
+# through its PyTorch fallback on CUDA. The fallback runs where fused-ssim doesn't import, or
+# for a window or σ other than the ones fused-ssim hardcodes (Q-42); with λ_ssim = 0 SSIM
+# doesn't run at all.
+SSIM_FALLBACK_CASES = [
+    pytest.param(True, LossConfig(), False, id="fused-ssim"),
+    pytest.param(False, LossConfig(), True, id="no-fused-ssim"),
+    pytest.param(True, LossConfig(ssim_window=7), True, id="fused-ssim-window-7"),
+    pytest.param(False, LossConfig(lambda_ssim=0.0), False, id="no-fused-ssim-no-ssim"),
+]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("caller", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize(("fused", "loss", "fallback"), SSIM_FALLBACK_CASES)
+def test_cudnn_autotuning_is_on_whenever_the_ssim_fallback_runs_on_cuda(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fused: bool,
+    loss: LossConfig,
+    fallback: bool,
+    deterministic: bool,
+    caller: bool,
+) -> None:
+    """§2.4 rule 2, D-52; Q-73, Q-273 (owner answer, 2026-10-26: B-4 measured the SSIM fallback
+    7 to 11 % faster with autotuning in both runs): with ꟻLIP, a network B-4 turned autotuning
+    on for nowhere, a training iteration on CUDA that isn't deterministic autotunes cuDNN
+    whenever SSIM runs through its PyTorch fallback, here because fused-ssim doesn't import or
+    the window isn't fused-ssim's, and otherwise leaves the flag as the caller set it; a
+    deterministic one never autotunes. fused-ssim is stood in for, or made unimportable, so the
+    test doesn't depend on whether it is installed (Q-2). Every flag is the caller's again
+    after the step."""
+    monkeypatch.setitem(sys.modules, "fused_ssim", _fused_ssim_stand_in() if fused else None)
+    cudnn = torch.backends.cudnn
+    saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
+    try:
+        cudnn.benchmark = caller
+        cfg = TrainConfig(
+            loss=dataclasses.replace(loss, perc_net="flip"),
+            perf=PerfConfig(deterministic=deterministic, frame_cache="off"),
+        )
+        trainer = Trainer(cfg, _scene(tmp_path), _init_points(), device="cuda")
+        seen: list[bool] = []
+        trainer.model.means.register_hook(lambda _: seen.append(cudnn.benchmark))  # type: ignore[no-untyped-call]
+        trainer.step()
+        assert seen == [False if deterministic else (True if fallback else caller)]
         assert (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32) == (caller, *saved[1:])
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
