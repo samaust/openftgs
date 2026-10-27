@@ -443,8 +443,8 @@ def test_u9_perceptual_network_of_an_image_with_itself(net: PercNet, dtype: torc
     """U-9 (D-89): on identical images a network gives 0, or at most 10⁻⁵ of its value under
     Gaussian noise of σ = 16/255 (float32 rounding, ꟻLIP's stabilizer), on each of five images:
     uniform noise and closed-form textures, one and two to an image batch. ꟻLIP is checked in
-    float32, its only dtype (Q-261), HaarPSI in float64 (Q-262), and the DINO networks, under
-    `weights` (Q-7), in float32 (Q-265)."""
+    float32, its only dtype (Q-261), HaarPSI in float64 (Q-262), and the two Caffe trunks and
+    the four DINO networks, under `weights` (Q-7), in float32 (Q-263, Q-265)."""
     loss = PerceptualLoss(net)
     images = [
         _image_pair((2, 32, 40, 3), seed=40, correlated=False)[0],
@@ -630,11 +630,12 @@ def test_u9_perceptual_network_of_an_image_with_itself_on_the_gpu(net: PercNet) 
 )
 @pytest.mark.parametrize("net", [*WITH_DINO, *CAFFE_PARAMS])
 def test_perceptual_loss_forward_and_backward_on_cuda_make_no_synchronization(net: PercNet) -> None:
-    """§2.4 rule 3 (#381, #385): after one call on a device, which builds the networks'
+    """§2.4 rule 3 (#381, #385, #386): after one call on a device, which builds the networks'
     constants and filters there (and, for ꟻLIP, reads its colour maximum back once), a
     forward and backward pass of the network on a render-sized pair make no host
     synchronization under `torch.cuda.set_sync_debug_mode("warn")`, by any route the recorder
-    sees. The Caffe trunks' weights are moved to the device with the module."""
+    sees. The Caffe trunks' weights and the DINO networks' parameters and buffers are moved to the
+    device with the module."""
     from sync_recorder import SyncRecorder, described
 
     loss = PerceptualLoss(net).to("cuda")
