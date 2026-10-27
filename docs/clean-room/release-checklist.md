@@ -420,3 +420,11 @@ Nothing else in the scope needed a row: every other URL, project and attribution
 - Q-239 and Q-240 moved from inside the Calibration data table into the Q-n table, after Q-238 and before Q-241 (PRD #355, owner decision 6; commit 071788e). The two rows are 4,332 bytes with SHA-256 `926d2b7637c513c198f1fc4d0f7730626afaf4f6b67269d1fcdae33764b9b4a8` before and after; `questions.md` keeps its size and its lines, and with the two rows taken out the old and new files are identical. The Calibration data table now holds only its own rows.
 - Row 276 records the owner's decision on row 273 (commit 6f42859).
 - The glossary's "Spec revision" entry already read revision 549n, word for word as the PRD gives it (5288b72); it was checked, not changed.
+
+## Benchmark baselines
+
+§3.4's CI paragraph (a budgeted figure more than 10 % worse than its stored baseline fails); Q-170, Q-196, Q-245, Q-253. Q-196's refresh is #369's (`docs/modules/cli/benchmarks.md`, "The refresh of M18"; Calibration data, 2026-10-23). Added by #432 on 2026-10-27.
+
+**The stored files after the merge of `main`** (9dc5ce30; Calibration data, 2026-10-27). `B-2-raster.json`, `B-3-slice.json` and `B-5-adam.json` keep #369's per-case medians of three clean runs. `B-4-losses.json`, `B-6-data.json` and `B-6-data-60.json` are `main`'s: `main` recorded them again with ꟻLIP after #369's runs, the two B-6 files in #394's recorded run and B-4 in #427's refresh, after #394's and #380's review's. #369's medians of those three, measured with LPIPS-VGG, are superseded.
+
+**The comparison on the merged tree.** #423 changed the gsplat path's SH gather after #369's runs (Q-274), so the GPU benchmark job's steps (`.github/workflows/gpu-bench.yml`: B-2, B-3, B-4, B-5, B-6 on the CI scene and B-6 on its 60-frame conversion) run once on the merged tree, alone on a quiet machine, and `scripts/bench_compare.py` compares the six files with the stored baselines. Pending: the run needs the machine to itself, and its result is added here and reported to the owner. Replacing a baseline is the owner's call (Q-196).
