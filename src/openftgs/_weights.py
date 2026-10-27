@@ -268,8 +268,9 @@ def _converted(name: str) -> pathlib.Path:
 # against the pinned conversion at every load.
 def _caffe_tensors(name: str, caffe: _Caffe) -> dict[str, Tensor]:
     """A Caffe trunk's convolutions, from its converted file in torch.hub's cache, made at
-    first use from the publisher's checked file. Raises OSError when a download fails or a
-    cached file isn't the publisher's or the pinned conversion (Q-142: exit 2)."""
+    first use from the publisher's checked file. Raises OSError when a download fails, a
+    cached file isn't the publisher's or the pinned conversion, or the conversion can't be
+    written (Q-142: exit 2)."""
     path = _converted(name)
     if not path.exists():
         source = fetch(caffe.download)
@@ -282,6 +283,10 @@ def _caffe_tensors(name: str, caffe: _Caffe) -> dict[str, Tensor]:
         try:
             safetensors.torch.save_file(tensors, str(partial), metadata=metadata)
             os.replace(partial, path)
+        except safetensors.SafetensorError as error:
+            # Q-158, Q-258: the library reports a write that fails (a full disk, no permission)
+            # through its own class, not an OSError (source log #148, #465); Q-142: exit 2.
+            raise OSError(f"cannot write {path}, the conversion of {source}: {error}") from error
         finally:
             partial.unlink(missing_ok=True)
         return tensors
@@ -415,8 +420,9 @@ def trunk_tensors(name: str) -> dict[str, Tensor]:
       channels); converted at first use and cached as safetensors.
     - `dinov2_s14`, `dinov2_b14`, `dino_s16`, `dino_b16`: the publisher's state dict as saved.
 
-    Raises ValueError for another name, and OSError when a download fails or a cached file
-    isn't the publisher's or its pinned conversion (Q-142: the CLI's exit 2)."""
+    Raises ValueError for another name, and OSError when a download fails, a cached file isn't
+    the publisher's or its pinned conversion, or the conversion can't be written (Q-142: the
+    CLI's exit 2)."""
     if name in _CAFFE:
         return _caffe_tensors(name, _CAFFE[name])
     if name in _DINO:

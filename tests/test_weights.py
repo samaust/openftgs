@@ -8,6 +8,7 @@ publisher's; the `weights` tests download the six real files (Q-7)."""
 
 import hashlib
 import http.server
+import os
 import re
 import struct
 import threading
@@ -317,6 +318,27 @@ def test_caffe_tensors_refuses_a_converted_file_that_isnt_the_conversion(
         _weights._caffe_tensors("standin", caffe)
     assert converted.read_bytes() == before
     assert [p.name for p in converted.parent.iterdir()] == [converted.name]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_caffe_tensors_reports_a_conversion_it_cannot_write_as_an_oserror(hub: Path) -> None:
+    """Q-142, Q-158, Q-258 (owner answer, #407): a conversion that can't be written, here into
+    a cache folder without write permission that holds the publisher's file, raises an OSError
+    naming the converted file, whatever safetensors' own exception class, the CLI's exit 2;
+    the cache is left as it was."""
+    data, convs = _standin_net()
+    caffe = _standin_caffe(_UNUSED_URL.replace(".bin", ".caffemodel"), data, convs)
+    checkpoints = hub / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "standin.caffemodel").write_bytes(data)
+    converted = checkpoints / "openftgs-standin.safetensors"
+    checkpoints.chmod(0o555)
+    try:
+        with pytest.raises(OSError, match=re.escape(str(converted))):
+            _weights._caffe_tensors("standin", caffe)
+        assert [p.name for p in checkpoints.iterdir()] == ["standin.caffemodel"]
+    finally:
+        checkpoints.chmod(0o755)
 
 
 # Source-log row 424: each publisher's file, its byte count and SHA-256, at the URL that rows
