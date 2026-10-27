@@ -840,8 +840,8 @@ class Trainer:
         if it > cfg.optim.iterations:
             raise ValueError(f"the run is complete at iteration {run.iteration}")
         entry = calendar_entry(cfg, it)
-        # §3.4: the iteration's stages (B-1); the slice, rasterization and loss stages are
-        # render's, at_time's and total_loss's.
+        # §3.4: the iteration's stages (B-1); the slice and rasterization stages are render's
+        # (with at_time's on the reference backend, Q-274), the loss stages total_loss's.
         with stage("iteration"):
             with _perf_flags(cfg.perf, autotune=self._autotune), torch.enable_grad():
                 # Steps 1–2: the next image of the sampler, its normalized time and L_active.

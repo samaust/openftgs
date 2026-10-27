@@ -93,8 +93,8 @@ The stages are also NVTX ranges, so Nsight Systems shows a benchmark's calls by 
 
 | Stage | In B-2 | In B-3 |
 | --- | --- | --- |
-| `slice`, `slice.kernel`, `slice.sh_concat` | the temporal slice inside `render` (`FreeTimeGaussians.at_time`) | `slice.kernel` alone: the forward call of `motion.temporal_slice` |
-| `raster.forward` and its four sub-stages | `render`'s rasterization forward, compaction included | |
+| `slice`, `slice.kernel` | the temporal slice inside `render`, without the SH since #423 (Q-274) | `slice.kernel` alone: the forward call of `motion.temporal_slice` |
+| `raster.forward` and its five sub-stages | `render`'s rasterization forward, compaction included; `raster.forward.sh_gather` builds the SH coefficients of the rows the SH evaluation receives (Q-274, #423) | |
 | `loss.l1` | the L1 loss against the camera's training image | |
 | `backward` | `torch.autograd.grad` from the L1 loss into the nine stored tensors | `torch.autograd.grad` from the slice's outputs to its inputs: the slice's backward alone, where a training iteration's `backward` holds every backward pass |
 | `backward.losses_done`, `backward.raster_done` (points) | where the loss's backward and the rasterization's end inside `backward`, as in `Trainer.step` | |
@@ -127,8 +127,8 @@ B-1 times `Trainer.step` by stage (§3.4), on synthesized models of 0.5M, 1M and
 | Part | From | To | Holds |
 | --- | --- | --- | --- |
 | `backward.losses` | `backward` begins | `backward.losses_done` | every loss's backward |
-| `backward.raster` | `backward.losses_done` | `backward.raster_done` | the rasterization's backward, projection and SH included |
-| `backward.slice` | `backward.raster_done` | `backward` ends | the temporal slice's backward, with the SH concat's and the gradients' accumulation |
+| `backward.raster` | `backward.losses_done` | `backward.raster_done` | the rasterization's backward, projection and SH included, and the SH coefficients' backward into `sh0` and `shN` (#423 measured it there, before and after its change) |
+| `backward.slice` | `backward.raster_done` | `backward` ends | the temporal slice's backward and the gradients' accumulation |
 
 Per event (`{"n", "active", "iteration"}`): the `events` stage, the whole iteration and N after it. Then, without gradients, the shares of the rows that pass the opacity cull ("active", D-32) and that are visible (E6), averaged over window A's 300 images and times, on the model as it is at 420; peak allocated and reserved memory over window A; N at iteration 0, at 121 and at 420.
 
@@ -300,6 +300,16 @@ At the contract's code (12e715d), with ꟻLIP at its calibrated weight and the t
 At #394's code, where ꟻLIP's iterations leave autotuning as the caller set it (`docs/modules/train/trainer.md`), B-1's rerun is no slower, Q-272's check (window B within 1.03 × the reference's in each case): 15.0, 17.5, 28.1 and 25.3 ms, 0.91 to 0.93 of the reference's (Calibration data, #394). Stages without a cuDNN convolution came out 4 to 9 % faster too, so most of that difference is the two runs' conditions rather than the change, which B-4 measured as neutral for ꟻLIP. The SH concat's share at 3M stays above 5 %, at 6.63 and 7.46 %.
 
 On validation run 35's trained kitchen model (#395; `docs/clean-room/validation-runs.md` and its Calibration data), at the integration branch's eaeb791, after #394, an iteration without an event takes 30.9 ms (window B), against 118.3 ms on M17's model with LPIPS-VGG: ꟻLIP's forward 5.5 ms (17 %), every loss's backward 5.4 ms, the rasterizer's backward 8.2 ms (26 %), Adam 6.2 ms (20 %). The slice takes 4.37 % of an iteration and the SH concat 5.91 % (1.88 ms), above 5 % as on the synthesized models. The bound is 934 s against 3,600 s, and the budget's own measure, the default `ftgs train` on kitchen (Q-168), took 862 s (14 min 22 s) against M17's 3,498 s. The run took 31 s.
+
+## B-1 and B-2 after #423: the SH gather
+
+Since #423 the gsplat backend concatenates `sh0` and `shN` only for the rows its SH evaluation receives, in `raster.forward.sh_gather`, and a training iteration runs no `slice.sh_concat` (Q-274). B-1 and B-2 were recorded on kitchen at main's code and then at #423's, back to back, alone on the RTX 4090 (Calibration data, #423).
+
+B-1 is no slower in any case and faster at 3M rows, Q-272's check against #394's rerun. Window B takes 14.60, 16.54, 25.45 and 22.11 ms, 0.873 to 0.973 of the reference.
+
+The SH work fell from 1.86 ms (6.65 and 7.42 % of an iteration at 3M) plus packed mode's gather of the concat to 0.54 and 0.11 ms (2.13 and 0.51 %), under PRD #220's 5 %. Its backward runs in `backward.raster`, before and after: at 3M that part falls by 0.95 and 1.29 ms, while `backward.slice` stays at 0.97 ms. D-50's slice share rises to 5.44 and 6.25 %, still under 10 %: the slice is unchanged and the iteration shorter.
+
+B-2 keeps D-57's defaults: no combination meets #227's rule. Packed/internal is 12 to 25 % faster with 5 % and 20 % of the rows active, but 4.6 % and 6.0 % slower with every row active (7.96 against 7.61 ms at 1M, 22.14 against 20.88 at 3M). There packed mode gathers nearly every row, and its backward accumulates into `sh0` and `shN` apart. That slowdown has gone to the owner with #423.
 
 ## B-5: `ftgs bench adam`
 

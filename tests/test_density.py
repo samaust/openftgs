@@ -12,6 +12,7 @@ gsplat 1.5.3's `compute_relocation` as the oracle U-13 names (GPU).
 
 import decimal
 import math
+from typing import Literal
 
 import pytest
 import scipy.spatial.transform
@@ -305,7 +306,10 @@ def test_u16_update_mean_and_reset_make_no_host_synchronization() -> None:
 
 
 @pytest.mark.gpu
-def test_u16_gsplat_packed_and_unpacked_layouts_give_the_same_statistics() -> None:
+@pytest.mark.parametrize("precull", ["internal", "compact"])  # Q-31, #423
+def test_u16_gsplat_packed_and_unpacked_layouts_give_the_same_statistics(
+    precull: Literal["internal", "compact"],
+) -> None:
     """U-16, D-75 (U-16 is its detecting test): the 2D means are the gradient anchor in both
     layouts, so a two-camera gsplat render backpropagated through one loss gives the same counts,
     exactly, and the same g_sum within U-12's criterion for gsplat gradients (cosine ≥ 0.999,
@@ -324,6 +328,7 @@ def test_u16_gsplat_packed_and_unpacked_layouts_give_the_same_statistics() -> No
             time_units="normalized",
             backend="gsplat",
             packed=packed,
+            precull=precull,
             return_aux=True,
         )
         torch.autograd.backward((out.image * weights).sum())

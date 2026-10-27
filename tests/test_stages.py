@@ -274,20 +274,21 @@ def test_cuda_events_time_each_stage_and_split_the_backward_pass() -> None:
 _TIME = TimeNormalizer(0.0, 2.0 / 30.0)  # three frames at 30 FPS
 _RASTER = [
     "raster.forward.projection",
+    "raster.forward.sh_gather",
     "raster.forward.sh",
     "raster.forward.isect",
     "raster.forward.rasterize",
 ]
 
 
-def _iteration(raster: list[str]) -> list[str]:
+def _iteration(raster: list[str], concat: list[str]) -> list[str]:
     """One iteration's records in the order they begin: λ_perc = 0, so no perceptual stage."""
     return [
         "iteration",
         "data",
         "slice",
         "slice.kernel",
-        "slice.sh_concat",
+        *concat,
         "raster.forward",
         *raster,
         "loss.l1",
@@ -304,18 +305,24 @@ def _iteration(raster: list[str]) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("device", "kind", "raster"),
+    ("device", "kind", "raster", "concat"),
     [
-        pytest.param("cpu", "wall", [], id="cpu-reference-wall"),
-        pytest.param("cuda", "cuda", _RASTER, id="gsplat-cuda", marks=pytest.mark.gpu),
+        pytest.param("cpu", "wall", [], ["slice.sh_concat"], id="cpu-reference-wall"),
+        pytest.param("cuda", "cuda", _RASTER, [], id="gsplat-cuda", marks=pytest.mark.gpu),
     ],
 )
 def test_a_training_iteration_runs_its_stages_in_order(
-    tmp_path: Path, device: str, kind: Literal["cuda", "wall"], raster: list[str]
+    tmp_path: Path,
+    device: str,
+    kind: Literal["cuda", "wall"],
+    raster: list[str],
+    concat: list[str],
 ) -> None:
     """§3.4 B-1: each training iteration runs the stages B-1 times, in order and nested in the
-    iteration, with the backward pass split by its two points (losses → raster → slice); the
-    gsplat backend adds rasterization's four sub-stages."""
+    iteration, with the backward pass split by its two points (losses → raster → slice). The
+    reference backend concatenates the SH coefficients of every row in `at_time`; the gsplat
+    backend adds rasterization's five sub-stages, among them the SH of the rows its SH
+    evaluation receives, gathered and concatenated, in place of that concat (Q-274, #423)."""
     cams = ring(3, radius=4.0, elevation=1.0, width_px=32, height_px=24, focal=30.0)
     truth = random_model(20, seed=0, sh_degree=1, time=_TIME, spread=0.6, log_scale=(-2.5, -1.5))
     images = [(cam, k / 30.0, "train") for k in range(3) for cam in cams]
@@ -332,7 +339,7 @@ def test_a_training_iteration_runs_its_stages_in_order(
         trainer.step()
         trainer.step()
     timings = clock.read()
-    expected = _iteration(raster)
+    expected = _iteration(raster, concat)
     assert [t.name for t in timings] == expected * 2
     for first in (0, len(expected)):
         it = timings[first : first + len(expected)]
@@ -343,5 +350,6 @@ def test_a_training_iteration_runs_its_stages_in_order(
         losses, raster_done = by_name["backward.losses_done"], by_name["backward.raster_done"]
         assert backward.start <= losses.start <= raster_done.start <= backward.end
         assert by_name["slice"].start <= by_name["slice.kernel"].start
-        assert by_name["slice.sh_concat"].end <= by_name["slice"].end
+        if concat:
+            assert by_name["slice.sh_concat"].end <= by_name["slice"].end
         assert by_name["slice"].end <= by_name["raster.forward"].start
