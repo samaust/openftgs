@@ -420,13 +420,13 @@ class PerceptualLoss(torch.nn.Module):
     reference gets no gradient. The network is frozen and stays in evaluation mode under
     `.train()` (D-89). "flip" is the vendored LDR-ꟻLIP loss at 67.0 pixels per degree, on
     float32 images; "haarpsi" is 1 − HaarPSI, the render clamped to [0, 1], on float32 or
-    float64 images of sides of at least 16 pixels (Q-261); both compute in their images' dtype
-    under a caller's `torch.autocast` too, which they turn off (Q-275). "vgg16_oxford" and
-    "alexnet_bvlc" are lpips's uncalibrated distance on the Caffe trunks, their weights fetched
-    at first use, AlexNet's sides of at least 23 pixels (Q-263). The DINO networks
-    ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16") take sides from 27 or 31 pixels
-    (Q-265) and need the [init] extra: an ImportError names it otherwise (Q-248). These six
-    trunk networks compute in their weights' dtype, float32 as built, and refuse images of
+    float64 images of sides of at least 16 pixels (Q-261); under a caller's `torch.autocast`,
+    both turn it off for their own computation, which stays in their images' dtype (Q-275).
+    "vgg16_oxford" and "alexnet_bvlc" are lpips's uncalibrated distance on the Caffe trunks,
+    their weights fetched at first use, AlexNet's sides of at least 23 pixels (Q-263). The DINO
+    networks ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16") take sides from 27 or 31
+    pixels (Q-265) and need the [init] extra: an ImportError names it otherwise (Q-248). These
+    six trunk networks compute in their weights' dtype, float32 as built, and refuse images of
     another; their weights are buffers no `state_dict` carries, which `.to()` moves and
     converts (Q-263, Q-265)."""
 
