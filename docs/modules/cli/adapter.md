@@ -28,14 +28,14 @@ ftgs-adapter [--backend …] train SCENE INIT CONFIG SEED OUT_DIR
 | temporal_opacity | `motion.temporal_opacity` (E4) |
 | effective_opacity | `motion.effective_opacity` (E3) |
 | sh_color | `model.at_time(t, sh_degree=…)`, then `sh.sh_to_color` from the camera centre to the moved mean (E2) |
-| losses | `l1_loss`, `ssim`, `reg4d_loss`, `LPIPSLoss("vgg")` when `lpips` is true, and `total_loss` at `iteration` (E7 to E9) |
+| losses | `l1_loss`, `ssim`, `PerceptualLoss("flip")` and `reg4d_loss`, and `total_loss` at `iteration` with the query's LossConfig fields and `perc_net` "flip" whatever the query names, so ꟻLIP is the total's perceptual term at the query's λ_perc, None its calibrated weight (E7 to E9; Q-249, Q-255). There is no `lpips` switch |
 | lr_schedule | `build_optimizer(…, adam="foreach")` on a one-row model, then `set_iteration` per iteration, columns in §1.3's order (E12, E13) |
 | relocation_math | `density.mcmc_split`, then D-14's lower bound on the float32 logit, as the trainer applies it (Q-50) |
 | velocity_init | `init.knn_velocities` (E15) |
 | relocation_sampling | `density.draw_targets` per seed, counted per row (D-15) |
-| grad_stats | the trainer's steps 3 to 5 for one image on the reference backend: `render(…, return_aux=True, packed=False)`, `total_loss`, backward, `GradStats.update` (D-12) |
+| grad_stats | the trainer's steps 3 to 5 for one image on the reference backend: `render(…, return_aux=True, packed=False)`, `total_loss` with the configuration's perceptual network, built when λ_perc is None or positive as the trainer builds it (`PerceptualLoss`), backward, `GradStats.update` (D-12; Q-249) |
 | relocation_score | `density.sampling_score` over a model whose logits are the opacities' and a `GradStats` holding the sums and counts (E10, D-13) |
 | spatial_scale | `data.spatial_scale` over records built from the cameras, no image read (D-27) |
 | growth_decisions | `density.growth_masks` (D-18, D-44) |
 
-A query that raises is an `error` answer; the others in the file are still answered. A kind the module doesn't know is `not_comparable`, and so is a query whose `loss`, `optim` or `reloc` section (grad_stats: its `config` subset) holds a key TrainConfig lacks or a value it refuses on its own; the message names those dotted keys (§3.3: a setting the adapter cannot honor is reported, never dropped silently).
+A query that raises is an `error` answer; the others in the file are still answered. An invalid environment is not an answer: building grad_stats's perceptual network when a trunk weight can't be downloaded or fails its check, or a DINO network without the `[init]` extra, is exit 2 with a message naming the file or the extra, as `ftgs train` and `ftgs bench` give it, and no answers are written (Q-142, Q-248, Q-270). A kind the module doesn't know is `not_comparable`, and so is a query whose `loss`, `optim` or `reloc` section (grad_stats: its `config` subset) holds a key TrainConfig lacks or a value it refuses on its own; the message names those dotted keys (§3.3: a setting the adapter cannot honor is reported, never dropped silently).

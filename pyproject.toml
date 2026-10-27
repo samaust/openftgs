@@ -14,11 +14,12 @@ authors = [{ name = "Samuel Austin" }]
 # Q-1: Python floor.
 requires-python = ">=3.11"
 # §2.3. Training needs a CUDA build of torch; on Linux x86_64 PyPI's default wheel is one (Q-3).
+# Since revision 549o (#393): no lpips, nor the tqdm and torchvision it brought to the core;
+# ꟻLIP, HaarPSI and the two Caffe trunks need nothing more (Q-248).
 dependencies = [
     "gsplat==1.5.3",
     "torch>=2.1",
     "safetensors>=0.4",
-    "lpips==0.1.4",
     "PyYAML>=6.0",
     "Pillow>=10",
     "scipy>=1.10",
@@ -35,7 +36,7 @@ ftgs-adapter = "openftgs.cli._adapter:main"
 [project.optional-dependencies]
 # §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. D-85: fused-local-corr, RoMa's optional
 # speed-up, isn't listed, on any Python; it is built from source against the installed torch
-# (README).
+# (README). Q-248: the four DINO perceptual networks, on RoMa's DINOv2 layers, need it too.
 init = [
     "torch>=2.5.1",
     "torchvision",
@@ -54,7 +55,6 @@ dev = [
     "pip-licenses",
     "scikit-image",
     "opencv-python-headless",
-    "torchmetrics",
 ]
 
 [tool.setuptools.packages.find]
@@ -64,6 +64,8 @@ where = ["src"]
 openftgs = ["py.typed"]
 # D-65, Q-115: the vendored RoMa's license texts and its patch record ship with it.
 "openftgs._vendor.romatch" = ["LICENSE", "LICENSES/*", "VENDOR.json"]
+# D-65, D-89: so do the vendored ꟻLIP's license and its vendoring record (#383).
+"openftgs._vendor.flip" = ["LICENSE", "VENDOR.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -72,14 +74,14 @@ markers = [
     "cpu: added to every test not marked gpu; uses the reference backend, but may still need a dataset or downloaded weights",
     "gpu: needs a CUDA device; skipped without one",
     "dataset: needs a real dataset under $OPENFTGS_DATASETS; skipped otherwise (Q-7)",
-    "weights: downloads pretrained weights at run time (RoMa, DINOv2, LPIPS backbones); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1 (Q-7)",
+    "weights: downloads pretrained weights at run time (RoMa, DINOv2, the trunk networks of D-89); skipped unless OPENFTGS_ALLOW_DOWNLOADS=1 (Q-7)",
 ]
 
 # Q-216: coverage of the CPU suite in CI, the ftgs and harness subprocesses included; the vendored
-# RoMa (D-65) is left out, as for ruff and mypy.
+# RoMa (D-65) is left out, as for ruff and mypy, and so are both copies of ꟻLIP (Q-254).
 [tool.coverage.run]
 source_pkgs = ["openftgs", "ftgs_harness"]
-omit = ["*/openftgs/_vendor/*"]
+omit = ["*/openftgs/_vendor/*", "*/ftgs_harness/_vendor/*"]
 branch = true
 relative_files = true
 patch = ["subprocess"]
@@ -90,7 +92,16 @@ skip_empty = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-extend-exclude = [".claude", "docs", "src/openftgs/_vendor/romatch"]
+# D-65: the vendored RoMa and ꟻLIP, U-23's reference copy of ꟻLIP (Q-252) and the harness's
+# own copy (Q-254) stay as upstream wrote them.
+extend-exclude = [
+    ".claude",
+    "docs",
+    "src/openftgs/_vendor/romatch",
+    "src/openftgs/_vendor/flip/flip_loss.py",
+    "harness/src/ftgs_harness/_vendor/flip/flip_loss.py",
+    "tests/reference/flip",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
@@ -102,18 +113,24 @@ known-first-party = ["openftgs", "ftgs_harness"]
 python_version = "3.11"
 strict = true
 files = ["src/openftgs", "harness/src/ftgs_harness", "tests", "scripts"]
-exclude = ["^src/openftgs/_vendor/romatch/"]
+exclude = [
+    "^src/openftgs/_vendor/romatch/",
+    "^src/openftgs/_vendor/flip/flip_loss\\.py$",
+    "^harness/src/ftgs_harness/_vendor/flip/flip_loss\\.py$",
+    "^tests/reference/flip/",
+]
+# D-65, D-89: the vendored ꟻLIP's classes are nn.Modules to mypy, but upstream's functions carry
+# no annotations; typed code may call them (#383), and so may the harness's copy's (Q-254).
+untyped_calls_exclude = ["openftgs._vendor.flip.flip_loss", "ftgs_harness._vendor.flip.flip_loss"]
 
 [[tool.mypy.overrides]]
 module = [
     "gsplat.*",
-    "lpips.*",
     "fused_ssim.*",
     "scipy.*",
     "yaml.*",
     "skimage.*",
     "cv2.*",
-    "torchmetrics.*",
 ]
 ignore_missing_imports = true
 
@@ -121,4 +138,10 @@ ignore_missing_imports = true
 # D-65: the vendored RoMa is third-party code, kept as upstream wrote it.
 module = ["openftgs._vendor.romatch.*"]
 follow_imports = "skip"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# D-65, D-89: the vendored ꟻLIP too (#383); read for its classes, its errors ignored. So is the
+# harness's own copy (Q-254), which `exclude` alone leaves checked as an import of the metrics.
+module = ["openftgs._vendor.flip.flip_loss", "ftgs_harness._vendor.flip.flip_loss"]
 ignore_errors = true

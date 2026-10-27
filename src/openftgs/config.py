@@ -13,11 +13,14 @@ from dataclasses import dataclass, field
 from types import UnionType
 from typing import Any, ClassVar, Literal, Union, get_args, get_origin, get_type_hints
 
+from openftgs._legacy import LPIPS_BACKBONES
+
 __all__ = [
     "GrowthConfig",
     "InitConfig",
     "LossConfig",
     "OptimConfig",
+    "PercNet",
     "PerfConfig",
     "RelocConfig",
     "TrainConfig",
@@ -44,24 +47,41 @@ class InitConfig:  # §1.3 Initialization
         _check_positive(self, "scale_floor")
 
 
+PercNet = Literal[
+    "flip", "haarpsi", "vgg16_oxford", "alexnet_bvlc",
+    "dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16",
+]  # D-89  # fmt: skip
+
+
 @dataclass
 class LossConfig:  # E7–E9
     lambda_img: float = 0.8  # P §3.3
     lambda_ssim: float = 0.2  # P §3.3
-    lambda_perc: float = 0.01  # P §3.3
+    lambda_perc: float | None = None  # D-9: None = perc_net's calibrated weight (D-89)
     lambda_reg: float = 1e-2  # P §3.3
     reg_until: int | None = None  # D-10: last iteration with L_reg; None = whole run
     ssim_window: int = 11  # D-8
     ssim_sigma: float = 1.5  # D-8
     ssim_padding: Literal["valid", "same"] = "valid"  # D-8
-    perc_net: Literal["vgg", "alex"] = "vgg"  # D-9
+    perc_net: PercNet = "flip"  # D-9
 
     _prefix: ClassVar[str] = "loss."
 
     def __post_init__(self) -> None:
+        # #375 (decided item 3), Q-247: LPIPS's backbones, the names before 549o, are refused
+        # naming the revision, before the generic Literal check would.
+        if self.perc_net in LPIPS_BACKBONES:
+            _fail(
+                self,
+                "perc_net",
+                f"is one of LPIPS's backbones, which revision 549o of the spec retired (D-9, "
+                f"D-89): choose one of D-89's networks {get_args(PercNet)}, 'flip' by default",
+            )
         _check_types(self)
         # Q-11
-        _check_non_negative(self, "lambda_img", "lambda_ssim", "lambda_perc", "lambda_reg")
+        _check_non_negative(self, "lambda_img", "lambda_ssim", "lambda_reg")
+        if self.lambda_perc is not None:
+            _check_non_negative(self, "lambda_perc")
         if self.reg_until is not None:
             _check_non_negative(self, "reg_until")
         _check_count(self, "ssim_window")

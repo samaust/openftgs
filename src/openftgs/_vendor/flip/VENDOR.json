@@ -1,0 +1,71 @@
+{
+  "upstream": "https://github.com/NVlabs/flip",
+  "commit": "d3ab02a4425eb167d8a4021b382a2bafc6e6c838",
+  "script": "scripts/vendor_flip.py",
+  "package": "openftgs._vendor.flip",
+  "reference": "tests/reference/flip",
+  "licenses": [
+    {
+      "path": "LICENSE",
+      "project": "ꟻLIP",
+      "license": "BSD-3-Clause",
+      "source": "https://raw.githubusercontent.com/NVlabs/flip/d3ab02a4425eb167d8a4021b382a2bafc6e6c838/LICENSE",
+      "sha256": "13b955078ffb4a3215757038ab2e5fcf0cc66349d0990faec9adba8ad034e578"
+    }
+  ],
+  "files": [
+    {
+      "path": "flip_loss.py",
+      "upstream_path": "src/pytorch/flip_loss.py",
+      "source": "https://raw.githubusercontent.com/NVlabs/flip/d3ab02a4425eb167d8a4021b382a2bafc6e6c838/src/pytorch/flip_loss.py",
+      "upstream_sha256": "bf2b83aeb2427a960abe1143d4436d48609f1cc4f256e685daa08d86cc07c4fc",
+      "sha256": "789799598c4d18bc8301165ad1b160315b44bd709099a5ec78ddbc2b1e23185e",
+      "edits": [
+        "device: in HDRFLIPLoss.forward, '.cuda()' -> '.to(reference.device)', 3 times",
+        "device: in tone_map, '.cuda()' -> '.to(img.device)', 3 times",
+        "device: in compute_start_stop_exposures, '.cuda()' -> '.to(reference.device)', 6 times",
+        "device: in generate_spatial_filter, 'def generate_spatial_filter(pixels_per_degree, channel):' -> 'def generate_spatial_filter(pixels_per_degree, channel, device):', once",
+        "device: in generate_spatial_filter, '.cuda()' -> '.to(device)', once",
+        "device: in compute_ldrflip, \"pixels_per_degree, 'A')\" -> \"pixels_per_degree, 'A', reference.device)\", once",
+        "device: in compute_ldrflip, \"pixels_per_degree, 'RG')\" -> \"pixels_per_degree, 'RG', reference.device)\", once",
+        "device: in compute_ldrflip, \"pixels_per_degree, 'BY')\" -> \"pixels_per_degree, 'BY', reference.device)\", once",
+        "device: in compute_ldrflip, '.unsqueeze(0), ' -> '.unsqueeze(0).to(reference.device), ', 2 times",
+        "device: in spatial_filter, \"device='cuda'\" -> 'device=img.device', 2 times",
+        "device: in spatial_filter, '.cuda()' -> '.to(img.device)', 3 times",
+        "device: in hunt_adjustment, \"device='cuda'\" -> 'device=img.device', once",
+        "device: in redistribute_errors, \"device='cuda'\" -> 'device=power_deltaE_hyab.device', once",
+        "device: in feature_detection, '.cuda()' -> '.to(img_y.device)', once",
+        "device: in color_space_transform, 'dim[2]*dim[3]).cuda()' -> 'dim[2]*dim[3]).to(input_color.device)', once",
+        "constants: in color_space_transform, '\\treference_illuminant = torch.tensor(' -> \"\\treference_illuminant = _constant('reference_illuminant', input_color.device, lambda: torch.tensor(\", once",
+        "constants: in color_space_transform, '\\tinv_reference_illuminant = torch.tensor(' -> \"\\tinv_reference_illuminant = _constant('inv_reference_illuminant', input_color.device, lambda: torch.tensor(\", once",
+        "constants: in color_space_transform, ']]).cuda()' -> ']]))', 2 times",
+        "constants: in color_space_transform, 'torch.matmul(A.cuda(), input_color)' -> 'torch.matmul(_constant(fromSpace2toSpace, input_color.device, lambda: A), input_color)', once",
+        "cmax: lines 202-204 of compute_ldrflip moved into a new function _cmax, added before tone_map ('reference.device' -> 'device' 2x in them); in their place 1 line",
+        "filters: lines 539-563 of feature_detection moved into a new function generate_feature_filter, added before feature_detection ('img_y.device' -> 'device' 1x in them); in their place 1 line",
+        "cache: 1 line added before 'import sys'",
+        "cache: 26 lines added before 'class HDRFLIPLoss(nn.Module):'",
+        "filters: 1 line added before 'def generate_spatial_filter('",
+        "notice: the modification notice added after NVIDIA's license header"
+      ]
+    }
+  ],
+  "changes": {
+    "device": "Device-agnostic tensors in place of the CUDA-only ones: every .cuda() becomes .to(<image>.device) and every device='cuda' becomes device=<image>.device, where <image> is the function's image argument, except for the colour transforms' constants ('constants'); generate_spatial_filter takes the device as a new last argument, which compute_ldrflip passes, and the two colours of the colour maximum are made on the reference's device, where the published file's color_space_transform moved them with .cuda()",
+    "constants": "The colour transforms' constant tensors copied to a device once (§2.4 rule 3): the D65 illuminant and its inverse, which color_space_transform built and copied at every call, and the RGB-to-XYZ and XYZ-to-RGB matrices, which its linrgb2xyz and xyz2linrgb branch copied at every call, are kept per device by _constant, under their names and the transform's; the matrix is still built on the host at every call, as published, and copied only once",
+    "cmax": "The per-call host read of the colour maximum replaced by a cached constant (§2.4 rule 3): its three lines move out of compute_ldrflip into _cmax(qc, eps, device), memoized by _once_per_device, which returns the published expression's .item(). It is computed on the device it serves, with the published expressions, so the CUDA path keeps the published value: in float32 the CPU gives 41.276100158691406 and CUDA 41.27609634399414 (RTX 4090, PyTorch 2.14.1), one ulp apart",
+    "cache": "The helper the caching changes share: _once_per_device memoizes a builder of tensors whose last argument is their device (functools.lru_cache), so that they are built and copied to the device once, and builds them outside inference mode, so that a tensor first built while evaluating under torch.inference_mode() can still be saved for a backward pass",
+    "filters": "The filters built once per device and size (§2.4's perceptual-loss row): generate_spatial_filter is memoized by _once_per_device, and the lines of feature_detection that build the edge and point filters move, unchanged but for the device change, into a new function generate_feature_filter(pixels_per_degree, feature_type, device), memoized the same way, which feature_detection calls. A filter's size is set by the pixels per degree alone, so the key is the pixels per degree, the channel or feature type and the device"
+  },
+  "first_call": "The first call of LDR-ꟻLIP on a device builds and copies there the five filters of its pixels per degree and the four colour constants, and reads the colour maximum back once; later calls on it copy and read nothing (§2.4 rule 3)",
+  "filter_support": {
+    "side": 21,
+    "radius": 10,
+    "pixels_per_degree": "the published default, (0.7 * 3840 / 0.7) * pi / 180 = 67.02064327658226, and 67.0 (E16), which give filters of the same size, whose values differ",
+    "filters": {
+      "spatial (A, RG, BY)": "21 x 21: radius ceil(3 * sqrt(0.04 / (2 * pi^2)) * ppd) = 10",
+      "feature (edge, point)": "19 x 19: radius ceil(3 * 0.5 * 0.082 * ppd) = 9"
+    },
+    "measured": "On a flat grey 96 x 96 pair (sRGB 0.5), a one-pixel chromatic difference (0.9, 0.2, 0.7) changes the error map within 10 px of it and no farther, all 21 x 21 pixels on this machine (the blue-yellow filter reaches that far); an achromatic one (0.6) within 9 px, through the feature filters, the achromatic filter's tail at 10 px being below float32's resolution",
+    "test": "tests/test_vendored_flip.py::test_flip_filter_support_at_67_pixels_per_degree"
+  }
+}

@@ -189,8 +189,20 @@ The configured rule for how N evolves: "gradient" (growth as above), "score" (ap
 _Avoid_: growth mode, strategy, densification strategy, MCMC mode
 
 **Rendering loss L_render**:
-The image term 0.8·L1 + 0.2·(1 − SSIM) + 0.01·LPIPS-VGG between the unclamped render and the training image. E7
+The image term 0.8·L1 + 0.2·(1 − SSIM) + λ_perc·L_perc between the unclamped render and the training image, where L_perc is the perceptual network's value. E7, D-9
 _Avoid_: photometric loss, reconstruction loss, image loss (the L1 term alone)
+
+**Perceptual network**:
+The frozen network that `perc_net` selects and whose value on the render and the training image is the rendering loss's perceptual term L_perc: ꟻLIP by default, or one of D-89's seven alternatives. D-9, D-89
+_Avoid_: LPIPS (the paper's network, which openftgs doesn't use), perceptual loss (when the network is meant), backbone (a trunk network's pretrained layers)
+
+**Trunk network**:
+One of the six perceptual networks built on pretrained weights, `vgg16_oxford`, `alexnet_bvlc` and the four DINO networks, as against the weight-free ꟻLIP and HaarPSI. D-89, U-9, B-4
+_Avoid_: deep metric, learned metric (their distances are uncalibrated, D-89), backbone
+
+**Calibrated weight**:
+A perceptual network's λ_perc in D-89's table, which `lambda_perc = None` selects; the weight that gives the network's gradient on the render the median norm LPIPS-VGG's has at the paper's 0.01. D-9, D-89
+_Avoid_: default weight (when a configured value is meant), perceptual weight (unqualified)
 
 **4D regularization L_reg**:
 The mean over all N primitives of σ·sg[σt(t)] at the current image's time, weighted by λ_reg = 10⁻² for the whole run unless reg_until ends it. E8, E9, D-10
@@ -514,17 +526,21 @@ _Avoid_: ssim (unsubscripted, in results), MS-SSIM, structural_similarity
 The dissimilarity (1 − SSIM_k)/2, lower is better, as the paper's main tables report. E16, D-29, D-40
 _Avoid_: D-SSIM loss (the loss term is 1 − SSIM), 1 − SSIM
 
-**LPIPS-Alex**:
-The LPIPS metric with the AlexNet backbone and inputs mapped to [−1, 1], reported for Neural3DV. E16, D-68
-_Avoid_: lpips (unqualified), perceptual metric
+**ꟻLIP**:
+NVIDIA's image-difference metric for LDR images, the mean of its error map at 67.0 pixels per degree; both the default perceptual network and the reported perceptual metric. E16, D-9, D-89
+_Avoid_: FLIP (except in identifiers such as `flip`), LDR-FLIP, perceptual metric (unqualified), LPIPS
+
+**Vendored ꟻLIP**:
+The copy of NVIDIA's PyTorch ꟻLIP loss at commit d3ab02a inside `openftgs._vendor.flip`, changed for device and caching only, on which the default perceptual network and the perceptual metric are built. §2.3, D-65, D-89
+_Avoid_: flip_loss (the upstream file's name), the published file (the unmodified one), FLIP
+
+**Reference copy of ꟻLIP**:
+NVIDIA's `flip_loss.py` and its license at commit d3ab02a, unmodified, kept beside the tests as U-23's oracle and as the source the vendored ꟻLIP is made from. U-23, Q-252
+_Avoid_: pristine copy, the published file (the one NVIDIA hosts), the harness's copy (Q-254's)
 
 **LPIPS-VGG**:
-The LPIPS metric with the VGG backbone and inputs mapped to [−1, 1], reported for ENeRF-Outdoor and SelfCap; the same network is the perceptual term of the rendering loss. E16, D-68
-_Avoid_: lpips (unqualified), LPIPS loss (when the metric is meant)
-
-**lpips_vgg_raw**:
-LPIPS-VGG computed on unmapped [0, 1] inputs, the 3DGS and gsplat convention, reported beside LPIPS-VGG until a comparison shows which the paper used. D-68
-_Avoid_: raw LPIPS, unnormalized LPIPS
+The LPIPS metric with the VGG backbone: the paper's perceptual term and metric, which openftgs neither trains with nor reports since revision 549o, and the reference its calibrated weights are scaled to. E7, E16, D-9, D-89
+_Avoid_: lpips (unqualified), perceptual network (ꟻLIP by default)
 
 **Dynamic-region metric**:
 Any metric computed after cropping render and ground truth to the dynamic-region mask's bounding box and blacking out pixels outside the mask in both; reported under `dynamic` beside the full-frame `entire` values. D-67
@@ -547,7 +563,7 @@ A pixel of a converted reference frame that the reference-quality diagnostics ma
 _Avoid_: bad pixel, outlier, masked pixel (masks are the dynamic-region masks)
 
 **Kept-pixel PSNR**:
-PSNR over the pixels of a test image left after removing the flagged pixels, with no crop and no fill; unlike a dynamic-region metric, SSIM and LPIPS have no kept-pixel form. E16, #318
+PSNR over the pixels of a test image left after removing the flagged pixels, with no crop and no fill; unlike a dynamic-region metric, SSIM and ꟻLIP have no kept-pixel form. E16, #318
 _Avoid_: masked PSNR, masked metric, clean PSNR
 
 ### Differential harness
@@ -569,12 +585,12 @@ The L1 tolerance class chosen from both info replies: same rasterizer and consta
 _Avoid_: level, tolerance mode, strictness
 
 **Run settings**:
-The harness's own settings for one run (case seed, seed count K, GPUs, trained models, L3 scenes, case sizes, whether L2 compares LPIPS), kept apart from harness_config.json, which holds TrainConfig values only. §3.3, Q-203, Q-212
+The harness's own settings for one run (case seed, seed count K, GPUs, trained models, L3 scenes, case sizes), kept apart from harness_config.json, which holds TrainConfig values only. §3.3, Q-203
 _Avoid_: harness config (reserved for harness_config.json), options file, run config
 
 **Reduced run**:
-A harness run whose run settings ask for less than §3.3 does, a case size below §3.3's or LPIPS left out of L2, and whose report says so; it fails no check by being reduced. Q-203, Q-212
-_Avoid_: partial run, quick run, smoke run, reduced case sizes (only one of the two reasons)
+A harness run whose run settings ask for case sizes below §3.3's, and whose report says so; it fails no check by being reduced. Q-203
+_Avoid_: partial run, quick run, smoke run
 
 **Probe**:
 One of the ten L1 scenes, P1 to P10, that isolates a single behavior by sweeping one variable so a mismatch points at one quantity. §3.3 L1

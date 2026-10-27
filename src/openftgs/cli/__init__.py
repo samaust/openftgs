@@ -68,8 +68,8 @@ def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _environment(what: str) -> Iterator[None]:
-    """Q-142: an OSError of a run-time download (the LPIPS weights, §2.3 notes) is an
-    environment error, exit code 2."""
+    """Q-142: an OSError of a run-time download or of a cached file's check (the trunk networks'
+    weights, §2.3 notes; Q-258) is an environment error, exit code 2."""
     try:
         yield
     except OSError as error:
@@ -409,6 +409,7 @@ class _Profile:
 def _train(args: argparse.Namespace) -> int:
     import torch
 
+    from openftgs._legacy import resume_refusal
     from openftgs.config import config_from_dict, config_to_dict, resume_conflicts
     from openftgs.io import (
         check_run_checkpoints,
@@ -437,7 +438,13 @@ def _train(args: argparse.Namespace) -> int:
         cfg = _read_config(args.config, args.seed)
     else:
         with _as_input_error(f"checkpoint {args.resume}"):
-            cfg = config_from_dict(load_checkpoint(args.resume).config)
+            stored = load_checkpoint(args.resume).config
+        # Q-247: a checkpoint saved before 549o is refused first, naming the revision.
+        refusal = resume_refusal(stored, f"checkpoint {args.resume}")
+        if refusal is not None:
+            _fail(refusal)
+        with _as_input_error(f"checkpoint {args.resume}"):
+            cfg = config_from_dict(stored)
         if args.config is not None or args.seed is not None:  # Q-134
             if args.config is not None:
                 given = _read_config(args.config, args.seed)
@@ -457,11 +464,15 @@ def _train(args: argparse.Namespace) -> int:
     if cfg.perf.deterministic:  # Q-131 (Q-73 note 2), before any CUDA call
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     device = _device()
+    # Q-142 (#389): the trainer builds its perceptual network, so a trunk weight that can't be
+    # downloaded or fails its check (an OSError naming the file, Q-258) and a DINO network
+    # without the [init] extra (an ImportError naming it, Q-248) are invalid environments.
+    building = (NotImplementedError, OSError, ImportError)
     if args.resume is None:
-        with _as_input_error("training setup", NotImplementedError):
+        with _as_input_error("training setup", *building):
             trainer = Trainer(cfg, video, points, device=device)
     else:
-        with _as_input_error(f"resume from {args.resume}", NotImplementedError):
+        with _as_input_error(f"resume from {args.resume}", *building):
             trainer = Trainer.from_checkpoint(
                 args.resume, video, device=device, force=args.force, perf=cfg.perf
             )
@@ -596,8 +607,9 @@ def _train(args: argparse.Namespace) -> int:
     if trace_failure is not None:
         raise trace_failure
     if has_test:  # §1.3 calendar: the final evaluation, after the checkpoint (Q-132)
-        # Q-161: one call downloads the networks and writes the file, so the message names both.
-        with _environment(f"LPIPS networks or {run_dir / 'METRICS.json'}"):
+        # Q-161 (as #380 changes it, #389): the evaluator's ꟻLIP downloads nothing, so an
+        # OSError here is METRICS.json's write (Q-142 as answered).
+        with _output(str(run_dir / "METRICS.json")):
             try:
                 trainer.evaluate("test", out_dir=run_dir)
             except FloatingPointError as error:  # Q-129, Q-147: a render isn't finite; no file
@@ -692,6 +704,7 @@ def _model_sha256_or_none(path: Path) -> str | None:
 
 
 def _read_model(path: Path, device: str) -> _Loaded:
+    from openftgs._legacy import with_current_loss
     from openftgs.config import config_from_dict
     from openftgs.io import load_checkpoint, read_exchange
     from openftgs.model import FreeTimeGaussians
@@ -705,7 +718,8 @@ def _read_model(path: Path, device: str) -> _Loaded:
             None,
         )
     state = load_checkpoint(path)
-    cfg = config_from_dict(state.config)
+    # Q-247: a checkpoint saved before 549o gives its model too; its loss isn't read here.
+    cfg = config_from_dict(with_current_loss(state.config))
     model = FreeTimeGaussians(
         {k: v.to(device) for k, v in state.params.items()},
         sh_degree=cfg.sh_degree,
@@ -850,8 +864,7 @@ def _eval(args: argparse.Namespace) -> int:
     supplied, entry = (None, None)
     if args.renders_dir is not None:
         supplied, entry = _match_renders(video, args.split, args.renders_dir)
-    with _environment("LPIPS networks"):
-        evaluator = Evaluator(device=device)
+    evaluator = Evaluator(device=device)  # ꟻLIP: nothing to download (E16, D-89)
     try:
         images = evaluate_images(
             loaded.model,

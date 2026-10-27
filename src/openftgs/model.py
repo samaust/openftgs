@@ -16,6 +16,7 @@ from typing import Literal, NoReturn, get_args
 import torch
 from torch import Tensor
 
+from openftgs._legacy import with_current_loss
 from openftgs._stages import stage
 from openftgs.config import InitConfig, config_from_dict
 from openftgs.io import load_checkpoint, read_exchange, validate_exchange, validate_init_points
@@ -298,14 +299,17 @@ class FreeTimeGaussians(torch.nn.Module):
     @classmethod
     def load(cls, path: Path, *, device: str = "cuda") -> "FreeTimeGaussians":
         """A model from a checkpoint directory or a ftgs-if file (§2.1). A checkpoint above its
-        stored configuration's N_max is rejected by `io.load_checkpoint` (§1.1; Q-25)."""
+        stored configuration's N_max is rejected by `io.load_checkpoint` (§1.1; Q-25); one saved
+        before revision 549o, whose configuration names LPIPS's backbone, is read (Q-271)."""
         path = Path(path)
         if not path.is_dir():
             return cls.from_exchange(read_exchange(path), device=device)
         state = load_checkpoint(path)
+        # Q-271, Q-247: the model doesn't depend on the loss it trained with.
+        config = config_from_dict(with_current_loss(state.config))
         return cls(
             {k: v.to(device) for k, v in state.params.items()},
-            sh_degree=config_from_dict(state.config).sh_degree,
+            sh_degree=config.sh_degree,
             time=state.time,
             time_unit=state.time_unit,
         )

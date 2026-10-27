@@ -31,6 +31,7 @@ from builders import (
     bad_exchange,
     look_at,
     n3dv_source,
+    pre_549o_checkpoint,
     random_model,
     ring,
     selfcap_archives,
@@ -49,6 +50,7 @@ from openftgs.config import (
     GrowthConfig,
     InitConfig,
     LossConfig,
+    PercNet,
     PerfConfig,
     TrainConfig,
     config_to_dict,
@@ -66,7 +68,7 @@ from openftgs.io import (
 )
 from openftgs.model import FreeTimeGaussians
 from openftgs.train import Trainer
-from openftgs.types import InitPoints, Renders, TimeNormalizer
+from openftgs.types import ExchangeModel, InitPoints, Renders, TimeNormalizer
 
 TAU1 = 2.0 / 30.0  # three frames at 30 FPS
 TIME = TimeNormalizer(0.0, TAU1)
@@ -93,8 +95,9 @@ def _ftgs(*args: object) -> int:
 def _scene(
     root: Path, *, test: bool = False, masks: bool = False, frames: int = 3, unit: str = "s"
 ) -> Path:
-    """Three 48×32 ring cameras (LPIPS-Alex needs 31 px) training at frames k/30 around a
-    random model; with `test`, a fourth camera is the test view."""
+    """Three 48×32 ring cameras training at frames k/30 around a random model; with `test`, a
+    fourth camera is the test view, whose masks' 24×32 left halves are usable dynamic regions
+    (Q-61, Q-257: at least 21 px on a side)."""
     cams = ring(4, radius=4.0, elevation=1.0, width_px=48, height_px=32, focal=44.0)
     gt = random_model(16, seed=0, sh_degree=1, time=TIME, spread=0.6, log_scale=(-2.5, -1.5))
     images: list[Any] = [(cam, k / 30.0, "train") for k in range(frames) for cam in cams[:3]]
@@ -120,7 +123,7 @@ def _init(path: Path, *, n: int = 30, unit: str = "s") -> Path:
 
 
 def _cfg(iterations: int = ITERATIONS, **fields: Any) -> TrainConfig:
-    """No perceptual loss (no downloads), a shortened calendar (§3.2, Q-75), logs every 5."""
+    """No perceptual loss (λ_perc = 0), a shortened calendar (§3.2, Q-75), logs every 5."""
     fields.setdefault("perf", PerfConfig(log_every=5))
     base = TrainConfig(loss=LossConfig(lambda_perc=0.0), **fields)
     cfg = shortened_config(iterations, base)
@@ -757,10 +760,11 @@ def test_train_refuses_a_partial_mask_set(
     assert not (tmp_path / "run").exists()
 
 
-@pytest.mark.weights
 def test_train_evaluates_the_test_split_at_the_end(tmp_path: Path) -> None:
     """§1.3 calendar ("Final checkpoint and evaluation"), Q-132, Q-136: with a test split, the
-    run directory gets METRICS.json naming the iteration, with a null model path."""
+    run directory gets METRICS.json naming the iteration, with a null model path; §2.1, Q-256:
+    version 2, its metrics psnr, ssim1, ssim2, dssim1, dssim2 and flip, in the scene means and
+    in every image's row."""
     scene = _scene(tmp_path / "scene", test=True)
     init = _init(tmp_path / "init.safetensors")
     cfg = _config_file(tmp_path / "cfg.json")
@@ -769,6 +773,11 @@ def test_train_evaluates_the_test_split_at_the_end(tmp_path: Path) -> None:
     report = json.loads((out / "METRICS.json").read_text())
     assert report["model"] == {"path": None, "iteration": ITERATIONS, "sha256": None}
     assert report["split"] == "test" and set(report["entire"]["scene"]) == set(METRIC_NAMES)
+    names = ["psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip"]
+    assert (report["version"], report["metrics"]) == (2, names)
+    assert "lpips_backbone" not in report
+    where = {"camera", "timestamp", "frame_index", "path"}
+    assert [set(row) - where for row in report["entire"]["images"]] == [set(names)] * 3
 
 
 # Periodic checkpoints (D-83; Q-149 to Q-152).
@@ -1129,7 +1138,7 @@ def test_eval_passes_a_checkpoints_frame_interval_as_the_bucket_width(
 ) -> None:
     """Q-174, Q-183: ftgs eval passes a checkpoint's Δt_f, through evaluate_images, to the
     render request of each timestamp, and None for an exchange model. (The render here stops
-    the command, as a render that isn't finite does, before any metric needs LPIPS weights.)"""
+    the command, as a render that isn't finite does, before anything is scored.)"""
     import openftgs.eval
 
     scene, checkpoint = _trained(tmp_path)
@@ -1200,8 +1209,8 @@ def test_eval_shards_only_over_two_or_more_visible_cuda_devices(
     """D-54, Q-175, Q-186 (as answered): `ftgs eval` on CUDA spreads the evaluation over the
     visible CUDA devices, `cuda:0` to `cuda:n−1`, with no option of its own, only when n ≥ 2;
     with one, or on the CPU (count 0: no CUDA), it passes None, so neither the model nor the
-    LPIPS networks are copied. (The evaluation here stops the command, as a render that isn't
-    finite does, before any metric needs LPIPS weights.)"""
+    evaluator is copied. (The evaluation here stops the command, as a render that isn't finite
+    does, before anything is scored.)"""
     import openftgs.eval
 
     scene, checkpoint = _trained(tmp_path)
@@ -1419,8 +1428,8 @@ def test_u26_cli_round_trips_for_each_sh_degree(tmp_path: Path, sh_degree: int) 
     init = _init(tmp_path / "init.safetensors")
     cfg = _config_file(tmp_path / "cfg.json", _cfg(50, sh_degree=sh_degree))
     out = tmp_path / "run"
-    # Training on a scene with a test split ends with an evaluation, which needs LPIPS weights:
-    # train on a copy of the manifest without the test split, and render the test views.
+    # Train on a copy of the manifest without the test split, so the run ends without an
+    # evaluation, and render the test views.
     data = json.loads(scene.read_text())
     data["images"] = [e for e in data["images"] if e["split"] == "train"]
     train_only = scene.parent / "train.json"
@@ -1483,7 +1492,6 @@ def _renders_dir(tmp_path: Path, checkpoint: Path, items: list[tuple[str, float,
     return directory
 
 
-@pytest.mark.weights
 def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Path) -> None:
     """§2.1, Q-63, Q-136: METRICS.json with every metric under `entire`, `dynamic` for a masked
     split (with no image missing a mask, Q-135), and the header: `model` = {path, iteration,
@@ -1499,8 +1507,11 @@ def test_eval_writes_metrics_for_a_checkpoint_and_an_exchange_model(tmp_path: Pa
     assert report["manifest"]["sha256"] == hashlib.sha256(scene.read_bytes()).hexdigest()
     assert set(report["entire"]["scene"]) == set(METRIC_NAMES)
     assert len(report["entire"]["images"]) == 3
-    # The masks' 24-px halves are below Q-61's smallest region, so each image is skipped.
+    # Q-257: the masks' 24×32 halves are above Q-61's smallest side, 21 px, so none is skipped.
     assert report["dynamic"]["missing"] == 0 and len(report["dynamic"]["images"]) == 3
+    assert (report["dynamic"]["count"], report["dynamic"]["skipped"]) == (3, 0)
+    assert set(report["dynamic"]["scene"]) == set(METRIC_NAMES)
+    assert all(v is not None for v in report["dynamic"]["scene"].values())
     exchange = tmp_path / "m.safetensors"
     assert _ftgs("export", checkpoint, "--format", "ftgs-if", "--out", exchange) == 0
     assert _ftgs("eval", exchange, scene, "--out", out) == 0
@@ -1516,7 +1527,7 @@ def test_eval_of_a_model_that_changes_while_it_is_read_is_exit_code_2(
 ) -> None:
     """Q-154, Q-136: ftgs eval hashes MODEL before and after reading it; a checkpoint whose
     manifest.json changes in between, as a periodic save changes RUN_DIR/checkpoint (D-83),
-    is exit 2 and nothing is written, before any LPIPS weights are needed."""
+    is exit 2 and nothing is written, before the evaluator is built."""
     import openftgs.io
 
     scene, checkpoint = _trained(tmp_path)
@@ -1673,7 +1684,6 @@ def test_eval_of_a_damaged_checkpoint_keeps_the_readers_message(
     assert not out.exists()
 
 
-@pytest.mark.weights
 def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) -> None:
     """D-84, Q-74: ftgs eval of a checkpoint renders against its configuration's background,
     so a white-background run's report body equals Trainer.evaluate's; its export records that
@@ -1702,7 +1712,6 @@ def test_eval_of_a_checkpoint_matches_the_trainers_evaluation(tmp_path: Path) ->
     _assert_close(_body(json.loads(exported.read_text())), _body(got))
 
 
-@pytest.mark.weights
 def test_eval_scores_supplied_renders_as_its_own(tmp_path: Path) -> None:
     """Q-137: ftgs render --backend reference then ftgs eval --renders-dir gives the body of
     ftgs eval without it; the header names what was scored."""
@@ -1750,7 +1759,6 @@ def _broken_first_render(
     return paths
 
 
-@pytest.mark.weights
 @pytest.mark.parametrize(
     ("part", "value"),
     [("rgb", math.nan), ("rgb", math.inf), ("rgb", -math.inf), ("alpha", math.nan)],
@@ -1784,7 +1792,6 @@ def test_eval_of_a_render_that_is_not_finite_is_exit_code_3(
     _assert_untouched(out, before)
 
 
-@pytest.mark.weights
 def test_a_render_that_is_not_finite_in_the_final_evaluation_is_exit_code_3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1803,11 +1810,10 @@ def test_a_render_that_is_not_finite_in_the_final_evaluation_is_exit_code_3(
     assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
 
 
-@pytest.mark.weights
 def test_eval_of_a_perfect_render_is_exit_code_0_with_a_null_psnr(tmp_path: Path) -> None:
     """Q-129, Q-63: supplied renders equal to the ground-truth images have an infinite PSNR,
     which is no failure: exit 0, PSNR null in the rows and the scene means, SSIM 1, DSSIM 0 and
-    every LPIPS 0 (a worked example: identical images)."""
+    ꟻLIP 0 (U-23's identical images, within its 1e-6)."""
     from openftgs.data import MultiViewVideo
 
     scene, checkpoint = _trained(tmp_path)
@@ -1834,7 +1840,7 @@ def test_eval_of_a_perfect_render_is_exit_code_0_with_a_null_psnr(tmp_path: Path
     assert all(row["psnr"] is None for row in entire["images"])
     scene_means = entire["scene"]
     assert scene_means["ssim1"] == pytest.approx(1.0) and scene_means["ssim2"] == pytest.approx(1.0)
-    for name in ("dssim1", "dssim2", "lpips_alex", "lpips_vgg", "lpips_vgg_raw"):
+    for name in ("dssim1", "dssim2", "flip"):
         assert scene_means[name] == pytest.approx(0.0, abs=1e-6), name
 
 
@@ -1890,25 +1896,189 @@ def test_eval_refuses_supplied_renders_that_do_not_match_the_split(tmp_path: Pat
     assert not out.exists()
 
 
-def test_unavailable_lpips_weights_are_exit_code_2(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Q-142: a download of the LPIPS weights that fails (an OSError) is an environment error,
-    in ftgs eval and in ftgs train's final evaluation, which runs after the checkpoint is saved
-    (Q-132)."""
-    import openftgs.eval
+# The trunk networks' weights and the [init] extra in ftgs train (Q-142 as #380 extends it to the
+# trunk weights, #389): the trainer builds its perceptual network when it is constructed, before
+# the run directory is made. torch.hub's folder is moved to an empty one, and the network is the
+# publisher's host, which these tests never reach.
+
+
+@pytest.fixture
+def hub(tmp_path: Path) -> Iterator[Path]:
+    """torch.hub's directory moved to an empty folder for one test, as the weights tests do."""
+    previous = torch.hub.get_dir()
+    torch.hub.set_dir(str(tmp_path / "hub"))
+    try:
+        yield tmp_path / "hub"
+    finally:
+        torch.hub.set_dir(previous)
+
+
+def _no_download(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Every download raises `error`, as an unreachable host does (or as a test whose download
+    must not start wants)."""
 
     def offline(*args: Any, **kwargs: Any) -> None:
-        raise OSError("no network")
+        raise error
 
-    monkeypatch.setattr(openftgs.eval.Evaluator, "__init__", offline)
-    scene, checkpoint = _trained(tmp_path)
-    assert _ftgs("eval", checkpoint, scene, "--out", tmp_path / "m.json") == 2
-    init = _init(tmp_path / "again.safetensors")
-    cfg = _config_file(tmp_path / "cfg.json")
+    monkeypatch.setattr(torch.hub, "download_url_to_file", offline)
+
+
+def _trunk_config(path: Path, net: PercNet) -> Path:
+    """A configuration file training with the perceptual network `net` at its calibrated weight
+    (λ_perc None, D-89)."""
+    cfg = _cfg()
+    loss = dataclasses.replace(cfg.loss, perc_net=net, lambda_perc=None)
+    return _config_file(path, dataclasses.replace(cfg, loss=loss))
+
+
+def test_a_trunk_weight_that_cannot_be_downloaded_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (#389): a trunk network's weight that can't be downloaded at first use (§2.3), here
+    VGG16's from an unreachable host, is exit 2, an invalid environment, with a message naming
+    the file; nothing is left in torch.hub's cache, and the run directory isn't made."""
+    _no_download(monkeypatch, OSError("no network (stood in for)"))
     out = tmp_path / "run"
-    assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 2
-    assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS
+    assert _train(run, out, "--config", _trunk_config(tmp_path / "vgg.json", "vgg16_oxford")) == 2
+    err = capsys.readouterr().err
+    assert "VGG_ILSVRC_16_layers.caffemodel" in err and "no network (stood in for)" in err
+    assert not out.exists()
+    checkpoints = hub / "checkpoints"
+    assert not checkpoints.exists() or list(checkpoints.iterdir()) == []
+
+
+def test_a_cached_trunk_weight_that_fails_its_hash_check_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142, Q-258 (#389): a file in torch.hub's cache under the publisher's name that isn't the
+    publisher's (here AlexNet's, a few bytes) is exit 2 naming it, with no download started and
+    the file left as it was."""
+    _no_download(monkeypatch, AssertionError("a download started"))
+    cached = hub / "checkpoints" / "bvlc_alexnet.caffemodel"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"not the publisher's file")
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", _trunk_config(tmp_path / "alex.json", "alexnet_bvlc")) == 2
+    assert str(cached) in capsys.readouterr().err
+    assert cached.read_bytes() == b"not the publisher's file"
+    assert not out.exists()
+
+
+def test_a_dino_network_without_the_init_extra_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142, Q-248 (#389): a DINO network without the [init] extra, its vendored DINOv2 layers
+    made unimportable, is exit 2 with a message naming the extra, before anything is
+    downloaded. That nothing is downloaded is `openftgs.losses`'s order (Q-248: the layers are
+    imported before the checkpoint is fetched), which the CLI relies on."""
+    monkeypatch.setitem(sys.modules, "openftgs._vendor.romatch.models.transformer.dinov2", None)
+    _no_download(monkeypatch, AssertionError("a download started"))
+    out = tmp_path / "run"
+    assert _train(run, out, "--config", _trunk_config(tmp_path / "dino.json", "dinov2_s14")) == 2
+    err = capsys.readouterr().err
+    assert "[init]" in err and "dinov2_s14" in err
+    assert not hub.exists() and not out.exists()
+
+
+def test_resuming_with_a_trunk_weight_that_cannot_be_downloaded_is_exit_code_2(
+    run: dict[str, Path],
+    hub: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q-142 (#389): `--resume` builds the checkpoint's perceptual network as a new run does, so
+    a trunk weight that can't be downloaded is exit 2 there too, naming the file."""
+    first = tmp_path / "first"
+    assert _train(run, first, "--config", run["config"]) == 0
+    state = load_checkpoint(first / "checkpoint")
+    config = json.loads(json.dumps(state.config))
+    config["loss"] |= {"perc_net": "alexnet_bvlc", "lambda_perc": None}
+    alex = tmp_path / "alex-checkpoint"
+    save_checkpoint(dataclasses.replace(state, config=config), alex)
+    _no_download(monkeypatch, OSError("no network (stood in for)"))
+    assert _train(run, tmp_path / "resumed", "--resume", alex) == 2
+    err = capsys.readouterr().err
+    assert "bvlc_alexnet.caffemodel" in err and "no network (stood in for)" in err
+
+
+# Checkpoints saved before revision 549o (Q-247): read by the model readers, refused by resume.
+
+
+def test_a_checkpoint_saved_before_549o_is_evaluated_rendered_and_exported(
+    tmp_path: Path,
+) -> None:
+    """Q-247: `ftgs eval`, `render` and `export` of a checkpoint whose configuration names
+    LPIPS-VGG ("vgg") succeed, and give what they give for the same checkpoint at 549o's
+    configuration, the model and its background being the same; nothing is written into it."""
+    scene, checkpoint = _trained(tmp_path, background=(0.25, 0.5, 0.75))
+    legacy = pre_549o_checkpoint(checkpoint, tmp_path / "legacy")
+    manifest = (legacy / "manifest.json").read_bytes()
+    request = write_render_request(tmp_path / "req.json", _test_items(scene))
+    results: dict[str, tuple[Any, Renders, ExchangeModel]] = {}
+    for name, model in (("now", checkpoint), ("legacy", legacy)):
+        out = tmp_path / name
+        assert _ftgs("eval", model, scene, "--out", out / "METRICS.json") == 0
+        renders_file = out / "renders.safetensors"
+        ref = ("--backend", "reference")
+        assert _ftgs("render", model, "--request", request, "--out", renders_file, *ref) == 0
+        exchange_file = out / "model.safetensors"
+        assert _ftgs("export", model, "--format", "ftgs-if", "--out", exchange_file) == 0
+        report = json.loads((out / "METRICS.json").read_text())["entire"]["scene"]
+        results[name] = (report, read_renders(renders_file), read_exchange(exchange_file))
+    (metrics, renders, exchange), (old_metrics, old_renders, old_exchange) = results.values()
+    assert old_metrics == metrics
+    assert sorted(old_renders.rgb) == sorted(renders.rgb)
+    for key in renders.rgb:
+        assert torch.equal(old_renders.rgb[key], renders.rgb[key]), key
+    assert old_exchange.background == exchange.background == (0.25, 0.5, 0.75)
+    for key, array in exchange.arrays.items():
+        assert torch.equal(old_exchange.arrays[key], array), key
+    assert (legacy / "manifest.json").read_bytes() == manifest
+    assert load_checkpoint(legacy).config["loss"]["perc_net"] == "vgg"
+
+
+@pytest.mark.parametrize("net", ["vgg", "alex"])
+def test_resuming_a_checkpoint_saved_before_549o_is_exit_code_2_naming_549o(
+    run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str], net: str
+) -> None:
+    """Q-247: `ftgs train --resume` of a checkpoint whose configuration names LPIPS's backbone
+    is exit 2, naming the backbone and revision 549o, and writes nothing; so is a `--config`
+    file naming one (#375), and a run directory whose config.json names one is no resumed
+    run's own."""
+    first = tmp_path / "first"
+    assert _train(run, first, "--config", run["config"]) == 0
+    legacy = pre_549o_checkpoint(first / "checkpoint", tmp_path / "legacy", net)
+    capsys.readouterr()
+    resumed = tmp_path / "resumed"
+    assert _train(run, resumed, "--resume", legacy) == 2
+    err = capsys.readouterr().err
+    assert f"'{net}'" in err and "549o" in err and "Traceback" not in err
+    assert not resumed.exists()
+    config = json.loads(run["config"].read_text())
+    config["loss"] |= {"perc_net": net}
+    named = tmp_path / "named.json"
+    named.write_text(json.dumps(config))
+    assert _train(run, tmp_path / "new", "--config", named) == 2
+    assert "549o" in capsys.readouterr().err
+    assert not (tmp_path / "new").exists()
+    recorded = json.loads((first / "config.json").read_text())
+    recorded["loss"] |= {"perc_net": net, "lambda_perc": 0.01}
+    (first / "config.json").write_text(json.dumps(recorded))
+    assert _train(run, first, "--resume", first / "checkpoint") == 2
+    assert "config.json" in capsys.readouterr().err
 
 
 def test_eval_refuses_a_partial_mask_set_and_an_empty_split(
@@ -2792,12 +2962,12 @@ def test_out_of_memory_in_a_profile_window_writes_the_trace(
     assert json.loads((out / "profile" / "trace.json").read_text())["traceEvents"]
 
 
-@pytest.mark.weights
 def test_metrics_that_cannot_be_written_in_training_are_exit_code_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-142 (as answered), Q-161: a METRICS.json write that fails in ftgs train's final
-    evaluation is exit code 2 naming METRICS.json, after the checkpoint is saved (Q-132)."""
+    """Q-142 (as answered), Q-161 (as #380 changes it, #389): a METRICS.json write that fails in
+    ftgs train's final evaluation is exit code 2 naming METRICS.json alone, after the checkpoint
+    is saved (Q-132): the evaluator builds ꟻLIP, which downloads nothing (#387)."""
 
     def full(*args: Any, **kwargs: Any) -> None:
         raise OSError(28, "No space left on device")
@@ -2810,5 +2980,6 @@ def test_metrics_that_cannot_be_written_in_training_are_exit_code_2(
     capsys.readouterr()
     assert _ftgs("train", scene, "--init", init, "--out", out, "--config", cfg) == 2
     err = capsys.readouterr().err
-    assert "METRICS.json" in err and "No space left" in err
+    assert str(out / "METRICS.json") in err and "No space left" in err
+    assert "LPIPS" not in err and "network" not in err
     assert load_checkpoint(out / "checkpoint").iteration == ITERATIONS

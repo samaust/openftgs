@@ -6,6 +6,8 @@ How D-65 is met, as Q-113, Q-114, Q-115 and Q-118 amend it: RoMa's inference cod
 
 The 22 inference files of D-65: the package's `__init__`, the models (model zoo, matcher, encoders, Tiny RoMa, the transformer with its DINOv2 layers) and the utilities (`utils`, `kde`, `local_correlation`). Benchmarks, datasets, losses, training and checkpointing are left out, and so is `utils/transforms.py`, which nothing in the set imports.
 
+Besides `openftgs.init`, which matches with it, `openftgs.losses` builds the four DINO perceptual networks on its DINOv2 layers, unchanged, and imports them only when one is built; since the package's `__init__` modules import torchvision, einops and loguru, those networks need the `[init]` extra too (Q-248; `docs/modules/losses/terms-and-paths.md`).
+
 ## The patch
 
 The vendoring script, `scripts/vendor_roma.py`, builds the copy from a git clone holding the commit (a blobless clone will do), checking each file's git blob id against the commit's tree; nothing in the copy is edited by hand. It locates every change with Python's ast and makes these, and no others:

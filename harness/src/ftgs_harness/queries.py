@@ -86,10 +86,9 @@ def _losses(
         if edge
         else random_exchange(rng, 20, sh_degree=0, tau0=_TAU0, tau1=_TAU1)
     )
+    # Q-255: the row's perceptual network is ꟻLIP, whatever perc_net the configuration names.
     loss = {k: v for k, v in dict(cfg.get("loss", {})).items() if k != "perc_net"}
-    params, tensors = _with_model(
-        ex, loss=loss, iteration=int(rng.integers(1, 30_000)), lpips=bool(cfg.get("_lpips", True))
-    )
+    params, tensors = _with_model(ex, loss=loss, iteration=int(rng.integers(1, 30_000)))
     gt = rng.random((48, 48, 3)).astype(np.float32)
     noise = 0.0 if edge else 0.1
     tensors["gt"] = gt
@@ -162,9 +161,7 @@ def _grad_stats(
     angle = float(rng.uniform(0, 2 * math.pi))
     eye = np.array([4.0 * math.cos(angle), 4.0 * math.sin(angle), 1.5])
     width, height = 48, 32
-    loss = dict(cfg.get("loss", {}))
-    if not cfg.get("_lpips", True):
-        loss["lambda_perc"] = 0.0
+    loss = dict(cfg.get("loss", {}))  # Q-255: the configuration's network and weight
     optim = {
         k: v for k, v in dict(cfg.get("optim", {})).items() if k in ("iterations", "sh_interval")
     }
