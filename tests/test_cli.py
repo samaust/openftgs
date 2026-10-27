@@ -601,8 +601,11 @@ _TRAINING_STAGES = {
     "events",
     "log",
 }
+# Q-274 (#423): the gsplat backend gathers the SH coefficients of the rows its SH evaluation
+# receives in place of the slice's concat over every row.
 _GSPLAT_STAGES = {
     "raster.forward.projection",
+    "raster.forward.sh_gather",
     "raster.forward.sh",
     "raster.forward.isect",
     "raster.forward.rasterize",
@@ -613,7 +616,12 @@ _GSPLAT_STAGES = {
     ("stages", "cuda"),
     [
         pytest.param(_TRAINING_STAGES, False, id="cpu"),
-        pytest.param(_TRAINING_STAGES | _GSPLAT_STAGES, True, id="gpu", marks=pytest.mark.gpu),
+        pytest.param(
+            _TRAINING_STAGES - {"slice.sh_concat"} | _GSPLAT_STAGES,
+            True,
+            id="gpu",
+            marks=pytest.mark.gpu,
+        ),
     ],
 )
 def test_profile_trace_carries_the_stage_names(

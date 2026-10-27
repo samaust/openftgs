@@ -948,14 +948,16 @@ def test__training_bound_counts_the_default_calendars_iterations_and_events() ->
 # holds ꟻLIP, which needs no weights (#389).
 
 TRAIN_STEP_CASES = ((300, 0.2), (400, 0.05))
+# Q-274 (#423): the gsplat backend's SH gather of the rows its SH evaluation receives, in place
+# of the slice's concat over every row, which a training iteration no longer runs.
 TRAINING_STAGES = (
     "iteration",
     "data",
     "slice",
     "slice.kernel",
-    "slice.sh_concat",
     "raster.forward",
     "raster.forward.projection",
+    "raster.forward.sh_gather",
     "raster.forward.sh",
     "raster.forward.isect",
     "raster.forward.rasterize",
@@ -1019,6 +1021,8 @@ def test__train_step_times_every_stage_and_bounds_a_training_run(
     assert (setup["training_iterations"], setup["default_events"]) == (30_000, 246)
     cases = _cases_by(body)
     for n, active in TRAIN_STEP_CASES:
+        # Q-274 (#423): no training iteration concatenates the SH of every row
+        assert (("active", active), ("n", n), ("stage", "slice.sh_concat")) not in cases
         for name in TRAINING_STAGES + BACKWARD_PARTS:
             figures = cases[(("active", active), ("n", n), ("stage", name))]
             assert set(figures) == {"mean_s", "median_s", "share", "count"}, name

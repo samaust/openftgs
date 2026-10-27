@@ -1466,3 +1466,40 @@ def test_render_request_raises_a_shards_error_in_the_caller() -> None:
     for devices in (None, ["cpu"] * 2):
         with pytest.raises(ValueError, match="sh_degree"):
             render_request(model, request, backend="reference", devices=devices)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("degree", [0, 1, 3])
+@pytest.mark.parametrize("compacted", [False, True], ids=["all rows", "compacted"])
+@pytest.mark.parametrize("gathered", [False, True], ids=["every row", "some rows"])
+def test__sh_parts_take_is_the_concat_gathered(
+    device: str, degree: int, compacted: bool, gathered: bool
+) -> None:
+    """#423 (§1.1: `sh` is concat(`sh0`, `shN`)): the SH coefficients the gsplat backend takes,
+    `sh0` and `shN` cut to the active degree gathered for the rows its SH evaluation receives
+    and then concatenated, are bitwise the concatenation of every row gathered for them, as
+    before #423, and so are the gradients of `sh0` and `shN` under one seeded cotangent; for
+    every row, after compaction's ascending rows, for a subset of rows (packed mode's visible
+    rows, each once), and at degree 0, whose `shN` part is empty (U-26)."""
+    from openftgs.render import _ShParts
+
+    g = torch.Generator().manual_seed(423)
+    n, k = 40, (degree + 1) ** 2 - 1
+    sh0 = torch.randn(n, 1, 3, generator=g).to(device).requires_grad_()
+    sh_n = torch.randn(n, 15, 3, generator=g).to(device).requires_grad_()
+    rows = torch.tensor([1, 4, 5, 9, 20, 22, 31, 39], device=device) if compacted else None
+    count = 8 if compacted else n
+    ids = torch.tensor([6, 0, 3, 7, 2], device=device) if gathered else None
+    if ids is not None and not compacted:
+        ids = ids * 5
+    whole = torch.cat([sh0, sh_n[:, :k]], dim=1)  # before #423: every row, then gathered
+    before = whole if rows is None else whole[rows]
+    before = before if ids is None else before[ids]
+    after = _ShParts(sh0, sh_n[:, :k], rows).take(ids)
+    assert after.shape == before.shape == ((5 if gathered else count), k + 1, 3)
+    assert torch.equal(after, before)
+    cotangent = torch.randn(before.shape, generator=g).to(device)
+    grads_before = torch.autograd.grad(before, (sh0, sh_n), cotangent)
+    grads_after = torch.autograd.grad(after, (sh0, sh_n), cotangent)
+    for name, old, new in zip(("sh0", "shN"), grads_before, grads_after, strict=True):
+        assert torch.equal(new, old), name

@@ -13,8 +13,8 @@ import numbers
 import statistics
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass, fields
-from typing import Literal, get_args
+from dataclasses import dataclass, fields, replace
+from typing import Literal, TypeVar, get_args
 
 import torch
 from torch import Tensor
@@ -22,7 +22,7 @@ from torch import Tensor
 from openftgs import _shards
 from openftgs._stages import point, stage
 from openftgs.model import FreeTimeGaussians, GaussiansAtTime, covariance
-from openftgs.motion import temporal_slice
+from openftgs.motion import TemporalSlice, temporal_slice
 from openftgs.sh import sh_to_color
 from openftgs.types import Camera, RenderItem, RenderOutput, RenderRequest, Renders
 
@@ -109,7 +109,15 @@ def render(
     if backend == "gsplat":
         _check_gsplat_model(model)
     t = _normalized_time(model, timestamp, time_units)
-    g = model.at_time(t, sh_degree=sh_degree)
+    g: GaussiansAtTime | TemporalSlice
+    if backend == "gsplat":
+        # #423: the temporal slice without at_time's concat over all N rows (§1.1); the backend
+        # concatenates sh0 and shN for the rows its SH evaluation receives, which gives the same
+        # bits (§2.4 rule 2).
+        sh = _ShParts(model.sh0, model.shN[:, : (_active_degree(model, sh_degree) + 1) ** 2 - 1])
+        g = _temporal(model, t)
+    else:
+        g = model.at_time(t, sh_degree=sh_degree)
     # §3.4: with a stage clock active, the moved means' gradient marks where the rasterization's
     # backward ends and the temporal slice's begins, compaction's gather included.
     point(g.means_t, "backward.raster_done")
@@ -123,9 +131,16 @@ def render(
         gaussian_ids: Tensor | None = None
         if backend == "gsplat":
             image, alpha, means2d, visible, gaussian_ids = _render_gsplat(
-                g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians, packed=packed
+                g,
+                cams,
+                backgrounds,
+                sh=sh if rows is None else replace(sh, rows=rows),
+                rows=rows,
+                num_rows=model.num_gaussians,
+                packed=packed,
             )
         else:
+            assert isinstance(g, GaussiansAtTime)
             image, alpha, means2d, visible = _render_reference(
                 g, cams, backgrounds, rows=rows, num_rows=model.num_gaussians
             )
@@ -294,16 +309,48 @@ def _backgrounds(background: Tensor | None, num_cameras: int, like: Tensor) -> T
     raise ValueError(f"background must be [3] or [{num_cameras}, 3], got {list(color.shape)}")
 
 
-def _kept_rows(g: GaussiansAtTime) -> Tensor:
+def _kept_rows(g: GaussiansAtTime | TemporalSlice) -> Tensor:
     """The rows that pass the opacity cull, ascending (Q-31). Selecting them reads their count
     back, the one host synchronization compaction adds (§2.4 rule 3, D-57), which U-29 allows
     here only (Q-171)."""
     return torch.nonzero(g.passes_cull).squeeze(1)
 
 
-def _take_rows(g: GaussiansAtTime, rows: Tensor) -> GaussiansAtTime:
+_PerTime = TypeVar("_PerTime", bound=GaussiansAtTime | TemporalSlice)
+
+
+def _take_rows(g: _PerTime, rows: Tensor) -> _PerTime:
     """The per-time arrays of the given rows (compaction, Q-31)."""
-    return GaussiansAtTime(**{f.name: getattr(g, f.name)[rows] for f in fields(g)})
+    return type(g)(**{f.name: getattr(g, f.name)[rows] for f in fields(g)})
+
+
+@dataclass(frozen=True)
+class _ShParts:
+    """§1.1's per-time SH coefficients as the two stored tensors they concatenate, `sh0`
+    [N, 1, 3] and `shN` cut to the active degree [N, (L′+1)² − 1, 3] (D-3), with, after
+    compaction, the model rows of the per-time arrays (Q-31). The gsplat backend concatenates
+    them only for the rows its SH evaluation receives (#423)."""
+
+    sh0: Tensor
+    shN: Tensor
+    rows: Tensor | None = None
+
+    def take(self, ids: Tensor | None) -> Tensor:
+        """concat(sh0, shN) of the per-time arrays' rows `ids`, or of all of them."""
+        if self.rows is not None:
+            ids = self.rows if ids is None else self.rows[ids]
+        if ids is None:
+            return torch.cat([self.sh0, self.shN], dim=1)
+        return torch.cat([self.sh0[ids], self.shN[ids]], dim=1)
+
+
+def _coefficients(sh: Tensor | _ShParts, ids: Tensor | None) -> Tensor:
+    """The SH coefficients of the per-time arrays' rows `ids`, or of all of them: gathered from
+    a concatenation of every row (a request's, Q-174), or concatenated from the stored
+    tensors for those rows alone (#423)."""
+    if isinstance(sh, _ShParts):
+        return sh.take(ids)
+    return sh if ids is None else sh[ids]
 
 
 def _scatter_rows(values: Tensor, rows: Tensor | None, num_rows: int) -> Tensor:
@@ -439,13 +486,19 @@ def _bucket_width(frame_dt: float | None, times: Sequence[float]) -> float:
     return max(width, _INDEX_MIN_WIDTH)
 
 
-def _sh_concat(model: FreeTimeGaussians, sh_degree: int | None) -> Tensor:
-    """The SH coefficients of every row cut to the request's degree, as `at_time` concatenates
-    them (Q-20), built once per request (Q-174); `at_time`'s check of the degree."""
+def _active_degree(model: FreeTimeGaussians, sh_degree: int | None) -> int:
+    """The SH degree a render uses, the model's by default (D-3); `at_time`'s check of it."""
     degree = model.sh_degree if sh_degree is None else sh_degree
     allowed = tuple(range(model.sh_degree + 1))
     if isinstance(degree, bool) or not isinstance(degree, int) or degree not in allowed:
         raise ValueError(f"sh_degree must be one of {allowed}, got {degree!r}")
+    return degree
+
+
+def _sh_concat(model: FreeTimeGaussians, sh_degree: int | None) -> Tensor:
+    """The SH coefficients of every row cut to the request's degree, as `at_time` concatenates
+    them (Q-20), built once per request (Q-174)."""
+    degree = _active_degree(model, sh_degree)
     return torch.cat([model.sh0, model.shN[:, : (degree + 1) ** 2 - 1]], dim=1)
 
 
@@ -512,19 +565,16 @@ class _TemporalIndex:
         return torch.sort(torch.cat([listed, self._long])).values
 
 
-def _slice(
-    model: FreeTimeGaussians, t: float, sh: Tensor, rows: Tensor | None = None
-) -> GaussiansAtTime:
-    """The per-time arrays of `at_time`, from the request's SH concat `sh`, for every row or
-    only for `rows`, which are gathered first (Q-174)."""
+def _temporal(model: FreeTimeGaussians, t: float, rows: Tensor | None = None) -> TemporalSlice:
+    """The temporal slice of `at_time`, for every row or only for `rows`, which are gathered
+    first, without the SH coefficients (Q-174, #423): the stages `slice` and `slice.kernel`."""
     with stage("slice"):
         arrays = [getattr(model, name) for name in _SLICE_INPUTS]
         if rows is not None:
             arrays = [array[rows] for array in arrays]
-            sh = sh[rows]
         means, times, log_durations, velocities, log_scales, quats, opacity_logits = arrays
         with stage("slice.kernel"):
-            s = temporal_slice(
+            return temporal_slice(
                 means,
                 times,
                 log_durations,
@@ -535,6 +585,16 @@ def _slice(
                 t,
                 impl=model.slice_impl,
             )
+
+
+def _slice(
+    model: FreeTimeGaussians, t: float, sh: Tensor, rows: Tensor | None = None
+) -> GaussiansAtTime:
+    """The per-time arrays of `at_time`, from the request's SH concat `sh`, for every row or
+    only for `rows`, which are gathered first (Q-174)."""
+    s = _temporal(model, t, rows)
+    if rows is not None:
+        sh = sh[rows]
     return GaussiansAtTime(
         means_t=s.means_t,
         opacities_t=s.opacities_t,
@@ -575,7 +635,13 @@ def _render_indexed(
             g = _take_rows(g, rows)
         if backend == "gsplat":
             image, alpha, *_ = _render_gsplat(
-                g, cameras, backgrounds, rows=rows, num_rows=model.num_gaussians, packed=True
+                g,
+                cameras,
+                backgrounds,
+                sh=g.sh,
+                rows=rows,
+                num_rows=model.num_gaussians,
+                packed=True,
             )
         else:
             image, alpha, *_ = _render_reference(
@@ -887,22 +953,26 @@ def _rasterize(
 
 
 def _render_gsplat(
-    g: GaussiansAtTime,
+    g: GaussiansAtTime | TemporalSlice,
     cameras: list[Camera],
     background: Tensor,
     *,
+    sh: Tensor | _ShParts,
     rows: Tensor | None,
     num_rows: int,
     packed: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
     """Image [C, H, W, 3], alpha [C, H, W, 1], 2D means ([C, N, 2] unpacked, [nnz, 2] packed),
     visibility [C, N] and, packed, the model row behind each row of the 2D means [nnz], of the
-    per-time arrays `g`, which hold all N rows or the ascending subset `rows` (D-75, D-76)."""
+    per-time arrays `g`, which hold all N rows or the ascending subset `rows` (D-75, D-76), with
+    the SH coefficients of `g`'s rows `sh`, concatenated or as their stored tensors (#423)."""
     num_cams, width, height = len(cameras), cameras[0].width, cameras[0].height
     like = g.means_t
     if like.shape[0] == 0:
         # D-76: gsplat's kernels cannot run on zero rows; this is Q-32's empty render.
-        return _empty_gsplat_render(g, background, width, height, num_rows=num_rows, packed=packed)
+        return _empty_gsplat_render(
+            g, sh, background, width, height, num_rows=num_rows, packed=packed
+        )
 
     import gsplat
 
@@ -951,7 +1021,6 @@ def _render_gsplat(
             anchor = rasterized = means2d
             passed_visible = (radii > 0).all(dim=-1)
             dirs = g.means_t[local_ids] - centers[camera_ids]
-            coeffs = g.sh[local_ids]
             opacities = g.opacities_t[local_ids]
             gaussian_ids = local_ids if rows is None else rows[local_ids]
             visible = torch.zeros((num_cams, num_rows), dtype=torch.bool, device=like.device)
@@ -975,14 +1044,19 @@ def _render_gsplat(
                     1, rows, passed_visible
                 )
             dirs = g.means_t[None] - centers[:, None]
-            coeffs = g.sh.expand(num_cams, *g.sh.shape)
             opacities = g.opacities_t.expand(num_cams, -1)
         if compensations is not None:
             opacities = opacities * compensations  # as gsplat's rasterization() does
+    with stage("raster.forward.sh_gather"):
+        # Q-274, #423: the SH coefficients of the rows the SH evaluation receives only, the
+        # visible rows packed, every row (the kept ones after compaction) unpacked.
+        coeffs = _coefficients(sh, local_ids)
+        if not packed:
+            coeffs = coeffs.expand(num_cams, *coeffs.shape)
     with stage("raster.forward.sh"):
-        # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; at_time has
-        # already cut the bands above the active degree (D-3).
-        degree = math.isqrt(g.sh.shape[1]) - 1
+        # E2, D-4: SH from the camera center to the moved position, + 0.5, clamped at 0; the
+        # bands above the active degree are already cut (D-3).
+        degree = math.isqrt(coeffs.shape[-2]) - 1
         colors = gsplat.spherical_harmonics(degree, dirs, coeffs, masks=passed_visible)
         colors = torch.clamp_min(colors + _SH_OFFSET, 0.0)
     with stage("raster.forward.isect"):
@@ -1044,7 +1118,8 @@ def _intrinsics(cam: _CameraTensors) -> Tensor:
 
 
 def _empty_gsplat_render(
-    g: GaussiansAtTime,
+    g: GaussiansAtTime | TemporalSlice,
+    sh: Tensor | _ShParts,
     background: Tensor,
     width: int,
     height: int,
@@ -1057,7 +1132,8 @@ def _empty_gsplat_render(
     with weight zero on the 2D means, which depend with weight zero on every per-time array, so
     every stored tensor and the 2D means get an exactly zero gradient (U-8, D-57)."""
     num_cams = background.shape[0]
-    arrays = (g.means_t, g.opacities_t, g.quats_n, g.scales, g.sh)
+    parts = (sh.sh0, sh.shN) if isinstance(sh, _ShParts) else (sh,)
+    arrays = (g.means_t, g.opacities_t, g.quats_n, g.scales, *parts)
     zero = sum((array.sum() for array in arrays), start=g.means_t.new_zeros(())) * 0.0
     means2d = zero.expand(0, 2) if packed else zero.expand(num_cams, num_rows, 2)
     through = means2d.sum() * 0.0  # the outputs read the 2D means, as compositing does

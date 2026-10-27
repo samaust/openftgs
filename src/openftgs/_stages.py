@@ -44,6 +44,7 @@ STAGES: tuple[str, ...] = (
     "slice.sh_concat",
     "raster.forward",  # pre-culling by compaction included (D-57)
     "raster.forward.projection",
+    "raster.forward.sh_gather",  # the SH of the rows the SH evaluation receives (Q-274, #423)
     "raster.forward.sh",
     "raster.forward.isect",
     "raster.forward.rasterize",
