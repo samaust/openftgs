@@ -594,7 +594,7 @@ def test_flip_takes_float32_images_only(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("net", ["flip", "haarpsi"])
+@pytest.mark.parametrize("net", WEIGHT_FREE_NETWORKS)
 def test_weight_free_networks_compute_in_the_images_dtype_under_autocast(
     net: PercNet, dtype: torch.dtype
 ) -> None:
