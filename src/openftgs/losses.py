@@ -358,6 +358,13 @@ class _DinoDistance(torch.nn.Module):
                 f"the publisher's state dict of {net} doesn't fit the vendored {builder}: "
                 f"missing {loaded.missing_keys}, unexpected {loaded.unexpected_keys}"
             )
+        # Q-265: the weights as buffers no `state_dict` carries, as the Caffe trunks (Q-263;
+        # §2.3: never redistributed), which `.to()` still moves and converts. The vendored
+        # layers read them as attributes, so their files stay unchanged (D-65).
+        for module in vit.modules():
+            for name, parameter in list(module.named_parameters(recurse=False)):
+                delattr(module, name)
+                module.register_buffer(name, parameter.detach(), persistent=False)
         self._vit: Any = vit
         self._net = net
         self._patch = patch
@@ -383,10 +390,15 @@ class _DinoDistance(torch.nn.Module):
         return list(self._vit.get_intermediate_layers(image, n=_DINO_BLOCKS, norm=False))
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
-        # Q-265: the publishers' float32, never a cast; at least one patch at half
-        # resolution, 2p − 1 pixels for an even patch p. Shapes and dtypes only.
-        if x.dtype != torch.float32:
-            _fail(f"PerceptualLoss({self._net!r}) takes float32 images, got {x.dtype}")
+        # Q-265: the weights' dtype, float32 as built, never a cast, as the Caffe trunks
+        # (Q-263); at least one patch at half resolution, 2p − 1 pixels for an even patch p.
+        # Shapes and dtypes only.
+        dtype = self._mean.dtype
+        if x.dtype != dtype:
+            _fail(
+                f"PerceptualLoss({self._net!r}) computes in its weights' dtype {dtype}, so it "
+                f"takes {dtype} images, got {x.dtype}"
+            )
         if min(_halved(x)) < self._patch:
             _fail(
                 f"PerceptualLoss({self._net!r}) needs H and W >= {2 * self._patch - 1}, one "
