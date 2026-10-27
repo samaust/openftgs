@@ -269,11 +269,11 @@ The copy adds about 0.05 ms to the Caffe trunks' NCHW cases, so Q-272's outcomes
 | `alexnet_bvlc`, autotuning off | 9.76 / 17.25 | 9.31 / 15.48 |
 | `alexnet_bvlc`, autotuning on | 9.23 / 15.62 | 8.36 / 14.18 |
 
-Two of Q-273's autotuning readings per precision change on these two runs, and go to the owner (#427) before the trainer or Q-273's row does:
+Two of Q-273's autotuning readings per precision change on these two runs, which went to the owner (#427) before the trainer or Q-273's row did:
 - **alexnet_bvlc under IEEE** (NCHW inputs): +3.14 / +5.82 % and +3.10 / +5.32 %. That is 3 % in both runs, after −3.00 / +5.53 % and +9.69 / −2.00 % at #394, and +3.03 / +5.24 % and +3.03 / +5.36 % at #380.
 - **dinov2_b14 under bf16** (the render's view): +4.62 / +4.91 % and +4.64 / +5.00 %, after +1.92 / +0.44 % and +0.94 / +4.92 % on kitchen at #394 and #380.
 
-Until the owner decides, the trainer leaves the flag to the caller there, as Q-273 answered on #422.
+The owner's answer on #427 (2026-10-27; Q-273, changed): dinov2_b14 autotunes under bf16, whose path without autotuning repeats within 0.5 % over the six runs while the autotuned one is never slower, at the same peak memory; alexnet_bvlc under IEEE keeps the caller's flag, about 0.3 ms at 1352×1014 for 12.46 GiB peak allocated against 0.66 GiB (`docs/modules/train/trainer.md`).
 
 Against the stored baseline of #380's review, the CI run passes: its 206 timed medians are within −6.1 to +6.4 %, its NCHW cases, now with the copy, within −3.8 to +6.4 %. Against the refreshed baseline, the kitchen run passes too, its timed medians within −7.8 to +5.8 %.
 

@@ -1424,10 +1424,11 @@ def test_a_bf16_step_changes_only_the_perceptual_term(
 
 # Q-273's table, from B-4's recorded rerun under Q-272's rule (Calibration data, #394): per
 # network, the precisions under which the trainer autotunes in a step that isn't deterministic
-# (as changed, #428), every other network and precision leaving the flag as the caller set it;
-# and, per network, the (perc_precision, autotuned) pairs under which it gets contiguous NCHW
-# inputs, every other network and pair getting the render's channels-last view as it comes.
-B4_AUTOTUNED = {"vgg16_oxford": {"tf32"}, "alexnet_bvlc": {"tf32", "bf16"}}
+# (as changed, #428; dinov2_b14 under "bf16" from #427's runs, the owner's answer), every other
+# network and precision leaving the flag as the caller set it; and, per network, the
+# (perc_precision, autotuned) pairs under which it gets contiguous NCHW inputs, every other
+# network and pair getting the render's channels-last view as it comes.
+B4_AUTOTUNED = {"vgg16_oxford": {"tf32"}, "alexnet_bvlc": {"tf32", "bf16"}, "dinov2_b14": {"bf16"}}
 B4_NCHW = {
     "vgg16_oxford": {("ieee", False), ("ieee", True), ("tf32", True)},
     "alexnet_bvlc": {(p, a) for p in ("ieee", "tf32", "bf16") for a in (False, True)},
