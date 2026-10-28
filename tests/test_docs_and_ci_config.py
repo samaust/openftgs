@@ -8,6 +8,7 @@ with the `docs` dependency group (Q-241), warnings as errors; CI's test job runs
 only on GitHub, so these tests read their files.
 """
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 SITE = "https://openftgs.readthedocs.io"
+REPOSITORY = "https://github.com/samaust/openftgs"
 # Without `?version=`, the badge reports the project's default version (source log 315).
 BADGE = "https://app.readthedocs.org/projects/openftgs/badge/"
 
@@ -127,3 +129,74 @@ def test_project_urls_and_readme_point_to_the_site() -> None:
     intro = readme.split("\n## ", 1)[0].splitlines()  # the title, the badges, the summary
     assert f"[![Documentation]({BADGE})]({SITE})" in intro[2]
     assert any(f"]({SITE})" in line for line in intro[3:])
+
+
+# Q-244's classifiers, spelled as PyPI's classifier list spells them (source log 471).
+RELEASE_CLASSIFIERS = {
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Typing :: Typed",
+}
+
+
+def test_release_metadata_is_version_0_1_0_with_q244_classifiers_and_urls() -> None:
+    """Q-244 (#370): version 0.1.0; keywords; exactly Q-244's classifiers, with no license
+    classifier, since PEP 639's `license` expression is set; and URLs for Homepage, Source,
+    Documentation, Issues and Changelog, each on the project's site or repository."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["version"] == "0.1.0"
+    assert project["license"] == "Apache-2.0"
+    assert project["keywords"] and all(isinstance(k, str) and k for k in project["keywords"])
+    assert set(project["classifiers"]) == RELEASE_CLASSIFIERS
+    assert len(project["classifiers"]) == len(RELEASE_CLASSIFIERS)
+    assert not any(c.startswith("License ::") for c in project["classifiers"])
+    urls = project["urls"]
+    assert set(urls) == {"Homepage", "Source", "Documentation", "Issues", "Changelog"}
+    assert urls["Homepage"] == urls["Source"] == REPOSITORY
+    assert urls["Issues"] == f"{REPOSITORY}/issues"
+    assert urls["Changelog"] == f"{REPOSITORY}/blob/main/docs/changelog.md"
+
+
+def _markdown_targets(text: str) -> list[str]:
+    """The targets of a Markdown document's inline links and images, `[text](target)`."""
+    return re.findall(r"\]\(([^)\s]+)\)", text)
+
+
+def test_readme_states_the_release_and_links_the_records_on_github() -> None:
+    """#370 (D-62, §0, Q-244): the README is also PyPI's project description, so every link and
+    image opens on github.com or another absolute URL, never a path relative to the repository;
+    it installs with `pip install openftgs`, its status line is no longer M14's, and its
+    clean-room statement links the spec, the source log, the questions (whose raw file is linked
+    too, since GitHub doesn't render a Markdown file that large), the milestones and the release
+    checklist, and says that the project page's renderer was read for a documentation-only
+    survey (#352)."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith("# openftgs\n")
+    targets = _markdown_targets(readme)
+    assert targets
+    relative = [t for t in targets if not t.startswith(("https://", "#"))]
+    assert relative == []
+    assert "pip install openftgs\n" in readme
+    assert "M14" not in readme
+    blob = f"{REPOSITORY}/blob/main/"
+    for record in (
+        "docs/spec/openftgs-spec.md",
+        "docs/clean-room/source-log.md",
+        "docs/clean-room/questions.md",
+        "docs/clean-room/milestones.md",
+        "docs/clean-room/release-checklist.md",
+    ):
+        assert blob + record in targets, record
+    assert f"{REPOSITORY}/raw/main/docs/clean-room/questions.md" in targets
+    clean_room = readme.split("\n## Clean-room process\n", 1)[1].split("\n## ", 1)[0]
+    assert f"{REPOSITORY}/issues/352" in _markdown_targets(clean_room)
+    assert "renderer" in clean_room
