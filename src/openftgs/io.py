@@ -33,6 +33,7 @@ from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
+from openftgs._legacy import with_current_loss
 from openftgs.config import config_from_dict
 from openftgs.types import (
     Camera,
@@ -1035,6 +1036,12 @@ def load_checkpoint(directory: Path) -> TrainerState:
     before anything else is read; files the manifest doesn't list are ignored. The stored
     configuration must be valid (Q-10, Q-11), and N must not exceed its ``n_max`` (§1.1).
 
+    A checkpoint saved before revision 549o, whose configuration names the old perceptual
+    backbone "vgg" or "alex", is read too: its configuration is validated with 549o's loss
+    defaults in place of its ``perc_net`` and ``lambda_perc``, in memory only, and the state
+    keeps the configuration as saved (Q-247). Only resuming its training refuses it
+    (:meth:`openftgs.train.Trainer.from_checkpoint`).
+
     Parameters
     ----------
     directory
@@ -1043,7 +1050,7 @@ def load_checkpoint(directory: Path) -> TrainerState:
     Returns
     -------
     openftgs.types.TrainerState
-        The state, its tensors on the CPU.
+        The state, its tensors on the CPU, its ``config`` the dict as saved.
 
     Raises
     ------
@@ -1111,9 +1118,10 @@ def load_checkpoint(directory: Path) -> TrainerState:
     if set(params) != set(_PARAM_NAMES):
         _fail(where, f"params.safetensors must hold exactly {_PARAM_NAMES}")
     # §1.1 validity rules, checked on load (Q-25): a valid configuration (Q-10, Q-11), and N
-    # within its N_max, for every reader of a checkpoint.
+    # within its N_max, for every reader of a checkpoint. Q-247: a checkpoint saved before 549o
+    # is validated with 549o's loss defaults in place of LPIPS's backbone, in memory only.
     try:
-        n_max = config_from_dict(state.config).growth.n_max
+        n_max = config_from_dict(with_current_loss(state.config)).growth.n_max
     except ValueError as err:
         raise ValueError(f"{where}: invalid configuration: {err}") from None
     n = int(params["means"].shape[0])

@@ -652,6 +652,72 @@ def test_u8_culled_primitives_get_exactly_zero_render_gradient(packed: bool, pre
         assert float(grad[~culled].abs().sum()) > 0.0, name
 
 
+@LAYOUTS
+@PLACEMENTS
+@pytest.mark.parametrize("sh_degree", [None, 1, 0], ids=["model degree", "degree 1", "degree 0"])
+def test__render_gsplat_concatenates_the_sh_of_its_rows_as_the_whole_concat_gathered(
+    packed: bool, precull: str, sh_degree: int | None
+) -> None:
+    """#423 (§1.1: `sh` is concat(`sh0`, `shN`); §2.4 rule 2: an exact option changes results
+    through rounding only): the gsplat backend concatenates `sh0` and `shN`, cut to the active
+    degree (D-3), only for the rows its SH evaluation receives. For one camera, the image, alpha,
+    2D means and visibility are bitwise those of the path before #423, rebuilt here: `at_time`
+    concatenates every row, compaction gathers the concat, and the backend gathers it again; in
+    both layouts and placements, at the model's SH degree and two lower ones, degree 0 with an
+    empty `shN` part (U-26). The gradients of all
+    nine stored tensors agree within 1e-6 of their largest element: gsplat's rasterization
+    accumulates its backward with atomic additions, so the path before #423 doesn't give the
+    same bits twice (up to 1.6e-8 of the largest element, measured on this scene), and the
+    gather alone is held to the bit by `test__sh_parts_take_is_the_concat_gathered`. With several
+    cameras, whose packed rows repeat model rows, the images are bitwise those of the path
+    before."""
+    from openftgs.render import _backgrounds, _kept_rows, _render_gsplat, _take_rows
+
+    model = _cuda(u8_scene(64, F32, tie=True))
+
+    def before(cameras: list[Camera]) -> tuple[Tensor, ...]:
+        g = model.at_time(_T, sh_degree=sh_degree)
+        background = _backgrounds(None, len(cameras), g.means_t)
+        rows = None
+        if precull == "compact":
+            rows = _kept_rows(g)
+            g = _take_rows(g, rows)
+        image, alpha, means2d, visible, _ = _render_gsplat(
+            g, cameras, background, sh=g.sh, rows=rows, num_rows=64, packed=packed
+        )
+        return image, alpha, means2d, visible
+
+    def after(cameras: list[Camera]) -> tuple[Tensor, ...]:
+        out = _gsplat(
+            model, cameras, _T, sh_degree=sh_degree, precull=precull, packed=packed, return_aux=True
+        )
+        assert out.means2d is not None and out.visible is not None
+        return out.image, out.alpha, out.means2d, out.visible
+
+    params = [getattr(model, name) for name in PARAM_NAMES]
+    one = [ring(3)[0]]
+    results = []
+    for path in (before, after):
+        image, alpha, means2d, visible = path(one)
+        weights = torch.Generator(device="cuda").manual_seed(2)
+        loss = (image * torch.rand(image.shape, generator=weights, device="cuda")).sum() + (
+            alpha * torch.rand(alpha.shape, generator=weights, device="cuda")
+        ).sum()
+        grads = torch.autograd.grad(loss, params)
+        results.append((image.detach(), alpha.detach(), means2d.detach(), visible, *grads))
+    sh0_grad = results[0][4 + PARAM_NAMES.index("sh0")]  # every degree reads sh0
+    assert bool(results[0][3].any()) and float(sh0_grad.abs().sum()) > 0.0
+    outputs = ("image", "alpha", "means2d", "visible")
+    for name, old, new in zip(outputs, results[0][:4], results[1][:4], strict=True):
+        assert torch.equal(new, old), name
+    for name, old, new in zip(PARAM_NAMES, results[0][4:], results[1][4:], strict=True):
+        scale = float(old.abs().max())
+        torch.testing.assert_close(new, old, rtol=0.0, atol=1e-6 * scale, msg=name)
+    cameras = ring(3)
+    with torch.no_grad():
+        assert torch.equal(after(cameras)[0], before(cameras)[0])
+
+
 # U-7's random scenes and U-12, gsplat against the reference (Q-39's margins)
 
 _T = 0.37
@@ -713,7 +779,8 @@ def _compare(
 
 
 @LAYOUTS
-def test_u7_random_scenes_match_the_reference(packed: bool) -> None:
+@PLACEMENTS
+def test_u7_random_scenes_match_the_reference(packed: bool, precull: str) -> None:
     """U-7: 50 random scenes (N ≤ 64, 64×48, two cameras) rendered by gsplat and by the reference
     from the same CUDA model agree within 1e-4 in RGB and alpha, outside the pixels Q-39 excludes
     (at most 1% of a camera's pixels); `visible` agrees outside the excluded rows, and the 2D
@@ -724,7 +791,7 @@ def test_u7_random_scenes_match_the_reference(packed: bool) -> None:
     visible_rows = 0
     for seed in range(50):
         model = _random_scene(seed)
-        out = _gsplat(model, _CAMERAS, _T, return_aux=True, packed=packed)
+        out = _gsplat(model, _CAMERAS, _T, return_aux=True, packed=packed, precull=precull)
         reference = _reference(model, _CAMERAS, _T, return_aux=True)
         scene_worst, scene_share, scene_excluded, scene_differ = _compare(
             seed, out, reference, model
@@ -734,7 +801,8 @@ def test_u7_random_scenes_match_the_reference(packed: bool) -> None:
         assert reference.visible is not None
         visible_rows += int(reference.visible.sum())
     print(
-        f"\nU-7 ({'packed' if packed else 'unpacked'}): largest |Δ| outside the mask {worst:.3g}, "
+        f"\nU-7 ({'packed' if packed else 'unpacked'}, {precull}): largest |Δ| outside the mask "
+        f"{worst:.3g}, "
         f"largest excluded share {share:.3g}, excluded pixels differing by more than 1e-4 "
         f"{excluded_differ} of {excluded}, visible primitive–camera pairs {visible_rows}"
     )
@@ -750,7 +818,10 @@ def _weighted_loss(out: RenderOutput, keep: Tensor, seed: int) -> Tensor:
 
 
 @LAYOUTS
-def test_u12_gradients_match_the_reference(packed: bool) -> None:
+@PLACEMENTS
+def test_u12_gradients_match_the_reference(
+    packed: bool, precull: Literal["internal", "compact"]
+) -> None:
     """U-12: for 20 random scenes (U-7's generator, at least 8 rows), the gradients of a random
     weighting of image and alpha with respect to each of the nine stored tensors agree between
     gsplat and the reference: cosine ≥ 0.999 and relative L2 error ≤ 1e-3. The weights are zero
@@ -775,6 +846,7 @@ def test_u12_gradients_match_the_reference(packed: bool) -> None:
                 time_units="normalized",
                 backend=backend,
                 packed=packed,
+                precull=precull if backend == "gsplat" else "internal",
             )
             grads[backend] = torch.autograd.grad(_weighted_loss(out, keep, seed), params)
         for name, a, b in zip(PARAM_NAMES, grads["gsplat"], grads["reference"], strict=True):
@@ -786,7 +858,7 @@ def test_u12_gradients_match_the_reference(packed: bool) -> None:
             assert cos >= 0.999 and rel <= 1e-3, (seed, name, cos, rel)
             worst_cos, worst_rel = min(worst_cos, cos), max(worst_rel, rel)
     print(
-        f"\nU-12 ({'packed' if packed else 'unpacked'}): worst cosine {worst_cos:.7f}, "
+        f"\nU-12 ({'packed' if packed else 'unpacked'}, {precull}): worst cosine {worst_cos:.7f}, "
         f"worst relative L2 error {worst_rel:.3g}, largest excluded share {worst_share:.3g}"
     )
 

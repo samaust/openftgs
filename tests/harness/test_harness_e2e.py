@@ -5,9 +5,12 @@ implementations, every level at §3.3's full case sizes, on S-9 for L3 (K = 5).
 "Passes every level" is read as no failed check and exit 0 (Q-211): with K = 5 no
 Holm-corrected distribution flag is reachable, so those checks, and L3's summary, are
 `inconclusive` (Q-210). PSNR's verdict depends on S-9's seed-to-seed spread (Calibration data):
-it may be "equivalent" or "inconclusive", never "different"; SSIM and LPIPS, far inside their
-margins, are "equivalent". The verdicts and the wall time are recorded for the Calibration data
-table."""
+it may be "equivalent" or "inconclusive", never "different"; SSIM, far inside its margin, is
+"equivalent". ꟻLIP's seed spread on S-9 hasn't been measured yet (#391), so its verdict may be
+"equivalent" or "inconclusive", never "different", and its per-seed values are recorded. The
+verdicts and the wall time are recorded for the Calibration data table. L2's losses queries
+carry ꟻLIP, which needs no weights (Q-255), and S-9 trains without a perceptual term (Q-140), so
+nothing is downloaded."""
 
 import json
 import subprocess
@@ -25,7 +28,6 @@ Record = Callable[[str, object], None]
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_the_harness_passes_every_level_with_openftgs_as_both(
     tmp_path: Path, record_property: Record
 ) -> None:
@@ -67,11 +69,20 @@ def test_the_harness_passes_every_level_with_openftgs_as_both(
     assert summary["failed_checks"] == 0
     assert summary["L0"] == summary["L1"] == summary["L2"] == "pass"
     assert summary["L3"] == "inconclusive"
+    # Q-255: with no l2.lpips setting, every losses query is compared, ꟻLIP among its tensors.
+    losses = checks(report, "L2.forward.losses.")
+    assert len(losses) == 5 and {c["status"] for c in losses.values()} == {"pass"}
     metrics = checks(report, "L3.metric.s9.")
     verdicts = {k.rsplit(".", 1)[1]: c["localization"]["verdict"] for k, c in metrics.items()}
-    for metric in ("ssim1", "ssim2", "lpips_alex", "lpips_vgg"):
+    for metric in ("ssim1", "ssim2"):
         assert verdicts[metric] == "equivalent", verdicts
-    assert verdicts["psnr"] in ("equivalent", "inconclusive"), verdicts
+    assert sorted(verdicts) == ["flip", "psnr", "ssim1", "ssim2"]  # Q-210, #391
+    for metric in ("psnr", "flip"):
+        assert verdicts[metric] in ("equivalent", "inconclusive"), verdicts
+    flip = metrics["L3.metric.s9.flip"]["localization"]
+    record_property("flip_verdict", verdicts["flip"])
+    record_property("flip_per_seed_A", flip["per_seed_A"])
+    record_property("flip_per_seed_A2", flip["per_seed_A2"])
     psnr = metrics["L3.metric.s9.psnr"]["localization"]
     record_property("psnr_verdict", verdicts["psnr"])
     record_property("psnr_per_seed_A", psnr["per_seed_A"])

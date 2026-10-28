@@ -48,7 +48,7 @@ frame and averaged over frames as E16 does, its PSNR as E16 computes it, and the
 pixels left once those flagged in FLAGS_DIR are removed (Q-233), for each flag alone, for their
 union, and for the union at ½ and 2 times the thresholds; with the PSNR over the flagged pixels,
 their mean error (render − reference, in levels: below 0 where the render is darker) and their
-share. SSIM and LPIPS have no kept-pixel form.
+share. SSIM and ꟻLIP have no kept-pixel form.
 
 These are diagnostics, not pass criteria: the spec defines no metric for them. Exit 0 once
 written; 2 for an input that can't be read or matched.
@@ -709,7 +709,9 @@ def run_report(
     if not records:
         raise InputError(f"the test split of {scene} holds no images")
     device = torch.device("cuda" if backend == "gsplat" else "cpu")
-    config = config_from_dict(state.config)
+    # Q-271: the loss, which load_checkpoint has checked, is left out, so a checkpoint saved
+    # before 549o (LPIPS's backbone as perc_net, Q-247) gives its model and background too.
+    config = config_from_dict({k: v for k, v in state.config.items() if k != "loss"})
     # E16's Î is the render composited over the run's background (D-34), as evaluate() renders.
     background = torch.tensor(config.background, dtype=torch.float32, device=device)
     model = FreeTimeGaussians(

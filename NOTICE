@@ -38,3 +38,38 @@ Licensed under the Apache License, Version 2.0 (LICENSES/Kornia.txt).
 InLoc (https://github.com/HajimeTaira/InLoc_demo), whose approach RoMa's utils/utils.py credits
 Copyright (c) 2017 Hajime Taira
 Licensed under the MIT License (LICENSES/InLoc.txt).
+
+openftgs includes a copy of NVIDIA's ꟻLIP loss in the module openftgs._vendor.flip.flip_loss
+(folder openftgs/_vendor/flip), with changes that the file marks and its VENDOR.json lists, and
+its tests include the unmodified file as a reference (folder tests/reference/flip). Both folders
+hold ꟻLIP's license as LICENSE.
+
+ꟻLIP (https://github.com/NVlabs/flip), commit d3ab02a4425eb167d8a4021b382a2bafc6e6c838,
+src/pytorch/flip_loss.py
+Copyright (c) 2020-2025, NVIDIA CORPORATION & AFFILIATES (the file's own header reads
+2020-2024). All rights reserved.
+Licensed under the BSD 3-Clause License (LICENSE).
+
+openftgs adapts piq's HaarPSI in the module openftgs.losses (the functions _haarpsi_constants,
+_similarity and _haarpsi), with the changes its comments list.
+
+piq (https://github.com/photosynthesis-team/piq), version 0.8.0, piq/haarpsi.py and the helpers
+it calls (piq/functional/colour_conversion.py, piq/functional/filters.py, piq/functional/base.py)
+By Sergey Kastryulin and the piq contributors (the package's metadata names its author; its
+license file names no copyright holder, and it has no NOTICE file).
+Licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+
+Pretrained weights
+------------------
+
+openftgs downloads the pretrained weights of its trunk perceptual networks from their
+publishers at first use; it neither includes nor redistributes them.
+
+The perceptual network vgg16_oxford uses the 16-layer VGG model of the Visual Geometry Group,
+University of Oxford, from its Caffe release
+(https://www.robots.ox.ac.uk/~vgg/research/very_deep/), whose convolutions openftgs converts
+into the user's torch.hub cache at first use. The model is licensed under the Creative Commons
+Attribution 4.0 International License (https://creativecommons.org/licenses/by/4.0/), with
+attribution to its technical report: Karen Simonyan and Andrew Zisserman, "Very Deep
+Convolutional Networks for Large-Scale Image Recognition", arXiv:1409.1556 (2014).

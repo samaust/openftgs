@@ -1,23 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""L2 · forward behaviour on random inputs (§3.3 L2; Q-207, Q-208, Q-209), with openftgs as
-both implementations and with the fault-injecting wrapper as B. LPIPS is off (l2.lpips), or
-left out of the losses queries by the wrapper's lpips_off, so no weights are downloaded."""
+"""L2 · forward behaviour on random inputs (§3.3 L2; Q-207, Q-208, Q-209, Q-255), with
+openftgs as both implementations and with the fault-injecting wrapper as B. The losses queries
+always carry ꟻLIP, which needs no weights, so nothing is downloaded."""
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 from harness_runs import checks, faulty, openftgs, run_harness
 
+from ftgs_harness.formats import file_sha256, read_answers, read_queries
 from ftgs_harness.info import QUERY_KINDS
 from ftgs_harness.level2 import TOLERANCES
 
-SETTINGS = {"l2": {"queries": 2, "lpips": False}}
+SETTINGS = {"l2": {"queries": 2}}
+# The default configuration: ꟻLIP at its calibrated weight (§2.1 `LossConfig`, D-9, D-89), which
+# grad_stats takes from it.
+CONFIG: dict[str, Any] = {}
 
 
 def test_l2_passes_with_openftgs_as_both_implementations(tmp_path: Path) -> None:
     """Every kind, random and edge queries, at §3.3's tolerances."""
-    code, report = run_harness(tmp_path, "L2", a=openftgs(), b=openftgs(), settings=SETTINGS)
+    code, report = run_harness(
+        tmp_path, "L2", a=openftgs(), b=openftgs(), settings=SETTINGS, config=CONFIG
+    )
     assert code == 0, [c["id"] for c in report["checks"] if c["status"] != "pass"]
     # Every query compared: a not-comparable answer fails nothing, so the exit code alone
     # wouldn't show one.
@@ -25,10 +32,24 @@ def test_l2_passes_with_openftgs_as_both_implementations(tmp_path: Path) -> None
     kinds = {c["id"].split(".")[2] for c in checks(report, "L2.forward.").values()}
     assert kinds == set(QUERY_KINDS)
     assert len(checks(report, "L2.forward.motion.")) == 3  # two random, one edge
-    # Q-212: with LPIPS off the run is reduced, and report.md's header says why.
+    # Q-255: every losses answer carries ꟻLIP among the tensors compared, at §3.3's 1e-5
+    # relative, and the queries have no `lpips` parameter.
+    assert TOLERANCES["losses"]["flip"] == ("relative", 1e-5)
+    queries = tmp_path / "run" / "cases" / "L2" / "losses.queries.safetensors"
+    for label in ("A", "B"):
+        answers = read_answers(
+            tmp_path / "run" / label / "L2" / "losses.answers.safetensors",
+            kind="losses",
+            queries_sha256=file_sha256(queries),
+        )
+        assert len(answers) == 3 and all("flip" in a.tensors for a in answers.values())
+    _, sent = read_queries(queries)
+    assert sent and all("lpips" not in q.params for q in sent)
+    # Q-203, Q-255: two queries per kind, below §3.3's four, are the run's only reduction.
     assert report["run"]["settings"]["reduced"] is True
     md = (tmp_path / "run" / "report.md").read_text().splitlines()
-    assert "LPIPS left out of L2" in next(line for line in md if line.startswith("Started "))
+    header = next(line for line in md if line.startswith("Started "))
+    assert header.endswith("(reduced: case sizes below §3.3's)"), header
 
 
 @pytest.mark.parametrize(("scale", "fails"), [(2e-6, True), (5e-7, False)])
@@ -43,6 +64,7 @@ def test_answers_off_by_twice_the_tolerance_fail_and_by_half_pass(
         a=openftgs(),
         b=faulty(f"answers={scale}", on=("forward",)),
         settings=SETTINGS,
+        config=CONFIG,
     )
     motion = checks(report, "L2.forward.motion.")
     assert {c["status"] for c in motion.values()} == ({"fail"} if fails else {"pass"})
@@ -61,6 +83,7 @@ def test_an_exact_float64_motion_passes_against_openftgs(tmp_path: Path) -> None
         a=openftgs(),
         b=faulty("exact_motion", on=("forward",)),
         settings=SETTINGS,
+        config=CONFIG,
     )
     motion = checks(report, "L2.forward.motion.")
     assert len(motion) == 3 and {c["status"] for c in motion.values()} == {"pass"}
@@ -74,6 +97,7 @@ def test_signed_answers_zeroed_below_a_hundredth_of_their_scale_fail(tmp_path: P
         a=openftgs(),
         b=faulty("zero_answers=0.01", on=("forward",)),
         settings=SETTINGS,
+        config=CONFIG,
     )
     motion = checks(report, "L2.forward.motion.")
     assert len(motion) == 3 and {c["status"] for c in motion.values()} == {"fail"}
@@ -89,7 +113,7 @@ def test_ok_answers_without_a_tensor_of_their_kind_are_schema_violations(
     first = {kind: next(iter(names)) for kind, names in TOLERANCES.items()}
     dropping = faulty("drop_answer=" + ",".join(first.values()), on=("forward",))
     a = dropping if "A" in lacking else openftgs()
-    code, report = run_harness(tmp_path, "L2", a=a, b=dropping, settings=SETTINGS)
+    code, report = run_harness(tmp_path, "L2", a=a, b=dropping, settings=SETTINGS, config=CONFIG)
     assert code == 1
     for kind, name in first.items():
         found = checks(report, f"L2.forward.{kind}.")
@@ -102,34 +126,59 @@ def test_ok_answers_without_a_tensor_of_their_kind_are_schema_violations(
     assert sampling and all(c["status"] == "pass" for c in sampling.values())
 
 
-def test_losses_with_lpips_on_fail_without_lpips_vgg(tmp_path: Path) -> None:
-    """Q-212: with `lpips` true, losses answers that both lack lpips_vgg fail; with it false
-    the other four tensors suffice (the lpips-off runs above). The fault answers each losses
-    query as if `lpips` were false, and λ_perc = 0 keeps grad_stats off LPIPS, so no weights
-    are downloaded."""
-    adapter = faulty("lpips_off", on=("forward",))
+def test_an_adapter_without_flip_answers_its_losses_queries_not_comparable(
+    tmp_path: Path,
+) -> None:
+    """Q-255, Q-207: an adapter without ꟻLIP answers its losses queries `not_comparable`, so
+    those checks are not comparable, fail nothing and keep the adapter's message, while every
+    other kind is judged. The wrapper answers B's losses queries as such an adapter would."""
     code, report = run_harness(
         tmp_path,
         "L2",
-        a=adapter,
-        b=adapter,
-        settings={"l2": {"queries": 1, "lpips": True}},
-        config={"loss": {"lambda_perc": 0.0}},
+        a=openftgs(),
+        b=faulty("no_flip", on=("forward",)),
+        settings={"l2": {"queries": 1}},
+        config=CONFIG,
     )
-    assert code == 1
+    assert code == 0
     losses = checks(report, "L2.forward.losses.")
     assert len(losses) == 2  # one random, one edge
     for check in losses.values():
-        assert check["status"] == "fail" and check["pattern"] == "schema violation"
-        assert check["observed"] == "A lacks lpips_vgg; B lacks lpips_vgg"
+        assert check["status"] == "not_comparable" and check["observed"] == "B not_comparable"
+        assert "ꟻLIP" in check["localization"]["adapter_messages"]["B"]
     others = {k: c for k, c in checks(report, "L2.forward.").items() if k not in losses}
     assert others and all(c["status"] == "pass" for c in others.values()), others.keys()
+    assert report["summary"]["L2"] == "pass"
+
+
+def test_an_ok_losses_answer_without_flip_is_a_schema_violation(tmp_path: Path) -> None:
+    """Q-207, Q-255: an `ok` losses answer carries ꟻLIP like every tensor of its row; one
+    without it fails as a schema violation, never silently compared on the other four."""
+    code, report = run_harness(
+        tmp_path,
+        "L2",
+        a=openftgs(),
+        b=faulty("drop_answer=flip", on=("forward",)),
+        settings={"l2": {"queries": 1}},
+        config=CONFIG,
+    )
+    assert code == 1
+    losses = checks(report, "L2.forward.losses.")
+    assert len(losses) == 2
+    for check in losses.values():
+        assert check["status"] == "fail" and check["pattern"] == "schema violation"
+        assert check["observed"] == "B lacks flip"
 
 
 def test_a_biased_sampler_fails_the_chi2_test(tmp_path: Path) -> None:
     """§3.3: relocation_sampling's counts against the scores, p > 0.001."""
     code, report = run_harness(
-        tmp_path, "L2", a=openftgs(), b=faulty("biased_sampler", on=("forward",)), settings=SETTINGS
+        tmp_path,
+        "L2",
+        a=openftgs(),
+        b=faulty("biased_sampler", on=("forward",)),
+        settings=SETTINGS,
+        config=CONFIG,
     )
     assert code == 1
     sampling = checks(report, "L2.forward.relocation_sampling.")
@@ -143,7 +192,12 @@ def test_a_kind_missing_from_info_is_not_comparable(tmp_path: Path) -> None:
     """§3.3: "A query kind missing from an adapter's info reply is reported as not comparable",
     and fails nothing."""
     code, report = run_harness(
-        tmp_path, "L2", a=openftgs(), b=faulty("no_kind=motion", on=("info",)), settings=SETTINGS
+        tmp_path,
+        "L2",
+        a=openftgs(),
+        b=faulty("no_kind=motion", on=("info",)),
+        settings=SETTINGS,
+        config=CONFIG,
     )
     assert code == 0
     motion = checks(report)["L2.forward.motion"]

@@ -37,7 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
           # The test job imports the vendored RoMa (U-38, Q-117); the license job scans [init] (Q-4).
-          python -m pip install -e ".[dev${{ (matrix.job == 'test' || matrix.job == 'licenses') && ',init' || '' }}]" -e "harness[lpips]"
+          python -m pip install -e ".[dev${{ (matrix.job == 'test' || matrix.job == 'licenses') && ',init' || '' }}]" -e "harness[torch]"
       - name: Lint and type-check
         if: matrix.job == 'lint'
         run: |
@@ -68,23 +68,50 @@ jobs:
         run: |
           python -m pip wheel . ./harness --no-deps -w dist
           python - <<'PY'
-          import glob, hashlib, json, zipfile
+          import glob, hashlib, json, re, zipfile
           wheel = zipfile.ZipFile(glob.glob("dist/openftgs-*.whl")[0])
           names = wheel.namelist()
           for required in ("openftgs/py.typed", "licenses/LICENSE", "licenses/NOTICE"):
               assert any(n.endswith(required) for n in names), required
           assert not any(n.startswith("ftgs_harness/") for n in names), "Q-5"
-          # D-65, Q-115, Q-118: the vendored RoMa ships with its license files and VENDOR.json.
-          vendored = "openftgs/_vendor/romatch/"
-          record = json.loads(wheel.read(vendored + "VENDOR.json"))
-          assert [e["path"] for e in record["licenses"]][0] == "LICENSE"
-          assert len(record["licenses"]) == 8 and len(record["files"]) == 22
-          for entry in record["licenses"] + record["files"]:
-              digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
-              assert digest == entry["sha256"], entry["path"]
-          names = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0]).namelist()
+          # D-65, Q-115, Q-118: the vendored RoMa ships with its license files and VENDOR.json,
+          # and so does the vendored ꟻLIP (D-89, #383).
+          for vendored, licenses, files in (
+              ("openftgs/_vendor/romatch/", 8, 22),
+              ("openftgs/_vendor/flip/", 1, 1),
+          ):
+              record = json.loads(wheel.read(vendored + "VENDOR.json"))
+              assert [e["path"] for e in record["licenses"]][0] == "LICENSE"
+              assert len(record["licenses"]) == licenses and len(record["files"]) == files
+              for entry in record["licenses"] + record["files"]:
+                  digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
+                  assert digest == entry["sha256"], entry["path"]
+          # Q-248, §2.3 (#393): the core requires no lpips, no tqdm and none of the [init]
+          # extra's packages, which only RoMa and the DINO networks need; no extra names lpips,
+          # tqdm or torchmetrics.
+          metadata = wheel.read(next(n for n in names if n.endswith(".dist-info/METADATA")))
+          requires = [
+              line.split(":", 1)[1].strip()
+              for line in metadata.decode("utf-8").splitlines()
+              if line.startswith("Requires-Dist:")
+          ]
+          named = lambda r: re.sub(r"[-_.]+", "-", re.match(r"[A-Za-z0-9._-]+", r)[0]).lower()
+          core = {named(r) for r in requires if not re.search(r"\bextra\s*==", r)}
+          init = {named(r) for r in requires if re.search(r"\bextra\s*==\s*['\"]init['\"]", r)}
+          assert not core & {"torchvision", "einops", "loguru", "lpips", "tqdm"}, sorted(core)
+          assert {"torchvision", "einops", "loguru"} <= init, sorted(init)
+          assert not {named(r) for r in requires} & {"lpips", "tqdm", "torchmetrics"}, requires
+          wheel = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0])
+          names = wheel.namelist()
           for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):
               assert any(n.endswith(required) for n in names), required
           assert not any(n.startswith("openftgs/") for n in names), "Q-5"
+          # Q-254 (#391): the harness's own ꟻLIP ships with its license and provenance record.
+          vendored = "ftgs_harness/_vendor/flip/"
+          record = json.loads(wheel.read(vendored + "VENDOR.json"))
+          assert [e["path"] for e in record["licenses"]] == ["LICENSE"]
+          for entry in record["licenses"] + record["files"]:
+              digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
+              assert digest == entry["sha256"], entry["path"]
           print("wheel contents ok")
           PY

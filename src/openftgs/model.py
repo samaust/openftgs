@@ -18,6 +18,7 @@ from typing import Literal, NoReturn, get_args
 import torch
 from torch import Tensor
 
+from openftgs._legacy import with_current_loss
 from openftgs._stages import stage
 from openftgs.config import InitConfig, config_from_dict
 from openftgs.io import load_checkpoint, read_exchange, validate_exchange, validate_init_points
@@ -511,7 +512,10 @@ class FreeTimeGaussians(torch.nn.Module):
         """Load a model from a checkpoint directory or an ftgs-if file (§2.1).
 
         A directory is read as an ftgs-checkpoint, with the SH degree of its stored
-        configuration; any other path as an ftgs-if file (§2.2).
+        configuration; any other path as an ftgs-if file (§2.2). A checkpoint saved before
+        revision 549o, whose configuration names the old perceptual backbone "vgg" or "alex",
+        is read as :func:`openftgs.io.load_checkpoint` reads it, with 549o's loss defaults in
+        memory only, since a model doesn't depend on the loss it trained with (Q-247, Q-271).
 
         Parameters
         ----------
@@ -540,9 +544,11 @@ class FreeTimeGaussians(torch.nn.Module):
         if not path.is_dir():
             return cls.from_exchange(read_exchange(path), device=device)
         state = load_checkpoint(path)
+        # Q-271, Q-247: the model doesn't depend on the loss it trained with.
+        config = config_from_dict(with_current_loss(state.config))
         return cls(
             {k: v.to(device) for k, v in state.params.items()},
-            sh_degree=config_from_dict(state.config).sh_degree,
+            sh_degree=config.sh_degree,
             time=state.time,
             time_unit=state.time_unit,
         )

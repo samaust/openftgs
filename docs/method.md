@@ -171,15 +171,17 @@ Normative details, all matching gsplat 1.5.3 in classic mode:
 
 ### E7 · Rendering loss
 
-Provenance: \[P §3.2, Eq. 5; weights P §3.3\]
+Provenance: \[P §3.2, Eq. 5; λ\_img, λ\_ssim P §3.3; the perceptual network and λ\_perc D-9\]
 
 ```{math}
-\mathcal L_{render} = \lambda_{img}\,\mathcal L_{img} + \lambda_{ssim}\,\mathcal L_{ssim} + \lambda_{perc}\,\mathcal L_{perc},\qquad (\lambda_{img},\lambda_{ssim},\lambda_{perc}) = (0.8,\;0.2,\;0.01)
+\mathcal L_{render} = \lambda_{img}\,\mathcal L_{img} + \lambda_{ssim}\,\mathcal L_{ssim} + \lambda_{perc}\,\mathcal L_{perc},\qquad (\lambda_{img},\lambda_{ssim}) = (0.8,\;0.2)
 ```
+
+λ\_perc is the perceptual network's calibrated weight, 0.415 for the default ꟻLIP \[D-9, D-89\]; the paper's 0.01 was tuned for LPIPS.
 
 - L\_img = mean |Î − I| over pixels and channels (L1) \[D-7\].
 - L\_ssim = 1 − SSIM(Î, I) with an 11×11 Gaussian window (σ = 1.5), C₁ = 0.01², C₂ = 0.03², data range 1, per channel, no padding ("valid"), averaged over the map and channels \[D-8\].
-- L\_perc = LPIPS with the VGG backbone, inputs mapped from \[0, 1\] to \[−1, 1\] \[D-9\].
+- L\_perc = the perceptual network `perc_net`, ꟻLIP (LDR) by default, on Î and I; the networks, their inputs and weights are D-89's \[D-9\]. The paper uses LPIPS-VGG; openftgs doesn't, since its trunk's weights carry no grant from their publisher (#373).
 
 Î is the render after background compositing and is not clamped: E2 clamps colors only at 0, so Î can exceed 1, as in gsplat 1.5.3's trainer. I is float32 RGB in \[0, 1\]. Metrics clamp Î to \[0, 1\] first (E16).
 
@@ -271,13 +273,13 @@ x^(f) are the points triangulated at frame f, f′ is the next initialization fr
 
 ### E16 · Evaluation metrics
 
-Provenance: \[P §4, "Metrics"; DSSIM form derived from Tables 2, 3, 9 and 10; D-29, D-67\]
+Provenance: \[P §4, "Metrics", except the perceptual metric; DSSIM form derived from Tables 2, 3, 9 and 10; D-9, D-29, D-67\]
 
 ```{math}
 \mathrm{PSNR} = 10\log_{10}\frac{1}{\mathrm{MSE}(\hat I, I)},\qquad \mathrm{DSSIM}_k = \frac{1-\mathrm{SSIM}_k(\hat I, I)}{2},\quad k\in\{1,2\}
 ```
 
-SSIM\_k is E7's SSIM (11×11 Gaussian window, σ = 1.5, valid region, mean over the map and channels) with data range k, so C₁ = (0.01k)² and C₂ = (0.03k)². Renders are clamped to \[0, 1\] first; each metric is computed per test image, averaged over a scene's test images, then over scenes \[D-67\]. Cross-check: SelfCap SSIM₂ 0.952 (Table 10) corresponds to DSSIM₂ 0.024 (Table 3), and ENeRF-Outdoor 0.846 (Table 9) to 0.077 (Table 2). The identity holds for every SelfCap row and for the ENeRF, 4K4D and Ours rows on ENeRF-Outdoor, but not for the 4DGS and STGS rows of Table 2 \[D-29, D-40\]. LPIPS uses AlexNet for Neural3DV and VGG for ENeRF-Outdoor and SelfCap, per the captions of Tables 6–11. Its inputs are mapped from \[0, 1\] to \[−1, 1\] for both backbones, and LPIPS-VGG is also reported with unmapped \[0, 1\] inputs, the 3DGS convention that gsplat's trainer follows, because the paper does not say which it used \[D-68\].
+SSIM\_k is E7's SSIM (11×11 Gaussian window, σ = 1.5, valid region, mean over the map and channels) with data range k, so C₁ = (0.01k)² and C₂ = (0.03k)². Renders are clamped to \[0, 1\] first; each metric is computed per test image, averaged over a scene's test images, then over scenes \[D-67\]. Cross-check: SelfCap SSIM₂ 0.952 (Table 10) corresponds to DSSIM₂ 0.024 (Table 3), and ENeRF-Outdoor 0.846 (Table 9) to 0.077 (Table 2). The identity holds for every SelfCap row and for the ENeRF, 4K4D and Ours rows on ENeRF-Outdoor, but not for the 4DGS and STGS rows of Table 2 \[D-29, D-40\]. The perceptual metric is ꟻLIP (LDR) at NVIDIA's default 67.0 pixels per degree, on the clamped render against the reference, the mean of its error map per image, averaged as the others \[D-9, D-89\]. The paper reports LPIPS (AlexNet for Neural3DV, VGG otherwise, Tables 6–11); openftgs reports no LPIPS, so its perceptual figures can't be compared with the paper's.
 
 ### E17 · Split during growth
 

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """E16's metrics in openftgs.eval: U-23 and the added tests of PRD #74 (D-29, D-40, D-52, D-64,
-D-67 to D-69; Q-60 to Q-63), and the evaluation of a model on a scene's images (Q-68).
+D-67, D-69; Q-60, Q-61, Q-63) and of #387 (D-89; Q-256, Q-257, Q-259), and the evaluation of a
+model on a scene's images (Q-68).
 
 Expected values are worked by hand (PSNR at a known MSE, SSIM_k of constant images in closed
-form, crops built pixel by pixel) or come from torchmetrics' LPIPS, an oracle reached through
-another library's code path to the same published weights (§2.3).
+form, crops built pixel by pixel) or come from NVIDIA's ꟻLIP file as published, kept beside the
+tests (Q-252), the oracle U-23 names (D-89).
 """
 
+import importlib.util
 import json
 import math
 import warnings
@@ -29,7 +31,6 @@ from openftgs.eval import (
     dssim_k,
     dynamic_region,
     evaluate_images,
-    lpips_backbone,
     metrics_report,
     psnr,
     ssim_k,
@@ -54,8 +55,9 @@ def _noisy_pair(shape: tuple[int, ...], seed: int, *, noise: float = 0.1) -> tup
 
 
 def test_public_api() -> None:
-    """Q-60: `__all__` is exactly the public API, and the metric names are those §2.1's CLI
-    paragraph gives for METRICS.json."""
+    """Q-60: `__all__` is exactly the public API, without Q-62's retired `lpips_backbone`, and
+    the metric names are those §2.1's CLI paragraph gives for METRICS.json since 549o: psnr,
+    ssim1, ssim2, dssim1, dssim2 and flip (D-89)."""
     assert sorted(openftgs.eval.__all__) == [
         "Evaluator",
         "ImageMetrics",
@@ -64,22 +66,13 @@ def test_public_api() -> None:
         "dssim_k",
         "dynamic_region",
         "evaluate_images",
-        "lpips_backbone",
         "metrics_report",
         "psnr",
         "ssim_k",
         "write_metrics",
     ]
-    assert METRIC_NAMES == (
-        "psnr",
-        "ssim1",
-        "ssim2",
-        "dssim1",
-        "dssim2",
-        "lpips_alex",
-        "lpips_vgg",
-        "lpips_vgg_raw",
-    )
+    assert METRIC_NAMES == ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip")
+    assert not hasattr(openftgs.eval, "lpips_backbone")
 
 
 def test_u23_psnr_at_an_mse_of_1e_minus_4_is_40_db() -> None:
@@ -184,24 +177,6 @@ def test_average_metrics_is_the_mean_per_key() -> None:
         average_metrics([])
     with pytest.raises(ValueError, match="keys"):
         average_metrics([{"psnr": 1.0}, {"ssim1": 1.0}])
-
-
-@pytest.mark.parametrize(
-    ("source", "backbone"),
-    [
-        ("n3dv/flame_steak", "alex"),
-        ("n3dv", "alex"),
-        ("selfcap/dance1", "vgg"),
-        ("enerf_outdoor/actor1", "vgg"),
-        ("synthetic", "vgg"),
-        ("n3dvx/scene", "vgg"),
-        (None, "vgg"),
-    ],
-)
-def test_u23_lpips_backbone_per_dataset(source: str | None, backbone: str) -> None:
-    """U-23, D-29: LPIPS-Alex for Neural3DV, VGG otherwise, read from the scene manifest's
-    metadata.source (Q-62)."""
-    assert lpips_backbone(source) == backbone
 
 
 @pytest.mark.parametrize(
@@ -321,14 +296,15 @@ def test_dynamic_region_takes_masks_with_a_channel_and_bool_masks() -> None:
 
 @pytest.mark.parametrize(
     ("rows", "cols", "usable"),
-    [((0, 0), (0, 0), False), ((3, 33), (2, 40), False), ((3, 34), (2, 32), False),
-     ((3, 34), (2, 33), True)],
+    [((0, 0), (0, 0), False), ((3, 23), (2, 40), False), ((3, 24), (2, 22), False),
+     ((3, 24), (2, 23), True)],
 )  # fmt: skip
 def test_dynamic_region_needs_a_box_every_metric_accepts(
     rows: tuple[int, int], cols: tuple[int, int], usable: bool
 ) -> None:
-    """Q-61: an empty mask, or a box narrower than 31 px on a side (LPIPS-Alex's smallest
-    input), gives no region and a warning; a 31×31 box is usable."""
+    """Q-61, Q-257: an empty mask, or a box narrower than 21 px on a side, the larger of SSIM's
+    11-px window and the 21 px of ꟻLIP's filters at 67.0 pixels per degree, gives no region and
+    a warning; a 21×21 box is usable."""
     g = _gen(6)
     pred, gt = torch.rand(50, 60, 3, generator=g), torch.rand(50, 60, 3, generator=g)
     mask = torch.zeros(50, 60, dtype=torch.bool)
@@ -337,7 +313,7 @@ def test_dynamic_region_needs_a_box_every_metric_accepts(
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             region = dynamic_region(pred, gt, mask)
-        assert region is not None and region[0].shape == (31, 31, 3)
+        assert region is not None and region[0].shape == (21, 21, 3)
     else:
         with pytest.warns(UserWarning, match="dynamic"):
             assert dynamic_region(pred, gt, mask) is None
@@ -359,50 +335,71 @@ def test_dynamic_region_rejects_a_mask_of_another_shape_or_type(mask: Tensor) ->
         dynamic_region(image, image, mask)
 
 
-# The Evaluator: all eight metrics of an image (E16, D-68; Q-60).
+# The Evaluator: the six metrics of an image, ꟻLIP among them (E16, D-89; Q-60).
 
 
 @pytest.fixture(scope="module")
 def evaluator() -> Evaluator:
-    """Built once on the CPU (the LPIPS trunk weights are downloaded)."""
+    """Built once on the CPU; ꟻLIP needs no weights (D-89)."""
     return Evaluator(device="cpu")
 
 
-def _torchmetrics_lpips(
-    net: Literal["alex", "vgg"], pred: Tensor, gt: Tensor, *, normalize: bool
-) -> float:
-    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # torchvision's `pretrained` deprecation
-        metric = LearnedPerceptualImagePatchSimilarity(net_type=net, normalize=normalize)
-    with torch.no_grad():
-        value = metric(pred.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
-    return float(value)
+def test_u23_flip_of_identical_images_is_zero(evaluator: Evaluator) -> None:
+    """U-23: ꟻLIP of identical images is 0, within 1e-6 (E16, D-89), for the entire image and
+    for its dynamic region."""
+    image = torch.rand(50, 60, 3, generator=_gen(10))
+    entire, dynamic = evaluator(image, image.clone(), mask=_l_mask())
+    assert dynamic is not None
+    assert abs(entire["flip"]) <= 1e-6
+    assert abs(dynamic["flip"]) <= 1e-6
 
 
-@pytest.mark.weights
-def test_u23_lpips_against_torchmetrics(evaluator: Evaluator) -> None:
-    """U-23, D-68: LPIPS-Alex and LPIPS-VGG with inputs mapped to [−1, 1] match torchmetrics'
-    LPIPS with normalize=True, and lpips_vgg_raw (unmapped [0, 1] inputs) matches it with
-    normalize=False, within 1e-4. The render is clamped first (D-67)."""
-    pred, gt = _noisy_pair((48, 64, 3), seed=11, noise=0.15)
-    pred, gt = pred.to(F32), gt.to(F32)
-    raw = pred.clone()
-    raw[:4] += 0.5  # above 1 in places: the metrics see the clamped render
-    pred = raw.clamp(0.0, 1.0)
-    entire, dynamic = evaluator(raw, gt)
-    assert dynamic is None
-    assert abs(entire["lpips_alex"] - _torchmetrics_lpips("alex", pred, gt, normalize=True)) <= 1e-4
-    assert abs(entire["lpips_vgg"] - _torchmetrics_lpips("vgg", pred, gt, normalize=True)) <= 1e-4
-    expected_raw = _torchmetrics_lpips("vgg", pred, gt, normalize=False)
-    assert abs(entire["lpips_vgg_raw"] - expected_raw) <= 1e-4
-    assert abs(entire["lpips_vgg_raw"] - entire["lpips_vgg"]) > 1e-3
+# Q-252: NVIDIA's flip_loss.py at d3ab02a as published, kept beside the tests.
+_PUBLISHED_FLIP = Path(__file__).resolve().parent / "reference" / "flip" / "flip_loss.py"
 
 
-@pytest.mark.weights
+def _published_flip() -> Any:
+    """NVIDIA's LDR-ꟻLIP loss as published, loaded from the reference copy under a name of its
+    own (Q-252); the file runs on CUDA only."""
+    spec = importlib.util.spec_from_file_location("flip_published_for_eval", _PUBLISHED_FLIP)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.LDRFLIPLoss()
+
+
+@pytest.mark.gpu
+def test_u23_flip_against_the_published_file_on_cuda() -> None:
+    """U-23 (E16, D-89; Q-252, Q-259): on a fixed image pair on CUDA, the Evaluator's ꟻLIP is
+    NVIDIA's LDR-ꟻLIP as published, run on the clamped render against the reference at 67.0
+    pixels per degree in IEEE float32 (D-52), within 1e-6. The render leaves [0, 1] in places,
+    which E16 clamps and the loss clamps again (D-89). At the file's default 67.02 pixels per
+    degree the values differ by about 3·10⁻⁵, so the test tells the two apart (Q-259)."""
+    pred, gt = _noisy_pair((96, 128, 3), seed=15, noise=0.12)
+    raw = pred.to(F32)
+    raw[:6] += 0.6
+    raw[-5:, :9] -= 0.4
+    gt = gt.to(F32)
+    entire, _ = Evaluator(device="cuda")(raw.cuda(), gt.cuda())
+
+    def nchw(image: Tensor) -> Tensor:
+        return image.permute(2, 0, 1)[None].contiguous().cuda()
+
+    saved = (torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision())
+    try:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        with torch.no_grad():
+            expected = float(_published_flip()(nchw(raw.clamp(0.0, 1.0)), nchw(gt), 67.0))
+    finally:
+        torch.backends.cudnn.allow_tf32 = saved[0]
+        torch.set_float32_matmul_precision(saved[1])
+    assert 0.0 < expected < 1.0
+    assert abs(entire["flip"] - expected) <= 1e-6
+
+
 def test_evaluator_gives_every_metric_of_the_image_and_of_its_region(evaluator: Evaluator) -> None:
-    """Q-60: the eight metrics, in METRIC_NAMES order, agree with the metric functions; with a
+    """Q-60: the six metrics, in METRIC_NAMES order, agree with the metric functions; with a
     mask, the dynamic values are the same metrics on dynamic_region's pair (Q-61)."""
     g = _gen(12)
     gt = torch.rand(50, 60, 3, generator=g)
@@ -420,7 +417,6 @@ def test_evaluator_gives_every_metric_of_the_image_and_of_its_region(evaluator: 
     assert none is None
 
 
-@pytest.mark.weights
 def test_evaluator_takes_one_image_pair(evaluator: Evaluator) -> None:
     with pytest.raises(ValueError):
         evaluator(torch.zeros(2, 40, 40, 3), torch.zeros(2, 40, 40, 3))
@@ -448,16 +444,17 @@ def _image(
 
 
 def test_metrics_report_layout_without_masks() -> None:
-    """Q-63: format and version, the split, the metric names, the backbone from the source
-    (Q-62), and under `entire` the per-scene means and one row per image; no `dynamic` or
-    `fastest_10` block without masks or a range."""
+    """§2.1, Q-63, Q-256: format and version 2, the split, the metric names psnr, ssim1, ssim2,
+    dssim1, dssim2 and flip, and under `entire` the per-scene means and one row per image with
+    exactly those values; no `lpips_backbone`, whatever the manifest's source (Q-62, retired),
+    and no `dynamic` or `fastest_10` block without masks or a range."""
     images = [_image(0, frame=0), _image(1, frame=1), _image(2, frame=None)]
     report = metrics_report(images, split="test", metadata={"source": "n3dv/flame_steak"})
-    assert set(report) == {"format", "version", "split", "metrics", "lpips_backbone", "entire"}
-    assert report["format"] == "ftgs-metrics" and report["version"] == 1
+    assert set(report) == {"format", "version", "split", "metrics", "entire"}
+    assert report["format"] == "ftgs-metrics" and report["version"] == 2
     assert report["split"] == "test"
-    assert report["metrics"] == list(METRIC_NAMES)
-    assert report["lpips_backbone"] == "alex"
+    assert report["metrics"] == ["psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip"]
+    assert set(report["entire"]["scene"]) == set(report["metrics"])
     assert report["entire"]["scene"] == _values(10.0)  # the mean of 0, 10 and 20, plus k
     rows = report["entire"]["images"]
     assert [r["path"] for r in rows] == [im.path for im in images]
@@ -479,7 +476,6 @@ def test_metrics_report_writes_non_finite_values_as_null() -> None:
     assert report["entire"]["images"][0]["psnr"] is None
     assert report["entire"]["scene"]["psnr"] is None
     assert report["entire"]["scene"]["ssim1"] == (1.0 + 11.0) / 2
-    assert report["lpips_backbone"] == "vgg"
     json.dumps(report, allow_nan=False)
 
 
@@ -706,7 +702,6 @@ def test_evaluate_images_refuses_a_supplied_render_that_is_not_finite(tmp_path: 
         evaluate_images(model, video, evaluator, backend="reference", renders=supplied)
 
 
-@pytest.mark.weights
 def test_evaluate_images_scores_supplied_renders_as_its_own(
     tmp_path: Path, evaluator: Evaluator
 ) -> None:
@@ -787,14 +782,6 @@ def test_metrics_need_one_dtype_and_device(pred: Tensor, gt: Tensor) -> None:
         psnr(pred, gt)
 
 
-@pytest.mark.parametrize("source", [5, ["n3dv"], b"n3dv"])
-def test_lpips_backbone_needs_a_string_source(source: object) -> None:
-    """Q-62: metadata.source is a string or absent."""
-    with pytest.raises(ValueError, match="source"):
-        lpips_backbone(source)  # type: ignore[arg-type]
-
-
-@pytest.mark.weights
 def test_evaluator_reports_float32_metrics_for_float64_images(evaluator: Evaluator) -> None:
     """D-52, Q-60: reported metrics are plain float32: the Evaluator takes any floating pair
     and computes every metric on its float32 copy."""
@@ -804,32 +791,34 @@ def test_evaluator_reports_float32_metrics_for_float64_images(evaluator: Evaluat
     assert from64 == from32
 
 
-@pytest.mark.weights
-def test_evaluator_runs_lpips_without_tf32_and_restores_the_flag(
+def test_evaluator_runs_flip_in_ieee_float32_and_restores_the_flags(
     evaluator: Evaluator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """D-52, §2.4 Precision: cuDNN's TF32 flag is cleared for every LPIPS pass of the Evaluator
-    (LPIPS-Alex, LPIPS-VGG and lpips_vgg_raw), the convolutions the flag would reach, and
-    restored afterwards (Q-60)."""
-    from openftgs.losses import LPIPSLoss
+    """D-52, §2.4 Precision: the Evaluator's ꟻLIP, a convolution and a matrix product, runs in
+    IEEE float32, with cuDNN's TF32 flag cleared and float32 matrix products at "highest"
+    precision, and both are restored afterwards (Q-60)."""
+    from openftgs.losses import PerceptualLoss
 
-    seen: list[tuple[bool, bool]] = []
-    original = LPIPSLoss.forward
+    seen: list[tuple[bool, str]] = []
+    original = PerceptualLoss.forward
 
-    def spy(self: LPIPSLoss, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
-        seen.append((torch.backends.cudnn.allow_tf32, map_inputs))
-        return original(self, pred, gt, map_inputs=map_inputs)
+    def spy(self: PerceptualLoss, pred: Tensor, gt: Tensor) -> Tensor:
+        seen.append((torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision()))
+        return original(self, pred, gt)
 
-    monkeypatch.setattr(LPIPSLoss, "forward", spy)
+    monkeypatch.setattr(PerceptualLoss, "forward", spy)
     pred, gt = _noisy_pair((40, 48, 3), seed=14)
-    before = torch.backends.cudnn.allow_tf32
+    before = (torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision())
     try:
         torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
         evaluator(pred, gt)
         assert torch.backends.cudnn.allow_tf32 is True
+        assert torch.get_float32_matmul_precision() == "high"
     finally:
-        torch.backends.cudnn.allow_tf32 = before
-    assert sorted(seen) == [(False, False), (False, True), (False, True)]
+        torch.backends.cudnn.allow_tf32 = before[0]
+        torch.set_float32_matmul_precision(before[1])
+    assert seen == [(False, "highest")]
 
 
 # Evaluating a model on a scene's images (Q-68).
@@ -846,7 +835,6 @@ def _scene_for_evaluation(root: Path) -> MultiViewVideo:
     return MultiViewVideo.from_manifest(write_scene(root, gt, images, mask_tests=True))
 
 
-@pytest.mark.weights
 def test_evaluate_images_are_the_evaluator_on_render_request_images(
     tmp_path: Path, evaluator: Evaluator
 ) -> None:
@@ -873,7 +861,6 @@ def test_evaluate_images_are_the_evaluator_on_render_request_images(
         assert metrics.entire == entire and metrics.dynamic == dynamic
 
 
-@pytest.mark.weights
 def test_evaluate_images_of_the_training_split(tmp_path: Path, evaluator: Evaluator) -> None:
     """Q-68: any data split; an empty one is a ValueError."""
     video = _scene_for_evaluation(tmp_path)
@@ -901,7 +888,6 @@ def _sharding_scene(root: Path) -> MultiViewVideo:
     return MultiViewVideo.from_manifest(write_scene(root, gt, images, mask_tests=True))
 
 
-@pytest.mark.weights
 def test_evaluate_images_sharded_on_the_cpu_equals_unsharded(
     tmp_path: Path, evaluator: Evaluator
 ) -> None:
@@ -917,7 +903,6 @@ def test_evaluate_images_sharded_on_the_cpu_equals_unsharded(
 
 
 @pytest.mark.gpu
-@pytest.mark.weights
 def test_evaluate_images_sharded_on_one_gpu_equals_unsharded(tmp_path: Path) -> None:
     """D-54 ("without changing results"), Q-175 (GPU): three shards on one GPU
     (`devices=["cuda:0"] * 3`, shards simulated as U-33 simulates them), each rendering on
@@ -941,36 +926,42 @@ def test_sharded_evaluation_clears_tf32_once_and_restores_it(
     in the caller's thread, around the whole run: the flag is already False whenever a shard's
     Evaluator is called in its thread, before any metric's own save and restore, and the
     caller's True is back afterwards, also when a render that isn't finite fails the data split
-    (Q-147). (The Evaluator is stood in for, so no LPIPS weights are needed.)"""
+    (Q-147); so is float32 matrix products' "highest" precision (D-52, Q-60). (The Evaluator is
+    stood in for, so that only the flags are seen.)"""
     import threading
 
     video = _sharding_scene(tmp_path)
     model = random_model(12, seed=1, sh_degree=1, time=video.time, spread=0.5)
-    seen: list[tuple[str, bool]] = []
+    seen: list[tuple[str, tuple[bool, str]]] = []
 
     def build(self: Evaluator, *, device: str | torch.device = "cuda") -> None:
         pass
 
     def call(self: Evaluator, pred: Tensor, gt: Tensor, *, mask: Tensor | None = None) -> Any:
-        seen.append((threading.current_thread().name, torch.backends.cudnn.allow_tf32))
+        flags = torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision()
+        seen.append((threading.current_thread().name, flags))
         return dict.fromkeys(METRIC_NAMES, 0.0), None
 
     monkeypatch.setattr(Evaluator, "__init__", build)
     monkeypatch.setattr(Evaluator, "__call__", call)
     kw: dict[str, Any] = {"backend": "reference", "devices": ["cpu"] * 3}
-    before = torch.backends.cudnn.allow_tf32
+    before = torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision()
     try:
         torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
         results = evaluate_images(model, video, Evaluator(), **kw)
         assert torch.backends.cudnn.allow_tf32 is True
+        assert torch.get_float32_matmul_precision() == "high"
         _broken_renders(monkeypatch, "alpha", math.nan)
         with pytest.raises(FloatingPointError):
             evaluate_images(model, video, Evaluator(), **kw)
         assert torch.backends.cudnn.allow_tf32 is True
+        assert torch.get_float32_matmul_precision() == "high"
     finally:
-        torch.backends.cudnn.allow_tf32 = before
+        torch.backends.cudnn.allow_tf32 = before[0]
+        torch.set_float32_matmul_precision(before[1])
     assert len(results) == len(seen) == 8
-    assert {flag for _, flag in seen} == {False}
+    assert {flags for _, flags in seen} == {(False, "highest")}
     assert {name for name, _ in seen} <= {f"evaluate_images shard {k}" for k in range(3)}
 
 

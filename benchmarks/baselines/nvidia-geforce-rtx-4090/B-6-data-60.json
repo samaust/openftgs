@@ -8,7 +8,7 @@
   "data",
   "/home/auss/datasets/openftgs-m15/ci-scene/scene-60.json",
   "--out",
-  "/home/auss/datasets/openftgs-m15/bench/ci-369-2/B-6-data-60.json"
+  "/tmp/claude-1000/-home-auss-git-repos-samaust-openftgs/1b5982bb-363c-4bde-8cc3-ea14bf605e75/scratchpad/impl-394/bench-394/B-6-data-60.json"
  ],
  "environment": {
   "gpu": {
@@ -24,7 +24,7 @@
   "python": "3.14.9",
   "openftgs": "0.1.0.dev0",
   "cpu": "12th Gen Intel(R) Core(TM) i9-12900",
-  "commit": "4cd737d1da5d405195c08676b3c7fef200b88c66",
+  "commit": "12e715d8de8f2c0a124061beca93bb0a5d92b4b1",
   "dirty": false
  },
  "scene": {
@@ -35,7 +35,7 @@
   "width": 1352,
   "height": 1014
  },
- "date": "2026-10-23T04:06:48+00:00",
+ "date": "2026-10-26T19:24:37+00:00",
  "setup": {
   "model": "synthesized (Q-168, Q-181)",
   "seed": 0,
@@ -67,7 +67,7 @@
     null
    ]
   ],
-  "configuration": "B-1's (#226): the default, LPIPS-VGG included, except growth.start = reloc.start = 100, growth.n_max = \u23081.02\u00b7N\u2309 and optim.sh_interval = 1; with the case's perf.frame_cache and perf.prefetch",
+  "configuration": "B-1's (#226): the default, \ua7fbLIP included at its calibrated weight, except growth.start = reloc.start = 100, growth.n_max = \u23081.02\u00b7N\u2309 and optim.sh_interval = 1; with the case's perf.frame_cache and perf.prefetch",
   "frame_cache": "built before timing",
   "gpu": "measured where \"auto\" would place the cache on the GPU (Q-99, Q-225, Q-232): a trainer decoding PNGs runs until the iteration that follows the first at the last training image size to appear (the second for one size), and the free memory, the working memory that iteration left reserved and growth are read after it",
   "warmup": 120,
@@ -97,26 +97,26 @@
     "placement": "gpu"
    },
    "figures": {
-    "data_share": 0.00036854532089450895,
-    "data_mean_s": 3.683709116610251e-05,
-    "data_median_s": 3.662109374946709e-05,
-    "iteration_mean_s": 0.09995267631317079,
+    "data_share": 0.002147304563067033,
+    "data_mean_s": 3.6979639210095946e-05,
+    "data_median_s": 3.686523437496092e-05,
+    "iteration_mean_s": 0.017221422543468763,
     "iterations": 198,
-    "data_host_mean_s": 3.060196688624494e-05,
-    "iteration_host_mean_s": 0.09805551006204703,
+    "data_host_mean_s": 3.1792330602654305e-05,
+    "iteration_host_mean_s": 0.0169711811068195,
     "host_iterations": 99,
-    "peak_allocated_bytes": 11252801536,
-    "peak_reserved_bytes": 11576279040,
-    "auto_free_bytes": 23584433664,
+    "peak_allocated_bytes": 6534466048,
+    "peak_reserved_bytes": 6954156032,
+    "auto_free_bytes": 23038738944,
     "auto_growth_bytes": 20640000,
-    "auto_allocated_bytes": 835983872,
-    "auto_reserved_bytes": 6541017088,
+    "auto_allocated_bytes": 796900864,
+    "auto_reserved_bytes": 1537212416,
     "auto_total_bytes": 25249579008,
-    "auto_outside_bytes": 829161472,
+    "auto_outside_bytes": 1413939200,
     "cache_bytes": 4688573760,
-    "auto_limit_bytes": 8919060224.0,
-    "beyond_estimate_bytes": 326048192,
-    "margin_used": 0.036471937965511805
+    "auto_limit_bytes": 11128573696.0,
+    "beyond_estimate_bytes": 707729856,
+    "margin_used": 0.06347800618925369
    }
   },
   {
@@ -126,16 +126,16 @@
     "prefetch": 8
    },
    "figures": {
-    "data_share": 0.0003660350510438788,
-    "data_mean_s": 3.663318574600934e-05,
-    "data_median_s": 3.6132812500255795e-05,
-    "iteration_mean_s": 0.10008108688372007,
+    "data_share": 0.0021096642240906985,
+    "data_mean_s": 3.662448798335789e-05,
+    "data_median_s": 3.686523437496092e-05,
+    "iteration_mean_s": 0.01736033988970149,
     "iterations": 198,
-    "data_host_mean_s": 5.389492185033783e-05,
-    "iteration_host_mean_s": 0.09807468311816472,
+    "data_host_mean_s": 5.5384375343118054e-05,
+    "iteration_host_mean_s": 0.017113105234022093,
     "host_iterations": 99,
-    "peak_allocated_bytes": 6584126976,
-    "peak_reserved_bytes": 6861881344
+    "peak_allocated_bytes": 1867037696,
+    "peak_reserved_bytes": 2181038080
    }
   },
   {
@@ -145,16 +145,16 @@
     "prefetch": 0
    },
    "figures": {
-    "data_share": 0.0004548085651674018,
-    "data_mean_s": 4.543649770710944e-05,
-    "data_median_s": 3.6132812500255795e-05,
-    "iteration_mean_s": 0.09990246707509914,
+    "data_share": 0.0026385274653360847,
+    "data_mean_s": 4.5512821795795124e-05,
+    "data_median_s": 3.588867187520606e-05,
+    "iteration_mean_s": 0.01724932652539127,
     "iterations": 198,
-    "data_host_mean_s": 0.00043801660061522265,
-    "iteration_host_mean_s": 0.09803266797892073,
+    "data_host_mean_s": 0.0004313482510189366,
+    "iteration_host_mean_s": 0.017052159003791107,
     "host_iterations": 99,
-    "peak_allocated_bytes": 6550470656,
-    "peak_reserved_bytes": 6840909824
+    "peak_allocated_bytes": 1833315840,
+    "peak_reserved_bytes": 2160066560
    }
   },
   {
@@ -163,16 +163,16 @@
     "placement": "off"
    },
    "figures": {
-    "data_share": 0.020617059059848408,
-    "data_mean_s": 0.0021063636825514433,
-    "data_median_s": 0.0017929687500002345,
-    "iteration_mean_s": 0.10216605949650566,
+    "data_share": 0.6270266692233162,
+    "data_mean_s": 0.02994372590755893,
+    "data_median_s": 0.03186633110046398,
+    "iteration_mean_s": 0.047755107361939726,
     "iterations": 198,
-    "data_host_mean_s": 0.0372077225833294,
-    "iteration_host_mean_s": 0.10065645502816717,
+    "data_host_mean_s": 0.03950302754034937,
+    "iteration_host_mean_s": 0.04820615373612993,
     "host_iterations": 99,
-    "peak_allocated_bytes": 6549401088,
-    "peak_reserved_bytes": 6798966784
+    "peak_allocated_bytes": 1833777664,
+    "peak_reserved_bytes": 2139095040
    }
   },
   {
@@ -181,26 +181,26 @@
     "placement": "gpu"
    },
    "figures": {
-    "data_share": 0.0003496767407025325,
-    "data_mean_s": 3.8771506253042144e-05,
-    "data_median_s": 3.857421874942091e-05,
-    "iteration_mean_s": 0.11087813897815064,
+    "data_share": 0.0013715275346842463,
+    "data_mean_s": 3.882312865322901e-05,
+    "data_median_s": 3.881835937513678e-05,
+    "iteration_mean_s": 0.02830648869340191,
     "iterations": 198,
-    "data_host_mean_s": 3.099644725972956e-05,
-    "iteration_host_mean_s": 0.10882368443399724,
+    "data_host_mean_s": 3.156168715595597e-05,
+    "iteration_host_mean_s": 0.027709374682874315,
     "host_iterations": 99,
-    "peak_allocated_bytes": 13017206272,
-    "peak_reserved_bytes": 16414408704,
-    "auto_free_bytes": 21995639808,
+    "peak_allocated_bytes": 10074373632,
+    "peak_reserved_bytes": 12339642368,
+    "auto_free_bytes": 21468888064,
     "auto_growth_bytes": 61920000,
-    "auto_allocated_bytes": 2396728320,
-    "auto_reserved_bytes": 8329887744,
+    "auto_allocated_bytes": 2345780224,
+    "auto_reserved_bytes": 4632608768,
     "auto_total_bytes": 25249579008,
-    "auto_outside_bytes": 857210880,
+    "auto_outside_bytes": 1434910720,
     "cache_bytes": 4688573760,
-    "auto_limit_bytes": 7969320192.0,
-    "beyond_estimate_bytes": 3334027200,
-    "margin_used": 0.4151322984115278
+    "auto_limit_bytes": 9529109760.0,
+    "beyond_estimate_bytes": 2956539840,
+    "margin_used": 0.3082609390214216
    }
   }
  ],
@@ -212,7 +212,7 @@
    },
    "figure": "data_share",
    "limit": 0.01,
-   "value": 0.00036854532089450895,
+   "value": 0.002147304563067033,
    "pass": true,
    "kind": "budget"
   },
@@ -224,7 +224,7 @@
    },
    "figure": "data_share",
    "limit": 0.01,
-   "value": 0.0003660350510438788,
+   "value": 0.0021096642240906985,
    "pass": true,
    "kind": "budget"
   },
@@ -236,7 +236,7 @@
    },
    "figure": "data_share",
    "limit": 0.01,
-   "value": 0.0004548085651674018,
+   "value": 0.0026385274653360847,
    "pass": true,
    "kind": "budget"
   }

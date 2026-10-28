@@ -5,7 +5,9 @@ the L1 tier, the exit codes and `rerun`. A stub adapter answers `info`, and a st
 module produces checks, so these tests don't depend on any real level."""
 
 import json
+import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ from ftgs_harness.info import choose_tier, info_problems
 from ftgs_harness.report import build_report, render_markdown
 
 HERE = Path(__file__).parent
+ROOT = HERE.parents[1]
 STUB = f"{sys.executable} {HERE / 'stub_adapter.py'}"
 
 # §3.3's example: the top-level keys of report.json and of a check.
@@ -262,20 +265,15 @@ def test_runner_fails_the_check_of_an_incomplete_info_reply(
 
 
 @pytest.mark.parametrize(
-    ("settings", "reduced", "named"),
-    [
-        ({}, False, []),
-        ({"l2": {"queries": 2}}, True, ["case sizes"]),
-        ({"l2": {"lpips": False}}, True, ["LPIPS"]),
-        ({"l1": {"items": 10}, "l2": {"lpips": False}}, True, ["case sizes", "LPIPS"]),
-    ],
+    ("settings", "reduced"),
+    [({}, False), ({"l2": {"queries": 2}}, True), ({"l1": {"items": 10}}, True)],
 )
-def test_runner_marks_smaller_case_sizes_or_lpips_off_as_a_reduced_run(
-    tmp_path: Path, fake_l0: None, settings: dict[str, Any], reduced: bool, named: list[str]
+def test_runner_marks_smaller_case_sizes_as_a_reduced_run(
+    tmp_path: Path, fake_l0: None, settings: dict[str, Any], reduced: bool
 ) -> None:
-    """Q-203, Q-212: a run is reduced when a case size is below §3.3's or `l2.lpips` is false,
-    whatever levels it ran; report.md's header names what is reduced, and a reduced run fails
-    nothing by being reduced."""
+    """Q-203, Q-255: a run is reduced when a case size is below §3.3's, whatever levels it ran,
+    and only then; report.md's header names the case sizes, and a reduced run fails nothing by
+    being reduced."""
     path = tmp_path / "settings.json"
     path.write_text(json.dumps(settings))
     assert _run(tmp_path, "--levels", "L0", "--settings", str(path)) == 0
@@ -283,9 +281,8 @@ def test_runner_marks_smaller_case_sizes_or_lpips_off_as_a_reduced_run(
     assert report["run"]["settings"]["reduced"] is reduced
     md = (tmp_path / "run" / "report.md").read_text().splitlines()
     header = next(line for line in md if line.startswith("Started "))
-    assert ("reduced" in header) is reduced
-    for what in ("case sizes", "LPIPS"):
-        assert (what in header) is (what in named), header
+    assert ("reduced: case sizes below §3.3's)" in header) is reduced, header
+    assert "LPIPS" not in header
 
 
 def test_runner_rerun_reproduces_one_check(
@@ -353,27 +350,54 @@ def test_configuration_errors_exit_2(tmp_path: Path, case: str) -> None:
     assert code == 2
 
 
-def test_a_non_empty_run_directory_or_bad_settings_exit_2(tmp_path: Path) -> None:
+def test_a_non_empty_run_directory_or_bad_settings_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     (tmp_path / "run").mkdir()
     (tmp_path / "run" / "x").write_text("")
     assert _run(tmp_path, "--levels", "L0") == 2
+    (tmp_path / "run" / "x").unlink()  # the settings below are refused on their own
     settings = tmp_path / "settings.json"
-    settings.write_text(json.dumps({"l1": {"items": 0}}))
-    assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 2
-    settings.write_text(json.dumps({"unknown": 1}))
-    assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 2
+    # Q-255: the l2.lpips switch is gone with its reduced run, so the key is refused.
+    for bad, named in (
+        ({"l1": {"items": 0}}, "l1.items"),
+        ({"unknown": 1}, "unknown"),
+        ({"l2": {"lpips": False}}, "l2 may hold only ['queries']"),
+    ):
+        settings.write_text(json.dumps(bad))
+        capsys.readouterr()
+        assert _run(tmp_path, "--levels", "L0", "--settings", str(settings)) == 2
+        assert named in capsys.readouterr().err
+        assert not (tmp_path / "run" / "run.json").exists()
 
 
-def test_l3_without_the_lpips_extra_is_exit_2(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _names(requirements: list[str]) -> list[str]:
+    """The distribution names of requirement strings."""
+    matches = [re.match(r"[A-Za-z0-9_.-]+", r) for r in requirements]
+    return [m.group(0) if m else "" for m in matches]
+
+
+def test_harness_extra_holds_torch_alone() -> None:
+    """Q-201, Q-254, Q-260: the harness requires NumPy, SciPy, safetensors and matplotlib;
+    its one extra, `[torch]`, holds torch alone, for L3's ꟻLIP, and lpips is gone."""
+    project = tomllib.loads((ROOT / "harness" / "pyproject.toml").read_text(encoding="utf-8"))
+    names = _names(project["project"]["dependencies"])
+    assert names == ["numpy", "scipy", "safetensors", "matplotlib"]
+    extras = project["project"]["optional-dependencies"]
+    assert list(extras) == ["torch"]
+    assert _names(extras["torch"]) == ["torch"]
+
+
+def test_l3_without_the_torch_extra_is_exit_2_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Q-201: L3 computes LPIPS itself, so without torch and lpips it is a configuration
-    error, before any adapter runs."""
+    """Q-254, Q-260: L3 computes ꟻLIP itself with torch, so without the `[torch]` extra it
+    is a configuration error, before any adapter runs, whose message names the extra."""
     import importlib.util
 
     real = importlib.util.find_spec
     monkeypatch.setattr(
-        importlib.util, "find_spec", lambda name, *a: None if name == "lpips" else real(name, *a)
+        importlib.util, "find_spec", lambda name, *a: None if name == "torch" else real(name, *a)
     )
     scene = tmp_path / "scene.json"
     scene.write_text("{}")
@@ -383,3 +407,4 @@ def test_l3_without_the_lpips_extra_is_exit_2(
     )
     assert _run(tmp_path, "--levels", "L3", "--settings", str(settings)) == 2
     assert not (tmp_path / "run" / "run.json").exists()
+    assert "ftgs-harness[torch]" in capsys.readouterr().err

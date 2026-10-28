@@ -541,6 +541,18 @@ def shortened_config(iterations: int, base: TrainConfig) -> TrainConfig:
     )
 
 
+def pre_549o_checkpoint(checkpoint: Path, out: Path, net: str = "vgg") -> Path:
+    """`checkpoint` as it would have been saved before revision 549o, written to `out`: its stored
+    configuration rewritten to name LPIPS's backbone `net`, at M17's λ_perc = 0.01, which
+    `config_from_dict` refuses since then (Q-247's fixture, #392)."""
+    from openftgs.io import load_checkpoint, save_checkpoint
+
+    state = load_checkpoint(checkpoint)
+    config = json.loads(json.dumps(state.config))
+    config["loss"] |= {"perc_net": net, "lambda_perc": 0.01}
+    return save_checkpoint(dataclasses.replace(state, config=config), out)
+
+
 # A textured plane that a dense matcher can match (#137): RoMa's tests need real images, which
 # the coordinate-encoded scenes of the init tests are not. The plane y = y₀ + v_y·τ carries a
 # seeded multi-octave value-noise texture that moves with it by (v_x, v_z)·τ; each pixel is the

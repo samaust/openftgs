@@ -9,6 +9,7 @@ Spec: §1.3, §2.2 (Full checkpoint), §2.4 rule 3, D-26, D-45. Band: Orchestrat
 import contextlib
 import dataclasses
 import hashlib
+import importlib
 import math
 import random
 import warnings
@@ -22,8 +23,10 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from openftgs._legacy import resume_refusal
 from openftgs._stages import point, stage
 from openftgs.config import (
+    LossConfig,
     PerfConfig,
     TrainConfig,
     config_from_dict,
@@ -49,7 +52,7 @@ from openftgs.eval import (
     write_metrics,
 )
 from openftgs.io import load_checkpoint
-from openftgs.losses import LPIPSLoss, total_loss
+from openftgs.losses import PerceptualLoss, total_loss
 from openftgs.model import FreeTimeGaussians
 from openftgs.optim import FTGSOptimizer, build_optimizer
 from openftgs.render import render
@@ -373,10 +376,56 @@ def _global_rng_restorer(rng: Mapping[str, Any]) -> Callable[[], None]:
 
 # Global PyTorch flags around a training iteration (Q-73).
 
-# Q-173 (changed, #326), Q-223: cuDNN autotuning during a training iteration that isn't
-# deterministic (§2.4 rule 2, D-52). B-4 measured it alone at +4.3 % and −1.0 % (#228); with the
-# perceptual network's NCHW inputs (_NCHWLPIPSLoss) at +7.2 % and +3.9 % (Calibration data).
-_AUTOTUNE = True
+# §2.4's perceptual-loss row, D-52; Q-173 (changed, #394), Q-272, Q-273 (changed, #428, #427):
+# per perceptual network, the precisions under which its training iterations autotune cuDNN
+# unless deterministic, read from B-4's recorded rerun (#394; the figures in Q-273's row, the
+# "tf32" ones also in the Calibration data) as the layout is: where
+# autotuning is at least 3 % faster than the same layout without it at both sizes in both runs,
+# the layout being the one the network takes at that precision. Under "tf32" it is Q-272's
+# adopted option, autotuning with NCHW inputs, against the plain path: vgg16_oxford +4.7 % /
+# +4.7 % on the CI scene and +3.4 % / +3.0 % on kitchen, alexnet_bvlc +15.0 % / +18.5 % and
+# +15.4 % / +16.7 %. Under "bf16", alexnet_bvlc with NCHW inputs, +82.9 % / +4.5 % and +83.0 % /
+# +4.5 %. Not under "ieee" (vgg16_oxford +1.2 % / +1.2 % and −3.3 % / −3.0 %, alexnet_bvlc −3.0 % /
+# +5.5 % and +9.7 % / −2.0 %), nor vgg16_oxford under "bf16" (+1.6 % / +0.7 % and −2.0 % /
+# +0.6 %), and B-4 measured no such gain for the other six networks. #427's runs, which time the
+# trainer's copy, add dinov2_b14 under "bf16" with the render's view, +4.6 % / +4.9 % and +4.6 % /
+# +5.0 %, never slower than without autotuning in six runs and at the same peak memory (the
+# owner's answer on #427), while alexnet_bvlc under "ieee", +3.1 % / +5.8 % and +3.1 % / +5.3 %
+# there, stays off: about 0.3 ms at 1352×1014 for a peak of 12.5 GiB allocated against 0.7 GiB.
+# Every other network and precision leaves the flag as the caller set it (Q-73), unless SSIM
+# runs through its PyTorch fallback on CUDA (`_ssim_fallback_on_cuda`), which autotuning made 7
+# to 11 % faster in both runs (Q-273, owner answer): then every network's iteration autotunes.
+# With no perceptual network the only cuDNN convolutions are the SSIM fallback's, so such an
+# iteration autotunes, as every one did since #326.
+_AUTOTUNED_PRECISIONS: dict[str, frozenset[str]] = {
+    "vgg16_oxford": frozenset({"tf32"}),
+    "alexnet_bvlc": frozenset({"tf32", "bf16"}),
+    "dinov2_b14": frozenset({"bf16"}),
+}
+# Q-42: the window and σ fused-ssim hardcodes (E7's); `losses.ssim` takes its PyTorch fallback for
+# any other.
+_FUSED_SSIM_WINDOW = (11, 1.5)
+
+
+def _fused_ssim_imports() -> bool:
+    """Q-2: whether fused-ssim imports in this process, as `losses.ssim` tries it on CUDA."""
+    try:
+        importlib.import_module("fused_ssim")
+    except ImportError:
+        return False
+    return True
+
+
+def _ssim_fallback_on_cuda(loss: LossConfig, device: torch.device) -> bool:
+    """Say whether a training iteration's SSIM runs through its PyTorch fallback on CUDA.
+
+    Q-273 (owner answer, 2026-10-26): a CUDA device's training image computed with
+    λ_ssim > 0, where fused-ssim doesn't import or the window and σ aren't the ones it
+    hardcodes (Q-42).
+    """
+    if device.type != "cuda" or loss.lambda_ssim <= 0.0:
+        return False
+    return (loss.ssim_window, loss.ssim_sigma) != _FUSED_SSIM_WINDOW or not _fused_ssim_imports()
 
 
 class _PlacementWait:
@@ -407,10 +456,11 @@ class _PlacementWait:
 
 
 @contextlib.contextmanager
-def _perf_flags(perf: PerfConfig) -> Iterator[None]:
+def _perf_flags(perf: PerfConfig, *, autotune: bool) -> Iterator[None]:
     """Set PerfConfig's process-global flags for one training iteration (Q-73).
 
-    They are restored afterwards.
+    They are restored afterwards. cuDNN autotuning is turned on when ``autotune`` and the run
+    isn't deterministic (Q-273).
     """
     cudnn = torch.backends.cudnn
     saved = (cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32)
@@ -429,8 +479,8 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
             cudnn.benchmark = False
             cudnn.deterministic = True
             torch.use_deterministic_algorithms(True, warn_only=True)
-        elif _AUTOTUNE:
-            cudnn.benchmark = True  # Q-173; otherwise the flag stays the caller's (Q-73)
+        elif autotune:
+            cudnn.benchmark = True  # Q-273; otherwise the flag stays the caller's (Q-73)
         yield
     finally:
         cudnn.benchmark, cudnn.deterministic, cudnn.allow_tf32 = saved
@@ -438,55 +488,136 @@ def _perf_flags(perf: PerfConfig) -> Iterator[None]:
         torch.set_float32_matmul_precision(matmul)
 
 
-# Q-173: the training perceptual network's weights in channels-last memory, turned on only when
-# B-4 shows a gain and B-1 is no worse (§2.4 rule 2, D-52). Off: B-4 measured +1.0 % and +2.9 %
-# at its two sizes (Calibration data, #228), with the inputs channels-last as `LPIPSLoss` views
-# a render's [..., H, W, 3] batch first; since #326 mostly NCHW (_perceptual_network, Q-223).
-_CHANNELS_LAST_WEIGHTS = False
+# Q-173, Q-269, Q-272, Q-273 (owner answer, 2026-10-26, during the #380 build's review): per
+# network, the (perc_precision, autotuned) pairs under which the trainer's network holds its
+# weights channels-last in memory. B-4's two runs with channels-last weights as a third layout for
+# the two Caffe trunks (Calibration data, #380's review) put them within −1.4 to +1.0 % of the
+# render's view with NCHW weights at every precision and autotuning, never Q-272's 3 % in both
+# runs. Against the plain path alexnet_bvlc's autotuning with them meets it (+6.1 to +9.9 %), as
+# autotuning alone does, below the autotuning with NCHW inputs it takes (+14.9 to +18.5 %). So no
+# network and no pair: every network keeps its weights as built, contiguous NCHW, as §2.4's
+# perceptual-loss row leaves them, now measured.
+_CHANNELS_LAST_WEIGHTS: dict[str, frozenset[tuple[str, bool]]] = {}
+
+# Q-273 (Q-223 as changed, #394): per network, the (perc_precision, autotuned) pairs under
+# which the trainer's network gets contiguous NCHW inputs, from B-4's recorded rerun (Calibration
+# data, #394). Under "tf32" with autotuning it is Q-272's adopted option; otherwise NCHW
+# where it was at least 3 % faster than the render's view at both sizes in both runs, at that
+# precision and autotuning: vgg16_oxford under "ieee" (+10 to +16 %), not under "bf16" (−7 to
+# −12 %) nor in a deterministic "tf32" run (−1 to −5 %); alexnet_bvlc everywhere (+3.5 to +88 %).
+# Every other network and pair takes the render's channels-last view as it comes. Where
+# `_AUTOTUNED_PRECISIONS` leaves the flag to the caller, vgg16_oxford under "ieee" and "bf16" and
+# alexnet_bvlc under "ieee", both pairs of the precision agree, so the layout is the same whether
+# the caller's flag or the SSIM fallback autotunes or not (Q-273, as changed, #428).
+_NCHW_INPUTS: dict[str, frozenset[tuple[str, bool]]] = {
+    "vgg16_oxford": frozenset({("ieee", False), ("ieee", True), ("tf32", True)}),
+    "alexnet_bvlc": frozenset(
+        (precision, autotuned)
+        for precision in ("ieee", "tf32", "bf16")
+        for autotuned in (False, True)
+    ),
+}
 
 
-# Q-173 (changed, #326), Q-223: B-4 measured NCHW inputs the fastest layout in IEEE float32, and
-# in TF32 with autotuning; slower in TF32 without it and in bfloat16, which keep the plain view.
-class _NCHWLPIPSLoss(LPIPSLoss):
-    """LPIPS whose network gets its two images as contiguous NCHW tensors, by a copy.
+# Q-273: a subclass in openftgs.train, so that `PerceptualLoss` and its other callers (the
+# evaluator, the harness's adapter) keep the render's view.
+class _NCHWPerceptualLoss(PerceptualLoss):
+    """Give a perceptual network both images as contiguous NCHW tensors, by a copy.
 
-    The trainer's network under `perc_precision` "ieee", and "tf32" with autotuning. The copy
-    is exact (§2.4 rule 2); the evaluator's networks stay plain.
+    The images are copied so that the batch-first views ``PerceptualLoss.forward`` takes of
+    the [..., H, W, 3] images are contiguous NCHW (Q-273). The copy is exact (§2.4 rule 2).
     """
 
-    def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
-        # [..., H, W, 3] in memory whose batch-first view, `LPIPSLoss`'s, is contiguous NCHW
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        # [..., H, W, 3] in memory whose batch-first view [..., 3, H, W] is contiguous
         pred, gt = (image.movedim(-1, -3).contiguous().movedim(-3, -1) for image in (pred, gt))
-        return super().forward(pred, gt, map_inputs=map_inputs)
+        return super().forward(pred, gt)
 
 
-# Q-172: autocast is local to the perceptual network, which only the trainer builds this way.
-class _Bf16LPIPSLoss(LPIPSLoss):
-    """LPIPS with its network run under bfloat16 autocast, returning float32 (D-52).
+# Q-172, Q-250, Q-251: autocast is local to the perceptual network, which only the trainer builds
+# this way; the bfloat16 path of LPIPS-VGG, before revision 549o, generalized to D-89's trunk
+# networks.
+class _Bf16PerceptualLoss(PerceptualLoss):
+    """Run a trunk network under bfloat16 autocast, returning float32 (D-52).
 
-    D-52's approximate option, `perc_precision = "bf16"`, autocast on the images' device. The
-    evaluator's networks stay float32 (#228).
+    D-52's approximate option, ``perc_precision = "bf16"``: the network runs under bfloat16
+    autocast on the images' device, the CPU included (Q-191). The images enter as float32, the
+    dtype of the networks' weights as built (Q-263, Q-265), and the module keeps its float32
+    weights and constants; only the operations autocast covers run in bfloat16. The
+    evaluator's networks stay float32.
     """
 
-    def forward(self, pred: Tensor, gt: Tensor, *, map_inputs: bool = True) -> Tensor:
-        # Q-191: on the CPU too; the network's own reductions as autocast leaves them.
+    def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
         with torch.autocast(pred.device.type, dtype=torch.bfloat16):
-            out = super().forward(pred, gt, map_inputs=map_inputs)
+            out = super().forward(pred, gt)
         return out.float()
 
 
-def _perceptual_network(perf: PerfConfig) -> type[LPIPSLoss]:
-    """Return the trainer's perceptual network for `perf`.
+class _Bf16NCHWPerceptualLoss(_Bf16PerceptualLoss, _NCHWPerceptualLoss):
+    """Run bfloat16's network (Q-172) with NCHW inputs (Q-273).
 
-    bf16's (Q-172), NCHW inputs where B-4 measured them faster (Q-223), else plain `LPIPSLoss`
-    with its channels-last view.
+    The copy, inside the autocast, then the network; alexnet_bvlc's under "bf16".
     """
-    if perf.perc_precision == "bf16":
-        return _Bf16LPIPSLoss
-    autotuned = _AUTOTUNE and not perf.deterministic
-    if perf.perc_precision == "ieee" or autotuned:
-        return _NCHWLPIPSLoss
-    return LPIPSLoss
+
+
+def _builds_perceptual(loss: LossConfig) -> bool:
+    """Say whether the trainer builds its perceptual network (D-77, Q-69, Q-249).
+
+    It does when λ_perc is None, which ``total_loss`` resolves to the network's calibrated
+    weight (D-89), or positive.
+    """
+    return loss.lambda_perc is None or loss.lambda_perc > 0.0
+
+
+def _autotunes(cfg: TrainConfig, device: torch.device) -> bool:
+    """Say whether a training iteration of `cfg` on `device` autotunes cuDNN (Q-273).
+
+    For an iteration that isn't deterministic: for the networks and precisions B-4 turned it on
+    for (as changed, #428, #427), without a perceptual network, and whenever SSIM runs through
+    its PyTorch fallback on CUDA (the owner's answer). Otherwise the iteration leaves the flag
+    as the caller set it (Q-73).
+    """
+    return (
+        not _builds_perceptual(cfg.loss)
+        or cfg.perf.perc_precision in _AUTOTUNED_PRECISIONS.get(cfg.loss.perc_net, frozenset())
+        or _ssim_fallback_on_cuda(cfg.loss, device)
+    )
+
+
+# Q-250: D-89's networks without trained weights, which have no bfloat16 path (B-4 measures
+# bfloat16 for the trunk networks only).
+_WEIGHT_FREE = ("flip", "haarpsi")
+
+
+def _check_perceptual(cfg: TrainConfig) -> None:
+    """Refuse bf16 with a weight-free network before anything is built (Q-250).
+
+    The ``TrainConfig`` stays valid on its own, so it can move to a trunk network. Without a
+    network (λ_perc = 0) nothing would run in bfloat16, and nothing is refused (Q-267).
+    """
+    net = cfg.loss.perc_net
+    # Q-267: refused only when the network is built.
+    if cfg.perf.perc_precision == "bf16" and net in _WEIGHT_FREE and _builds_perceptual(cfg.loss):
+        raise ValueError(
+            f"perf.perc_precision 'bf16' runs a trunk network in bfloat16 (D-52), and "
+            f"loss.perc_net {net!r} has no bfloat16 path: use 'tf32' or 'ieee', or a trunk network"
+        )
+
+
+def _perceptual_network(cfg: TrainConfig, device: torch.device) -> PerceptualLoss:
+    """Return the trainer's perceptual network for `cfg`, on the CPU (Q-273, Q-250).
+
+    With NCHW inputs where `_NCHW_INPUTS` puts them for its precision and its autotuning on
+    `device`, the autotuning `_autotunes` turns on at that precision, otherwise the render's
+    view as it comes (Q-273); a trunk network under bfloat16 autocast when asked (Q-250;
+    `_check_perceptual` refuses bf16 for the weight-free ones).
+    """
+    net, precision = cfg.loss.perc_net, cfg.perf.perc_precision
+    autotuned = _autotunes(cfg, device) and not cfg.perf.deterministic
+    nchw = (precision, autotuned) in _NCHW_INPUTS.get(net, frozenset())
+    if precision == "bf16":
+        return _Bf16NCHWPerceptualLoss(net) if nchw else _Bf16PerceptualLoss(net)
+    return _NCHWPerceptualLoss(net) if nchw else PerceptualLoss(net)
 
 
 def _check_ablation(cfg: TrainConfig) -> None:
@@ -608,7 +739,15 @@ class Trainer:
     ValueError
         If a model passed as ``init`` doesn't fit the run, ``init`` is neither initial points
         nor a model, the configuration sets ``reloc.prune_opacity`` with relocation on (Q-71),
-        or an explicitly placed frame cache can't be made (D-51).
+        ``perf.perc_precision`` is "bf16" with ``loss.perc_net`` "flip" or "haarpsi" and the
+        network is built (Q-250, Q-267), or an explicitly placed frame cache can't be made
+        (D-51).
+    ImportError
+        If ``loss.perc_net`` is a DINO network, the network is built and the ``[init]`` extra
+        isn't installed (Q-248).
+    OSError
+        If a trunk network's weights can't be downloaded, fail their check, or can't be
+        converted (Q-258).
     NotImplementedError
         If ``cfg.perf`` asks for an option that isn't built: ``images_per_step`` above 1
         (D-54), or ``slice_impl`` "cuda" (D-50).
@@ -618,6 +757,16 @@ class Trainer:
     Initial points become a model as §1.3 steps 7 to 9 say (D-24, D-74; Q-16), with the run's
     own initialization generator. A model passed in is copied, never modified or moved (Q-69).
     The spatial scale S comes from the dataset and ``cfg.scene_scale_factor`` (D-27).
+
+    The trainer builds one :class:`~openftgs.losses.PerceptualLoss` of ``cfg.loss.perc_net``
+    when ``cfg.loss.lambda_perc`` is None, its calibrated weight, or positive, and passes it to
+    :func:`~openftgs.losses.total_loss` (D-77; Q-69, Q-249); at λ_perc = 0 it builds none.
+    ``perf.perc_precision`` "bf16" runs a trunk network under bfloat16 autocast; with ``"flip"``
+    or ``"haarpsi"`` it is refused before anything is built, and accepted at λ_perc = 0, where
+    no network runs (Q-250, Q-267). The network's input layout and cuDNN autotuning follow
+    B-4's measurements per network and precision, with autotuning off in a deterministic run
+    (Q-251, Q-272, Q-273). Under ``perf.deterministic`` a DINO network warns and continues,
+    deterministic only up to floating-point reordering (Q-268).
 
     Examples
     --------
@@ -706,7 +855,10 @@ class Trainer:
 
         The checkpoint is read with :func:`~openftgs.io.load_checkpoint`, then
         :meth:`load_state_dict` continues its run. A checkpoint of another scene manifest is
-        refused unless forced; a forced resume keeps the run's τ₀, τ₁, S and Δt_f (Q-70).
+        refused unless forced; a forced resume keeps the run's τ₀, τ₁, S and Δt_f (Q-70). A
+        checkpoint saved before revision 549o, whose configuration names the old perceptual
+        backbone "vgg" or "alex", is refused before anything else, with a message naming 549o;
+        its model can still be read (Q-247).
 
         Parameters
         ----------
@@ -731,14 +883,20 @@ class Trainer:
         Raises
         ------
         ValueError
-            If the checkpoint can't be read, was made from another scene manifest and ``force``
-            is False, or holds a state that doesn't fit the dataset (:meth:`load_state_dict`),
-            or if ``perf`` differs from the checkpoint's where it must match.
+            If the checkpoint can't be read, was saved before revision 549o (Q-247), was made
+            from another scene manifest and ``force`` is False, or holds a state that doesn't
+            fit the dataset (:meth:`load_state_dict`), if ``perf`` differs from the
+            checkpoint's where it must match, or if the constructor would refuse its
+            configuration (bf16 with a weight-free network, Q-250).
         NotImplementedError
             If the performance settings ask for an option that isn't built, as for the
             constructor.
         """
         state = load_checkpoint(Path(directory))
+        # Q-247: the stored configuration first; its run trained with a network that is gone.
+        refusal = resume_refusal(state.config, f"checkpoint {directory}")
+        if refusal is not None:
+            raise ValueError(refusal)
         if state.scene_sha256 != dataset.manifest.sha256 and not force:
             raise ValueError(
                 f"checkpoint {directory} was made from the scene manifest {state.scene_sha256}, "
@@ -763,6 +921,7 @@ class Trainer:
     def _configure(self, cfg: TrainConfig, dataset: MultiViewVideo, device: str) -> None:
         _check_ablation(cfg)
         _check_perf(cfg.perf)
+        _check_perceptual(cfg)  # Q-250
         self._cfg = cfg
         self._dataset = dataset
         self._device = torch.device(device)
@@ -772,14 +931,24 @@ class Trainer:
         )
         self._training = [i for i, r in enumerate(dataset.records) if r.split == "train"]
         self._background = torch.tensor(cfg.background, dtype=torch.float32, device=self._device)
-        # D-77: one perceptual network, built only when its weight is positive; D-52: in bfloat16
-        # when asked (Q-172), otherwise with NCHW inputs where they are faster (Q-223).
-        self._perceptual: LPIPSLoss | None = None
-        if cfg.loss.lambda_perc > 0.0:
-            perceptual = _perceptual_network(cfg.perf)(cfg.loss.perc_net).to(self._device)
-            if _CHANNELS_LAST_WEIGHTS:  # Q-173
+        # D-77: one perceptual network, built when its weight is None or positive (Q-69, Q-249).
+        self._perceptual: PerceptualLoss | None = None
+        if _builds_perceptual(cfg.loss):
+            # Q-72: the vendored DINOv2 builders initialize their weights from torch's global
+            # CPU generator before the publisher's are loaded; its state is restored, so the
+            # trainer draws nothing from it.
+            with torch.random.fork_rng(devices=[]):
+                perceptual = _perceptual_network(cfg, self._device)
+            perceptual = perceptual.to(self._device)
+            # Q-173, Q-269: channels-last weights where B-4 measured them faster, at the
+            # network's precision and autotuning (none since #380's review).
+            autotuned = _autotunes(cfg, self._device) and not cfg.perf.deterministic
+            pair = (cfg.perf.perc_precision, autotuned)
+            if pair in _CHANNELS_LAST_WEIGHTS.get(cfg.loss.perc_net, frozenset()):
                 perceptual = perceptual.to(memory_format=torch.channels_last)
             self._perceptual = perceptual
+        # Q-273: per network and precision, as B-4 measured
+        self._autotune = _autotunes(cfg, self._device)
         self._evaluator: Evaluator | None = None
         self._frames: Prefetcher | None = None  # D-51: training images through the frame cache
         self._placement_wait: _PlacementWait | None = None  # "auto" pending on CUDA (Q-232)
@@ -953,10 +1122,10 @@ class Trainer:
         if it > cfg.optim.iterations:
             raise ValueError(f"the run is complete at iteration {run.iteration}")
         entry = calendar_entry(cfg, it)
-        # §3.4: the iteration's stages (B-1); the slice, rasterization and loss stages are
-        # render's, at_time's and total_loss's.
+        # §3.4: the iteration's stages (B-1); the slice and rasterization stages are render's
+        # (with at_time's on the reference backend, Q-274), the loss stages total_loss's.
         with stage("iteration"):
-            with _perf_flags(cfg.perf), torch.enable_grad():
+            with _perf_flags(cfg.perf, autotune=self._autotune), torch.enable_grad():
                 # Steps 1–2: the next image of the sampler, its normalized time and L_active.
                 index = run.sampler.next()
                 record = self._dataset.records[index]

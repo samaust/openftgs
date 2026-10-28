@@ -20,7 +20,7 @@ the glossary) stays outside the build and is linked on GitHub. Its tools are the
 PyTorch comes first; a CPU build is enough:
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e . --group docs
 sphinx-build -W --keep-going -b html docs docs/_build/html
 sphinx-build -b linkcheck docs docs/_build/linkcheck

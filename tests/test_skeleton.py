@@ -33,8 +33,16 @@ def _source_files() -> list[Path]:
     files: list[Path] = []
     for top in ("src", "harness/src", "tests", "scripts"):
         files.extend((ROOT / top).rglob("*.py"))
-    # D-65: the vendored RoMa keeps its upstream headers; openftgs._vendor's own __init__ doesn't.
-    return sorted(p for p in files if not p.is_relative_to(PACKAGE_DIR / "_vendor" / "romatch"))
+    # D-65: the vendored RoMa and ꟻLIP keep their upstream headers, and so do U-23's reference
+    # copy of ꟻLIP (Q-252) and the harness's own copy (Q-254); the _vendor packages' own
+    # __init__ files don't.
+    upstream = (
+        PACKAGE_DIR / "_vendor" / "romatch",
+        PACKAGE_DIR / "_vendor" / "flip" / "flip_loss.py",
+        HARNESS_DIR / "_vendor" / "flip" / "flip_loss.py",
+        ROOT / "tests" / "reference" / "flip",
+    )
+    return sorted(p for p in files if not any(p.is_relative_to(u) for u in upstream))
 
 
 def _package_of(path: Path) -> list[str]:
@@ -188,6 +196,48 @@ def test_shard_module_imports_nothing_from_openftgs() -> None:
     assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
 
 
+def test_weights_module_imports_nothing_from_openftgs() -> None:
+    """#384: the trunk networks' weights are a private top-level module that
+    `openftgs.losses` imports, of the same kind as the stage instrumentation, so it imports
+    nothing from openftgs itself (§2.1 bands) and nothing of the `[init]` extra (Q-248)."""
+    path = PACKAGE_DIR / "_weights.py"
+    assert path.is_file()
+    imported = {n.split(".")[0] for n in _imported_modules(path)}
+    assert imported & {"openftgs", "torchvision", "einops", "loguru"} == set()
+
+
+def test_caffe_trunks_module_imports_nothing_from_openftgs() -> None:
+    """#385: D-89's two Caffe trunks are a private top-level module that `openftgs.losses`
+    imports and passes the weights, of the same kind as `openftgs._weights`, so it imports
+    nothing from openftgs itself (§2.1 bands) and nothing of the `[init]` extra (Q-248)."""
+    path = PACKAGE_DIR / "_caffe_trunks.py"
+    assert path.is_file()
+    imported = {n.split(".")[0] for n in _imported_modules(path)}
+    assert imported & {"openftgs", "torchvision", "einops", "loguru"} == set()
+
+
+def test_legacy_module_imports_nothing_from_openftgs() -> None:
+    """#392 (Q-247): the settings before revision 549o, which `openftgs.config` refuses and the
+    checkpoint readers of `io`, `model`, `train` and `cli` handle, are a private top-level
+    module of the same kind as the stage instrumentation, so it imports nothing from openftgs
+    itself (§2.1 bands)."""
+    path = PACKAGE_DIR / "_legacy.py"
+    assert path.is_file()
+    assert {n for n in _imported_modules(path) if n.split(".")[0] == "openftgs"} == set()
+
+
+def test_no_module_imports_lpips() -> None:
+    """#392 (#380's contract step; §2.3: lpips leaves): no module of `openftgs` or
+    `ftgs_harness` imports lpips, at the top or inside a function."""
+    offenders = [
+        str(p.relative_to(ROOT))
+        for top in (PACKAGE_DIR, HARNESS_DIR)
+        for p in sorted(top.rglob("*.py"))
+        if any(n.split(".")[0] == "lpips" for n in _imported_modules(p))
+    ]
+    assert offenders == []
+
+
 def test_harness_never_imports_openftgs() -> None:
     offenders = [
         str(p.relative_to(ROOT))
@@ -231,3 +281,19 @@ def test_init_extra_lists_no_fused_local_corr() -> None:
     assert isinstance(project, dict)
     init = project["optional-dependencies"]["init"]
     assert "fused-local-corr" not in {_requirement_name(r) for r in init}
+
+
+def test_core_names_neither_lpips_nor_the_init_packages() -> None:
+    """§2.3 since revision 549o (#393): lpips leaves the core, and tqdm, which only lpips
+    brought, with it; torchvision, einops and loguru are the `[init]` extra's alone, which the
+    four DINO networks need (Q-248); and torchmetrics leaves the dev set. No extra names lpips,
+    tqdm or torchmetrics."""
+    project = _pyproject(ROOT / "pyproject.toml")["project"]
+    assert isinstance(project, dict)
+    core = {_requirement_name(r) for r in project["dependencies"]}
+    assert core & {"lpips", "tqdm", "torchvision", "einops", "loguru", "torchmetrics"} == set()
+    extras = project["optional-dependencies"]
+    for name, extra in extras.items():
+        named = {_requirement_name(r) for r in extra}
+        assert named & {"lpips", "tqdm", "torchmetrics"} == set(), name
+    assert {"torchvision", "einops", "loguru"} <= {_requirement_name(r) for r in extras["init"]}
