@@ -231,8 +231,8 @@ class RelocConfig:  # E10, E11, §1.3 Relocation
     Parameters
     ----------
     enabled
-        Whether relocation runs; False only in the "w/o periodic relocation" ablation
-        [P §4.2].
+        Whether relocation runs; False only in the "w/o periodic relocation" ablation, which
+        §1.3 tags [P §4.2]; untagged in §2.1.
     every
         The period of relocation events, in iterations, ≥ 1; growth events share it [P §3.3].
     start
@@ -257,8 +257,9 @@ class RelocConfig:  # E10, E11, §1.3 Relocation
         leaves the copies on the target (U-13) [D-15].
     prune_opacity
         The opacity below which primitives are pruned at growth events, in (0, 1), or None for
-        no pruning; set, to 0.005, only in the ablation with relocation off (Q-71)
-        [L: 3DGS §5.2].
+        no pruning; set, to 0.005, only in the ablation with relocation off (Q-71), whose
+        threshold §1.3 tags [L: 3DGS §5.2; thresholds from gsplat DefaultStrategy]; untagged in
+        §2.1.
 
     Raises
     ------
@@ -394,7 +395,9 @@ class PerfConfig:  # §2.4 Settings
     slice_impl
         The implementation of the fused temporal slice: ``"eager"`` plain PyTorch,
         ``"compiled"`` through torch.compile, ``"cuda"`` the custom operator, or ``"auto"``,
-        which compiles on CUDA and stays eager on the CPU [D-50].
+        which compiles on CUDA and stays eager on the CPU [D-50]. The custom operator isn't
+        built: the trainer refuses ``"cuda"`` with :exc:`NotImplementedError` (D-50; Q-13 as
+        changed).
     packed
         Whether gsplat runs in packed mode; on by default, gsplat's default, which B-2 kept
         [D-57; Q-187].
@@ -405,7 +408,8 @@ class PerfConfig:  # §2.4 Settings
         Where the uint8 frame cache lives: ``"gpu"``, ``"mmap"`` memory-mapped, ``"off"``
         none, or ``"auto"``, on the GPU when it fits and memory-mapped otherwise [D-51].
     prefetch
-        How many images ahead of the sampler the prefetcher loads, ≥ 0 [D-51].
+        How many images ahead of the sampler the prefetcher loads, ≥ 0; untagged in §2.4,
+        whose prose gives the 8 and whose prefetcher is D-51's.
     log_every
         Every how many iterations the loss terms are read and their means reported, ≥ 1
         (§2.4 rule 3; Q-69); untagged in §2.4.
@@ -419,7 +423,8 @@ class PerfConfig:  # §2.4 Settings
         ``"selective"``, which is approximate [D-53].
     images_per_step
         Images per training step, ≥ 1; more than 1 is approximate and uses several GPUs
-        [D-54].
+        [D-54]. Training on several GPUs isn't built: the trainer refuses any value but 1 with
+        :exc:`NotImplementedError` (Q-177).
     deterministic
         Whether cuDNN autotuning is off and PyTorch's deterministic kernels are used where it
         has them; RoMa initialization always runs this way [D-56].
