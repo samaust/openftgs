@@ -67,7 +67,54 @@ In all three, gsplat 1.5.3 (`UNKNOWN`) matched its existing sign-off, and no row
 | `venv-suite-314-370b` (CI's) | 3.14.9 | 2.15.0+cpu | 60 | Passed (exit 0); as `venv-suite-311-370b` |
 | `venv-cuda-314-370b` (CUDA) | 3.14.9 | 2.15.0 (cu132) | 79 | **Failed (exit 1): open, put to the owner.** torch 2.15.0's CUDA 13.2 wheel brings new versions of the NVIDIA runtime wheels, so 12 of the 16 sign-offs are void (version changed) and one wheel is new (`nvidia-cuda-cccl`): `cuda-toolkit` 13.2.2 (`UNKNOWN`) and `nvidia-cublas` 13.4.1.3, `nvidia-cuda-cccl` 13.3.4.3.1, `nvidia-cuda-cupti`, `nvidia-cuda-nvrtc` and `nvidia-cuda-runtime` 13.2.86, `nvidia-cudnn-cu13` 9.26.0.51, `nvidia-cufft` 12.2.0.57, `nvidia-cufile` 1.17.1.22, `nvidia-cusolver` 12.2.0.11, `nvidia-cusparse` 12.7.10.12, `nvidia-nvshmem-cu13` 3.7.2 and `nvidia-nvtx` 13.2.86 (`LicenseRef-NVIDIA-Proprietary`), each installed by torch, directly or through `cuda-toolkit`'s extras. `nvidia-cusparselt-cu13` 0.8.1, `nvidia-nccl-cu13` 2.30.7 and `nvidia-nvjitlink` 13.4.92 still match their sign-offs; `nvidia-curand` is no longer installed. Nothing was signed off |
 
-The bundled-library inventory differs from the one above in the same way: torch 2.15.0 (both builds) now also bundles `torch/lib/libgfortran.so.5`, beside the `libgomp.so.1` signed off for torch 2.14.1; torchvision is 0.29.2 (libcudart and libnvjpeg in its CUDA wheel) and triton 3.9.0 (CUPTI, and a new `triton/backends/amd/lib/libtriton_amd_codegen.so`), where the sign-offs name 0.29.1 and 3.8.0. Open with the owner, with the CUDA rows (Q-4).
+The bundled-library inventory differs from the one above in the same way: torch 2.15.0 (both builds) now also bundles `torch/lib/libgfortran.so.5`, beside the `libgomp.so.1` signed off for torch 2.14.1; torchvision is 0.29.2 (libcudart and libnvjpeg in its CUDA wheel) and triton 3.9.0 (CUPTI, and a new `triton/backends/amd/lib/libtriton_amd_codegen.so`), where the sign-offs name 0.29.1 and 3.8.0. Open with the owner, with the CUDA rows (Q-4); settled on 2026-10-28, below.
+
+**Sign-off table for torch 2.15.0's CUDA environment: signed off by the owner on 2026-10-28** (#370, owner's option (a) of 2026-10-28: read the new versions' notices, then a table; the answers follow the three batches). Each wheel's license metadata and notices were read in `venv-cuda-314-370b` and compared, file by file, with #366's versions in `venv-cuda-314-432` (source-log rows 483 to 488); license texts, metadata and binary strings only. None of these comes from openftgs's own requirements: torch's Linux CUDA 13.2 wheel requires them, directly or through `cuda-toolkit`'s extras (`nvidia-cuda-cccl` through `nvidia-nvshmem-cu13`), the user installs them with torch, and openftgs never redistributes them. The CUDA Toolkit EULA's Attachment A lists the portions that may be redistributed (row 331); openftgs redistributes none of them and uses them only through the user's torch. The table was put to the owner before any entry went into `scripts/license_signoff.json`, keyed on the package, the version and the license string shown.
+
+*Batch A: version changed, notice unchanged.* Each notice is byte-identical to the one signed off on 2026-10-23. Seven of them also changed their reported license string, from the classifier `Other/Proprietary License` to the expression `LicenseRef-NVIDIA-Proprietary` (marked †); `cuda-toolkit` had no notice then and has none now.
+
+| Package | Version (was) | Reported license | The wheel's notice: use and redistribution | Recommendation |
+| --- | --- | --- | --- | --- |
+| cuda-toolkit | 13.2.2 (13.0.3.0) | `UNKNOWN` | None: a meta-package with no files besides its metadata ("CUDA Toolkit meta-package"); its extras pull in the wheels below | Sign off, as on 2026-10-23 |
+| nvidia-cublas | 13.4.1.3 (13.1.1.3) | `LicenseRef-NVIDIA-Proprietary` | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-cuda-cupti | 13.2.86 (13.0.85) | `LicenseRef-NVIDIA-Proprietary` † | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-cuda-nvrtc | 13.2.86 (13.0.88) | `LicenseRef-NVIDIA-Proprietary` † | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-cuda-runtime | 13.2.86 (13.0.96) | `LicenseRef-NVIDIA-Proprietary` | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-cudnn-cu13 | 9.26.0.51 (9.24.0.43) | `LicenseRef-NVIDIA-Proprietary` | NVIDIA's license agreement for cuDNN, unchanged | Sign off |
+| nvidia-cufft | 12.2.0.57 (12.0.0.61) | `LicenseRef-NVIDIA-Proprietary` † | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-cufile | 1.17.1.22 (1.15.1.6) | `LicenseRef-NVIDIA-Proprietary` † | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-cusolver | 12.2.0.11 (12.0.4.66) | `LicenseRef-NVIDIA-Proprietary` † | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-cusparse | 12.7.10.12 (12.6.3.3) | `LicenseRef-NVIDIA-Proprietary` † | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-nvshmem-cu13 | 3.7.2 (3.4.5) | `LicenseRef-NVIDIA-Proprietary` | CUDA Toolkit EULA, unchanged | Sign off |
+| nvidia-nvtx | 13.2.86 (13.0.85) | `LicenseRef-NVIDIA-Proprietary` † | Apache-2.0, unchanged (its metadata says proprietary; its notice is Apache-2.0) | Sign off |
+
+*Batch B: new.* No notice changed text; the one new wheel:
+
+| Package | Version | Reported license | The wheel's notices: use and redistribution | Recommendation |
+| --- | --- | --- | --- | --- |
+| nvidia-cuda-cccl | 13.3.4.3.1 (new; required by nvidia-nvshmem-cu13) | `LicenseRef-NVIDIA-Proprietary` | The CUDA Toolkit EULA (`License.txt`, the same text as the others), and CCCL's own `nvidia/cu13/cccl/LICENSE`: Thrust Apache-2.0, libcu++ Apache-2.0 WITH LLVM-exception, CUB BSD-3-Clause, with the legacy LLVM (NCSA, MIT) and FreeBSD notices for parts; all permissive | Sign off |
+
+*Batch C: libraries bundled in dependency wheels.* The rule of "Libraries bundled in dependency wheels" above: GPL with a runtime exception, and proprietary libraries inside a permissive wheel, go to the owner.
+
+| Library | Bundled by (was) | License, and where it is stated | Recommendation |
+| --- | --- | --- | --- |
+| libgfortran (`torch/lib/libgfortran.so.5`, new in torch) | torch 2.15.0+cpu and 2.15.0 (new) | No notice in torch's wheel. GCC's Fortran runtime by its `GFORTRAN_8` and `GCC_*` symbol versions: GPL-3.0-or-later WITH GCC-exception-3.1, as numpy's notice states for the same library | Sign off, as for numpy, scipy and opencv-python-headless |
+| libgomp (`torch/lib/libgomp.so.1`) | torch 2.15.0+cpu and 2.15.0 (2.14.1+cpu and 2.14.1) | No notice in torch's wheel; GCC's OpenMP runtime (`GOMP_1.0` to `GOMP_5.0`): GPL-3.0-or-later WITH GCC-exception-3.1 | Sign off for 2.15.0 |
+| libcudart, libnvjpeg (`torchvision.libs/`) | torchvision 0.29.2, CUDA build (0.29.1) | No notice in torchvision's wheel (its BSD-3-Clause `LICENSE`, unchanged). NVIDIA's CUDA runtime and nvJPEG, listed in Attachment A of the unchanged CUDA Toolkit EULA as distributable | Sign off for 0.29.2 |
+| CUPTI (`triton/backends/nvidia/lib/cupti*/`) | triton 3.9.0 (3.8.0) | No notice in triton's wheel (its MIT `LICENSE`, unchanged); both copies byte-identical to 3.8.0's; listed in Attachment A of the CUDA Toolkit EULA as distributable | Sign off for 3.9.0 |
+| `libtriton_amd_codegen.so` (`triton/backends/amd/lib/`, new) | triton 3.9.0 (new) | triton's own AMD backend, built with LLVM's AMDGPU code generator by its strings; triton's notice is MIT, and LLVM's license, Apache-2.0 WITH LLVM-exception, isn't shipped. Both permissive; it isn't loaded on NVIDIA hardware | Pass, as triton's own libraries under "Unrecognised layouts" above; listed for the owner since the wheel ships no LLVM notice |
+
+**Sign-off, 2026-10-28.** The owner, in the build session: on batch A, "Yes, sign off all 12"; on batch B, "Yes, sign it off"; on batch C, "Yes, all of batch C", with `libtriton_amd_codegen.so` passing as one of triton's own libraries, like `libtriton.so`, the missing LLVM notice noted. Batches A and B are 13 entries of `scripts/license_signoff.json`, keyed on the package, its exact version and the reported license string above, with the wheel's notice as `actual`, the reason "Installed by torch's Linux CUDA 13.2 wheel, not by openftgs; installed by the user and never redistributed (Q-4)", source-log rows 483 to 485 and the owner's answer as their source, and the date 2026-10-28. #366's entries for the torch 2.14.1 wheels stay in the file as the owner's record for that environment; the scan reports entries that match no installed distribution as stale, a warning only. Batch C is recorded under "Libraries bundled in dependency wheels" below.
+
+**Rerun after the sign-offs**, on 2026-10-28, from `ticket-370-release` at 7359b01 (the 13 entries added), `python scripts/license_scan.py` and `scripts/bundled_libs.py` with each environment's interpreter, as CI's licenses job runs the scan:
+
+| Environment | Python | torch | Distributions | Result |
+| --- | --- | --- | --- | --- |
+| `venv-suite-311-370b` (CI's) | 3.11.17 | 2.15.0+cpu | 60 | Passed (exit 0); gsplat signed off; the CUDA entries reported as stale, a warning only |
+| `venv-suite-314-370b` (CI's) | 3.14.9 | 2.15.0+cpu | 60 | Passed (exit 0); as `venv-suite-311-370b` |
+| `venv-cuda-314-370b` (CUDA) | 3.14.9 | 2.15.0 (cu132) | 79 | **Passed (exit 0)**: gsplat and 16 NVIDIA rows signed off (the 13 new entries, and cusparselt 0.8.1, nccl 2.30.7 and nvjitlink 13.4.92 from 2026-10-23); 13 of #366's entries stale (the 12 superseded versions and nvidia-curand, no longer installed) |
+
+The bundled-library inventory is unchanged from the 2026-10-28 run above in all three environments. `tests/test_license_scan.py`, `tests/test_bundled_libs.py` and `tests/test_skeleton.py` pass (146 tests).
 
 The code openftgs now carries from other projects is covered by NOTICE, not by the scan, which sees installed distributions only: the vendored ꟻLIP loss (`openftgs._vendor.flip`, BSD-3-Clause, with its license file and VENDOR.json; D-65, D-89) and the HaarPSI adapted from piq 0.8.0 in `openftgs.losses` (Apache-2.0, attribution in the code; §2.3). Both are named in NOTICE, checked under "The vendored ꟻLIP" below.
 
@@ -119,10 +166,14 @@ The notices were then read, each distribution's own LICENSE first (source-log ro
 | FFmpeg (libavcodec, libavformat, libavutil, libswresample, libswscale) | LGPL-2.1 | opencv-python-headless 5.0.0.93 | all three |
 | libgfortran | GPL-3.0-or-later WITH GCC-exception-3.1 | numpy, scipy, opencv-python-headless (versions as above) | all three |
 | libgomp | GPL-3.0-or-later WITH GCC-exception-3.1 | torch 2.14.1+cpu and 2.14.1 | all three |
+| libgfortran | GPL-3.0-or-later WITH GCC-exception-3.1 | torch 2.15.0+cpu and 2.15.0 (new in torch; no notice in its wheel; GCC's Fortran runtime by its symbol versions) | `venv-suite-311-370b`, `venv-suite-314-370b`, `venv-cuda-314-370b` (signed off 2026-10-28, #370) |
+| libgomp | GPL-3.0-or-later WITH GCC-exception-3.1 | torch 2.15.0+cpu and 2.15.0 | the same three (signed off 2026-10-28, #370) |
 
 **Put to the owner as well** (not in the ticket's sign-off rule, but proprietary or unknown, which Q-4 sends to a sign-off when it is a distribution's declared license): NVIDIA's libcudart and libnvjpeg inside torchvision 0.29.1's CUDA wheel; NVIDIA's CUPTI inside triton 3.8.0; libdrm inside opencv-python-headless 5.0.0.93, for which no installed wheel ships a notice.
 
 **Sign-off, 2026-10-23.** The owner, in the build session, on the four libraries of the table above: "Yes." On the three items put to them: "(a) for the NVIDIA ones and (c) for libdrm", that is, NVIDIA's libcudart and libnvjpeg in torchvision's CUDA wheel and NVIDIA's CUPTI in triton are signed off like the proprietary rows of the license scan, and libdrm's license is to be read on its own project first, passing with no sign-off if it is permissive.
+
+**Sign-off, 2026-10-28 (#370, torch 2.15.0).** Batch C of the license scan's sign-off table for torch 2.15.0 (License scan, above; source-log rows 486 to 488), on which the owner answered "Yes, all of batch C": libgfortran, new in torch 2.15.0, and libgomp in torch 2.15.0 (the two rows added to the table above); NVIDIA's libcudart and libnvjpeg inside torchvision 0.29.2's CUDA wheel and NVIDIA's CUPTI inside triton 3.9.0 (both CUPTI copies byte-identical to 3.8.0's), signed off like the proprietary rows of the license scan, as on 2026-10-23; and `triton/backends/amd/lib/libtriton_amd_codegen.so`, new in triton 3.9.0, which passes as one of triton's own libraries, like `libtriton.so` under "Unrecognised layouts" above: triton's AMD backend, built with LLVM's AMDGPU code generator, under triton's MIT license, with LLVM's license (Apache-2.0 WITH LLVM-exception) not shipped in the wheel, as noted.
 
 **libdrm, 2026-10-23: open** (settled on 2026-10-27, below). Its project's GitLab (`gitlab.freedesktop.org/mesa/drm`) refused the automated request, so its release tarball `https://dri.freedesktop.org/libdrm/libdrm-2.4.134.tar.xz`, the newest, was downloaded into the session's scratchpad and its file names listed: it has no LICENSE, COPYING or other license file. Its `README.rst`, the only top-level documentation, states no license. Nothing else of it was opened, since its license is stated only inside its source files and build files, which the clean-room rules don't open for a project whose license isn't established (source-log row 333). The owner decides how it is established.
 
