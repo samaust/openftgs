@@ -25,7 +25,8 @@ specification, milestones M0 to M18 of its plan. Its development status is alpha
   `export` and `bench`, each with its help text ({doc}`cli`). The second executable,
   `ftgs-adapter`, serves the differential harness.
 - **Initialization** from RoMa's dense matches, with a vendored copy of RoMa's inference code
-  (MIT, with DINOv2's layers under Apache-2.0), in the `[init]` extra.
+  (MIT, with DINOv2's layers under Apache-2.0), in the `[init]` extra, which brings torchvision,
+  einops and loguru, and tqdm for the code of XFeat that Tiny RoMa loads through torch.hub.
 - **Evaluation:** PSNR, SSIM, DSSIM and ꟻLIP on a scene's test views, written to METRICS.json,
   with the dynamic-region and fastest-frames metrics where a scene provides them.
 - **The perceptual network:** ꟻLIP (LDR) is the default perceptual network and the reported

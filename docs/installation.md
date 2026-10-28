@@ -32,8 +32,10 @@ pip install "openftgs[init]"
 
 `ftgs init roma` matches the training views with RoMa, whose inference code openftgs vendors as
 `openftgs._vendor.romatch` (D-65), with its license files. The extra adds the libraries that code
-imports (torchvision, einops and loguru) and requires torch ≥ 2.5.1. The matcher downloads its
-weights through `torch.hub` the first time it runs, and needs a CUDA device.
+imports (torchvision, einops and loguru), and tqdm, which XFeat's code imports when
+`RomaInitConfig.model = "tiny_roma_v1_outdoor"` loads it through `torch.hub` (Q-T370.1), and
+requires torch ≥ 2.5.1. The matcher downloads its weights through `torch.hub` the first time it
+runs, and needs a CUDA device.
 
 The four DINO perceptual networks (`dinov2_s14`, `dinov2_b14`, `dino_s16` and `dino_b16` as
 `loss.perc_net`) run on the vendored RoMa's DINOv2 layers, so they need the extra too: without
