@@ -8,7 +8,7 @@
   "raster",
   "/home/auss/datasets/openftgs-m15/ci-scene/scene.json",
   "--out",
-  "/home/auss/datasets/openftgs-m15/bench/ci-369-2/B-2-raster.json"
+  "/home/auss/datasets/openftgs-m15/bench/432/b2-run-1/B-2-raster.json"
  ],
  "environment": {
   "gpu": {
@@ -24,7 +24,7 @@
   "python": "3.14.9",
   "openftgs": "0.1.0.dev0",
   "cpu": "12th Gen Intel(R) Core(TM) i9-12900",
-  "commit": "4cd737d1da5d405195c08676b3c7fef200b88c66",
+  "commit": "8e0a5daf5d63c42d213a31bdf9f9ef02e2774498",
   "dirty": false
  },
  "scene": {
@@ -35,7 +35,7 @@
   "width": 1352,
   "height": 1014
  },
- "date": "2026-10-23T03:59:59+00:00",
+ "date": "2026-10-28T03:27:06+00:00",
  "setup": {
   "model": "synthesized (Q-168, Q-181)",
   "seed": 0,
@@ -147,14 +147,14 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.0026067194938659694,
-    "raster_s": 0.0016865277290344233,
-    "raster_forward_s": 0.0005201935768127408,
-    "raster_backward_s": 0.0010290870666503985,
-    "backward_s": 0.0012728314399719216,
+    "forward_backward_s": 0.002082942962646484,
+    "raster_s": 0.001748992919921876,
+    "raster_forward_s": 0.0005068802833557125,
+    "raster_backward_s": 0.0010371513366699212,
+    "backward_s": 0.0013424773216247545,
     "repetitions": 50,
-    "first_call_s": 0.05543431203113869,
-    "peak_memory_bytes": 775654912
+    "first_call_s": 0.05622280901297927,
+    "peak_memory_bytes": 776365056
    }
   },
   {
@@ -165,14 +165,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.002933761596679685,
-    "raster_s": 0.0020275230407714798,
-    "raster_forward_s": 0.0006584320068359351,
-    "raster_backward_s": 0.001181074380874636,
-    "backward_s": 0.0014578704833984255,
+    "forward_backward_s": 0.002419743537902833,
+    "raster_s": 0.0020874240398406985,
+    "raster_forward_s": 0.0007101440429687494,
+    "raster_backward_s": 0.0011779527664184542,
+    "backward_s": 0.001481328010559082,
     "repetitions": 50,
-    "first_call_s": 0.002930193964857608,
-    "peak_memory_bytes": 775654912,
+    "first_call_s": 0.002378688892349601,
+    "peak_memory_bytes": 776365056,
     "image_max_abs_diff": 0.0,
     "image_pixels_over_limit": 0,
     "precull_max_abs_diff": 0.0
@@ -186,13 +186,13 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.002901004791259758,
-    "raster_s": 0.00199372673034668,
-    "raster_forward_s": 0.00043929481506347484,
-    "raster_backward_s": 0.0013847389221191414,
-    "backward_s": 0.0016508655548095712,
+    "forward_backward_s": 0.002900485992431638,
+    "raster_s": 0.002568191528320305,
+    "raster_forward_s": 0.0009937915802001977,
+    "raster_backward_s": 0.0013945922851562528,
+    "backward_s": 0.0016752624511718744,
     "repetitions": 50,
-    "first_call_s": 0.002918889047577977,
+    "first_call_s": 0.0029769589891657233,
     "peak_memory_bytes": 979687424,
     "image_max_abs_diff": 1.7881393432617188e-07,
     "image_pixels_over_limit": 0
@@ -206,14 +206,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.0028231697082519505,
-    "raster_s": 0.0019107856750488206,
-    "raster_forward_s": 0.0006430740356445294,
-    "raster_backward_s": 0.001087421417236334,
-    "backward_s": 0.0013711395263671933,
+    "forward_backward_s": 0.002391550064086912,
+    "raster_s": 0.002057405471801752,
+    "raster_forward_s": 0.0007137298583984458,
+    "raster_backward_s": 0.0011482720375061047,
+    "backward_s": 0.0014479365348815934,
     "repetitions": 50,
-    "first_call_s": 0.002838331973180175,
-    "peak_memory_bytes": 775654912,
+    "first_call_s": 0.0023233380634337664,
+    "peak_memory_bytes": 776365056,
     "image_max_abs_diff": 1.7881393432617188e-07,
     "image_pixels_over_limit": 0,
     "precull_max_abs_diff": 0.0
@@ -272,14 +272,14 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.0034728927612304727,
-    "raster_s": 0.0025599999427795336,
-    "raster_forward_s": 0.0006891555786132861,
-    "raster_backward_s": 0.0017745933532714933,
-    "backward_s": 0.0019650573730468704,
+    "forward_backward_s": 0.0030540809631347636,
+    "raster_s": 0.002723834991455079,
+    "raster_forward_s": 0.0007321624755859402,
+    "raster_backward_s": 0.001899147510528572,
+    "backward_s": 0.0020828461647033674,
     "repetitions": 50,
-    "first_call_s": 0.003404804039746523,
-    "peak_memory_bytes": 807646208
+    "first_call_s": 0.003084984957240522,
+    "peak_memory_bytes": 779112448
    }
   },
   {
@@ -290,14 +290,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.004123645782470698,
-    "raster_s": 0.003206146240234381,
-    "raster_forward_s": 0.0009354209899902384,
-    "raster_backward_s": 0.0021708259582519512,
-    "backward_s": 0.0023592872619628905,
+    "forward_backward_s": 0.0035041275024414176,
+    "raster_s": 0.003178489685058586,
+    "raster_forward_s": 0.0009395122528076151,
+    "raster_backward_s": 0.0021514253616333016,
+    "backward_s": 0.002334751129150393,
     "repetitions": 50,
-    "first_call_s": 0.004099394951481372,
-    "peak_memory_bytes": 773714432,
+    "first_call_s": 0.003462346037849784,
+    "peak_memory_bytes": 773714944,
     "image_max_abs_diff": 0.0,
     "image_pixels_over_limit": 0,
     "precull_max_abs_diff": 0.0
@@ -311,13 +311,13 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.0036880149841308635,
-    "raster_s": 0.0027647991180419947,
-    "raster_forward_s": 0.0006809616088867196,
-    "raster_backward_s": 0.0019973077774047797,
-    "backward_s": 0.002183677673339851,
+    "forward_backward_s": 0.0036792297363281296,
+    "raster_s": 0.0033439178466797004,
+    "raster_forward_s": 0.0012339248657226576,
+    "raster_backward_s": 0.0020187354087829595,
+    "backward_s": 0.0022082562446594225,
     "repetitions": 50,
-    "first_call_s": 0.003782458952628076,
+    "first_call_s": 0.003794088028371334,
     "peak_memory_bytes": 981340672,
     "image_max_abs_diff": 0.0022356193512678146,
     "image_pixels_over_limit": 4
@@ -331,14 +331,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.00384875106811524,
-    "raster_s": 0.0029385595321655307,
-    "raster_forward_s": 0.0008427550792694076,
-    "raster_backward_s": 0.0019978256225585966,
-    "backward_s": 0.0021872634887695336,
+    "forward_backward_s": 0.0035589103698730473,
+    "raster_s": 0.0032309150695800787,
+    "raster_forward_s": 0.0009748535156250127,
+    "raster_backward_s": 0.0021643514633178755,
+    "backward_s": 0.002352638244628908,
     "repetitions": 50,
-    "first_call_s": 0.003911477979272604,
-    "peak_memory_bytes": 774652416,
+    "first_call_s": 0.003721649991348386,
+    "peak_memory_bytes": 776329216,
     "image_max_abs_diff": 0.0022356193512678146,
     "image_pixels_over_limit": 4,
     "precull_max_abs_diff": 0.0
@@ -397,14 +397,14 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.0075709381103515605,
-    "raster_s": 0.006660095214843745,
-    "raster_forward_s": 0.0019471354484558133,
-    "raster_backward_s": 0.004616706848144511,
-    "backward_s": 0.004806656837463385,
+    "forward_backward_s": 0.007953411102294916,
+    "raster_s": 0.007620094299316427,
+    "raster_forward_s": 0.002335237503051736,
+    "raster_backward_s": 0.005190658569335926,
+    "backward_s": 0.005378570556640622,
     "repetitions": 50,
-    "first_call_s": 0.007605681021232158,
-    "peak_memory_bytes": 1016509952
+    "first_call_s": 0.009127496043220162,
+    "peak_memory_bytes": 1083228160
    }
   },
   {
@@ -415,14 +415,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.010747924804687503,
-    "raster_s": 0.00982988166809081,
-    "raster_forward_s": 0.003028991699218747,
-    "raster_backward_s": 0.006693374633789079,
-    "backward_s": 0.006888458251953111,
+    "forward_backward_s": 0.009724411010742173,
+    "raster_s": 0.009383529663085935,
+    "raster_forward_s": 0.0029619140624999873,
+    "raster_backward_s": 0.006319000244140616,
+    "backward_s": 0.006515716552734391,
     "repetitions": 50,
-    "first_call_s": 0.01072107901563868,
-    "peak_memory_bytes": 1048555520,
+    "first_call_s": 0.009640794014558196,
+    "peak_memory_bytes": 1109903872,
     "image_max_abs_diff": 0.0,
     "image_pixels_over_limit": 0,
     "precull_max_abs_diff": 0.0
@@ -436,13 +436,13 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.006448135375976577,
-    "raster_s": 0.005535736083984361,
-    "raster_forward_s": 0.0015114269256591706,
-    "raster_backward_s": 0.003924087524414081,
-    "backward_s": 0.004114433288574207,
+    "forward_backward_s": 0.006388389587402352,
+    "raster_s": 0.006049294710159293,
+    "raster_forward_s": 0.002064384460449195,
+    "raster_backward_s": 0.003900932312011711,
+    "backward_s": 0.004091388702392576,
     "repetitions": 50,
-    "first_call_s": 0.006378768011927605,
+    "first_call_s": 0.006464362959377468,
     "peak_memory_bytes": 981340160,
     "image_max_abs_diff": 0.001383960247039795,
     "image_pixels_over_limit": 18
@@ -456,14 +456,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.009617401123046848,
-    "raster_s": 0.008711151123046879,
-    "raster_forward_s": 0.0026337280273437402,
-    "raster_backward_s": 0.005979422569274901,
-    "backward_s": 0.006167040824890136,
+    "forward_backward_s": 0.010331138610839834,
+    "raster_s": 0.009994747161865214,
+    "raster_forward_s": 0.0031744041442871157,
+    "raster_backward_s": 0.006724617004394529,
+    "backward_s": 0.006919166564941431,
     "repetitions": 50,
-    "first_call_s": 0.009722716000396758,
-    "peak_memory_bytes": 1010248704,
+    "first_call_s": 0.010340863023884594,
+    "peak_memory_bytes": 1204444160,
     "image_max_abs_diff": 0.001383960247039795,
     "image_pixels_over_limit": 18,
     "precull_max_abs_diff": 0.0
@@ -522,14 +522,14 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.006707324981689432,
-    "raster_s": 0.0038333473205566446,
-    "raster_forward_s": 0.000783355712890621,
-    "raster_backward_s": 0.0029567985534668002,
-    "backward_s": 0.003486724853515616,
+    "forward_backward_s": 0.00503462600708008,
+    "raster_s": 0.003958972930908196,
+    "raster_forward_s": 0.0007956428527832043,
+    "raster_backward_s": 0.0030622749328613266,
+    "backward_s": 0.00360448169708252,
     "repetitions": 50,
-    "first_call_s": 0.006676083023194224,
-    "peak_memory_bytes": 1942910464
+    "first_call_s": 0.005043643061071634,
+    "peak_memory_bytes": 1942943744
    }
   },
   {
@@ -540,14 +540,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.006863873958587647,
-    "raster_s": 0.003969535827636726,
-    "raster_forward_s": 0.0007982025146484398,
-    "raster_backward_s": 0.003073984146118161,
-    "backward_s": 0.0036080780029296867,
+    "forward_backward_s": 0.0050616321563720715,
+    "raster_s": 0.003993652343750001,
+    "raster_forward_s": 0.0008048629760742249,
+    "raster_backward_s": 0.0030938720703125033,
+    "backward_s": 0.0036311035156249977,
     "repetitions": 50,
-    "first_call_s": 0.006831077975220978,
-    "peak_memory_bytes": 1943361536,
+    "first_call_s": 0.005000425968319178,
+    "peak_memory_bytes": 1942456832,
     "image_max_abs_diff": 0.0,
     "image_pixels_over_limit": 0,
     "precull_max_abs_diff": 0.0
@@ -561,13 +561,13 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.008495101928710946,
-    "raster_s": 0.005600757598876974,
-    "raster_forward_s": 0.0010572853088379047,
-    "raster_backward_s": 0.00443905639648437,
-    "backward_s": 0.00498350524902344,
+    "forward_backward_s": 0.008505023956298832,
+    "raster_s": 0.00742758560180664,
+    "raster_forward_s": 0.002859512329101574,
+    "raster_backward_s": 0.004459007263183587,
+    "backward_s": 0.005001220703125003,
     "repetitions": 50,
-    "first_call_s": 0.008441838959697634,
+    "first_call_s": 0.008618152001872659,
     "peak_memory_bytes": 2558142976,
     "image_max_abs_diff": 0.0025762037839740515,
     "image_pixels_over_limit": 2
@@ -581,14 +581,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.006674514770507824,
-    "raster_s": 0.003800064086914065,
-    "raster_forward_s": 0.0007516174316406221,
-    "raster_backward_s": 0.0029557609558105227,
-    "backward_s": 0.0035020768642425376,
+    "forward_backward_s": 0.005079551696777339,
+    "raster_s": 0.004008956909179691,
+    "raster_forward_s": 0.0008227882385253849,
+    "raster_backward_s": 0.0030843811035156238,
+    "backward_s": 0.0036204032897949184,
     "repetitions": 50,
-    "first_call_s": 0.00662044296041131,
-    "peak_memory_bytes": 1944078336,
+    "first_call_s": 0.0050495280884206295,
+    "peak_memory_bytes": 1942456832,
     "image_max_abs_diff": 0.0025762037839740515,
     "image_pixels_over_limit": 2,
     "precull_max_abs_diff": 0.0
@@ -647,14 +647,14 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.009595581054687483,
-    "raster_s": 0.006747652411460874,
-    "raster_forward_s": 0.0016317596435546783,
-    "raster_backward_s": 0.0050042800903320195,
-    "backward_s": 0.005523961544036868,
+    "forward_backward_s": 0.008424671173095713,
+    "raster_s": 0.007353355407714854,
+    "raster_forward_s": 0.0018616409301757952,
+    "raster_backward_s": 0.005399047851562505,
+    "backward_s": 0.005925468444824236,
     "repetitions": 50,
-    "first_call_s": 0.009581824007909745,
-    "peak_memory_bytes": 1957819392
+    "first_call_s": 0.008432578993961215,
+    "peak_memory_bytes": 1951650816
    }
   },
   {
@@ -665,14 +665,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.011070463180541992,
-    "raster_s": 0.00819762802124023,
-    "raster_forward_s": 0.0020976668596267515,
-    "raster_backward_s": 0.0059832763671874845,
-    "backward_s": 0.006503540039062478,
+    "forward_backward_s": 0.00899941635131836,
+    "raster_s": 0.00793504714965821,
+    "raster_forward_s": 0.0020679626464843864,
+    "raster_backward_s": 0.005775482177734409,
+    "backward_s": 0.006296066284179669,
     "repetitions": 50,
-    "first_call_s": 0.011224387970287353,
-    "peak_memory_bytes": 1943545344,
+    "first_call_s": 0.009228663053363562,
+    "peak_memory_bytes": 1943362048,
     "image_max_abs_diff": 0.0,
     "image_pixels_over_limit": 0,
     "precull_max_abs_diff": 0.0
@@ -686,13 +686,13 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.010791915893554715,
-    "raster_s": 0.007916040420532233,
-    "raster_forward_s": 0.001791992187499994,
-    "raster_backward_s": 0.006008317947387674,
-    "backward_s": 0.006526117324829113,
+    "forward_backward_s": 0.010830924987792964,
+    "raster_s": 0.009768959045410162,
+    "raster_forward_s": 0.0036055107116699375,
+    "raster_backward_s": 0.006083625793457045,
+    "backward_s": 0.006607398986816421,
     "repetitions": 50,
-    "first_call_s": 0.01051365799503401,
+    "first_call_s": 0.010759909986518323,
     "peak_memory_bytes": 2559080448,
     "image_max_abs_diff": 0.002538323402404785,
     "image_pixels_over_limit": 6
@@ -706,14 +706,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.010387969970703126,
-    "raster_s": 0.007494148254394518,
-    "raster_forward_s": 0.0018815841674804934,
-    "raster_backward_s": 0.005508094787597645,
-    "backward_s": 0.006037490844726573,
+    "forward_backward_s": 0.009386611938476591,
+    "raster_s": 0.008323577880859384,
+    "raster_forward_s": 0.0021959838867187526,
+    "raster_backward_s": 0.006029663085937512,
+    "backward_s": 0.00655174255371091,
     "repetitions": 50,
-    "first_call_s": 0.010471549001522362,
-    "peak_memory_bytes": 1944026624,
+    "first_call_s": 0.009275043033994734,
+    "peak_memory_bytes": 1944027136,
     "image_max_abs_diff": 0.002538323402404785,
     "image_pixels_over_limit": 6,
     "precull_max_abs_diff": 0.0
@@ -772,14 +772,14 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.020670974731445295,
-    "raster_s": 0.017785854339599637,
-    "raster_forward_s": 0.005245952606201171,
-    "raster_backward_s": 0.01244419860839846,
-    "backward_s": 0.012977146148681645,
+    "forward_backward_s": 0.02211483693902845,
+    "raster_s": 0.021037597596645405,
+    "raster_forward_s": 0.006633514404296881,
+    "raster_backward_s": 0.0142811050415039,
+    "backward_s": 0.014818809509277345,
     "repetitions": 50,
-    "first_call_s": 0.020512825984042138,
-    "peak_memory_bytes": 2578192384
+    "first_call_s": 0.021787486970424652,
+    "peak_memory_bytes": 2863933952
    }
   },
   {
@@ -790,14 +790,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.030709209442138716,
-    "raster_s": 0.027838066101074227,
-    "raster_forward_s": 0.008458251953124996,
-    "raster_backward_s": 0.01930560302734377,
-    "backward_s": 0.019829849243164055,
+    "forward_backward_s": 0.02790196228027337,
+    "raster_s": 0.026834949493408145,
+    "raster_forward_s": 0.008475616455078105,
+    "raster_backward_s": 0.018265640258789018,
+    "backward_s": 0.018792968749999944,
     "repetitions": 50,
-    "first_call_s": 0.030545465007890016,
-    "peak_memory_bytes": 2670298112,
+    "first_call_s": 0.02756539301481098,
+    "peak_memory_bytes": 2942429696,
     "image_max_abs_diff": 0.0,
     "image_pixels_over_limit": 0,
     "precull_max_abs_diff": 0.0
@@ -811,13 +811,13 @@
     "precull": "internal"
    },
    "figures": {
-    "forward_backward_s": 0.017251327514648473,
-    "raster_s": 0.014407287597656304,
-    "raster_forward_s": 0.003987455725669862,
-    "raster_backward_s": 0.010345957040786703,
-    "backward_s": 0.010870758056640617,
+    "forward_backward_s": 0.017293823242187506,
+    "raster_s": 0.01623754882812503,
+    "raster_forward_s": 0.005786117553710973,
+    "raster_backward_s": 0.010318328857421899,
+    "backward_s": 0.010837005615234374,
     "repetitions": 50,
-    "first_call_s": 0.017069905996322632,
+    "first_call_s": 0.018010511994361877,
     "peak_memory_bytes": 2559567360,
     "image_max_abs_diff": 0.0010680556297302246,
     "image_pixels_over_limit": 15
@@ -831,14 +831,14 @@
     "precull": "compact"
    },
    "figures": {
-    "forward_backward_s": 0.027456542968749997,
-    "raster_s": 0.024573471069335995,
-    "raster_forward_s": 0.0072678527832031325,
-    "raster_backward_s": 0.017200546264648425,
-    "backward_s": 0.017720840454101605,
+    "forward_backward_s": 0.029752822875976526,
+    "raster_s": 0.028691482543945268,
+    "raster_forward_s": 0.009001983642578065,
+    "raster_backward_s": 0.01951727294921879,
+    "backward_s": 0.020038818359374932,
     "repetitions": 50,
-    "first_call_s": 0.027484937047120184,
-    "peak_memory_bytes": 2643789312,
+    "first_call_s": 0.02977684698998928,
+    "peak_memory_bytes": 3220596736,
     "image_max_abs_diff": 0.0010680556297302246,
     "image_pixels_over_limit": 15,
     "precull_max_abs_diff": 0.0
