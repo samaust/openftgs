@@ -48,7 +48,8 @@ docstring (Q-243); the API pages render them.
   A function that returns None has no `Returns` section, except where the Python 3.11 build
   needs one: there sphinx-autodoc-typehints 3.6.1 can put its "Return type" line under the
   `Notes` heading and fail the build, which a `Returns` section holding just `None` prevents
-  (`FTGSOptimizer.step`, `write_metrics`).
+  (`FTGSOptimizer.step`, `reset_rows` and `resize_`, `GradStats.update`, `write_metrics` and
+  `Trainer.load_state_dict`).
 - `Raises` where the code raises for user input; `Notes` for the other spec citations;
   `Examples` on the entry points users call directly. Examples are shown, not run.
 - Tensors and arrays state their shape, dtype and range or units, as `[N, 3] float32`. Config

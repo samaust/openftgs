@@ -271,8 +271,7 @@ class RenderOutput:
     Parameters
     ----------
     image
-        The rendered colors composited over the background, [C, H, W, 3], ≥ 0 and not clamped
-        to 1.
+        The rendered colors composited over the background, [C, H, W, 3], not clamped to 1.
     alpha
         The accumulated opacity 1 − T_final, [C, H, W, 1], in [0, 1].
     means2d
