@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""render() with two backends, gsplat 1.5.3 (CUDA, float32, production) and reference (pure
-PyTorch, the readable oracle for tests); render_request(), which answers a render request with
-cameras batched per time; and, from M15, the temporal index used for rendering (D-55).
+"""Rendering: render() with its two backends, render_request() and the temporal index (D-55).
+
+render() has two backends, gsplat 1.5.3 (CUDA, float32, production) and reference (pure PyTorch,
+the readable oracle for tests); render_request() answers a render request with cameras batched per
+time and, from M15, uses the temporal index (D-55), which render() doesn't.
 
 Spec: E2, E5, E6, D-3, D-4, D-6, D-12, D-28, D-31, D-32, D-34, D-55, D-57. Band: Core model
 (§2.1).
@@ -90,15 +92,90 @@ def render(
     precull: _Precull = "internal",  # Q-31
     packed: bool = True,  # Q-36
 ) -> RenderOutput:
-    """Render `model` at one time from one or more cameras of the same size (E2, E5, E6).
+    """Render ``model`` at one time from one or more cameras of the same size (E6).
 
-    `timestamp` is a raw τ (`time_units="raw"`) or a normalized t. `sh_degree` limits the SH
-    bands (default: the model's degree). `background` is [3] or [C, 3], black by default (D-34).
-    `precull="compact"` applies the opacity cull of D-32 by compaction before the backend instead
-    of inside its projection (Q-31); images are unchanged. `packed` selects gsplat's packed mode
-    (D-57, Q-36); the reference backend is always unpacked. With `return_aux`, the output also
-    holds the 2D means, whose gradient is retained, the visibility mask and, in packed mode, the
-    primitive behind each row of the 2D means (Q-32, D-75, D-76).
+    The model is sliced at the time (:meth:`~openftgs.model.FreeTimeGaussians.at_time`), then
+    splatted and composited front to back over the background by E6, with colors from E2 and
+    covariances from E5. Rendering is differentiable with respect to the model's parameters.
+    The gsplat backend is the production one; the reference backend, in pure PyTorch, is the
+    readable oracle the tests compare it with, and also renders float64 models and runs on the
+    CPU.
+
+    Parameters
+    ----------
+    model
+        The model to render; the gsplat backend takes float32 models on a CUDA device only.
+    cameras
+        One camera or a non-empty sequence of them, all of one positive width and height, each
+        with ``K`` ``[3, 3]`` and ``world_to_camera`` ``[4, 4]``; only f_x, f_y, c_x, c_y, R_w
+        and t_w are read. C is the number of cameras.
+    timestamp
+        The time: a raw τ in the model's time unit with ``time_units="raw"``, or a normalized
+        t; a finite real number, not a bool. Outside the training range the motion extrapolates
+        linearly, with a warning (§1.4).
+    time_units
+        Whether ``timestamp`` is "raw" (the default) or "normalized".
+    sh_degree
+        The SH degree to render, from 0 to the model's degree; None, the default, renders every
+        band of the model.
+    background
+        The background color, ``[3]`` for every camera or ``[C, 3]``, nominally in [0, 1]; None,
+        the default, is black.
+    backend
+        "gsplat" (the default) or "reference".
+    return_aux
+        Whether the output also holds the 2D means, the visibility mask and, in packed mode, the
+        primitive behind each row of the 2D means.
+    precull
+        Where D-32's opacity cull happens: "internal" (the default) leaves it to the backend's
+        projection; "compact" applies it by compaction before the backend. The images are the
+        same.
+    packed
+        Whether gsplat runs in packed mode, True by default; the reference backend is always
+        unpacked.
+
+    Returns
+    -------
+    openftgs.types.RenderOutput
+        ``image`` ``[C, H, W, 3]``, in the model's dtype, not clamped to 1; ``alpha``
+        ``[C, H, W, 1]``, 1 − T_final, in [0, 1]. With ``return_aux``, also
+        ``means2d``, μ′ in pixels, 0 where a primitive isn't visible, ``[C, N, 2]`` unpacked or
+        ``[nnz, 2]`` packed, its gradient retained; ``visible`` ``[C, N]`` bool, both screen
+        radii positive; and ``gaussian_ids``, in packed mode, the model row behind each row of
+        ``means2d``, ``[nnz]`` int64 (None unpacked). Without it the three are None.
+
+    Raises
+    ------
+    ValueError
+        If an option isn't one of its values, a camera, the timestamp, the background or the SH
+        degree is invalid, or the gsplat backend gets a model that isn't float32 on CUDA.
+
+    Warns
+    -----
+    UserWarning
+        When the timestamp lies outside the training range (§1.4).
+
+    Notes
+    -----
+    E2 gives the colors (D-4), E5 the covariances, and E6 the projection, culls and
+    compositing in gsplat 1.5.3's classic mode (D-6, D-28, D-31, D-32, D-57), over a black
+    background by default (D-34). §2.1 fixes the signature; Q-31 adds ``precull`` and Q-36
+    ``packed``; Q-32 fixes the inputs' checks and the outputs, Q-9 the warning for raw time.
+    D-75 and D-76: how the gsplat backend fills the output.
+
+    Examples
+    --------
+    Render the model of :class:`~openftgs.model.FreeTimeGaussians`' example, whose raw time
+    span is [0, 10], at τ = 5 from one camera with the reference backend:
+
+    >>> import torch
+    >>> from openftgs.render import render
+    >>> from openftgs.types import Camera
+    >>> K = torch.tensor([[100.0, 0.0, 32.0], [0.0, 100.0, 24.0], [0.0, 0.0, 1.0]])
+    >>> camera = Camera(K, torch.eye(4), 64, 48, "front")
+    >>> out = render(model, camera, 5.0, backend="reference")
+    >>> out.image.shape, out.alpha.shape
+    (torch.Size([1, 48, 64, 3]), torch.Size([1, 48, 64, 1]))
     """
     _check_choice("backend", backend, get_args(_Backend))
     _check_choice("time_units", time_units, get_args(_TimeUnits))
@@ -165,24 +242,79 @@ def render_request(
     device: str | torch.device = "cpu",  # Q-174
     devices: Sequence[str] | None = None,  # Q-175
 ) -> Renders:
-    """Answer a render request (§2.2, Q-57): one image and alpha per item, at the item's raw
-    timestamp, with the request's background and SH degree, keyed by item id in request order.
+    """Answer a render request with one image and alpha per item (§2.2 ftgs-render-request).
 
-    Items that share a timestamp and an image size render in one call (D-55). Item ids must be
-    unique; outputs are keyed by them, whatever the cameras' names. Runs in inference mode;
-    outputs are inference tensors on `device`, the CPU by default.
+    Each item renders at its raw timestamp, with the request's background and SH degree, and
+    the outputs are keyed by item id in request order, whatever the cameras' names. Items that
+    share a timestamp and an image size render in one call (D-55). Runs in inference mode, so
+    nothing is differentiable.
 
-    The temporal index of D-55 (Q-174) renders each timestamp inside the training span, a
-    normalized time in [0, 1], from the rows that can pass the opacity cull then, with images
-    unchanged (U-32); other timestamps render as without it. `temporal_index` None turns it on for
-    the gsplat backend when the request has at least `_INDEX_MIN_TIMES` distinct times in
-    [0, 1]; True or False forces it. `frame_dt` is the buckets' width in normalized time, Δt_f
-    (E14) for a model from a checkpoint; None takes the median gap between the request's
-    distinct times in [0, 1].
+    The temporal index of D-55 renders each timestamp inside the training span, a normalized
+    time in [0, 1], from the rows that can pass the opacity cull then, with images unchanged;
+    other timestamps render as without it.
 
-    `devices` spreads the request's calls over shards, one per entry, each with its own copy of
-    the model on its device and its own thread, without changing the images (D-54; Q-175,
-    Q-186). None renders on the model's device, in the caller's thread.
+    Parameters
+    ----------
+    model
+        The model to render; the gsplat backend takes float32 models on a CUDA device only.
+    request
+        The request: its items (an id, a raw timestamp and a camera each), its time unit, which
+        must be the model's, its background, black by default, and its SH degree, None for the
+        model's.
+    backend
+        "gsplat" (the default) or "reference".
+    temporal_index
+        Whether to render through the temporal index. None, the default, turns it on for the
+        gsplat backend when the request has at least 32 distinct times in [0, 1]; True or False
+        forces it.
+    frame_dt
+        The width of the index's buckets in normalized time, finite and positive: Δt_f (E14)
+        for a model from a checkpoint. None, the default, takes the median gap between the
+        request's distinct times in [0, 1].
+    device
+        The device of the outputs, the CPU by default.
+    devices
+        The devices of the shards that share the request's calls, one shard per entry, each with
+        its own copy of the model and its own thread; the images are the same. None, the
+        default, renders on the model's device, in the caller's thread.
+
+    Returns
+    -------
+    openftgs.types.Renders
+        ``rgb``, item id → image ``[H, W, 3]``, not clamped to 1, and ``alpha``, item id →
+        ``[H, W, 1]`` in [0, 1], both in request order: inference tensors in the model's dtype
+        on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If an option is invalid, the request's time unit differs from the model's, item ids
+        repeat, or :func:`render` rejects an item's camera, timestamp or SH degree.
+
+    Warns
+    -----
+    UserWarning
+        When a timestamp lies outside the training span (§1.4).
+
+    Notes
+    -----
+    Q-57 fixes the signature and the grouping, and Q-56 the unique ids. Q-174 adds
+    ``temporal_index``, ``frame_dt`` and ``device``, and the index keeps every image (U-32);
+    the threshold of 32 distinct times is B-7's (Q-195). Q-175 and Q-186 add ``devices``, the
+    shards of D-54.
+
+    Examples
+    --------
+    Render two items of the model and camera of :func:`render`'s example, at τ = 2.5 and 7.5:
+
+    >>> from openftgs.render import render_request
+    >>> from openftgs.types import RenderItem, RenderRequest
+    >>> request = RenderRequest(
+    ...     items=(RenderItem("a", 2.5, camera), RenderItem("b", 7.5, camera)), time_unit="s"
+    ... )
+    >>> renders = render_request(model, request, backend="reference")
+    >>> list(renders.rgb), renders.rgb["a"].shape
+    (['a', 'b'], torch.Size([48, 64, 3]))
     """
     _check_choice("backend", backend, get_args(_Backend))
     if temporal_index is not None and not isinstance(temporal_index, bool):  # Q-174
@@ -297,7 +429,7 @@ def _normalized_time(model: FreeTimeGaussians, timestamp: float, time_units: _Ti
 
 
 def _backgrounds(background: Tensor | None, num_cameras: int, like: Tensor) -> Tensor:
-    """One background color per camera, [C, 3], in the parameters' dtype and device (D-34)."""
+    """Return a background color per camera, [C, 3], in the parameters' dtype and device (D-34)."""
     # Q-32: None (black), [3] for every camera, or [C, 3].
     if background is None:
         # Filled on the device, not copied from the host, so a render doesn't synchronize (D-49).
@@ -312,9 +444,11 @@ def _backgrounds(background: Tensor | None, num_cameras: int, like: Tensor) -> T
 
 
 def _kept_rows(g: GaussiansAtTime | TemporalSlice) -> Tensor:
-    """The rows that pass the opacity cull, ascending (Q-31). Selecting them reads their count
-    back, the one host synchronization compaction adds (§2.4 rule 3, D-57), which U-29 allows
-    here only (Q-171)."""
+    """Return the rows that pass the opacity cull, ascending (Q-31).
+
+    Selecting them reads their count back, the one host synchronization compaction adds (§2.4
+    rule 3, D-57), which U-29 allows here only (Q-171).
+    """
     return torch.nonzero(g.passes_cull).squeeze(1)
 
 
@@ -322,23 +456,25 @@ _PerTime = TypeVar("_PerTime", bound=GaussiansAtTime | TemporalSlice)
 
 
 def _take_rows(g: _PerTime, rows: Tensor) -> _PerTime:
-    """The per-time arrays of the given rows (compaction, Q-31)."""
+    """Take the per-time arrays of the given rows (compaction, Q-31)."""
     return type(g)(**{f.name: getattr(g, f.name)[rows] for f in fields(g)})
 
 
 @dataclass(frozen=True)
 class _ShParts:
-    """§1.1's per-time SH coefficients as the two stored tensors they concatenate, `sh0`
-    [N, 1, 3] and `shN` cut to the requested degree L′ [N, (L′+1)² − 1, 3] (D-3), with, after
-    compaction, the model rows of the per-time arrays (Q-31). The gsplat backend concatenates
-    them only for the rows its SH evaluation receives (#423)."""
+    """Hold §1.1's per-time SH coefficients as the two stored tensors they concatenate.
+
+    ``sh0`` is [N, 1, 3] and ``shN`` is cut to the requested degree L′, [N, (L′+1)² − 1, 3]
+    (D-3), with, after compaction, the model rows of the per-time arrays (Q-31). The gsplat
+    backend concatenates them only for the rows its SH evaluation receives (#423).
+    """
 
     sh0: Tensor
     shN: Tensor
     rows: Tensor | None = None
 
     def take(self, ids: Tensor | None) -> Tensor:
-        """concat(sh0, shN) of the per-time arrays' rows `ids`, or of all of them."""
+        """Return concat(sh0, shN) of the per-time arrays' rows `ids`, or of all of them."""
         if self.rows is not None:
             ids = self.rows if ids is None else self.rows[ids]
         if ids is None:
@@ -347,16 +483,18 @@ class _ShParts:
 
 
 def _coefficients(sh: Tensor | _ShParts, ids: Tensor | None) -> Tensor:
-    """The SH coefficients of the per-time arrays' rows `ids`, or of all of them: gathered from
-    a concatenation of every row (a request's, Q-174), or concatenated from the stored
-    tensors for those rows alone (#423)."""
+    """Return the SH coefficients of the per-time arrays' rows `ids`, or of all of them.
+
+    They are gathered from a concatenation of every row (a request's, Q-174), or concatenated
+    from the stored tensors for those rows alone (#423).
+    """
     if isinstance(sh, _ShParts):
         return sh.take(ids)
     return sh if ids is None else sh[ids]
 
 
 def _scatter_rows(values: Tensor, rows: Tensor | None, num_rows: int) -> Tensor:
-    """Per-row values of a row subset placed back among all rows, zero (or False) elsewhere."""
+    """Place per-row values of a row subset back among all rows, zero (or False) elsewhere."""
     if rows is None:
         return values
     full = values.new_zeros((num_rows, *values.shape[1:]))
@@ -410,9 +548,11 @@ def _check_frame_dt(frame_dt: object) -> None:
 
 
 def _time_in_span(model: FreeTimeGaussians, timestamp: object) -> float | None:
-    """Q-174: the normalized time of a raw timestamp inside the training span [τ₀, τ₁], which
-    lies in [0, 1] and draws no warning; None for any other timestamp, which goes to `render()`
-    to be checked and warned about as before (Q-9, Q-32)."""
+    """Return the normalized time of a raw timestamp inside the training span [τ₀, τ₁] (Q-174).
+
+    That time lies in [0, 1] and draws no warning; any other timestamp gets None, and goes to
+    `render()` to be checked and warned about as before (Q-9, Q-32).
+    """
     if isinstance(timestamp, bool) or not isinstance(timestamp, numbers.Real):
         return None
     value = float(timestamp)
@@ -429,17 +569,21 @@ def _output_device(device: str | torch.device) -> torch.device:
 
 
 def _request_background(values: Sequence[float], like: Tensor) -> Tensor:
-    """The request's background [3], in float32 as render requests have always passed it (Q-57),
-    on the model's device: filled there rather than copied from the host, so building it doesn't
-    synchronize (Q-174)."""
+    """Build the request's background [3] on the model's device (Q-57, Q-174).
+
+    It is float32, as render requests have always passed it (Q-57), and filled on the device
+    rather than copied from the host, so building it doesn't synchronize (Q-174).
+    """
     return torch.stack([like.new_full((), float(v), dtype=torch.float32) for v in values])
 
 
 def _staged_cameras(items: Sequence[RenderItem], device: torch.device) -> dict[str, Camera]:
-    """Each item's camera by item id, with its tensors on the model's device (Q-174). Cameras
-    held on the host go to a CUDA device in one copy for the whole request, staged in pinned
+    """Return each item's camera by item id, with its tensors on the model's device (Q-174).
+
+    Cameras held on the host go to a CUDA device in one copy for the whole request, staged in pinned
     memory and sent without blocking, so that no render synchronizes to copy them (§2.4 rule 3);
-    their values are unchanged."""
+    their values are unchanged.
+    """
     cameras = {item.id: item.camera for item in items}
     if device.type != "cuda":
         return cameras
@@ -466,19 +610,24 @@ def _staged_cameras(items: Sequence[RenderItem], device: torch.device) -> dict[s
 
 
 def _index_on(temporal_index: bool | None, backend: str, distinct_times: int) -> bool:
-    """Q-174: whether a request with this many distinct times in [0, 1] renders through the
-    temporal index. None turns it on for gsplat from `_INDEX_MIN_TIMES` times, so never for one
-    time; that threshold is B-7's (Q-195)."""
+    """Decide whether a request renders through the temporal index (Q-174).
+
+    The request has `distinct_times` distinct times in [0, 1]. None turns the index on for gsplat
+    from `_INDEX_MIN_TIMES` times, so never for one time; that threshold is B-7's (Q-195).
+    """
     if temporal_index is not None:
         return temporal_index
     return backend == "gsplat" and distinct_times >= _INDEX_MIN_TIMES
 
 
 def _bucket_width(frame_dt: float | None, times: Sequence[float]) -> float:
-    """Q-174: the buckets' width in normalized time: `frame_dt` when given, otherwise the median
-    gap between the request's distinct times in [0, 1] (`times`, ascending), as Q-8 takes
-    medians, and 1 for a single time, as E14 gives Δt_f = 1 for a single timestamp (Q-8). Never
-    below `_INDEX_MIN_WIDTH`; the images are the same at any width."""
+    """Return the buckets' width in normalized time (Q-174).
+
+    It is `frame_dt` when given, otherwise the median gap between the request's distinct times
+    in [0, 1] (`times`, ascending), as Q-8 takes medians, and 1 for a single time, as E14 gives
+    Δt_f = 1 for a single timestamp (Q-8). Never below `_INDEX_MIN_WIDTH`; the images are the
+    same at any width.
+    """
     if frame_dt is not None:
         width = float(frame_dt)
     elif len(times) >= 2:
@@ -489,8 +638,11 @@ def _bucket_width(frame_dt: float | None, times: Sequence[float]) -> float:
 
 
 def _sh_concat(model: FreeTimeGaussians, sh_degree: int | None) -> Tensor:
-    """The SH coefficients of every row cut to the request's degree, as `at_time` concatenates
-    them (Q-20), built once per request (Q-174); `at_time`'s check of the degree."""
+    """Concatenate every row's SH coefficients, cut to the request's degree (Q-174).
+
+    They are cut as `at_time` concatenates them (Q-20), once per request (Q-174), after
+    `at_time`'s check of the degree.
+    """
     degree = model.sh_degree if sh_degree is None else sh_degree
     allowed = tuple(range(model.sh_degree + 1))
     if isinstance(degree, bool) or not isinstance(degree, int) or degree not in allowed:
@@ -549,9 +701,12 @@ class _TemporalIndex:
         return math.floor(t * self._scale)
 
     def rows(self, t: float) -> Tensor:
-        """The ascending model rows to render at normalized time t, one of the times the index
-        was built for: its bucket's rows and the long rows, a superset of the rows that pass the
-        opacity cull at t. Their count is known on the host."""
+        """Return the ascending model rows to render at normalized time t.
+
+        t is one of the times the index was built for; the rows are its bucket's rows and the
+        long rows, a superset of the rows that pass the opacity cull at t. Their count is known
+        on the host.
+        """
         start, stop = self._ranges[self._bucket(t)]
         listed = self._rows[start:stop]
         if self._long.shape[0] == 0:
@@ -564,10 +719,12 @@ class _TemporalIndex:
 def _temporal(
     model: FreeTimeGaussians, t: float, rows: Tensor | None = None, sh: Tensor | None = None
 ) -> tuple[TemporalSlice, Tensor | None]:
-    """The temporal slice of `at_time`, for every row or only for `rows`, which are gathered
-    first, with them a request's SH concat `sh` (Q-174), in the stage `slice`; not
-    `at_time`'s concat over every row, which the gsplat backend makes for the rows it
-    evaluates (Q-274, #423)."""
+    """Compute the temporal slice of `at_time`, in the stage `slice` (Q-274, #423).
+
+    It is computed for every row, or only for `rows`, which are gathered first, with them a
+    request's SH concat `sh` (Q-174); not `at_time`'s concat over every row, which the gsplat
+    backend makes for the rows it evaluates.
+    """
     with stage("slice"):
         arrays = [getattr(model, name) for name in _SLICE_INPUTS]
         if rows is not None:
@@ -592,8 +749,10 @@ def _temporal(
 def _slice(
     model: FreeTimeGaussians, t: float, sh: Tensor, rows: Tensor | None = None
 ) -> GaussiansAtTime:
-    """The per-time arrays of `at_time`, from the request's SH concat `sh`, for every row or
-    only for `rows`, which are gathered first (Q-174)."""
+    """Compute the per-time arrays of `at_time` from the request's SH concat `sh` (Q-174).
+
+    They are computed for every row, or only for `rows`, which are gathered first.
+    """
     s, gathered = _temporal(model, t, rows, sh)
     assert gathered is not None
     return GaussiansAtTime(
@@ -618,10 +777,12 @@ def _render_indexed(
     background: Tensor,
     backend: _Backend,
 ) -> tuple[Tensor, Tensor]:
-    """Image [C, H, W, 3] and alpha [C, H, W, 1] of `cameras` at normalized time t, rendered from
-    the ascending model rows `rows` that the temporal index lists then, with `render()`'s
-    defaults (D-55, Q-174). The backend's own opacity cull then decides, so the images are those
-    of every row (U-32)."""
+    """Render `cameras` at normalized time t from the rows the temporal index lists (D-55, Q-174).
+
+    The image is [C, H, W, 3] and the alpha [C, H, W, 1], rendered from the ascending model rows
+    `rows` that the temporal index lists then, with `render()`'s defaults. The backend's own
+    opacity cull then decides, so the images are those of every row (U-32).
+    """
     backgrounds = _backgrounds(background, len(cameras), model.means)
     if rows.shape[0] == 0:
         # Q-174: no row can pass the cull, so the slice isn't run (dynamo would specialize a
@@ -652,8 +813,11 @@ def _render_indexed(
 
 
 def _empty_images(background: Tensor, width: int, height: int) -> tuple[Tensor, Tensor]:
-    """Q-38's empty render's image and alpha (D-76): the background [C, 3] composited as both
-    backends composite it, image + (1 − alpha)·c_bg with nothing drawn, so its bits are theirs."""
+    """Return the image and alpha of Q-38's empty render (D-76).
+
+    The background [C, 3] is composited as both backends composite it, image + (1 − alpha)·c_bg
+    with nothing drawn, so its bits are theirs.
+    """
     count = background.shape[0]
     alpha = background.new_zeros((count, height, width, 1))
     image = background.new_zeros((count, height, width, 3))
@@ -681,9 +845,11 @@ class _Group:
 
 
 class _GroupRenderer:
-    """One model's renders of one request's groups. What doesn't change with time is built once
-    (Q-174): the background and the cameras on the model's device and, with the index on, the
-    SH concat and the temporal index."""
+    """One model's renders of one request's groups.
+
+    What doesn't change with time is built once (Q-174): the background and the cameras on the
+    model's device and, with the index on, the SH concat and the temporal index.
+    """
 
     def __init__(self, model: FreeTimeGaussians, plan: _Plan) -> None:
         self._model = model
@@ -702,9 +868,11 @@ class _GroupRenderer:
                 self._index = _TemporalIndex(model, plan.width, plan.index_times)
 
     def render(self, group: _Group) -> list[tuple[Tensor, Tensor]]:
-        """The image [H, W, 3] and alpha [H, W, 1] of each of the group's items, in its order, on
-        the request's output device. Inference mode is entered here, in the thread that renders,
-        since it is per thread."""
+        """Render the image [H, W, 3] and alpha [H, W, 1] of each of the group's items, in order.
+
+        They are on the request's output device. Inference mode is entered here, in the thread
+        that renders, since it is per thread.
+        """
         plan, model = self._plan, self._model
         with torch.inference_mode():
             cams = [self._cameras[item.id] for item in group.items]
@@ -735,11 +903,13 @@ class _GroupRenderer:
             ]
 
     def warm_up(self, groups: Sequence[_Group]) -> None:
-        """Q-175, Q-186: runs the temporal slice once, under inference mode as the renders
-        do, on each path that rendering `groups` takes: every row, as `render()` and the
+        """Run the temporal slice once on each path that rendering `groups` takes (Q-175, Q-186).
+
+        It runs under inference mode, as the renders do: every row, as `render()` and the
         reference backend's index slice them, and the gathered rows that gsplat slices with the
         index on. So the compiled slice is compiled for this device here, in the caller's
-        thread, and not by several worker threads at once."""
+        thread, and not by several worker threads at once.
+        """
         model, plan = self._model, self._plan
         indexed = self._index is not None
         gathered = indexed and plan.backend == "gsplat" and not _GSPLAT_FULL_SLICE
@@ -754,7 +924,7 @@ class _GroupRenderer:
 
 
 def _slice_once(arrays: Sequence[Tensor], impl: _SliceImpl) -> None:
-    """The temporal slice of `_SLICE_INPUTS`' arrays at t = 0, for its side effect: compiling."""
+    """Run the temporal slice of `_SLICE_INPUTS`' arrays at t = 0 for its side effect, compiling."""
     means, times, log_durations, velocities, log_scales, quats, opacity_logits = arrays
     temporal_slice(
         means, times, log_durations, velocities, log_scales, quats, opacity_logits, 0.0, impl=impl
@@ -762,8 +932,10 @@ def _slice_once(arrays: Sequence[Tensor], impl: _SliceImpl) -> None:
 
 
 def _model_copy(model: FreeTimeGaussians, device: torch.device) -> FreeTimeGaussians:
-    """Q-175, Q-186: the model on `device`, made with the public constructor from its stored
-    tensors, which it copies, keeping its `slice_impl` (Q-66)."""
+    """Copy the model to `device` with the public constructor (Q-175, Q-186).
+
+    The constructor copies its stored tensors; the copy keeps the model's `slice_impl` (Q-66).
+    """
     copy = FreeTimeGaussians(
         {name: getattr(model, name).detach().to(device) for name in model.PARAM_NAMES},
         sh_degree=model.sh_degree,
@@ -777,8 +949,11 @@ def _model_copy(model: FreeTimeGaussians, device: torch.device) -> FreeTimeGauss
 def _shard_renderer(
     model: FreeTimeGaussians, plan: _Plan, groups: Sequence[_Group], device: torch.device
 ) -> _GroupRenderer:
-    """One shard of a request (D-54; Q-175, Q-186): a copy of the model on `device`, what the
-    request builds once for it, and the warm-up of its temporal slice."""
+    """Build one shard of a request (D-54; Q-175, Q-186).
+
+    A shard is a copy of the model on `device`, what the request builds once for it, and the
+    warm-up of its temporal slice.
+    """
     copy = _model_copy(model, device)
     if plan.backend == "gsplat":
         _check_gsplat_model(copy)
@@ -802,9 +977,11 @@ class _Projection:
 
 
 def _matmul(a: Tensor, b: Tensor) -> Tensor:
-    """a @ b for small matrices, as a broadcast product and a sum, so that every row gives the
-    same bits whatever the number of rows (source log #17); batched matmul with a camera matrix
-    through BLAS does not."""
+    """Multiply small matrices, a @ b, as a broadcast product and a sum.
+
+    That way every row gives the same bits whatever the number of rows (source log #17);
+    batched matmul with a camera matrix through BLAS does not.
+    """
     return (a[..., :, :, None] * b[..., None, :, :]).sum(dim=-2)
 
 
@@ -816,8 +993,11 @@ def _render_reference(
     rows: Tensor | None,
     num_rows: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Image [C, H, W, 3], alpha [C, H, W, 1], 2D means [C, N, 2] and visibility [C, N] of the
-    per-time arrays `g`, which hold all N rows or the ascending subset `rows`."""
+    """Render the per-time arrays `g` with the reference backend.
+
+    It returns the image [C, H, W, 3], alpha [C, H, W, 1], 2D means [C, N, 2] and visibility
+    [C, N]; `g` holds all N rows or the ascending subset `rows`.
+    """
     cams = [_camera_tensors(camera, g.means_t) for camera in cameras]
     projections = [_project(g, cam) for cam in cams]
     # Every camera is projected before any is composited: compositing reads μ′ from this stacked
@@ -845,11 +1025,12 @@ def _render_reference(
 
 
 def _project(g: GaussiansAtTime, cam: _CameraTensors) -> _Projection:
-    """E6's projection, EWA covariance and culls, and E2's colors, for every passed row.
+    """Apply E6's projection, EWA covariance and culls, and E2's colors, to every passed row.
 
     Every input that could make a local derivative infinite is replaced before use (the depth of
     a row the depth cull removes, the det Σ′ of a row the det cull removes), and the integer
-    screen radii are computed without gradient, so a culled row's gradient is exactly zero."""
+    screen radii are computed without gradient, so a culled row's gradient is exactly zero.
+    """
     x_c = _matmul(cam.rotation, g.means_t[..., None])[..., 0] + cam.translation
     x, y, z = x_c.unbind(-1)
     in_depth = (z >= _NEAR) & (z <= _FAR)
@@ -917,12 +1098,14 @@ def _rasterize(
     width: int,
     height: int,
 ) -> tuple[Tensor, Tensor]:
-    """E6's compositing of the visible primitives, sorted front to back, at every pixel center:
-    image [H, W, 3] and alpha [H, W, 1] = 1 − T_final (Q-32).
+    """Composite the visible primitives, sorted front to back, at every pixel center (E6).
+
+    It returns the image [H, W, 3] and alpha [H, W, 1] = 1 − T_final (Q-32).
 
     Every pixel is evaluated against every primitive. That gives gsplat's image: a primitive's α
     reaches the skip threshold only inside its screen box, whose extent cap is never reached
-    since σ_eff ≤ 1. Rows of pixels are processed a chunk at a time to bound memory."""
+    since σ_eff ≤ 1. Rows of pixels are processed a chunk at a time to bound memory.
+    """
     like = means2d
     px = torch.arange(width, dtype=like.dtype, device=like.device) + _PIXEL_CENTER
     py = torch.arange(height, dtype=like.dtype, device=like.device) + _PIXEL_CENTER
@@ -963,10 +1146,13 @@ def _render_gsplat(
     num_rows: int,
     packed: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
-    """Image [C, H, W, 3], alpha [C, H, W, 1], 2D means ([C, N, 2] unpacked, [nnz, 2] packed),
-    visibility [C, N] and, packed, the model row behind each row of the 2D means [nnz], of the
-    per-time arrays `g`, which hold all N rows or the ascending subset `rows` (D-75, D-76), with
-    the SH coefficients of `g`'s rows `sh`, concatenated or as their stored tensors (#423)."""
+    """Render the per-time arrays `g` with gsplat 1.5.3's stage functions (D-75, D-76).
+
+    It returns the image [C, H, W, 3], alpha [C, H, W, 1], 2D means ([C, N, 2] unpacked,
+    [nnz, 2] packed), visibility [C, N] and, packed, the model row behind each row of the 2D
+    means [nnz]; `g` holds all N rows or the ascending subset `rows`. `sh` holds the SH
+    coefficients of `g`'s rows, concatenated or as their stored tensors (#423).
+    """
     num_cams, width, height = len(cameras), cameras[0].width, cameras[0].height
     like = g.means_t
     if like.shape[0] == 0:
@@ -1100,14 +1286,14 @@ def _render_gsplat(
 
 
 def _view_matrix(cam: _CameraTensors) -> Tensor:
-    """gsplat's view matrix [4, 4] (world to camera) from R_w and t_w only (§1.4, Q-32)."""
+    """Build gsplat's view matrix [4, 4] (world to camera) from R_w and t_w only (§1.4, Q-32)."""
     # Filled on the device, not written from the host, so a render doesn't synchronize (D-49).
     bottom = torch.cat([cam.translation.new_zeros(3), cam.translation.new_ones(1)])[None]
     return torch.cat([torch.cat([cam.rotation, cam.translation[:, None]], dim=1), bottom])
 
 
 def _intrinsics(cam: _CameraTensors) -> Tensor:
-    """gsplat's K [3, 3] from f_x, f_y, c_x and c_y only (§1.4, Q-32)."""
+    """Build gsplat's K [3, 3] from f_x, f_y, c_x and c_y only (§1.4, Q-32)."""
     zero, one = torch.zeros_like(cam.fx), torch.ones_like(cam.fx)
     return torch.stack(
         [
@@ -1128,10 +1314,12 @@ def _empty_gsplat_render(
     num_rows: int,
     packed: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
-    """Q-32's empty render, in the gsplat backend's layouts (D-76), for per-time arrays `g` with no
-    rows. It stays on the autograd graph, as the reference's empty render does: the outputs depend
+    """Return Q-32's empty render in the gsplat backend's layouts, for `g` with no rows (D-76).
+
+    It stays on the autograd graph, as the reference's empty render does: the outputs depend
     with weight zero on the 2D means, which depend with weight zero on every per-time array, so
-    every stored tensor and the 2D means get an exactly zero gradient (U-8, D-57)."""
+    every stored tensor and the 2D means get an exactly zero gradient (U-8, D-57).
+    """
     num_cams = background.shape[0]
     # The SH coefficients of no row: the stored tensors' rows that compaction kept, none.
     arrays = (g.means_t, g.opacities_t, g.quats_n, g.scales, _coefficients(sh, None))

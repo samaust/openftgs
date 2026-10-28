@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # CI for the CPU suite (§3 introduction) with its coverage (Q-216), and the license scan (§2.3 notes;
-# Q-4).
+# Q-4). The test job runs on Python 3.11, the floor, beside 3.14 (Q-1, Q-29: the M18 CI matrix).
 name: CI
 
 on:
@@ -12,17 +12,22 @@ permissions:
 
 jobs:
   checks:
-    name: ${{ matrix.job }}
+    name: ${{ matrix.job }} (${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         job: [lint, test, licenses, wheel]
+        python: ["3.14"]
+        # It would overwrite an original value, so it is a combination of its own (Q-1, Q-29).
+        include:
+          - job: test
+            python: "3.11"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"  # Q-1
+          python-version: ${{ matrix.python }}  # Q-1
           cache: pip
           cache-dependency-path: |
             pyproject.toml
@@ -51,7 +56,7 @@ jobs:
         if: matrix.job == 'test' && !cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage
+          name: coverage-${{ matrix.python }}  # v4's artifacts are immutable: one per job
           path: |
             coverage.xml
             htmlcov/
@@ -63,7 +68,7 @@ jobs:
         run: |
           python -m pip wheel . ./harness --no-deps -w dist
           python - <<'PY'
-          import glob, hashlib, json, re, zipfile
+          import email, glob, hashlib, json, re, zipfile
           wheel = zipfile.ZipFile(glob.glob("dist/openftgs-*.whl")[0])
           names = wheel.namelist()
           for required in ("openftgs/py.typed", "licenses/LICENSE", "licenses/NOTICE"):
@@ -82,8 +87,8 @@ jobs:
                   digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
                   assert digest == entry["sha256"], entry["path"]
           # Q-248, §2.3 (#393): the core requires no lpips, no tqdm and none of the [init]
-          # extra's packages, which only RoMa and the DINO networks need; no extra names lpips,
-          # tqdm or torchmetrics.
+          # extra's packages, which only RoMa and the DINO networks need; no extra names lpips
+          # or torchmetrics. Q-276: tqdm is [init]'s alone, for XFeat's hub code (Tiny RoMa).
           metadata = wheel.read(next(n for n in names if n.endswith(".dist-info/METADATA")))
           requires = [
               line.split(":", 1)[1].strip()
@@ -94,8 +99,23 @@ jobs:
           core = {named(r) for r in requires if not re.search(r"\bextra\s*==", r)}
           init = {named(r) for r in requires if re.search(r"\bextra\s*==\s*['\"]init['\"]", r)}
           assert not core & {"torchvision", "einops", "loguru", "lpips", "tqdm"}, sorted(core)
-          assert {"torchvision", "einops", "loguru"} <= init, sorted(init)
-          assert not {named(r) for r in requires} & {"lpips", "tqdm", "torchmetrics"}, requires
+          assert {"torchvision", "einops", "loguru", "tqdm"} <= init, sorted(init)
+          assert not {named(r) for r in requires} & {"lpips", "torchmetrics"}, requires
+          other_extras = {
+              named(r) for r in requires
+              if re.search(r"\bextra\s*==", r)
+              and not re.search(r"\bextra\s*==\s*['\"]init['\"]", r)
+          }
+          assert "tqdm" not in other_extras, requires
+          # Q-244 (#370): PEP 639's license expression and no license classifier, Q-244's
+          # classifiers among them, and the project URLs.
+          headers = email.message_from_bytes(metadata)
+          assert headers["License-Expression"] == "Apache-2.0", headers["License-Expression"]
+          classifiers = headers.get_all("Classifier", [])
+          assert not [c for c in classifiers if c.startswith("License ::")], classifiers
+          assert "Development Status :: 3 - Alpha" in classifiers, classifiers
+          labels = {u.split(",", 1)[0] for u in headers.get_all("Project-URL", [])}
+          assert labels == {"Homepage", "Source", "Documentation", "Issues", "Changelog"}, labels
           wheel = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0])
           names = wheel.namelist()
           for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):

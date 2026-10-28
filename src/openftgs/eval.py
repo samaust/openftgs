@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PSNR, SSIM_k, DSSIM_k and ꟻLIP, the dynamic-region crop and mask, the evaluation of a model
-on a scene's images, and the metrics report that `ftgs eval` writes.
+"""Evaluation metrics (E16), the dynamic-region crop, and the report ``ftgs eval`` writes.
+
+PSNR, SSIM_k, DSSIM_k and ꟻLIP, the dynamic-region crop and mask, the evaluation of a model on
+a scene's images, and the metrics report that ``ftgs eval`` writes.
 
 Spec: E16, App. B.1, D-29, D-52, D-55, D-64, D-67, D-69, D-89. Band: Orchestration (§2.1).
 """
@@ -44,6 +46,12 @@ __all__ = [
 
 # §2.1 CLI paragraph: the metrics METRICS.json reports, in this order (Q-60).
 METRIC_NAMES = ("psnr", "ssim1", "ssim2", "dssim1", "dssim2", "flip")
+"""The six metrics METRICS.json reports, in its order (§2.1 CLI paragraph; Q-60, Q-256).
+
+PSNR, SSIM with data ranges 1 and 2 and the matching DSSIMs (E16), and ``flip``, LDR-ꟻLIP at
+67.0 pixels per degree on the clamped render against the reference, the mean of its error map
+(E16, D-89; Q-259).
+"""
 
 # Q-61, Q-257: the smallest side of a dynamic region that holds every metric's window, the larger
 # of SSIM's valid window, 11 px, and ꟻLIP's filters at 67.0 pixels per degree, 21 px (three
@@ -56,12 +64,14 @@ _MASK_THRESHOLD = 0.5  # D-67: soft masks are binarized at 0.5; Q-61: 0.5 counts
 
 @contextlib.contextmanager
 def _tf32_off() -> Iterator[None]:
-    """D-52, §2.4 Precision: cuDNN's TF32 flag cleared and float32 matrix products at "highest"
-    precision (ꟻLIP's colour transforms are matrix products, Q-60), both restored on exit. Both
-    are one for the whole process, so a sharded evaluation sets them once in the caller's thread
-    around the whole run: each metric's own save and restore in a worker thread then reads and
-    writes IEEE float32's values only, and no thread can restore TF32 while another computes
-    (Q-175, Q-186)."""
+    """Clear cuDNN's TF32 flag and run float32 matrix products at "highest" precision (D-52).
+
+    Both are restored on exit (§2.4 Precision); ꟻLIP's colour transforms are matrix products
+    (Q-60). Both are one for the whole process, so a sharded evaluation sets them once in the
+    caller's thread around the whole run: each metric's own save and restore in a worker thread
+    then reads and writes IEEE float32's values only, and no thread can restore TF32 while
+    another computes (Q-175, Q-186).
+    """
     before = torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision()
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
@@ -74,9 +84,11 @@ def _tf32_off() -> Iterator[None]:
 
 @contextlib.contextmanager
 def _metric_mode() -> Iterator[None]:
-    """D-52, §2.4 Precision: evaluation is a forward pass in IEEE float32, so cuDNN's TF32 flag
-    is cleared and matrix products run at "highest" precision, both restored on exit; inference
-    mode, as for rendering."""
+    """Run evaluation's forward pass in IEEE float32 and inference mode (D-52, §2.4 Precision).
+
+    cuDNN's TF32 flag is cleared and matrix products run at "highest" precision, both restored
+    on exit; inference mode, as for rendering.
+    """
     with _tf32_off(), torch.inference_mode():
         yield
 
@@ -102,8 +114,35 @@ def _check_k(k: int) -> None:
 
 
 def psnr(pred: Tensor, gt: Tensor) -> Tensor:
-    """PSNR = 10·log10(1/MSE) per image, the render clamped to [0, 1] first (E16, D-67); the MSE
-    is taken in float64 over pixels and channels, and an MSE of 0 gives +inf (Q-60)."""
+    """Compute the PSNR of each image pair, 10·log10(1/MSE) (E16).
+
+    The render is clamped to [0, 1] first (D-67); the MSE is taken in float64 over pixels and
+    channels, and an MSE of 0 gives +inf (Q-60).
+
+    Parameters
+    ----------
+    pred
+        Renders, [..., H, W, 3], of a floating dtype; values outside [0, 1] are clamped.
+    gt
+        Ground-truth images, in [0, 1], of ``pred``'s shape, dtype and device.
+
+    Returns
+    -------
+    torch.Tensor
+        The PSNR of each image in dB, [...] float64; +inf where the clamped render equals the
+        ground truth.
+
+    Raises
+    ------
+    ValueError
+        If the images aren't [..., H, W, 3], or don't share one shape, floating dtype and
+        device.
+
+    Notes
+    -----
+    Q-60: the images may carry any leading dimensions, and give one value each; Q-41: one
+    floating dtype and device for both.
+    """
     _check_pair(pred, gt)
     with _metric_mode():
         diff = pred.to(torch.float64).clamp(0.0, 1.0) - gt.to(torch.float64)
@@ -112,8 +151,37 @@ def psnr(pred: Tensor, gt: Tensor) -> Tensor:
 
 
 def ssim_k(pred: Tensor, gt: Tensor, k: int) -> Tensor:
-    """SSIM_k per image: E7's SSIM with data range k ∈ {1, 2}, so C₁ = (0.01k)² and
-    C₂ = (0.03k)², the render clamped to [0, 1] first (E16, D-67)."""
+    """Compute SSIM_k of each image pair, E7's SSIM with data range k (E16).
+
+    With k ∈ {1, 2}, C₁ = (0.01k)² and C₂ = (0.03k)²; the render is clamped to [0, 1] first
+    (D-67). Each image's SSIM is the mean over its map and channels.
+
+    Parameters
+    ----------
+    pred
+        Renders, [..., H, W, 3], of a floating dtype; values outside [0, 1] are clamped.
+    gt
+        Ground-truth images, in [0, 1], of ``pred``'s shape, dtype and device.
+    k
+        The data range, 1 or 2.
+
+    Returns
+    -------
+    torch.Tensor
+        The SSIM of each image, [...], in the images' dtype; at most 1. No images give an
+        empty tensor (Q-60).
+
+    Raises
+    ------
+    ValueError
+        If the images aren't [..., H, W, 3], or don't share one shape, floating dtype and
+        device, or if ``k`` isn't 1 or 2.
+
+    Notes
+    -----
+    D-67: the metric's SSIM is E7's, an 11×11 Gaussian window with σ = 1.5 over the valid
+    region, with the data range as the only change.
+    """
     _check_pair(pred, gt)
     _check_k(k)
     with _metric_mode():
@@ -128,18 +196,82 @@ def ssim_k(pred: Tensor, gt: Tensor, k: int) -> Tensor:
 
 
 def dssim_k(pred: Tensor, gt: Tensor, k: int) -> Tensor:
-    """DSSIM_k = (1 − SSIM_k)/2 per image, a dissimilarity (E16, D-29, D-40)."""
+    """Compute DSSIM_k = (1 − SSIM_k)/2 of each image pair, a dissimilarity (E16).
+
+    The SSIM is :func:`ssim_k`'s, on the render clamped to [0, 1].
+
+    Parameters
+    ----------
+    pred
+        Renders, [..., H, W, 3], of a floating dtype; values outside [0, 1] are clamped.
+    gt
+        Ground-truth images, in [0, 1], of ``pred``'s shape, dtype and device.
+    k
+        The data range, 1 or 2.
+
+    Returns
+    -------
+    torch.Tensor
+        The DSSIM of each image, [...], in the images' dtype; at least 0.
+
+    Raises
+    ------
+    ValueError
+        If the images aren't [..., H, W, 3], or don't share one shape, floating dtype and
+        device, or if ``k`` isn't 1 or 2.
+
+    Notes
+    -----
+    D-29, D-40: the form the paper's tables report, derived from Tables 2, 3, 9 and 10.
+    """
     value = ssim_k(pred, gt, k)
     with _metric_mode():
         return (1.0 - value) / 2.0
 
 
 def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tensor] | None:
-    """The pair a dynamic-region metric compares (App. B.1, D-67): the render clamped to
-    [0, 1], then both images set to black outside the mask and cropped to the mask's bounding
-    box. `mask` is [H, W] or [H, W, 1], bool or floating, binarized at 0.5 (≥ 0.5 is dynamic).
-    None, with a warning, for an empty mask or a box narrower than 21 px on a side, too small to
-    hold SSIM's window or ꟻLIP's filters (Q-61, Q-257)."""
+    """Crop an image pair to its dynamic region, for the dynamic metrics (Appendix B.1, D-67).
+
+    The render is clamped to [0, 1], then both images are set to black outside the mask and
+    cropped to the mask's bounding box.
+
+    Parameters
+    ----------
+    pred
+        One render, [H, W, 3], of a floating dtype; values outside [0, 1] are clamped.
+    gt
+        Its ground truth, in [0, 1], of ``pred``'s shape, dtype and device.
+    mask
+        The dynamic-region mask, [H, W] or [H, W, 1], bool or floating in [0, 1], on the
+        images' device; binarized at 0.5 (≥ 0.5 is dynamic).
+
+    Returns
+    -------
+    tuple of torch.Tensor or None
+        The clamped render and the ground truth, each cropped to [h, w, 3] and black outside
+        the mask; None, with a warning, for an empty mask or a box narrower than 21 px on a
+        side (Q-61, Q-257).
+
+    Raises
+    ------
+    ValueError
+        If the images aren't one pair [H, W, 3] of one shape, floating dtype and device, or the
+        mask's shape, device or dtype doesn't fit them.
+
+    Warns
+    -----
+    UserWarning
+        When the mask is empty, or its box is narrower than 21 px on a side.
+
+    Notes
+    -----
+    Q-257: 21 px is the larger of SSIM's 11-px valid window and the support of ꟻLIP's filters at
+    67.0 pixels per degree; ꟻLIP pads and gives a value at any size, but below 21 px every pixel
+    of its error map would be computed partly from copied border pixels. The bounding box is
+    inclusive, so stray mask pixels enlarge it. A mask value of exactly 0.5 counts as dynamic,
+    and an integer mask is refused, so the readers of mask files divide 8-bit masks by 255
+    first, as §1.4 "Images" does for every 8-bit input (Q-61).
+    """
     if pred.dim() != 3:
         raise ValueError(f"dynamic_region takes one image pair [H, W, 3], got {list(pred.shape)}")
     _check_pair(pred, gt)
@@ -186,8 +318,26 @@ def dynamic_region(pred: Tensor, gt: Tensor, mask: Tensor) -> tuple[Tensor, Tens
 
 
 def average_metrics(rows: Sequence[Mapping[str, float]]) -> dict[str, float]:
-    """The arithmetic mean of each metric over the rows (D-67): images → scene, then scenes →
-    overall. Every row must hold the same keys."""
+    """Average each metric over the rows (D-67).
+
+    The arithmetic mean, as E16 averages: images → scene, then scenes → overall. Every row
+    must hold the same keys.
+
+    Parameters
+    ----------
+    rows
+        One mapping of metric name to value per image or per scene, all with the same keys.
+
+    Returns
+    -------
+    dict of str to float
+        The mean of each metric, by name, in the first row's order.
+
+    Raises
+    ------
+    ValueError
+        If ``rows`` is empty, or its rows don't all hold the same keys.
+    """
     if not rows:
         raise ValueError("average_metrics needs at least one row")
     keys = list(rows[0])
@@ -197,9 +347,35 @@ def average_metrics(rows: Sequence[Mapping[str, float]]) -> dict[str, float]:
 
 
 class Evaluator:
-    """The six metrics of METRIC_NAMES for one image pair on `device`, ꟻLIP among them (E16,
-    D-89; Q-60). Calling it with a dynamic-region mask also gives the same metrics on
-    `dynamic_region`'s pair, or None when the mask has no usable region (Q-61)."""
+    """All six metrics of :data:`METRIC_NAMES` for one image pair (E16, D-89).
+
+    ꟻLIP's network, :class:`~openftgs.losses.PerceptualLoss` ``("flip")`` at 67.0 pixels per
+    degree, is built once on ``device``; it has no weights, so nothing is downloaded (Q-259).
+    Calling the evaluator with a render and its ground truth, ``evaluator(pred, gt, mask=None)``,
+    returns two dicts: the six metrics of the entire images by name, and, given a
+    dynamic-region mask, the same metrics on :func:`dynamic_region`'s pair, or None when the
+    mask has no usable region (Q-61) or there is no mask. The images are [H, W, 3], of one
+    shape, floating dtype and device, the render clamped to [0, 1] and the ground truth in
+    [0, 1]; they are copied to ``device`` in float32.
+
+    Parameters
+    ----------
+    device
+        The device ꟻLIP runs on, and the images are scored on.
+
+    Raises
+    ------
+    ValueError
+        When called, if the images aren't one pair [H, W, 3] of one shape, floating dtype and
+        device, or the mask doesn't fit them (:func:`dynamic_region`).
+
+    Notes
+    -----
+    Q-60: the images are scored in IEEE float32, ꟻLIP's only dtype (D-52, Q-261), with
+    cuDNN's TF32 flag cleared and matrix products at "highest" precision; PSNR takes its MSE
+    in float64 (:func:`psnr`), and the DSSIMs come from the same SSIM values. ꟻLIP sees the
+    clamped render against the reference and reports the mean of its error map (E16, D-67).
+    """
 
     def __init__(self, *, device: str | torch.device = "cuda") -> None:
         self._device = torch.device(device)
@@ -209,6 +385,37 @@ class Evaluator:
     def __call__(
         self, pred: Tensor, gt: Tensor, *, mask: Tensor | None = None
     ) -> tuple[dict[str, float], dict[str, float] | None]:
+        """Score one render against its ground truth (E16, D-67).
+
+        Parameters
+        ----------
+        pred
+            The render, [H, W, 3], of a floating dtype; values outside [0, 1] are clamped.
+        gt
+            Its ground truth, in [0, 1], of ``pred``'s shape, dtype and device.
+        mask
+            The dynamic-region mask, [H, W] or [H, W, 1], bool or floating in [0, 1],
+            binarized at 0.5; None scores the entire images only.
+
+        Returns
+        -------
+        entire : dict of str to float
+            The six metrics of the entire images, by name in :data:`METRIC_NAMES`' order.
+        dynamic : dict of str to float or None
+            The same metrics on :func:`dynamic_region`'s pair; None without a mask, or when the
+            mask has no usable region (Q-61).
+
+        Raises
+        ------
+        ValueError
+            If the images aren't one pair [H, W, 3] of one shape, floating dtype and device, or
+            the mask doesn't fit them.
+
+        Warns
+        -----
+        UserWarning
+            When the mask is empty, or its box is narrower than 21 px on a side (Q-257).
+        """
         if pred.dim() != 3:
             raise ValueError(f"Evaluator takes one image pair [H, W, 3], got {list(pred.shape)}")
         _check_pair(pred, gt)
@@ -235,6 +442,28 @@ class Evaluator:
 # Q-60: one test image's results, as metrics_report reads them.
 @dataclass(frozen=True)
 class ImageMetrics:
+    """One test image's results, as :func:`metrics_report` reads them (Q-60).
+
+    Parameters
+    ----------
+    camera
+        The image's camera name.
+    timestamp
+        The image's raw time τ, in the scene's time unit.
+    frame_index
+        The image's frame index, or None when its record has none.
+    path
+        The image path of the scene manifest, relative to the manifest's directory, with
+        forward slashes.
+    entire
+        The six :data:`METRIC_NAMES` values of the entire image.
+    dynamic
+        The same values on the image's dynamic region; None without a usable dynamic region
+        (Q-61).
+    masked
+        Whether the image carries a dynamic-region mask.
+    """
+
     camera: str
     timestamp: float  # raw τ
     frame_index: int | None
@@ -257,23 +486,79 @@ def evaluate_images(
     frame_dt: float | None = None,  # Q-183
     devices: Sequence[str] | None = None,  # Q-175
 ) -> list[ImageMetrics]:
-    """The metrics of every image of one data split (E16, D-67): each record rendered at its
-    raw timestamp with the model's full SH degree and `background`, through `render_request`
-    one timestamp at a time, so cameras that share a time render together (D-55) and one
-    time's renders are held at once, then evaluated by `evaluator` with the image's mask.
-    Results come in the manifest's order. Given `renders`, a prediction [H, W, 3] for every
-    record of the split by record index, nothing is rendered and those are scored (Q-137); one
-    that isn't finite is a ValueError. `frame_dt` goes to every render request as the temporal
-    index's bucket width (Q-174); with one timestamp per request the index stays off by default.
+    """Evaluate every image of one data split (E16, D-67).
 
-    `devices` spreads the timestamps over shards, one per entry, each rendering and scoring on
-    its device with its own copy of the model and its own `Evaluator`, built by the public
-    constructor, in its own thread; `evaluator` is then not used. The results are unchanged
-    (D-54; Q-175, Q-186). None evaluates in the caller's thread.
+    Each record is rendered at its raw timestamp with the model's full SH degree and
+    ``background``, through :func:`~openftgs.render.render_request` one timestamp at a time, so
+    cameras that share a time render together (D-55) and one time's renders are held at once,
+    then scored by ``evaluator`` with the image's mask. Results come in the manifest's order.
 
-    A render of the model that isn't finite, in its colors or its alpha, is not scored, nor is
-    anything after it: once the whole data split is rendered, FloatingPointError names up to
-    five such images (Q-129, Q-147)."""
+    Parameters
+    ----------
+    model
+        The model to evaluate.
+    dataset
+        The scene whose records of ``split`` are evaluated, with their images and masks.
+    evaluator
+        Scores each image; not used when ``devices`` is given.
+    split
+        The data split whose images are evaluated.
+    backend
+        The renderer.
+    background
+        The background color composited behind the renders, RGB in [0, 1].
+    renders
+        A prediction [H, W, 3] for every record of the split, by record index: nothing is
+        rendered and those are scored (Q-137). None, the default, renders the model.
+    frame_dt
+        The temporal index's bucket width, in normalized time, passed to every render request
+        (Q-174); with one timestamp per request the index stays off by default.
+    devices
+        Spreads the timestamps over shards, one per entry, each rendering and scoring on its
+        device in its own thread. None evaluates in the caller's thread.
+
+    Returns
+    -------
+    list of openftgs.eval.ImageMetrics
+        One record per image of the split, in the manifest's order.
+
+    Raises
+    ------
+    ValueError
+        If the split holds no images, ``devices`` is a string, empty or holds an entry that
+        isn't a device (Q-175, Q-186), ``renders`` lacks an image of the split or holds one
+        that isn't finite, or a render doesn't match its ground truth's shape, or a mask
+        doesn't fit it (:class:`Evaluator`).
+    FloatingPointError
+        If a render of the model isn't finite, in its colors or its alpha. It is not scored,
+        nor is anything after it: once the whole data split is rendered, the error names up to
+        five such images (Q-129, Q-147).
+
+    Notes
+    -----
+    With ``devices``, each shard renders and scores with its own copy of the model and its own
+    :class:`Evaluator`, built by the public constructor; the results are unchanged (D-54;
+    Q-175, Q-186). Q-68: the images of one data split, rendered through
+    :func:`~openftgs.render.render_request`, the path renders share (Q-57).
+
+    Examples
+    --------
+    Score an exported model on a scene's test images; ꟻLIP needs no download:
+
+    >>> from pathlib import Path
+    >>> from openftgs.data import MultiViewVideo
+    >>> from openftgs.eval import METRIC_NAMES, Evaluator, average_metrics, evaluate_images
+    >>> from openftgs.io import read_exchange
+    >>> from openftgs.model import FreeTimeGaussians
+    >>> video = MultiViewVideo.from_manifest(Path("scene/scene.json"))
+    >>> model = FreeTimeGaussians.from_exchange(read_exchange(Path("model.safetensors")))
+    >>> images = evaluate_images(model, video, Evaluator(device="cuda"), split="test")
+    >>> scene = average_metrics([image.entire for image in images])
+    >>> list(scene) == list(METRIC_NAMES)
+    True
+    >>> list(METRIC_NAMES)
+    ['psnr', 'ssim1', 'ssim2', 'dssim1', 'dssim2', 'flip']
+    """
     shard_devices = None if devices is None else _shards.devices(devices)  # Q-186
     indices = [i for i, record in enumerate(dataset.records) if record.split == split]
     if not indices:
@@ -364,11 +649,14 @@ class _Outcome:
 
 
 def _shard(model: FreeTimeGaussians, device: torch.device, rendering: bool) -> _Shard:
-    """One shard of an evaluation (D-54; Q-175, Q-186): an `Evaluator` on `device` and, when
-    it renders, a copy of the model there, made with the public constructor and keeping its
-    `slice_impl` (Q-66), whose temporal slice has run once under inference mode, as its renders
-    run it: a request at one timestamp renders through `render()`, which slices every row. So
-    the compiled slice is compiled for the device here, in the caller's thread."""
+    """Build one shard of an evaluation (D-54; Q-175, Q-186).
+
+    An `Evaluator` on `device` and, when it renders, a copy of the model there, made with the
+    public constructor and keeping its `slice_impl` (Q-66), whose temporal slice has run once
+    under inference mode, as its renders run it: a request at one timestamp renders through
+    `render()`, which slices every row. So the compiled slice is compiled for the device here,
+    in the caller's thread.
+    """
     copy = model
     if rendering:
         copy = FreeTimeGaussians(
@@ -430,11 +718,44 @@ def _row(image: ImageMetrics, values: Mapping[str, float] | None) -> dict[str, A
 def metrics_report(
     images: Sequence[ImageMetrics], *, split: str, metadata: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """The body of METRICS.json (§2.1 CLI paragraph; Q-63): per-image rows and per-scene means
-    under `entire`; under `dynamic` when an image is masked, with the manifest's mask source and
-    approximate flag (D-64); under `fastest_10` the means over the Fastest-10 frames when the
-    manifest names them (D-69). `metadata` is the scene manifest's `metadata`. Non-finite values
-    and means over no image are null. The caller adds the header (model, scene, producer)."""
+    """Build the body of METRICS.json from per-image results (§2.1 CLI paragraph; Q-63).
+
+    Per-image rows and per-scene means go under ``entire``; under ``dynamic`` when an image is
+    masked, with the manifest's mask source and approximate flag (D-64); under ``fastest_10``
+    the means over the Fastest-10 frames when the manifest names them (D-69). Non-finite values
+    and means over no image are null. The caller adds the header (model, scene, producer), as
+    :func:`write_metrics` does.
+
+    Parameters
+    ----------
+    images
+        The per-image results, as :func:`evaluate_images` returns them.
+    split
+        The data split's name, recorded as ``split``.
+    metadata
+        The scene manifest's ``metadata``: ``mask_source`` and ``masks_approximate`` describe
+        the masks, and ``fastest_10``, [n0, n0 + 10), names the Fastest-10 frames.
+
+    Returns
+    -------
+    dict
+        The report body, ready for JSON: ``format``, ``version`` (2), ``split``, ``metrics``
+        and ``entire``, then ``dynamic`` and ``fastest_10`` when they apply.
+
+    Raises
+    ------
+    ValueError
+        If ``images`` is empty, an image's metrics aren't exactly :data:`METRIC_NAMES`, an
+        unmasked image has dynamic metrics, ``masks_approximate`` isn't a bool, or
+        ``fastest_10`` isn't [n0, n0 + 10).
+
+    Notes
+    -----
+    Under ``dynamic``, ``count`` is the images with a usable region, ``skipped`` the masked
+    images without one (Q-61), and ``missing`` the images of the split without a mask (Q-135).
+    Q-256: version 2, since revision 549o, reports ``flip`` among :data:`METRIC_NAMES` and has
+    no ``lpips_backbone`` key; the scripts that read METRICS.json also read version 1.
+    """
     if not images:
         raise ValueError("metrics_report needs at least one image")
     for image in images:
@@ -517,12 +838,48 @@ def write_metrics(
     renders: Mapping[str, Any] | None = None,
     model_sha256: str | None = None,
 ) -> None:
-    """Writes METRICS.json: the header (`producer`; `model` as {path, iteration, sha256}, any of
-    which may be null, the hash being of an exchange model's file or of a checkpoint's
-    manifest.json; the scene manifest as `manifest`, {path, sha256}; `renders` when given,
-    Q-137), then `body`, the `metrics_report` dict, as JSON without NaN or Infinity (Q-25).
-    A body holding header keys, or a `model_sha256` that isn't 64 lowercase hex digits, is a
-    ValueError, raised before anything is written."""
+    """Write METRICS.json: a header, then the report body (Q-136; Q-63).
+
+    The header holds ``producer``; ``model`` as ``{path, iteration, sha256}``, any of which may
+    be null; the scene manifest as ``manifest``, ``{path, sha256}``; and ``renders`` when given
+    (Q-137). Then comes ``body``, the :func:`metrics_report` dict, all as JSON without NaN or
+    Infinity (Q-25).
+
+    Parameters
+    ----------
+    path
+        The file to write; its directory is made when missing.
+    body
+        The report body, from :func:`metrics_report`; it must not hold the header's keys.
+    manifest
+        The scene manifest evaluated, recorded by path and SHA-256.
+    model_path
+        The model's path, or None.
+    iteration
+        The model's iteration, or None.
+    renders
+        The header's ``renders`` entry, when the metrics score supplied renders (Q-137).
+    model_sha256
+        The SHA-256 of an exchange model's file or of a checkpoint's ``manifest.json``, as 64
+        lowercase hex digits, or None.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If ``body`` holds the header's keys, or ``model_sha256`` isn't 64 lowercase hex digits;
+        raised before anything is written.
+
+    Notes
+    -----
+    Q-136: the one writer of METRICS.json, for :meth:`openftgs.train.Trainer.evaluate` and
+    ``ftgs eval`` (Q-63, Q-74). The file is written to a temporary sibling and renamed over
+    ``path``, so a write that fails partway leaves the old file, or no file (Q-126); a symlink
+    at ``path`` becomes a regular file (Q-146).
+    """
     clash = [key for key in _HEADER if key in body]
     if clash:
         raise ValueError(f"the report body holds header keys {clash}")

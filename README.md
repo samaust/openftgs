@@ -1,33 +1,36 @@
 # openftgs
 
-[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml) [![Coverage](docs/coverage.svg)](#tests)
+[![CI](https://github.com/samaust/openftgs/actions/workflows/ci.yml/badge.svg)](https://github.com/samaust/openftgs/actions/workflows/ci.yml) [![Coverage](https://raw.githubusercontent.com/samaust/openftgs/main/docs/coverage.svg)](#tests) [![Documentation](https://app.readthedocs.org/projects/openftgs/badge/)](https://openftgs.readthedocs.io)
 
 openftgs is an independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors.
 
 Python package `openftgs`, under the Apache-2.0 license, with the command-line tool `ftgs`.
 
-**Status: pre-alpha.** The library and its command line are built through milestone M14; the performance work, the differential harness and the validation runs follow (`docs/clean-room/milestones.md`).
+The documentation is at [openftgs.readthedocs.io](https://openftgs.readthedocs.io): installation, a quickstart, the datasets, the method, the command line and the API reference.
+
+**Status: alpha, version 0.1.0.** The first release, at the end of the plan's milestones M0 to M18: the library and its command line are complete, the differential harness checks them, and the method is validated on openftgs-synth, the owner's CC0-1.0 rendered dataset, rather than on the paper's datasets, so no result is compared with the paper's tables. The [changelog](https://github.com/samaust/openftgs/blob/main/docs/changelog.md) lists what the release contains and its known limitations.
 
 ## Clean-room process
 
-The code is written from the paper (arXiv 2506.05348 v2) and from the owner's specification, which was itself written from the paper alone. No code, notebook, checkpoint or issue thread from any other implementation of the method, including the authors' own, is consulted. Third-party software is read only within its license: source code only under permissive licenses that allow commercial use, documentation only for everything else. Every source consulted is logged.
+The code is written from the paper (arXiv 2506.05348 v2) and from the owner's specification, which was itself written from the paper alone. No code, notebook, checkpoint or issue thread from any other implementation of the method, including the authors' own, is consulted. Third-party software is read only within its license: source code only under permissive licenses that allow commercial use, documentation only for everything else. Every source consulted is logged. The renderer the paper's project page links was read for a documentation-only survey ([#352](https://github.com/samaust/openftgs/issues/352)), and nothing from it is in the package.
 
-- [`docs/spec/`](docs/spec/): the specification, the source of truth for the implementation.
-- [`docs/clean-room/source-log.md`](docs/clean-room/source-log.md): every source consulted during the implementation and what was taken from it.
-- [`docs/clean-room/questions.md`](docs/clean-room/questions.md): gaps found in the spec and the provisional decisions made for them.
-- [`docs/clean-room/milestones.md`](docs/clean-room/milestones.md): the order in which the package is built.
+- [`docs/spec/openftgs-spec.md`](https://github.com/samaust/openftgs/blob/main/docs/spec/openftgs-spec.md): the specification, the source of truth for the implementation.
+- [`docs/clean-room/source-log.md`](https://github.com/samaust/openftgs/blob/main/docs/clean-room/source-log.md): every source consulted during the implementation and what was taken from it.
+- [`docs/clean-room/questions.md`](https://github.com/samaust/openftgs/blob/main/docs/clean-room/questions.md): gaps found in the spec and the provisional decisions made for them. GitHub doesn't render a Markdown file of this size, so it may show only the source; the [raw file](https://github.com/samaust/openftgs/raw/main/docs/clean-room/questions.md) opens as plain text.
+- [`docs/clean-room/milestones.md`](https://github.com/samaust/openftgs/blob/main/docs/clean-room/milestones.md): the order in which the package was built.
+- [`docs/clean-room/release-checklist.md`](https://github.com/samaust/openftgs/blob/main/docs/clean-room/release-checklist.md): the release-time checks of this version: the license scan, the libraries bundled in dependency wheels, the vendored code's license files, the pretrained weights' terms, the absence of dataset material, and the source-log audit.
 
 ## Installation
 
 ```bash
-pip install -e .[dev]
+pip install openftgs
 ```
 
-Training needs a CUDA build of PyTorch. On Linux x86_64 the default `torch` wheel on PyPI already is one (torch 2.14.1 bundles the CUDA 13.0 libraries), so the command above installs it. For another CUDA version, or on Windows, install torch from the [PyTorch index](https://pytorch.org/get-started/locally/) before installing openftgs. A CPU build is enough for the tests on the reference backend; CI uses one because its runners have no GPU.
+openftgs needs Python 3.11 or later. Training needs a CUDA build of PyTorch. On Linux x86_64 the default `torch` wheel on PyPI already is one (torch 2.14.1 bundles the CUDA 13.0 libraries), so the command above installs it. For another CUDA version, or on Windows, install torch from the [PyTorch index](https://pytorch.org/get-started/locally/) before installing openftgs. A CPU build is enough for the tests on the reference backend; CI uses one because its runners have no GPU.
 
 Optional extras:
 
-- `[init]`: the dependencies of the RoMa-based 4D initialization, and of the four DINO perceptual networks (`dinov2_s14`, `dinov2_b14`, `dino_s16` and `dino_b16` as `loss.perc_net`), which run on the vendored RoMa's DINOv2 layers: without the extra, building one is an error that names it (Q-248). ꟻLIP, the default perceptual network, HaarPSI and the two Caffe trunks (`vgg16_oxford`, `alexnet_bvlc`) need no extra. RoMa's optional speed-up, [fused-local-corr](https://github.com/Parskatt/fused-local-corr) (MIT), isn't part of it: every release since 0.3.27 requires one exact torch release (0.3.211 requires torch 2.11.0), so installing one would replace your torch, and the newest unpinned wheel, 0.2.4, built for CUDA 12, doesn't load with torch 2.14.1 (D-85). On Linux, build it from source against the torch you have; this needs the CUDA toolkit (`nvcc`) and a CUDA build of PyTorch already installed:
+- `[init]`: the dependencies of the RoMa-based 4D initialization (torchvision, einops and loguru, and tqdm for the code of XFeat that Tiny RoMa loads, Q-276), and of the four DINO perceptual networks (`dinov2_s14`, `dinov2_b14`, `dino_s16` and `dino_b16` as `loss.perc_net`), which run on the vendored RoMa's DINOv2 layers: without the extra, building one is an error that names it (Q-248). ꟻLIP, the default perceptual network, HaarPSI and the two Caffe trunks (`vgg16_oxford`, `alexnet_bvlc`) need no extra. RoMa's optional speed-up, [fused-local-corr](https://github.com/Parskatt/fused-local-corr) (MIT), isn't part of it: every release since 0.3.27 requires one exact torch release (0.3.211 requires torch 2.11.0), so installing one would replace your torch, and the newest unpinned wheel, 0.2.4, built for CUDA 12, doesn't load with torch 2.14.1 (D-85). On Linux, build it from source against the torch you have; this needs the CUDA toolkit (`nvcc`) and a CUDA build of PyTorch already installed:
 
   ```bash
   pip install --no-build-isolation git+https://github.com/Parskatt/fused-local-corr@689f2f7303ca0d97ac1f3d1364c732c6d8e889a8
@@ -42,7 +45,13 @@ Optional extras:
 
   Without it, the SSIM loss runs in plain PyTorch and gives the same values.
 
-The differential harness is a separate package in `harness/` (`pip install -e harness`).
+For development, install from a clone of the repository, with the test and lint tools:
+
+```bash
+pip install -e .[dev]
+```
+
+The differential harness is a separate package in `harness/` (`pip install -e harness`), which isn't published.
 
 ## Command line
 
@@ -57,7 +66,7 @@ ftgs render model.safetensors --request request.json --out renders.safetensors
 ftgs eval RUN_DIR/checkpoint OUT/scene.json --split test --out METRICS.json
 ```
 
-`ftgs <command> --help` lists every option. A run directory holds `config.json`, `train_log.jsonl`, `checkpoint/` and, when the scene has a test split, `METRICS.json`; Ctrl-C saves the checkpoint before stopping. Exit code 0 is success, 2 an invalid input or environment, 3 a numerical failure. See [`docs/modules/cli/command-line.md`](docs/modules/cli/command-line.md).
+`ftgs <command> --help` lists every option. A run directory holds `config.json`, `train_log.jsonl`, `checkpoint/` and, when the scene has a test split, `METRICS.json`; Ctrl-C saves the checkpoint before stopping. Exit code 0 is success, 2 an invalid input or environment, 3 a numerical failure. See [`docs/modules/cli/command-line.md`](https://github.com/samaust/openftgs/blob/main/docs/modules/cli/command-line.md).
 
 ## Tests
 
@@ -71,10 +80,10 @@ OPENFTGS_ALLOW_DOWNLOADS=1 pytest -m weights      # tests that download pretrain
 python scripts/license_scan.py                    # GPL, AGPL, non-commercial fail; others need a sign-off in scripts/license_signoff.json
 ```
 
-The coverage badge is the CPU and GPU suites' total on a machine with a CUDA device, the dataset and weights tests left out. `python scripts/coverage_local.py` runs both suites, writes `htmlcov/` and `coverage.xml`, and rewrites `docs/coverage.svg` when both pass; commit the SVG to update the badge (Q-217). CI's `test` job reports the CPU suite's coverage in its summary (Q-216).
+The coverage badge is the CPU and GPU suites' total on a machine with a CUDA device, the dataset and weights tests left out. `python scripts/coverage_local.py` runs both suites, writes `htmlcov/` and `coverage.xml`, and rewrites `docs/coverage.svg` when both pass; commit the SVG to update the badge (Q-217). CI's `test` job runs the CPU suite on Python 3.14 and on 3.11, the oldest Python openftgs supports (Q-1), and reports its coverage in its summary (Q-216).
 
-The license scan passes in CI's environment (CPU torch). With CUDA torch it also lists the NVIDIA runtime wheels, which stay unapproved until they are signed off for the release (milestone M18).
+The license scan passes in CI's environment (CPU torch) and, for this release, in an environment with CUDA torch, whose NVIDIA runtime wheels the owner signed off in `scripts/license_signoff.json` (the release checklist records each sign-off).
 
 ## License
 
-Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0; see [LICENSE](https://github.com/samaust/openftgs/blob/main/LICENSE) and [NOTICE](https://github.com/samaust/openftgs/blob/main/NOTICE).

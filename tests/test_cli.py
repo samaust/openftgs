@@ -8,6 +8,7 @@ The tests call `main(argv)` in process, on the CPU unless marked gpu: `torch.cud
 is patched for the CLI to read False (Q-125). A few subprocess tests run the real entry points.
 """
 
+import argparse
 import dataclasses
 import hashlib
 import importlib.metadata
@@ -45,7 +46,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from openftgs import _stages
-from openftgs.cli import main
+from openftgs.cli import _parser, main
 from openftgs.config import (
     GrowthConfig,
     InitConfig,
@@ -176,6 +177,30 @@ def test_help_and_usage_errors(capsys: pytest.CaptureFixture[str]) -> None:
     assert _ftgs("export", "x", "--format", "ply", "--out", "y") == 2
     assert _ftgs("train", "scene.json") == 2  # --init and --out are required
     capsys.readouterr()
+
+
+def test_parser_every_subcommand_and_option_has_help_text() -> None:
+    """Q-242: every `ftgs` subcommand, and every positional and option of each, carries a
+    non-empty help string, and `format_help()` succeeds on the parser and every subparser, so a
+    stray `%` that breaks argparse's formatting fails here. Misleading wording isn't caught."""
+    parser = _parser()
+    parser.format_help()
+    groups = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert len(groups) == 1
+    commands = groups[0]
+    names = ("convert", "cache", "init", "train", "render", "eval", "export", "bench")
+    assert set(commands.choices) == set(names)
+    listed = {action.dest: action.help for action in commands._choices_actions}
+    assert set(listed) == set(names)
+    bare = [name for name, text in listed.items() if not text]
+    for name, sub in commands.choices.items():
+        sub.format_help()
+        bare += [
+            f"{name} {'/'.join(a.option_strings) or a.dest}"
+            for a in sub._actions
+            if not a.help or a.help == argparse.SUPPRESS
+        ]
+    assert bare == []
 
 
 def test_the_ftgs_console_script_runs_main() -> None:

@@ -42,12 +42,38 @@ def _check_pair(pred: Tensor, gt: Tensor) -> None:
 
 
 def _batch_first(image: Tensor) -> Tensor:
-    """[..., H, W, 3] as [B, 3, H, W]; a contiguous input gives a channels-last view, no copy."""
+    """Reshape [..., H, W, 3] images to [B, 3, H, W].
+
+    A contiguous input gives a channels-last view, no copy.
+    """
     return image.reshape(-1, *image.shape[-3:]).permute(0, 3, 1, 2)
 
 
 def l1_loss(pred: Tensor, gt: Tensor) -> Tensor:
-    """L_img = mean |Î − I| over the batch, pixels and channels (E7, D-7)."""
+    """Compute the image loss L_img, the mean of ``|Î − I|`` (E7, D-7).
+
+    The L1 term of E7: the absolute difference averaged over the batch, the pixels and the
+    channels.
+
+    Parameters
+    ----------
+    pred
+        The render Î, [..., H, W, 3], floating point; any leading dimensions form a batch
+        (Q-41). It isn't clamped, so it may exceed 1 (E7).
+    gt
+        The ground-truth image I, RGB in [0, 1], with ``pred``'s shape, dtype and device.
+
+    Returns
+    -------
+    torch.Tensor
+        L_img, a 0-d tensor in ``pred``'s dtype, on its device.
+
+    Raises
+    ------
+    ValueError
+        If the images differ in shape, dtype or device, are not [..., H, W, 3], or are not
+        floating point.
+    """
     _check_pair(pred, gt)
     return (pred - gt).abs().mean()
 
@@ -60,7 +86,7 @@ _FUSED_SSIM_CONSTANTS = (11, 1.5, 1.0)
 # a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38 of https://github.com/rahul-goel/fused-ssim (MIT).
 @functools.cache
 def _fused_ssim() -> Callable[..., Tensor] | None:
-    """fused-ssim's `fused_ssim(img1, img2, padding, train)`, or None when it doesn't import."""
+    """Return fused-ssim's `fused_ssim(img1, img2, padding, train)`, or None if it won't import."""
     try:
         from fused_ssim import fused_ssim
     except ImportError:
@@ -69,8 +95,10 @@ def _fused_ssim() -> Callable[..., Tensor] | None:
 
 
 def _gaussian_window(window: int, sigma: float, like: Tensor) -> Tensor:
-    """The normalized 1-D Gaussian of `window` taps and standard deviation `sigma`, centred on the
-    middle tap, in `like`'s dtype and on its device (D-8)."""
+    """Build the normalized 1-D Gaussian of `window` taps and standard deviation `sigma` (D-8).
+
+    Centred on the middle tap, in `like`'s dtype and on its device.
+    """
     x = torch.arange(window, dtype=like.dtype, device=like.device) - (window - 1) / 2
     g = torch.exp(-(x * x) / (2.0 * sigma * sigma))
     return g / g.sum()
@@ -79,9 +107,11 @@ def _gaussian_window(window: int, sigma: float, like: Tensor) -> Tensor:
 def _ssim_torch(
     x: Tensor, y: Tensor, *, window: int, sigma: float, data_range: float, padding: str
 ) -> Tensor:
-    """SSIM of [B, 3, H, W] images (Wang et al. 2004; E7, D-8): local moments under the Gaussian
-    window, population (weighted) variances, the map averaged over batch, channels and pixels.
-    "same" zero-pads the images (Q-42)."""
+    """Compute the SSIM of [B, 3, H, W] images (Wang et al. 2004; E7, D-8).
+
+    Local moments under the Gaussian window, population (weighted) variances, the map averaged
+    over batch, channels and pixels. "same" zero-pads the images (Q-42).
+    """
     channels = x.shape[1]
     g = _gaussian_window(window, sigma, x)
     kernel = (g[:, None] * g[None, :]).expand(5 * channels, 1, window, window)
@@ -109,8 +139,53 @@ def ssim(
     data_range: float = 1.0,
     padding: Literal["valid", "same"] = "valid",
 ) -> Tensor:
-    """SSIM(Î, I) with a `window`×`window` Gaussian window of standard deviation `sigma`, per
-    channel, averaged over the map, channels and batch (E7, D-8). Returns SSIM, not 1 − SSIM."""
+    """Compute SSIM(Î, I) under a Gaussian window, per channel, averaged (E7, D-8).
+
+    The local means, variances and covariance are taken under a ``window`` × ``window``
+    Gaussian window of standard deviation ``sigma``, with population (weighted) variances and the
+    constants C₁ = (0.01·``data_range``)² and C₂ = (0.03·``data_range``)² (Wang et al. 2004).
+    The SSIM map is averaged over its pixels, the channels and the batch. This is SSIM, not
+    1 − SSIM.
+
+    On CUDA, for float32 images with E7's window, σ and data range and a ``gt`` that doesn't
+    require a gradient, fused-ssim computes it when it is installed (Q-2, Q-42); a PyTorch
+    implementation does otherwise.
+
+    Parameters
+    ----------
+    pred
+        The first image, Î, [..., H, W, 3], floating point; any leading dimensions form a batch
+        (Q-41).
+    gt
+        The second image, I, with ``pred``'s shape, dtype and device.
+    window
+        The window's width and height in pixels, an odd int ≥ 1 (E7: 11).
+    sigma
+        The Gaussian's standard deviation in pixels, > 0 (E7: 1.5).
+    data_range
+        The images' value range, > 0: 1 for images in [0, 1] (E7), k for E16's SSIM_k.
+    padding
+        "valid" keeps only the window positions inside the image (E7); "same" zero-pads the
+        images by ``window // 2`` pixels, so the map has the image's size (Q-42).
+
+    Returns
+    -------
+    torch.Tensor
+        SSIM, a 0-d tensor; 1 for identical images.
+
+    Raises
+    ------
+    ValueError
+        If the images differ in shape, dtype or device or are not [..., H, W, 3] floating
+        point, ``window`` is not an odd int ≥ 1, ``sigma`` or ``data_range`` is not > 0,
+        ``padding`` is not "valid" or "same", or, with "valid" padding, H or W is smaller
+        than ``window``.
+
+    Notes
+    -----
+    Q-41 fixes the image layout and the checks, and scales the constants with the data range;
+    Q-42 the fused path and "same" padding.
+    """
     _check_pair(pred, gt)
     # Q-41
     if isinstance(window, bool) or not isinstance(window, int) or window < 1 or window % 2 == 0:
@@ -174,10 +249,13 @@ _HAARPSI_ALPHA = 4.2
 
 @functools.cache
 def _haarpsi_constants(device: torch.device, dtype: torch.dtype) -> tuple[Tensor, list[Tensor]]:
-    """The RGB-to-YIQ matrix, transposed for a matmul over the channels-last image, and the
-    stacked horizontal and vertical Haar filters of each scale, on `device` in `dtype`. Made
-    outside inference mode, so that a loss first called by a metric under
-    `torch.inference_mode()` still serves a training step's backward."""
+    """Build HaarPSI's RGB-to-YIQ matrix and Haar filters on `device` in `dtype`.
+
+    The matrix is transposed for a matmul over the channels-last image, and the horizontal and
+    vertical Haar filters of each scale are stacked. Made outside inference mode, so that a
+    loss first called by a metric under `torch.inference_mode()` still serves a training
+    step's backward.
+    """
     with torch.inference_mode(False):
         yiq = torch.tensor(
             [[0.299, 0.587, 0.114], [0.5959, -0.2746, -0.3213], [0.2115, -0.5227, 0.3112]],
@@ -195,14 +273,18 @@ def _haarpsi_constants(device: torch.device, dtype: torch.dtype) -> tuple[Tensor
 
 
 def _similarity(x: Tensor, y: Tensor, c: float) -> Tensor:
-    """piq's `similarity_map` with its masking coefficient at its default 0, whose terms are
-    dropped."""
+    """Compute piq's `similarity_map` with its masking coefficient at its default 0.
+
+    The masking terms, whose coefficient is 0, are dropped.
+    """
     return (2.0 * x * y + c) / (x**2 + y**2 + c)
 
 
 def _haarpsi(x: Tensor, y: Tensor) -> Tensor:
-    """HaarPSI of [B, 3, H, W] images in [0, 1], the mean over the batch, as piq 0.8.0's
-    `haarpsi` at D-89's settings computes it."""
+    """Compute HaarPSI of [B, 3, H, W] images in [0, 1], the mean over the batch.
+
+    As piq 0.8.0's `haarpsi` at D-89's settings computes it.
+    """
     # Q-261: piq's minimal size, checked before the subsampling.
     kernel_size = 2 ** (_HAARPSI_SCALES + 1)
     if x.size(-1) < kernel_size or x.size(-2) < kernel_size:
@@ -307,9 +389,11 @@ _UNIT_EPS = 1e-10
 
 
 def _vendored_dinov2(net: str) -> Any:
-    """The vendored DINOv2 builders (D-65), imported only when a DINO network is built: their
-    package's `__init__` modules import torchvision, einops and loguru, which the [init] extra
-    installs (Q-248)."""
+    """Import the vendored DINOv2 builders (D-65), only when a DINO network is built.
+
+    Their package's `__init__` modules import torchvision, einops and loguru, which the [init]
+    extra installs (Q-248).
+    """
     try:
         return importlib.import_module("openftgs._vendor.romatch.models.transformer.dinov2")
     except ImportError as error:  # Q-248; Q-142: the CLI's exit 2
@@ -320,24 +404,29 @@ def _vendored_dinov2(net: str) -> Any:
 
 
 def _halved(image: Tensor) -> tuple[int, int]:
-    """D-89's half resolution of [..., H, W] images: each side halved and rounded half to even,
-    as #374's prototype rounds it (Q-265)."""
+    """Return D-89's half resolution of [..., H, W] images (Q-265).
+
+    Each side is halved and rounded half to even, as #374's prototype rounds it.
+    """
     return round(image.shape[-2] / 2), round(image.shape[-1] / 2)
 
 
 def _unit_tokens(tokens: Tensor) -> Tensor:
-    """Each token's vector [..., C] at unit length, as lpips normalizes its features."""
+    """Scale each token's vector [..., C] to unit length, as lpips normalizes its features."""
     return tokens / (tokens.pow(2).sum(dim=-1, keepdim=True).sqrt() + _UNIT_EPS)
 
 
 class _DinoDistance(torch.nn.Module):
-    """D-89's distance over four blocks of the DINO network `net`, as the mean over a batch of
-    [B, 3, H, W] images: each image at half resolution (bilinear, antialiased), centre-cropped
-    to a multiple of the patch and standardized; the patch tokens after blocks 3, 6, 9 and 12,
-    unit-normalized, their squared differences summed over channels, averaged over tokens and
-    summed over the blocks. The position embeddings are interpolated by the vendored model's
-    own code. It computes in its weights' dtype, float32 as built, and holds them as buffers
-    that no `state_dict` carries and `.to()` converts, as the Caffe trunks (Q-263, Q-265)."""
+    """Compute D-89's distance over four blocks of the DINO network `net`.
+
+    The mean over a batch of [B, 3, H, W] images: each image at half resolution (bilinear,
+    antialiased), centre-cropped to a multiple of the patch and standardized; the patch tokens
+    after blocks 3, 6, 9 and 12, unit-normalized, their squared differences summed over
+    channels, averaged over tokens and summed over the blocks. The position embeddings are
+    interpolated by the vendored model's own code. It computes in its weights' dtype, float32
+    as built, and holds them as buffers that no `state_dict` carries and `.to()` converts, as
+    the Caffe trunks (Q-263, Q-265).
+    """
 
     _mean: Tensor
     _std: Tensor
@@ -377,7 +466,7 @@ class _DinoDistance(torch.nn.Module):
         self.register_buffer("_std", std, persistent=False)
 
     def _tokens(self, image: Tensor) -> list[Tensor]:
-        """The patch tokens [B, T, C] after the four blocks, for [B, 3, H, W] images."""
+        """Return the patch tokens [B, T, C] after the four blocks, for [B, 3, H, W] images."""
         # D-89: half resolution, bilinear and antialiased (Q-265: the rounding).
         half = _halved(image)
         image = F.interpolate(
@@ -415,20 +504,76 @@ class _DinoDistance(torch.nn.Module):
 
 
 class PerceptualLoss(torch.nn.Module):
-    """L_perc: the perceptual network `net` of D-89 on the render and the training image, as the
-    mean over the batch (E7, D-9). `forward(pred, gt)` takes Q-41's [..., H, W, 3] images; the
-    reference gets no gradient. The network is frozen and stays in evaluation mode under
-    `.train()` (D-89). "flip" is the vendored LDR-ꟻLIP loss at 67.0 pixels per degree, on
-    float32 images; "haarpsi" is 1 − HaarPSI, the render clamped to [0, 1], on float32 or
-    float64 images of sides of at least 16 pixels (Q-261); under a caller's `torch.autocast`,
-    both turn it off for their own computation, which stays in their images' dtype (Q-275).
-    "vgg16_oxford" and "alexnet_bvlc" are lpips's uncalibrated distance on the Caffe trunks,
-    their weights fetched at first use, AlexNet's sides of at least 23 pixels (Q-263). The DINO
-    networks ("dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16") take sides from 27 or 31
-    pixels (Q-265) and need the [init] extra: an ImportError names it otherwise (Q-248). These
-    six trunk networks compute in their weights' dtype, float32 as built, and refuse images of
-    another; their weights are buffers no `state_dict` carries, which `.to()` moves and
-    converts (Q-263, Q-265)."""
+    """The perceptual loss L_perc, one of D-89's eight networks (E7, D-9).
+
+    ``net`` selects the network (:data:`openftgs.config.PercNet`); the module computes the
+    network's distance between the render, which E7 doesn't clamp, and the training image in
+    [0, 1], as the mean over the batch, the reference without a gradient. The network is
+    frozen and stays in evaluation mode, whatever :meth:`train` is given (D-89). Calling the
+    module, ``loss(pred, gt)``, runs :meth:`forward`. The trainer builds one network and
+    passes it to :func:`total_loss` (D-77); the evaluator builds ``"flip"`` for its ꟻLIP
+    metric (E16).
+
+    Parameters
+    ----------
+    net
+        The network, ``"flip"`` by default (D-89):
+
+        - ``"flip"``: NVIDIA's LDR-ꟻLIP loss, vendored (D-65), at 67.0 pixels per degree
+          (Q-259), the mean of its error map; it clamps both images to [0, 1] (D-89);
+        - ``"haarpsi"``: 1 − HaarPSI at 3 scales, subsampled, c = 30, α = 4.2, the render
+          clamped to [0, 1];
+        - ``"vgg16_oxford"``, ``"alexnet_bvlc"``: the distance between unit-normalized
+          features of five layers of the Caffe releases of Oxford's VGG16 and BVLC's AlexNet,
+          every channel weighted equally, at full resolution;
+        - ``"dinov2_s14"``, ``"dinov2_b14"``, ``"dino_s16"``, ``"dino_b16"``: the distance
+          between the patch tokens of DINOv2's or DINO's blocks 3, 6, 9 and 12, at half
+          resolution.
+
+    Raises
+    ------
+    ValueError
+        If ``net`` is not one of D-89's eight networks.
+    ImportError
+        If ``net`` is a DINO network and the ``[init]`` extra isn't installed, naming the
+        extra (Q-248).
+    OSError
+        If a trunk network's weights can't be downloaded, fail their check, or can't be
+        converted into the cache (Q-258).
+
+    Notes
+    -----
+    ``"flip"`` and ``"haarpsi"`` have no weights. The six trunk networks download their
+    publisher's weights at first use into torch.hub's cache,
+    ``torch.hub.get_dir()/checkpoints/``, and check them against their byte count and SHA-256
+    before every use; a Caffe file is converted once into a safetensors file beside it (§2.3;
+    Q-258). Their weights are buffers that no ``state_dict`` carries, which ``.to()`` moves and
+    converts (Q-263, Q-265).
+
+    The inputs each network refuses, with a ValueError raised on shapes and dtypes alone and
+    without a cast, before any work but for ``"haarpsi"``'s size check, which follows the
+    render's clamp (Q-261, Q-263, Q-265): ``"flip"`` takes float32 images only; ``"haarpsi"``
+    float32 or float64 images whose height and width are at least 16 pixels; the trunk
+    networks images of their weights' dtype, float32 as built, and ``"alexnet_bvlc"`` sides of
+    at least 23 pixels, the DINOv2 networks 27 and the DINO networks 31, one patch at half
+    resolution.
+
+    Under a caller's :class:`torch.autocast`, ``"flip"`` and ``"haarpsi"`` turn autocast off
+    for their own computation, which stays in their images' dtype; the trunk networks run
+    under it, as the trainer's bfloat16 path asks (Q-275, Q-250).
+
+    Examples
+    --------
+    >>> import torch
+    >>> from openftgs.losses import PerceptualLoss
+    >>> loss = PerceptualLoss("flip")
+    >>> pred = torch.rand(64, 96, 3, requires_grad=True)
+    >>> gt = torch.rand(64, 96, 3)
+    >>> value = loss(pred, gt)
+    >>> value.shape
+    torch.Size([])
+    >>> value.backward()
+    """
 
     def __init__(self, net: PercNet = "flip") -> None:
         super().__init__()
@@ -448,10 +593,47 @@ class PerceptualLoss(torch.nn.Module):
         self.train(False)
 
     def train(self, mode: bool = True) -> "PerceptualLoss":
+        """Keep the network in evaluation mode, whatever ``mode`` asks (D-89).
+
+        A parent module's ``.train()`` reaches this module too; it stays frozen and in
+        evaluation mode.
+
+        Parameters
+        ----------
+        mode
+            Ignored; accepted for :meth:`torch.nn.Module.train`'s signature.
+
+        Returns
+        -------
+        openftgs.losses.PerceptualLoss
+            This module.
+        """
         # D-89: in evaluation mode, also when a parent module calls `.train()`.
         return super().train(False)
 
     def forward(self, pred: Tensor, gt: Tensor) -> Tensor:
+        """Compute the network's distance between ``pred`` and ``gt`` (E7, D-89).
+
+        Parameters
+        ----------
+        pred
+            The render Î, [..., H, W, 3], floating point, not clamped (E7); any leading
+            dimensions form a batch (Q-41).
+        gt
+            The training image I, RGB in [0, 1], with ``pred``'s shape, dtype and device; it
+            gets no gradient.
+
+        Returns
+        -------
+        torch.Tensor
+            The distance, a 0-d tensor, the mean over the batch.
+
+        Raises
+        ------
+        ValueError
+            If the images differ in shape, dtype or device, aren't [..., H, W, 3] floating
+            point, or are of a dtype or size the network refuses.
+        """
         _check_pair(pred, gt)
         # D-89: the reference without a gradient.
         x, y = _batch_first(pred), _batch_first(gt.detach())
@@ -483,8 +665,25 @@ class PerceptualLoss(torch.nn.Module):
 
 
 def reg4d_loss(model: FreeTimeGaussians, t: float) -> Tensor:
-    """L_reg(t) = (1/N)·Σ σᵢ·sg[σt,ᵢ(t)] over all N primitives at normalized time t (E8, D-11).
-    The stop-gradient is motion's (Q-12); the parameters are read at call time."""
+    """Compute the 4D regularization L_reg(t) at normalized time ``t`` (E8, D-11).
+
+    ``L_reg(t) = (1/N)·Σᵢ σᵢ·sg[σt,ᵢ(t)]`` over all N primitives, visible or not, with σᵢ the
+    base opacity and σt,ᵢ(t) the temporal opacity. The stop-gradient is motion's (Q-12), so the
+    gradient reaches only the opacity logits (E8). The parameters are read at call time. An
+    empty model gives 0 (Q-41).
+
+    Parameters
+    ----------
+    model
+        The model whose opacities, time centers and durations enter the sum.
+    t
+        The training image's normalized time (E14), in [0, 1] for a training timestamp.
+
+    Returns
+    -------
+    torch.Tensor
+        L_reg(t), a 0-d float32 tensor in [0, 1], on the model's device.
+    """
     terms = reg4d_terms(model.opacity_logits, model.times, model.log_durations, t)
     # Q-41: an empty model gives 0, not the NaN of an empty mean.
     return terms.mean() if terms.numel() > 0 else terms.sum()
@@ -505,8 +704,10 @@ _CALIBRATED_WEIGHTS = {
 
 # Q-249: a private resolver, so that no §2.1 addition is needed.
 def _resolve_lambda_perc(cfg: LossConfig) -> float:
-    """λ_perc as `total_loss` applies it: `cfg.lambda_perc`, or the calibrated weight of
-    `cfg.perc_net` when it is None (D-9, D-89)."""
+    """Return λ_perc as `total_loss` applies it (D-9, D-89).
+
+    `cfg.lambda_perc`, or the calibrated weight of `cfg.perc_net` when it is None.
+    """
     if cfg.lambda_perc is not None:
         return cfg.lambda_perc
     return _CALIBRATED_WEIGHTS[cfg.perc_net]
@@ -524,12 +725,81 @@ def total_loss(
     *,
     perceptual: PerceptualLoss | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·L_perc + λ_reg·L_reg(t) at iteration `it` (E7,
-    E9, D-37), and its unweighted terms with the total under "total". t is the training image's
-    normalized time (§1.4), as for `reg4d_loss`. λ_perc = None is the calibrated weight of
-    `cfg.perc_net` (D-89; Q-249). A term whose λ is 0 is neither computed nor reported. After
-    `cfg.reg_until`, L_reg leaves the total but is still reported, computed without a gradient,
-    so the keys stay fixed for a run (D-10, Q-41)."""
+    """Compute the total loss L of E9 at iteration ``it``, and its unweighted terms (E9, D-77).
+
+    ``L = λ_img·L1 + λ_ssim·(1 − SSIM) + λ_perc·L_perc + λ_reg·L_reg(t)`` (E7, E9, D-37), from
+    :func:`l1_loss`, :func:`ssim`, :class:`PerceptualLoss` and :func:`reg4d_loss`.
+    ``cfg.lambda_perc = None`` stands for the calibrated weight of ``cfg.perc_net``, 0.415 for
+    ``"flip"`` (D-9, D-89; Q-249). A term whose λ is 0 is neither computed nor reported. After
+    ``cfg.reg_until``, L_reg leaves the total but is still reported, computed without a
+    gradient, so the keys stay fixed for a run (D-10, Q-41). Each term runs as a stage of its
+    own, for the benchmarks (§3.4, B-1).
+
+    Parameters
+    ----------
+    pred
+        The render Î, [..., H, W, 3], floating point, not clamped (E7); any leading dimensions
+        form a batch (Q-41).
+    gt
+        The training image I, RGB in [0, 1], with ``pred``'s shape, dtype and device.
+    model
+        The model, for L_reg.
+    t
+        The training image's normalized time (§1.4), as for :func:`reg4d_loss`.
+    it
+        The iteration, counted from 1 (D-41); it decides whether L_reg enters the total.
+    cfg
+        The weights λ and the SSIM settings (E7 to E9, D-8), the end of L_reg (D-10) and the
+        perceptual network (D-9).
+    perceptual
+        The perceptual network, built once by the caller as ``PerceptualLoss(cfg.perc_net)``;
+        required when the resolved λ_perc is positive, and unused otherwise. Its network must
+        be ``cfg.perc_net`` in either case (Q-41).
+
+    Returns
+    -------
+    loss : torch.Tensor
+        L, a 0-d tensor that carries the gradient; 0 when every λ is 0.
+    terms : dict of str to torch.Tensor
+        The unweighted terms, "l1", "one_minus_ssim", "perceptual" and "reg", each present
+        when its λ > 0, and the total under "total": detached 0-d tensors on the images'
+        device (D-77).
+
+    Raises
+    ------
+    ValueError
+        If ``it`` is not an int ≥ 1, the resolved λ_perc is positive and ``perceptual`` is
+        None (D-77; Q-249), ``perceptual``'s network differs from ``cfg.perc_net``, the
+        images fail :func:`l1_loss`'s checks, H or W is smaller than ``cfg.ssim_window`` with
+        "valid" padding (:func:`ssim`), or the perceptual network refuses the images' dtype or
+        size (:class:`PerceptualLoss`; Q-261, Q-263, Q-265).
+
+    Notes
+    -----
+    §2.1's signature is D-77's: the terms stay on the device, so the loss never synchronizes
+    with the host (§2.4 rule 3), and the perceptual network is passed in rather than built
+    here. The trainer accumulates the terms and reads them every ``log_every`` iterations.
+    Q-249: D-77's raise reads the resolved weight, so the default configuration, whose
+    ``lambda_perc`` is None, needs the network.
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> import torch
+    >>> from openftgs.config import LossConfig
+    >>> from openftgs.losses import PerceptualLoss, total_loss
+    >>> from openftgs.model import FreeTimeGaussians
+    >>> model = FreeTimeGaussians.load(Path("run/checkpoint"))
+    >>> pred = torch.rand(480, 640, 3, device="cuda", requires_grad=True)  # a render, say
+    >>> gt = torch.rand(480, 640, 3, device="cuda")
+    >>> t, it = 0.5, 1
+    >>> cfg = LossConfig()  # perc_net "flip", lambda_perc None: 0.415
+    >>> perceptual = PerceptualLoss(cfg.perc_net).to(pred.device)
+    >>> loss, terms = total_loss(pred, gt, model, t, it, cfg, perceptual=perceptual)
+    >>> loss.backward()
+    >>> sorted(terms)
+    ['l1', 'one_minus_ssim', 'perceptual', 'reg', 'total']
+    """
     # Q-41: iterations count from 1 (D-41).
     if isinstance(it, bool) or not isinstance(it, int) or it < 1:
         _fail(f"it must be an int >= 1, got {it!r}")

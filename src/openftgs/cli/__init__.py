@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ftgs command line: convert, cache, init, train, render, eval, export and bench.
-
-Spec: §2.1 (CLI block and exit codes), §2.2, §3.4, D-62. Band: Interface (§2.1).
+"""The ``ftgs`` command line of §2.1: convert, cache, init, train, render, eval, export, bench.
 
 Each command parses its options and calls the library; heavy imports happen inside the
-commands, so `ftgs --help` stays fast and `ftgs train` can set environment variables before
-CUDA starts. The exit codes are §2.1's: 0 success, 2 invalid input or environment, 3 a
-numerical failure (Q-142); `ftgs train` stopped by a signal exits with 128 plus its number
-(Q-133). Any other exception is a bug and keeps its traceback (Q-26). `ftgs bench` and its
-benchmarks are in the private module `_bench` (Q-166 to Q-168).
+commands, so ``ftgs --help`` stays fast and ``ftgs train`` can set environment variables
+before CUDA starts. The module's one public name is ``main``, which the ``ftgs`` console
+script and ``python -m openftgs.cli`` run.
+
+Notes
+-----
+Spec: §2.1 (CLI block and exit codes), §2.2, §3.4, D-62. Band: Interface (§2.1).
+
+The exit codes are §2.1's: 0 success, 2 invalid input or environment, 3 a numerical failure
+(Q-142); ``ftgs train`` stopped by a signal exits with 128 plus its number (Q-133). Any other
+exception is a bug and keeps its traceback (Q-26). ``ftgs bench`` and its benchmarks are in
+the private module ``_bench`` (Q-166 to Q-168).
 """
 
 from __future__ import annotations
@@ -57,8 +62,11 @@ def _fail(message: str, code: int = _INPUT) -> NoReturn:
 
 @contextlib.contextmanager
 def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
-    """Q-26, Q-142: a ValueError (and the listed types) of a call that reads or checks user
-    input is exit code 2; anywhere else it stays a bug with its traceback."""
+    """Turn a ValueError, or one of the listed types, into exit code 2.
+
+    Q-26, Q-142: for a call that reads or checks user input; anywhere else a ValueError stays
+    a bug with its traceback.
+    """
     caught: tuple[type[Exception], ...] = (ValueError, *also)
     try:
         yield
@@ -68,8 +76,10 @@ def _as_input_error(what: str, *also: type[Exception]) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _environment(what: str) -> Iterator[None]:
-    """Q-142: an OSError of a run-time download or of a cached file's check (the trunk networks'
-    weights, §2.3 notes; Q-258) is an environment error, exit code 2."""
+    """Turn an OSError of a run-time download or of a cached file's check into exit code 2.
+
+    Q-142: an environment error, as for the trunk networks' weights (§2.3 notes; Q-258).
+    """
     try:
         yield
     except OSError as error:
@@ -78,9 +88,11 @@ def _environment(what: str) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _output(what: str) -> Iterator[None]:
-    """Q-142 (as answered): an OSError while writing a user-chosen output, or making its
-    directory, is exit code 2; the atomic writes leave the old file or checkpoint (Q-25,
-    Q-126)."""
+    """Turn an OSError while writing a user-chosen output into exit code 2.
+
+    Q-142 (as answered): making the output's directory included; the atomic writes leave the
+    old file or checkpoint (Q-25, Q-126).
+    """
     try:
         yield
     except OSError as error:
@@ -95,7 +107,7 @@ def _producer() -> str:
 
 
 def _device() -> str:
-    """Q-125: CUDA when PyTorch sees a device, else the CPU."""
+    """Return CUDA when PyTorch sees a device, else the CPU (Q-125)."""
     import torch
 
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,9 +118,12 @@ def _backend(device: str) -> Literal["gsplat", "reference"]:
 
 
 def _shard_devices(device: str) -> list[str] | None:
-    """D-54, Q-175, Q-186: on CUDA with two or more visible CUDA devices, which
+    """Return the devices to shard over, or None to run unsharded.
+
+    D-54, Q-175, Q-186: on CUDA with two or more visible CUDA devices, which
     `CUDA_VISIBLE_DEVICES` restricts, every one of them, one shard each; None with one, or on
-    the CPU, which renders unsharded with no copy of the model."""
+    the CPU, which renders unsharded with no copy of the model.
+    """
     import torch
 
     if device != "cuda":
@@ -120,7 +135,7 @@ def _shard_devices(device: str) -> list[str] | None:
 
 
 def _empty_or_absent(path: Path, what: str) -> None:
-    """Q-126: a directory output must be absent or an empty directory."""
+    """Refuse a directory output that is neither absent nor an empty directory (Q-126)."""
     if path.exists() and (not path.is_dir() or any(path.iterdir())):
         _fail(f"{what} {path} must be absent or an empty directory")
 
@@ -144,7 +159,7 @@ def _sha256(path: Path) -> str:
 
 
 def _pair(text: str) -> tuple[int, int]:
-    """`A:B` with two integers (`--window N0:N1`, `--profile START:COUNT`)."""
+    """Parse `A:B` with two integers (`--window N0:N1`, `--profile START:COUNT`)."""
     parts = text.split(":")
     try:
         if len(parts) != 2:
@@ -299,7 +314,7 @@ def _init(args: argparse.Namespace) -> int:
 
 
 def _read_config(path: Path | None, seed: int | None) -> TrainConfig:
-    """§2.1: --config is a JSON TrainConfig (Q-10); --seed replaces its seed."""
+    """Read --config, a JSON TrainConfig (§2.1, Q-10), with --seed replacing its seed."""
     from openftgs.config import config_from_dict
 
     with _as_input_error(f"configuration {path}", OSError):
@@ -314,9 +329,12 @@ def _read_config(path: Path | None, seed: int | None) -> TrainConfig:
 
 
 def _check_resume_dir(run_dir: Path, cfg: TrainConfig) -> None:
-    """Q-134: a resumed run writes into an absent or empty directory, or into the run directory
-    of its own configuration: its config.json differs at most in the performance settings a
-    resume may change (Q-134 as answered, Q-153)."""
+    """Refuse a resumed run's directory unless it is absent, empty or the run's own (Q-134).
+
+    A resumed run writes into an absent or empty directory, or into the run directory of its
+    own configuration: its config.json differs at most in the performance settings a resume
+    may change (Q-134 as answered, Q-153).
+    """
     from openftgs.config import config_from_dict, resume_conflicts
 
     if not run_dir.exists() or (run_dir.is_dir() and not any(run_dir.iterdir())):
@@ -331,7 +349,7 @@ def _check_resume_dir(run_dir: Path, cfg: TrainConfig) -> None:
 
 
 def _check_masks(video: MultiViewVideo, split: str) -> None:
-    """Q-135 (#83): a split's masks are all there or none are."""
+    """Refuse a split whose masks aren't all there or all absent (Q-135, #83)."""
     indices = [i for i, r in enumerate(video.records) if r.split == split]
     absent = [i for i in indices if video.manifest.masks[i] is None]
     if absent and len(absent) < len(indices):
@@ -344,8 +362,10 @@ def _check_masks(video: MultiViewVideo, split: str) -> None:
 
 
 class _Signals:
-    """§2.2, Q-133: SIGINT and SIGTERM during training are recorded, and the trainer stops
-    after the current iteration; the old handlers come back afterwards."""
+    """The record of SIGINT and SIGTERM during training (§2.2, Q-133).
+
+    The trainer stops after the current iteration; the old handlers come back afterwards.
+    """
 
     def __init__(self) -> None:
         self.received: int | None = None
@@ -365,8 +385,11 @@ class _Signals:
 
 
 class _Profile:
-    """§3.4: a torch.profiler trace of iterations START … START + COUNT − 1, in which every
-    stage of an iteration is a named range; the stages' NVTX ranges run with or without it."""
+    """A torch.profiler trace of iterations START … START + COUNT − 1 (§3.4).
+
+    Every stage of an iteration is a named range in it; the stages' NVTX ranges run with or
+    without it.
+    """
 
     def __init__(self, start: int, count: int, path: Path, device: str) -> None:
         import torch.profiler
@@ -388,8 +411,10 @@ class _Profile:
             set_profiling(True)  # §3.4: the trace carries the stage names
 
     def step_done(self, iteration: int) -> None:
-        """After iteration `iteration`: start before the window's first, finish after its
-        last."""
+        """Start before the window's first iteration, and finish after its last.
+
+        Called after iteration `iteration`.
+        """
         self.begin_if_due(iteration)
         if iteration == self._last:
             self.finish()
@@ -503,9 +528,12 @@ def _train(args: argparse.Namespace) -> int:
     log_failure: _Failure | None = None  # Q-159 (as answered): reported once the checkpoint is safe
 
     def save() -> None:
-        """D-83: every save, periodic, final, on a signal or after a train_log.jsonl that
-        can't be written (Q-159 as answered), checks the state first (Q-133) and rotates the run
-        directory's kept checkpoints."""
+        """Save a checkpoint, the state checked first, and rotate the kept ones (D-83).
+
+        Every save, periodic, final, on a signal or after a train_log.jsonl that can't be
+        written (Q-159 as answered), checks the state first (Q-133) and rotates the run
+        directory's kept checkpoints.
+        """
         state = trainer.state_dict()
         _check_finite(trainer, state.stats)
         # Q-159: no further save is attempted; Q-150 (as answered): a rotation refused onto an
@@ -517,8 +545,11 @@ def _train(args: argparse.Namespace) -> int:
             save_run_checkpoint(state, run_dir, keep=args.keep_checkpoints)
 
     def end_profile(stage: Callable[[], None], *, failed: bool) -> None:
-        """Q-144: write the trace; Q-142: a trace that can't be written is exit 2, reported
-        after the checkpoint is saved; Q-160: after a training failure, only a warning."""
+        """Write the trace, holding back a failure to write it (Q-144).
+
+        Q-142: a trace that can't be written is exit 2, reported after the checkpoint is
+        saved; Q-160: after a training failure, only a warning.
+        """
         nonlocal trace_failure
         try:
             with _output(f"the profile trace {profile.path if profile else ''}"):
@@ -618,8 +649,11 @@ def _train(args: argparse.Namespace) -> int:
 
 
 def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
-    """Q-133: the trainer checks for divergence at log reads and events (Q-69), so a model that
-    turned non-finite since then is caught here, and a diverged state is never saved."""
+    """Refuse a model or statistics that aren't finite, as exit code 3 (Q-133).
+
+    The trainer checks for divergence at log reads and events (Q-69), so a model that turned
+    non-finite since then is caught here, and a diverged state is never saved.
+    """
     import torch
 
     try:
@@ -631,8 +665,11 @@ def _check_finite(trainer: Trainer, stats: Mapping[str, Any]) -> None:
 
 
 def _out_of_memory(completed: int, run_dir: Path, resumed: Path | None) -> str:
-    """Q-142 (as answered): what an out-of-memory failure in training lost, and the way on:
-    `completed` is the trainer's iteration, the step in progress being lost."""
+    """Describe what an out-of-memory failure in training lost, and the way on.
+
+    Q-142 (as answered): `completed` is the trainer's iteration, the step in progress being
+    lost.
+    """
     latest = run_dir / "checkpoint"
     if latest.is_dir():
         where = f"resume from {latest}"
@@ -668,12 +705,14 @@ def _model_sha256(path: Path) -> str:
 
 
 def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
-    """MODEL of §2.1: a checkpoint directory or an FTGS-IF file; with `hashed`, also the SHA-256
-    that names it (Q-136), taken before and after reading, so that it names the bytes read: a
-    model that changed meanwhile, as a periodic save (D-83) changes RUN_DIR/checkpoint, is
-    exit 2 (Q-154). So is a model whose second hash can't be taken, and a read that fails while
-    the hash changes, as when a save tears the read; a read that fails with the hash unchanged
-    keeps the reader's error (Q-154 as answered)."""
+    """Read MODEL of §2.1, a checkpoint directory or an FTGS-IF file.
+
+    With `hashed`, also the SHA-256 that names it (Q-136), taken before and after reading, so
+    that it names the bytes read: a model that changed meanwhile, as a periodic save (D-83)
+    changes RUN_DIR/checkpoint, is exit 2 (Q-154). So is a model whose second hash can't be
+    taken, and a read that fails while the hash changes, as when a save tears the read; a read
+    that fails with the hash unchanged keeps the reader's error (Q-154 as answered).
+    """
     changed_message = f"model {path} changed while it was read; evaluate it again"
     with _as_input_error(f"model {path}", OSError):  # Q-142, Q-154
         try:  # a mistyped checkpoint directory isn't an unreadable FTGS-IF file
@@ -696,7 +735,10 @@ def _load_model(path: Path, device: str, *, hashed: bool = False) -> _Loaded:
 
 
 def _model_sha256_or_none(path: Path) -> str | None:
-    """Q-154 (as answered): None when the model is gone or unreadable, as within a save."""
+    """Return the model's SHA-256, or None when it is gone or unreadable (Q-154).
+
+    Q-154 (as answered): gone or unreadable as within a save.
+    """
     try:
         return _model_sha256(path)
     except OSError:
@@ -750,7 +792,7 @@ def _render(args: argparse.Namespace) -> int:
 def _render_loaded(
     loaded: _Loaded, request_path: Path, out: Path, backend: str, device: str
 ) -> int:
-    """`ftgs render`'s body once MODEL is read: also `ftgs-adapter render`'s (Q-202)."""
+    """Run `ftgs render`'s body once MODEL is read; also `ftgs-adapter render`'s (Q-202)."""
     import torch
 
     from openftgs.io import read_render_request, write_renders
@@ -793,8 +835,10 @@ def _render_loaded(
 def _match_renders(
     video: MultiViewVideo, split: str, directory: Path
 ) -> tuple[dict[int, Any], dict[str, str]]:
-    """Q-137: each record of the split matched to exactly one item of DIR's request, by its
-    timestamp, image size and camera, and that item's render."""
+    """Match each record of the split to exactly one item of DIR's request (Q-137).
+
+    The match is by timestamp, image size and camera; each record gets that item's render.
+    """
     import torch
     from safetensors import safe_open
 
@@ -903,7 +947,7 @@ def _export(args: argparse.Namespace) -> int:
 
 
 def _export_loaded(loaded: _Loaded, out: Path) -> int:
-    """`ftgs export`'s body once the model is read: also `ftgs-adapter export`'s (Q-202)."""
+    """Run `ftgs export`'s body once the model is read; also `ftgs-adapter export`'s (Q-202)."""
     from openftgs.io import write_exchange
 
     # D-84: the file records the background the run was trained against.
@@ -925,30 +969,115 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
+    # Q-242: the help text, written from §2.1's CLI block, the paragraph after it and the module
+    # docs; it changes no default, type, choice or requirement. A literal percent sign is "%%".
     p = commands.add_parser("convert", help="convert a dataset into a scene manifest")
-    p.add_argument("kind", choices=tuple(_CONVERT_OPTIONS))
-    p.add_argument("src", type=Path, metavar="SRC")
-    p.add_argument("out", type=Path, metavar="OUT")
-    p.add_argument("--scene", metavar="NAME")
-    p.add_argument("--fps", type=float, metavar="F")
-    p.add_argument("--frames", type=int, metavar="N")
-    p.add_argument("--resize", type=float, metavar="R")
-    p.add_argument("--ffmpeg", metavar="PATH")
-    p.add_argument("--ffprobe", metavar="PATH")
-    p.add_argument("--hwaccel", choices=("none", "cuda"))
-    p.add_argument("--jobs", type=int, metavar="J")
-    p.add_argument("--test-camera", dest="test_camera", metavar="NAME")
-    p.add_argument("--window", type=_pair, metavar="N0:N1")
-    p.add_argument("--undistort", choices=("colmap", "internal"))
-    p.add_argument("--colmap", metavar="PATH")
-    p.add_argument("--no-sync", dest="use_sync", action="store_const", const=False)
-    p.add_argument("--masks", type=Path, metavar="DIR")
-    p.add_argument("--calib", type=Path, metavar="DIR")
+    p.add_argument(
+        "kind",
+        choices=tuple(_CONVERT_OPTIONS),
+        help="the converter: n3dv (Neural3DV), opencv-yaml (OpenCV-style YAML calibrations, "
+        "such as ENeRF-Outdoor) or selfcap (SelfCap's archives)",
+    )
+    p.add_argument("src", type=Path, metavar="SRC", help="the dataset's scene folder")
+    p.add_argument(
+        "out",
+        type=Path,
+        metavar="OUT",
+        help="the output folder, absent or empty; it receives the frames and OUT/scene.json, "
+        "whose path is printed",
+    )
+    p.add_argument(
+        "--scene",
+        metavar="NAME",
+        help="selfcap, required: the scene; a scene outside the dataset card's table needs "
+        "--window and --test-camera",
+    )
+    p.add_argument("--fps", type=float, metavar="F", help="opencv-yaml, required: frame rate")
+    p.add_argument(
+        "--frames",
+        type=int,
+        metavar="N",
+        help="n3dv and opencv-yaml: the first N frames of each camera (n3dv: 300 by default; "
+        "required for opencv-yaml)",
+    )
+    p.add_argument(
+        "--resize",
+        type=float,
+        metavar="R",
+        help="the resize ratio of frames and intrinsics (n3dv: 0.5 by default; required for "
+        "opencv-yaml; selfcap: the card's ratio, or 0.5 for other scenes)",
+    )
+    p.add_argument("--ffmpeg", metavar="PATH", help="the ffmpeg program (default: on PATH)")
+    p.add_argument(
+        "--ffprobe",
+        metavar="PATH",
+        help="the ffprobe program (default: beside a given --ffmpeg, else on PATH)",
+    )
+    p.add_argument(
+        "--hwaccel",
+        choices=("none", "cuda"),
+        help="ffmpeg's video decoding: none (the default) or cuda, which forces hardware frames",
+    )
+    p.add_argument(
+        "--jobs",
+        type=int,
+        metavar="J",
+        help="cameras decoded at once (0, the default: one per four cores); outputs don't "
+        "depend on it",
+    )
+    p.add_argument(
+        "--test-camera",
+        dest="test_camera",
+        metavar="NAME",
+        help="opencv-yaml and selfcap: the test view (opencv-yaml: none by default, so every "
+        "image trains; selfcap: the card's)",
+    )
+    p.add_argument(
+        "--window",
+        type=_pair,
+        metavar="N0:N1",
+        help="selfcap: frames N0 <= n < N1 of every camera (default: the card's)",
+    )
+    p.add_argument(
+        "--undistort",
+        choices=("colmap", "internal"),
+        help="selfcap: undistort with COLMAP (the default) or with the package's own code",
+    )
+    p.add_argument(
+        "--colmap", metavar="PATH", help="selfcap: the COLMAP program (default: on PATH)"
+    )
+    p.add_argument(
+        "--no-sync",
+        dest="use_sync",
+        action="store_const",
+        const=False,
+        help="selfcap: ignore the cameras' sync offsets, so frame n is at n/60 s",
+    )
+    p.add_argument(
+        "--masks",
+        type=Path,
+        metavar="DIR",
+        help="selfcap: one mask per test image, DIR/<n:06d>.png, with DIR/masks.json giving "
+        "their source",
+    )
+    p.add_argument(
+        "--calib",
+        type=Path,
+        metavar="DIR",
+        help="selfcap: a calibration folder that overrides either calibration source, the "
+        "scene's release archive or the hair-calib archive (D-63)",
+    )
     p.set_defaults(run=_convert)
 
     p = commands.add_parser("cache", help="build the frame cache of a scene")
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--placement", choices=("auto", "gpu", "mmap"), default="auto")
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "--placement",
+        choices=("auto", "gpu", "mmap"),
+        default="auto",
+        help="auto (the default) only builds the cache; gpu or mmap also opens it in that "
+        "placement, which shows that it fits",
+    )
     p.set_defaults(run=_cache)
 
     p = commands.add_parser(
@@ -957,48 +1086,163 @@ def _parser() -> argparse.ArgumentParser:
         description="Initial points for training. D-24's check of F·B against N_max happens "
         "when `ftgs train` builds the model, where it is exit code 2 (Q-128).",
     )
-    p.add_argument("method", choices=("roma",))
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("out", type=Path, metavar="OUT.safetensors")
-    p.add_argument("--stride", type=int, metavar="K")
-    p.add_argument("--points-per-frame", dest="points_per_frame", type=int, metavar="B")
-    p.add_argument("--seed", type=int, metavar="S")
-    p.add_argument("--model", choices=("roma_outdoor", "tiny_roma_v1_outdoor"))
-    p.add_argument("--no-upsample", dest="no_upsample", action="store_true")
+    p.add_argument("method", choices=("roma",), help="the method: roma (needs a CUDA device)")
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "out", type=Path, metavar="OUT.safetensors", help="the initial points file to write"
+    )
+    p.add_argument(
+        "--stride",
+        type=int,
+        metavar="K",
+        help="init frames at every K-th frame of the sequence (default: 1, every frame)",
+    )
+    p.add_argument(
+        "--points-per-frame",
+        dest="points_per_frame",
+        type=int,
+        metavar="B",
+        help="the point budget B per frame of the sequence; an init frame keeps at most K·B "
+        "(default: 1000)",
+    )
+    p.add_argument("--seed", type=int, metavar="S", help="the random seed (default: 0)")
+    p.add_argument(
+        "--model",
+        choices=("roma_outdoor", "tiny_roma_v1_outdoor"),
+        help="RoMa's model (default: roma_outdoor)",
+    )
+    p.add_argument(
+        "--no-upsample",
+        dest="no_upsample",
+        action="store_true",
+        help="match at RoMa's coarse resolution only",
+    )
     p.set_defaults(run=_init)
 
     p = commands.add_parser("train", help="train a model")
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--init", type=Path, required=True, metavar="INIT.safetensors")
-    p.add_argument("--out", type=Path, required=True, metavar="RUN_DIR")
-    p.add_argument("--config", type=Path, metavar="CFG.json")
-    p.add_argument("--seed", type=int, metavar="S")
-    p.add_argument("--resume", type=Path, metavar="CKPT_DIR")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--checkpoint-every", type=int, default=0, metavar="N")  # D-83
-    p.add_argument("--keep-checkpoints", type=int, default=1, metavar="K")  # D-83
-    p.add_argument("--profile", type=_pair, metavar="START:COUNT")
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "--init",
+        type=Path,
+        required=True,
+        metavar="INIT.safetensors",
+        help="the initial points, from ftgs init",
+    )
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="RUN_DIR",
+        help="the run directory, absent or empty for a new run; it receives config.json, "
+        "train_log.jsonl, the checkpoints and, when the scene has a test split, METRICS.json",
+    )
+    p.add_argument(
+        "--config",
+        type=Path,
+        metavar="CFG.json",
+        help="a TrainConfig as JSON (default: TrainConfig's defaults)",
+    )
+    p.add_argument("--seed", type=int, metavar="S", help="the seed, replacing the configuration's")
+    p.add_argument(
+        "--resume",
+        type=Path,
+        metavar="CKPT_DIR",
+        help="continue from a checkpoint, on its own configuration: a --config or --seed "
+        "must give that configuration, except the performance settings that change no number "
+        "(Q-134)",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="with --resume: resume despite a changed scene manifest",
+    )
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also save a checkpoint after every N-th iteration (0, the default, saves only at "
+        "the end and on SIGINT or SIGTERM)",
+    )  # D-83
+    p.add_argument(
+        "--keep-checkpoints",
+        type=int,
+        default=1,
+        metavar="K",
+        help="keep the K latest saves: RUN_DIR/checkpoint and RUN_DIR/checkpoint-<iteration> "
+        "(default: 1)",
+    )  # D-83
+    p.add_argument(
+        "--profile",
+        type=_pair,
+        metavar="START:COUNT",
+        help="write a torch.profiler trace of COUNT iterations from START to "
+        "RUN_DIR/profile/trace.json",
+    )
     p.set_defaults(run=_train)
 
     p = commands.add_parser("render", help="answer a render request")
-    p.add_argument("model", type=Path, metavar="MODEL")
-    p.add_argument("--request", type=Path, required=True, metavar="REQUEST.json")
-    p.add_argument("--out", type=Path, required=True, metavar="RENDERS.safetensors")
-    p.add_argument("--backend", choices=("gsplat", "reference"), default="gsplat")
+    p.add_argument(
+        "model", type=Path, metavar="MODEL", help="a checkpoint directory or an FTGS-IF file"
+    )
+    p.add_argument(
+        "--request", type=Path, required=True, metavar="REQUEST.json", help="the render request"
+    )
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="RENDERS.safetensors",
+        help="the renders file to write",
+    )
+    p.add_argument(
+        "--backend",
+        choices=("gsplat", "reference"),
+        default="gsplat",
+        help="gsplat (the default, needs a CUDA device) or reference, which renders on the CPU",
+    )
     p.set_defaults(run=_render)
 
     p = commands.add_parser("eval", help="evaluate a model on a scene")
-    p.add_argument("model", type=Path, metavar="MODEL")
-    p.add_argument("scene", type=Path, metavar="SCENE.json")
-    p.add_argument("--split", choices=("test", "train"), default="test")  # Q-143
-    p.add_argument("--out", type=Path, required=True, metavar="METRICS.json")
-    p.add_argument("--renders-dir", dest="renders_dir", type=Path, metavar="DIR")
+    p.add_argument(
+        "model", type=Path, metavar="MODEL", help="a checkpoint directory or an FTGS-IF file"
+    )
+    p.add_argument("scene", type=Path, metavar="SCENE.json", help="the scene manifest")
+    p.add_argument(
+        "--split",
+        choices=("test", "train"),
+        default="test",
+        help="the split to evaluate (default: test)",
+    )  # Q-143
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="METRICS.json",
+        help="the metrics file to write, per image and per scene",
+    )
+    p.add_argument(
+        "--renders-dir",
+        dest="renders_dir",
+        type=Path,
+        metavar="DIR",
+        help="score the renders in DIR (request.json and renders.safetensors) instead of "
+        "rendering the model",
+    )
     p.set_defaults(run=_eval)
 
     p = commands.add_parser("export", help="export a checkpoint as an exchange model")
-    p.add_argument("checkpoint", type=Path, metavar="CKPT_DIR")
-    p.add_argument("--format", choices=("ftgs-if",), required=True)
-    p.add_argument("--out", type=Path, required=True, metavar="MODEL.safetensors")
+    p.add_argument("checkpoint", type=Path, metavar="CKPT_DIR", help="the checkpoint directory")
+    p.add_argument(
+        "--format", choices=("ftgs-if",), required=True, help="the exchange format: ftgs-if"
+    )
+    p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="MODEL.safetensors",
+        help="the exchange model file to write",
+    )
     p.set_defaults(run=_export)
 
     from openftgs.cli import _bench  # the package is loaded by now; the module imports from it
@@ -1009,9 +1253,12 @@ def _parser() -> argparse.ArgumentParser:
 
 # Q-176 (as answered, #274): the cores of the affinity set, which PyTorch's own default follows.
 def _physical_cores() -> int:
-    """The distinct (package, core) pairs, in Linux's CPU topology, of the CPUs this process may
+    """Count the physical cores of the CPUs this process may run on (Q-176).
+
+    The distinct (package, core) pairs, in Linux's CPU topology, of the CPUs this process may
     run on; the number of those CPUs where the topology can't be read, and the logical CPUs
-    where Python has no `os.sched_getaffinity` (macOS, Windows)."""
+    where Python has no `os.sched_getaffinity` (macOS, Windows).
+    """
     if not hasattr(os, "sched_getaffinity"):
         return os.cpu_count() or 1
     cpus = os.sched_getaffinity(0)
@@ -1039,7 +1286,46 @@ def _set_intra_op_threads() -> None:
 
 # Q-124: the module's one public name; the ftgs console script and `python -m openftgs.cli`.
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run `ftgs` with `argv` (the process's arguments by default) and return its exit code."""
+    """Run ``ftgs`` with ``argv`` and return its exit code (§2.1).
+
+    Parse the arguments with the parser of §2.1's CLI block, set PyTorch's intra-op threads to
+    the physical cores, unless ``OMP_NUM_THREADS`` or ``MKL_NUM_THREADS`` is set, then run the
+    command and map its failures to §2.1's exit codes. ``--help`` and a usage error run no
+    command and change nothing.
+
+    Parameters
+    ----------
+    argv
+        The arguments after the program's name, as ``["train", "scene.json", "--init",
+        "init.safetensors", "--out", "run"]``; None, the default, reads the process's
+        arguments, ``sys.argv[1:]``.
+
+    Returns
+    -------
+    int
+        The exit code: 0 success (``--help`` included), 2 invalid input or environment (a
+        usage error included), 3 a numerical failure, and 128 plus the signal's number when
+        SIGINT or SIGTERM stops ``ftgs train`` after it saved its checkpoint. Exit 2 covers a
+        trunk network's weights that can't be downloaded, fail their check or can't be
+        converted (Q-142, Q-258), a DINO network without the ``[init]`` extra (Q-248), and
+        resuming from a checkpoint saved before revision 549o (Q-247).
+
+    Notes
+    -----
+    Q-124: the module's one public name, run by the ``ftgs`` console script and by
+    ``python -m openftgs.cli``. A failure the CLI reports is one line on stderr,
+    ``ftgs <command>: error: <message>``, followed by a warning line for each failure that
+    came after it (Q-159); any other exception is a bug and keeps its traceback (Q-26,
+    Q-142). Signals: Q-133. Threads: §2.4, Q-176.
+
+    Examples
+    --------
+    Train on a converted scene from Python, as ``ftgs train`` would:
+
+    >>> from openftgs.cli import main
+    >>> main(["train", "scene/scene.json", "--init", "init.safetensors", "--out", "run"])
+    0
+    """
     parser = _parser()
     try:
         args = parser.parse_args(argv)

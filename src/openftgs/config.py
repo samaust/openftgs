@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TrainConfig and its sub-configs, with the defaults of §1.5; every field records its provenance
-tag. Validation on construction (D-3; Q-11) and the JSON form the checkpoint manifest stores
-(§2.2; Q-10).
+"""TrainConfig and its sub-configs, with the defaults of §1.5.
+
+Every field records its provenance tag (§0): [P §x] stated by the paper, [P→3DGS] taken from
+3DGS through the paper's "same settings as 3DGS", [L: source] standard Gaussian-splatting
+practice, [D-n] a decision of the spec. Each config validates its fields on construction (D-3;
+Q-11), and :func:`config_to_dict` and :func:`config_from_dict` give the JSON form the checkpoint
+manifest stores (§2.2; Q-10). The field names are the hyperparameter names the harness uses
+(§3.3).
 
 Spec: §1.5, §2.1, §2.2, §2.4. Band: Foundation (§2.1).
 """
@@ -32,6 +37,29 @@ __all__ = [
 
 @dataclass
 class InitConfig:  # §1.3 Initialization
+    """Settings of the model's initialization from the initial points (§1.3 "Initialization").
+
+    Parameters
+    ----------
+    points_per_frame
+        The initial budget B, in points per frame of the sequence, ≥ 1; F·B must not exceed
+        ``GrowthConfig.n_max`` for a sequence of F frames [D-24].
+    init_opacity
+        The initial opacity of every primitive, in (0, 1) [D-5].
+    scale_knn
+        How many nearest neighbors' mean distance sets each initial scale, ≥ 1
+        [L: 3DGS §5.1].
+    scale_floor
+        The floor of that mean distance, in world units, > 0 [D-25].
+
+    Raises
+    ------
+    ValueError
+        If a field has the wrong type or lies outside its range, naming its dotted path (Q-10,
+        Q-11). An int is accepted for a float field and converted; a bool is refused for a
+        numeric field.
+    """
+
     points_per_frame: int = 1_000  # B, D-24; F·B must not exceed GrowthConfig.n_max
     init_opacity: float = 0.1  # D-5
     scale_knn: int = 3  # L: 3DGS §5.1
@@ -40,6 +68,7 @@ class InitConfig:  # §1.3 Initialization
     _prefix: ClassVar[str] = "init."
 
     def __post_init__(self) -> None:
+        """Check the fields' types and ranges (Q-10, Q-11)."""
         _check_types(self)
         # Q-11
         _check_count(self, "points_per_frame", "scale_knn")
@@ -51,10 +80,54 @@ PercNet = Literal[
     "flip", "haarpsi", "vgg16_oxford", "alexnet_bvlc",
     "dinov2_s14", "dinov2_b14", "dino_s16", "dino_b16",
 ]  # D-89  # fmt: skip
+"""The names of D-89's eight perceptual networks, which ``LossConfig.perc_net`` selects (D-9).
+
+``"flip"``, the default, is NVIDIA's LDR-ꟻLIP and ``"haarpsi"`` is 1 − HaarPSI, both without
+weights. ``"vgg16_oxford"`` and ``"alexnet_bvlc"`` compare unit-normalized features of Oxford's
+VGG16 and BVLC's AlexNet, and ``"dinov2_s14"``, ``"dinov2_b14"``, ``"dino_s16"`` and
+``"dino_b16"`` compare DINOv2's and DINO's patch tokens; these six trunk networks download their
+weights at first use (§2.3; Q-258). See :class:`openftgs.losses.PerceptualLoss`.
+"""
 
 
 @dataclass
 class LossConfig:  # E7–E9
+    """Weights and forms of the training loss (E7–E9).
+
+    Parameters
+    ----------
+    lambda_img
+        The weight λ_img of the image loss, the L1 difference (D-7), ≥ 0 [P §3.3].
+    lambda_ssim
+        The weight λ_ssim of the SSIM loss 1 − SSIM, ≥ 0 [P §3.3].
+    lambda_perc
+        The weight λ_perc of the perceptual loss, ≥ 0, or None, the default, for the
+        calibrated weight of ``perc_net`` (0.415 for ``"flip"``); 0 trains without a perceptual
+        term [D-9, D-89; Q-249].
+    lambda_reg
+        The weight λ_reg of the 4D regularization, ≥ 0; 0 turns it off [P §3.3].
+    reg_until
+        The last iteration with the 4D regularization, ≥ 0, or None for the whole run [D-10].
+    ssim_window
+        The side of SSIM's Gaussian window, in pixels, odd and ≥ 1 [D-8].
+    ssim_sigma
+        The standard deviation σ of that window, in pixels, > 0 [D-8].
+    ssim_padding
+        ``"valid"`` evaluates SSIM only where the window fits inside the image, ``"same"`` pads
+        with zeros [D-8].
+    perc_net
+        The perceptual network, one of :data:`PercNet`'s eight names; ``"flip"``, LDR-ꟻLIP, by
+        default [D-9, D-89].
+
+    Raises
+    ------
+    ValueError
+        If a field has the wrong type or lies outside its range, naming its dotted path (Q-10,
+        Q-11). An int is accepted for a float field and converted; a bool is refused for a
+        numeric field. ``perc_net`` "vgg" or "alex", the backbones of the perceptual loss
+        before revision 549o, is refused with a message naming 549o (D-89; Q-247).
+    """
+
     lambda_img: float = 0.8  # P §3.3
     lambda_ssim: float = 0.2  # P §3.3
     lambda_perc: float | None = None  # D-9: None = perc_net's calibrated weight (D-89)
@@ -68,6 +141,7 @@ class LossConfig:  # E7–E9
     _prefix: ClassVar[str] = "loss."
 
     def __post_init__(self) -> None:
+        """Check the fields' types and ranges (Q-10, Q-11)."""
         # #375 (decided item 3), Q-247: LPIPS's backbones, the names before 549o, are refused
         # naming the revision, before the generic Literal check would.
         if self.perc_net in LPIPS_BACKBONES:
@@ -92,6 +166,41 @@ class LossConfig:  # E7–E9
 
 @dataclass
 class GrowthConfig:  # §1.3 Growth and count-control modes
+    """Settings of the growth of the primitive count (§1.3 "Growth", "Count-control modes").
+
+    Growth events happen at the multiples of ``RelocConfig.every`` from ``start`` to ``stop``,
+    both included.
+
+    Parameters
+    ----------
+    mode
+        How the count grows: ``"gradient"`` by 3DGS clone and split, ``"score"`` by primitives
+        drawn by their sampling score, ``"none"`` not at all [D-18].
+    start
+        The first iteration of the growth window, ≤ ``stop`` [D-18].
+    stop
+        The last iteration of the growth window [D-18].
+    grad_threshold
+        τ_pos, the mean NDC gradient (E10's g) above which a primitive grows by clone or
+        split, > 0 [L: 3DGS §5.2].
+    split_scale
+        The clone/split boundary, in units of the spatial scale S: a candidate whose largest
+        scale exceeds it splits, a smaller one is cloned, > 0 [L: 3DGS §5.2].
+    n_max
+        N_max, the cap on the number of primitives, ≥ 1; 500,000 for the † rows (D-39)
+        [D-44].
+    score_rate
+        In mode ``"score"``, the fraction by which each event grows the count, in (0, 1]
+        [L: 3DGS-MCMC §3.6].
+
+    Raises
+    ------
+    ValueError
+        If a field has the wrong type or lies outside its range, naming its dotted path (Q-10,
+        Q-11). An int is accepted for a float field and converted; a bool is refused for a
+        numeric field.
+    """
+
     mode: Literal["gradient", "score", "none"] = "gradient"  # D-18
     start: int = 500  # D-18
     stop: int = 15_000  # D-18
@@ -103,6 +212,7 @@ class GrowthConfig:  # §1.3 Growth and count-control modes
     _prefix: ClassVar[str] = "growth."
 
     def __post_init__(self) -> None:
+        """Check the fields' types and ranges (Q-10, Q-11)."""
         _check_types(self)
         # Q-11
         _check_window(self)
@@ -113,6 +223,52 @@ class GrowthConfig:  # §1.3 Growth and count-control modes
 
 @dataclass
 class RelocConfig:  # E10, E11, §1.3 Relocation
+    """Settings of the periodic relocation of dead primitives (E10, E11, §1.3 "Relocation").
+
+    Relocation events happen at the multiples of ``every`` from ``start`` to ``stop``, both
+    included.
+
+    Parameters
+    ----------
+    enabled
+        Whether relocation runs; False only in the "w/o periodic relocation" ablation, which
+        §1.3 tags [P §4.2]; untagged in §2.1.
+    every
+        The period of relocation events, in iterations, ≥ 1; growth events share it [P §3.3].
+    start
+        The first iteration of the relocation window, ≤ ``stop`` [D-17].
+    stop
+        The last iteration of the relocation window [D-17].
+    lambda_g
+        The weight λ_g of the normalized gradient in the sampling score ρ (E10), ≥ 0
+        [P §3.3].
+    lambda_o
+        The weight λ_o of the base opacity in the sampling score ρ (E10), ≥ 0 [P §3.3].
+    grad_quantile
+        The quantile of the live primitives' gradients that normalizes them in the score, in
+        (0, 1] [D-13].
+    dead_opacity
+        The base opacity below which a primitive is dead and relocated, in (0, 1); compared as
+        a float32 logit [D-14].
+    reset_moved_moments
+        Whether the Adam moments of the target and moved rows are zeroed after a move [D-16].
+    copy_position
+        ``"sample"`` draws each moved copy's position from its target's Gaussian, ``"stack"``
+        leaves the copies on the target (U-13) [D-15].
+    prune_opacity
+        The opacity below which primitives are pruned at growth events, in (0, 1), or None for
+        no pruning; set, to 0.005, only in the ablation with relocation off (Q-71), whose
+        threshold §1.3 tags [L: 3DGS §5.2; thresholds from gsplat DefaultStrategy]; untagged in
+        §2.1.
+
+    Raises
+    ------
+    ValueError
+        If a field has the wrong type or lies outside its range, naming its dotted path (Q-10,
+        Q-11). An int is accepted for a float field and converted; a bool is refused for a
+        numeric field.
+    """
+
     enabled: bool = True  # False only in the "w/o periodic relocation" ablation
     every: int = 100  # P §3.3; growth events share this period
     start: int = 500  # D-17
@@ -129,6 +285,7 @@ class RelocConfig:  # E10, E11, §1.3 Relocation
     _prefix: ClassVar[str] = "reloc."
 
     def __post_init__(self) -> None:
+        """Check the fields' types and ranges (Q-10, Q-11)."""
         _check_types(self)
         # Q-11
         _check_count(self, "every")
@@ -142,6 +299,52 @@ class RelocConfig:  # E10, E11, §1.3 Relocation
 
 @dataclass
 class OptimConfig:  # E12, E13, §1.3 Optimizer
+    """Adam's settings and the learning rates of the nine stored tensors (E12, E13).
+
+    A pair is a rate at the first and at the last iteration, annealed between them; a single
+    number is a constant rate. Every rate is > 0 (§1.3 "Optimizer and learning rates").
+
+    Parameters
+    ----------
+    iterations
+        T_it, the number of training iterations, ≥ 1; 30,000 for any sequence length
+        [P §3.3; D-35].
+    betas
+        Adam's β₁ and β₂, each in [0, 1) [P→3DGS].
+    eps
+        Adam's ε, > 0 [P→3DGS].
+    means_lr
+        The rates of ``means``, in units of the spatial scale S, decaying exponentially (E13)
+        [P→3DGS].
+    velocities_lr
+        The rates of ``velocities``, in units of S/Δt_f, annealed by E12; the form is the
+        paper's, the values D-19's [P; D-19].
+    times_lr
+        The rates of ``times``, in normalized time, decaying exponentially [D-20].
+    log_durations_lr
+        The constant rate of ``log_durations`` [D-20].
+    log_scales_lr
+        The constant rate of ``log_scales`` [P→3DGS].
+    quats_lr
+        The constant rate of ``quats`` [P→3DGS].
+    opacity_logits_lr
+        The constant rate of ``opacity_logits`` [P→3DGS].
+    sh0_lr
+        The constant rate of ``sh0`` [P→3DGS].
+    shN_lr
+        The constant rate of ``shN`` [P→3DGS].
+    sh_interval
+        Every how many iterations one more SH band becomes active (E13), ≥ 1
+        [L: 3DGS §7.1].
+
+    Raises
+    ------
+    ValueError
+        If a field has the wrong type or lies outside its range, naming its dotted path (Q-10,
+        Q-11). An int is accepted for a float field and converted, a list for a pair; a bool is
+        refused for a numeric field.
+    """
+
     iterations: int = 30_000  # P §3.3; D-35
     betas: tuple[float, float] = (0.9, 0.999)  # P→3DGS
     eps: float = 1e-15  # P→3DGS
@@ -159,6 +362,7 @@ class OptimConfig:  # E12, E13, §1.3 Optimizer
     _prefix: ClassVar[str] = "optim."
 
     def __post_init__(self) -> None:
+        """Check the fields' types and ranges (Q-10, Q-11)."""
         _check_types(self)
         # Q-11
         _check_count(self, "iterations", "sh_interval")
@@ -181,6 +385,57 @@ class OptimConfig:  # E12, E13, §1.3 Optimizer
 
 @dataclass
 class PerfConfig:  # §2.4 Settings
+    """Performance settings (§2.4 "Settings").
+
+    The choices marked approximate change the results; a resume may change only the settings
+    that change no number (:func:`resume_conflicts`).
+
+    Parameters
+    ----------
+    slice_impl
+        The implementation of the fused temporal slice: ``"eager"`` plain PyTorch,
+        ``"compiled"`` through torch.compile, ``"cuda"`` the custom operator, or ``"auto"``,
+        which compiles on CUDA and stays eager on the CPU [D-50]. The custom operator isn't
+        built: the trainer refuses ``"cuda"`` with :exc:`NotImplementedError` (D-50; Q-13 as
+        changed).
+    packed
+        Whether gsplat runs in packed mode; on by default, gsplat's default, which B-2 kept
+        [D-57; Q-187].
+    precull
+        Where the opacity cull of D-32 happens: ``"internal"`` inside gsplat's projection,
+        ``"compact"`` by compaction before the backend [D-32, D-57].
+    frame_cache
+        Where the uint8 frame cache lives: ``"gpu"``, ``"mmap"`` memory-mapped, ``"off"``
+        none, or ``"auto"``, on the GPU when it fits and memory-mapped otherwise [D-51].
+    prefetch
+        How many images ahead of the sampler the prefetcher loads, ≥ 0; untagged in §2.4,
+        whose prose gives the 8 and whose prefetcher is D-51's.
+    log_every
+        Every how many iterations the loss terms are read and their means reported, ≥ 1
+        (§2.4 rule 3; Q-69); untagged in §2.4.
+    perc_precision
+        The precision of the perceptual loss: ``"tf32"``, ``"ieee"`` float32, or ``"bf16"``,
+        which is approximate and for the six trunk networks only: a :class:`TrainConfig` with
+        ``"bf16"`` and ``loss.perc_net`` ``"flip"`` or ``"haarpsi"`` is valid, but the trainer
+        refuses it when it builds the network [D-52; Q-250, Q-267].
+    adam
+        Adam's implementation: PyTorch's ``"fused"`` or ``"foreach"``, or gsplat's
+        ``"selective"``, which is approximate [D-53].
+    images_per_step
+        Images per training step, ≥ 1; more than 1 is approximate and uses several GPUs
+        [D-54]. Training on several GPUs isn't built: the trainer refuses any value but 1 with
+        :exc:`NotImplementedError` (Q-177).
+    deterministic
+        Whether cuDNN autotuning is off and PyTorch's deterministic kernels are used where it
+        has them; RoMa initialization always runs this way [D-56].
+
+    Raises
+    ------
+    ValueError
+        If a field has the wrong type or lies outside its range, naming its dotted path (Q-10,
+        Q-11). A bool is refused for a numeric field.
+    """
+
     slice_impl: Literal["auto", "eager", "compiled", "cuda"] = "auto"  # D-50
     packed: bool = True  # gsplat's default, which B-2 kept (D-57, Q-187)
     precull: Literal["internal", "compact"] = "internal"  # D-32, D-57
@@ -197,6 +452,7 @@ class PerfConfig:  # §2.4 Settings
     _prefix: ClassVar[str] = "perf."
 
     def __post_init__(self) -> None:
+        """Check the fields' types and ranges (Q-10, Q-11)."""
         _check_types(self)
         # Q-11
         _check_non_negative(self, "prefetch")
@@ -205,6 +461,44 @@ class PerfConfig:  # §2.4 Settings
 
 @dataclass
 class TrainConfig:
+    """The full training configuration: global settings and one sub-config per part (§2.1).
+
+    Its JSON form, nested by sub-config, is what a checkpoint's manifest stores
+    (:func:`config_to_dict`, :func:`config_from_dict`; Q-10). The defaults are those of §1.5.
+
+    Parameters
+    ----------
+    sh_degree
+        The SH degree L, one of 0, 1, 2 and 3 [D-3].
+    background
+        The RGB background the images are trained against, three numbers in [0, 1]; black by
+        default [D-34].
+    scene_scale_factor
+        The factor of the spatial scale S, which is this factor times the largest distance of
+        a training camera center from their centroid, > 0 [D-27].
+    seed
+        The run's one seed, from which training draws all its randomness; untagged in §2.1.
+    init
+        The initialization settings (§1.3 "Initialization").
+    loss
+        The loss settings (E7–E9).
+    growth
+        The growth settings (§1.3 "Growth").
+    reloc
+        The relocation settings (E10, E11).
+    optim
+        The optimizer settings (E12, E13).
+    perf
+        The performance settings (§2.4).
+
+    Raises
+    ------
+    ValueError
+        If a field has the wrong type or lies outside its range, naming its dotted path (D-3;
+        Q-10, Q-11). An int is accepted for a float field and converted, a list for a tuple; a
+        bool is refused for a numeric field.
+    """
+
     sh_degree: int = 3  # D-3
     background: tuple[float, float, float] = (0.0, 0.0, 0.0)  # D-34
     scene_scale_factor: float = 1.1  # D-27
@@ -219,6 +513,7 @@ class TrainConfig:
     _prefix: ClassVar[str] = ""
 
     def __post_init__(self) -> None:
+        """Check the fields' types and ranges (D-3; Q-10, Q-11)."""
         _check_types(self)
         if self.sh_degree not in (0, 1, 2, 3):  # D-3
             _fail(self, "sh_degree", "must be one of 0, 1, 2, 3")
@@ -229,16 +524,66 @@ class TrainConfig:
 
 
 def config_to_dict(cfg: TrainConfig) -> dict[str, Any]:
-    """TrainConfig as JSON-ready values, nested by sub-config (§2.2 manifest; Q-10)."""
+    """Convert a TrainConfig to JSON-ready values, nested by sub-config (Q-10).
+
+    Tuples become lists and None stays None, null in JSON. This is the form the checkpoint
+    manifest stores (§2.2), and :func:`config_from_dict` reads it back.
+
+    Parameters
+    ----------
+    cfg
+        The configuration.
+
+    Returns
+    -------
+    dict
+        One key per field of :class:`TrainConfig`, each sub-config a nested dict, as in
+        ``{"sh_degree": 3, …, "growth": {"mode": "gradient", …, "n_max": 3000000, …}, …}``.
+
+    Examples
+    --------
+    >>> from openftgs.config import GrowthConfig, TrainConfig, config_to_dict
+    >>> data = config_to_dict(TrainConfig(growth=GrowthConfig(n_max=500_000)))
+    >>> data["growth"]["n_max"]
+    500000
+    >>> data["background"]
+    [0.0, 0.0, 0.0]
+    """
     # Q-10: nested objects, tuples as lists, None as null.
     result: dict[str, Any] = _to_json(dataclasses.asdict(cfg))
     return result
 
 
 def config_from_dict(data: Mapping[str, Any]) -> TrainConfig:
-    """The inverse of config_to_dict; missing keys take their defaults (Q-10).
+    """Build a TrainConfig from its JSON form, the inverse of :func:`config_to_dict` (Q-10).
 
-    Raises ValueError for an unknown key, naming its dotted path, and for invalid values.
+    Missing keys take their defaults, so a partial configuration sets only what it names. The
+    values are checked as the constructors check them, so ``TrainConfig(...)`` and this
+    function accept exactly the same values.
+
+    Parameters
+    ----------
+    data
+        The configuration nested by sub-config, as :func:`config_to_dict` writes it, in full or
+        in part.
+
+    Returns
+    -------
+    openftgs.config.TrainConfig
+        The configuration.
+
+    Raises
+    ------
+    ValueError
+        For an unknown key, naming its dotted path; for a sub-config that isn't an object; for
+        a value of the wrong type or outside its range (Q-11).
+
+    Examples
+    --------
+    >>> from openftgs.config import config_from_dict
+    >>> cfg = config_from_dict({"seed": 7, "growth": {"n_max": 500_000}})
+    >>> cfg.growth.n_max, cfg.growth.stop
+    (500000, 15000)
     """
     # Q-10: missing keys take their defaults; unknown keys are errors.
     kwargs: dict[str, Any] = {}
@@ -257,9 +602,26 @@ def config_from_dict(data: Mapping[str, Any]) -> TrainConfig:
 
 # Q-153: the one rule for Trainer.load_state_dict and ftgs train --resume.
 def resume_conflicts(stored: TrainConfig, given: TrainConfig) -> list[str]:
-    """The dotted keys whose values differ between a checkpoint's configuration and the one a
-    resume is given, sorted, leaving out the PerfConfig fields that change no number and so may
-    differ (Q-134): an empty list means the resume may go on with `given`."""
+    """List the settings that differ between a checkpoint's configuration and a resume's (Q-153).
+
+    The comparison leaves out the PerfConfig fields that change no number and so may differ on
+    resume: ``slice_impl``, ``packed``, ``precull``, ``frame_cache``, ``prefetch``,
+    ``log_every`` and ``deterministic`` (Q-134). ``Trainer.load_state_dict`` and
+    ``ftgs train --resume`` both decide by it.
+
+    Parameters
+    ----------
+    stored
+        The configuration the checkpoint holds.
+    given
+        The configuration the resume is given.
+
+    Returns
+    -------
+    list of str
+        The dotted keys whose values differ, such as ``"growth.n_max"``, sorted; an empty list
+        means the resume may go on with ``given``.
+    """
     a, b = _dotted(config_to_dict(stored)), _dotted(config_to_dict(given))
     differ = {k for k in a.keys() | b.keys() if a.get(k) != b.get(k)}
     return sorted(differ - _MAY_DIFFER_ON_RESUME)
@@ -302,7 +664,7 @@ def _reject_unknown_keys(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _path(obj: object, name: str) -> str:
-    """The dotted path of a field, from its class's prefix ("growth.n_max")."""
+    """Return the dotted path of a field, from its class's prefix ("growth.n_max")."""
     return f"{getattr(obj, '_prefix', '')}{name}"
 
 

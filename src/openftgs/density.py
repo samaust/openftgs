@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gradient statistics, growth (clone and split), the sampling score, the dead set, relocation,
-and the count-control modes.
+"""Gradient statistics, growth, the sampling score, the dead set, relocation and count control.
+
+Growth clones and splits (E17); relocation moves dead primitives onto live targets (E11); the
+count-control modes, and the ablation's pruning and opacity reset, follow §1.3.
 
 Spec: E10, E11, E17, §1.3. Band: Mechanics (§2.1).
 """
@@ -37,8 +39,23 @@ _SPLIT_DIVISOR = 1.6  # E17: children's scales a/1.6
 
 @dataclass(frozen=True)
 class GrowthReport:
-    """What a growth event did (Q-48): candidates cloned and split ("gradient" mode), rows
-    appended by E11 ("score" mode), candidates left out by the cap N_max (D-44), and N after."""
+    """What a growth event did (Q-48).
+
+    Returned by :func:`grow`.
+
+    Parameters
+    ----------
+    cloned
+        The number of candidates cloned ("gradient" mode).
+    split
+        The number of candidates split, each into two children (E17; "gradient" mode).
+    sampled
+        The number of rows appended by E11 ("score" mode).
+    capped
+        The number of candidates left out by the cap N_max (D-44).
+    num_gaussians
+        The number of primitives N after the event.
+    """
 
     cloned: int
     split: int
@@ -49,8 +66,17 @@ class GrowthReport:
 
 @dataclass(frozen=True)
 class RelocationReport:
-    """What a relocation did (Q-48): the number of dead primitives moved and of distinct
-    targets."""
+    """What a relocation did (Q-48).
+
+    Returned by :func:`relocate`; both counts are 0 when nothing moved.
+
+    Parameters
+    ----------
+    dead
+        The number of dead primitives moved.
+    targets
+        The number of distinct live targets they were moved onto.
+    """
 
     dead: int
     targets: int
@@ -72,12 +98,18 @@ def _logit_bound(p: float) -> float:
 
 
 def _live(model: FreeTimeGaussians, cfg: RelocConfig) -> Tensor:
-    """[N] bool: the live set, ô ≥ ô_dead; the dead set is the rest (D-14, in float32)."""
+    """Return the live set, ô ≥ ô_dead, as a bool mask [N] (D-14, in float32).
+
+    The dead set is the rest.
+    """
     return model.opacity_logits.detach() >= _logit_bound(cfg.dead_opacity)
 
 
 def _check_stats(model: FreeTimeGaussians, stats: "GradStats") -> None:
-    """The statistics cover the model's rows, on its device (shapes only: no host sync)."""
+    """Check that the statistics cover the model's rows, on its device.
+
+    Shapes only: no host sync.
+    """
     if stats.num_gaussians != model.num_gaussians:
         _fail(f"the statistics hold {stats.num_gaussians} rows, the model {model.num_gaussians}")
     if stats.g_sum.device != model.means.device:
@@ -92,7 +124,30 @@ def _check_optimizer(model: FreeTimeGaussians, optimizer: FTGSOptimizer) -> None
 
 
 class GradStats:
-    """The gradient statistics g_sum and count of E10, one entry per primitive (Q-48)."""
+    """The gradient statistics g_sum and count of E10, one entry per primitive (Q-48).
+
+    At every iteration, each primitive visible in the image adds the NDC-scaled norm of its
+    2D-mean gradient to ``g_sum`` and one to ``count`` (§1.3 step 5, :meth:`update`);
+    :meth:`mean` gives E10's mean gradient g. The statistics are reset after each event (§1.3
+    step 7) and resized with the model when it grows (:meth:`resize_`).
+
+    Parameters
+    ----------
+    num_gaussians
+        The number of primitives N, an int ≥ 0.
+    device
+        The device that holds the statistics, the model's; ``"cpu"`` by default.
+
+    Raises
+    ------
+    ValueError
+        If ``num_gaussians`` is not an int ≥ 0.
+
+    Notes
+    -----
+    The statistics are part of the checkpoint, as ``TrainerState.stats`` (§2.1, §2.2), through
+    :meth:`state_dict` and :meth:`load_state_dict`.
+    """
 
     def __init__(self, num_gaussians: int, *, device: torch.device | str = "cpu") -> None:
         if not _is_int(num_gaussians) or num_gaussians < 0:
@@ -102,16 +157,20 @@ class GradStats:
 
     @property
     def num_gaussians(self) -> int:
+        """The number of primitives N the statistics cover (Q-48)."""
         return int(self._g_sum.shape[0])
 
     @property
     def g_sum(self) -> Tensor:
-        """[N] float32: the sum of NDC-scaled 2D-mean gradient norms (E10, D-12). Read-only."""
+        """The sum of NDC-scaled 2D-mean gradient norms, [N] float32 (E10, D-12). Read-only."""
         return self._g_sum
 
     @property
     def count(self) -> Tensor:
-        """[N] int32: the number of visible camera–primitive pairs summed into g_sum (Q-49)."""
+        """The number of visible camera–primitive pairs summed into g_sum, [N] int32 (Q-49).
+
+        Read-only.
+        """
         return self._count
 
     # Q-49: visible in unpacked mode, gaussian_ids in packed mode; no host synchronization.
@@ -124,10 +183,47 @@ class GradStats:
         visible: Tensor | None = None,
         gaussian_ids: Tensor | None = None,
     ) -> None:
-        """Add the NDC-scaled norm of each visible primitive's 2D-mean gradient to g_sum and one
-        to count (§1.3 step 5, D-12). Unpacked mode: `means2d_grad` [C, N, 2] with `visible`
-        [C, N]; packed mode: `means2d_grad` [nnz, 2] with `gaussian_ids` [nnz] (Q-49). Checks
-        shapes, dtypes and devices only, so nothing synchronizes (D-49)."""
+        """Add the visible primitives' NDC-scaled 2D-mean gradient norms (§1.3 step 5, D-12).
+
+        Each visible camera–primitive pair adds the norm of its 2D-mean gradient, with x scaled
+        by W/2 and y by H/2, to ``g_sum`` and one to ``count``. The two modes follow the
+        renderer's (Q-49): unpacked, ``means2d_grad`` [C, N, 2] with the mask ``visible``
+        [C, N]; packed, ``means2d_grad`` [nnz, 2] with ``gaussian_ids`` [nnz]. Shapes, dtypes
+        and devices are checked, never values, so nothing synchronizes (D-49).
+
+        Parameters
+        ----------
+        means2d_grad
+            The gradient of the loss with respect to the 2D means, in pixel coordinates:
+            [C, N, 2] unpacked or [nnz, 2] packed, floating point, on the statistics' device.
+        width
+            The image width W in pixels, an int ≥ 1.
+        height
+            The image height H in pixels, an int ≥ 1.
+        visible
+            Unpacked mode: the visible camera–primitive pairs, a bool mask [C, N].
+        gaussian_ids
+            Packed mode: the primitive of each row of ``means2d_grad``, [nnz] int64 in [0, N);
+            repeats add up. The range is not checked.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If ``width`` or ``height`` is not an int ≥ 1, ``means2d_grad`` is not a
+            floating-point tensor of its mode's shape, not exactly one of ``visible`` and
+            ``gaussian_ids`` is given, the one given has the wrong dtype or shape, or a tensor
+            is on another device.
+
+        Notes
+        -----
+        §2.1's signature lists the keyword-only pair ``visible`` and ``gaussian_ids``, whose
+        shapes and rules Q-49 defines. Packed rows are scatter-added, since every row is a
+        visible pair (D-75, D-76).
+        """
         self._check_update(means2d_grad, width, height, visible, gaussian_ids)
         # D-12: x scaled by W/2 and y by H/2; Python floats, so nothing is built on the host.
         norm = torch.hypot(means2d_grad[..., 0] * (width / 2), means2d_grad[..., 1] * (height / 2))
@@ -185,20 +281,50 @@ class GradStats:
                 _fail(f"{label} must be on the statistics' device {device}, got {value.device}")
 
     def mean(self) -> Tensor:
-        """[N] float32: g of E10, g_sum/count where count > 0 and 0 elsewhere."""
+        """Return E10's mean gradient g, ``g_sum / count`` where ``count`` > 0 and 0 elsewhere.
+
+        Returns
+        -------
+        torch.Tensor
+            g, [N] float32, ≥ 0, in NDC units (D-12).
+        """
         return torch.where(self._count > 0, self._g_sum / self._count.clamp_min(1), 0.0)
 
     def reset(self) -> None:
-        """Zero g_sum and count (§1.3 step 7)."""
+        """Zero g_sum and count (§1.3 step 7).
+
+        The statistics are reset after every event: by :func:`relocate` itself, or by the
+        trainer when relocation is off (Q-51).
+        """
         self._g_sum.zero_()
         self._count.zero_()
 
     def state_dict(self) -> dict[str, Tensor]:
-        """{"g_sum", "count"} as detached clones: TrainerState.stats (§2.1, §2.2; Q-48)."""
+        """Return the statistics as detached clones, for ``TrainerState.stats`` (§2.2, Q-48).
+
+        Returns
+        -------
+        dict of str to torch.Tensor
+            ``{"g_sum": [N] float32, "count": [N] int32}``, detached clones (§2.1, §2.2).
+        """
         return {"g_sum": self._g_sum.detach().clone(), "count": self._count.detach().clone()}
 
     def load_state_dict(self, state: Mapping[str, Tensor]) -> None:
-        """Restore `state_dict`'s layout from any device; on error nothing changes (Q-48)."""
+        """Restore the statistics from :meth:`state_dict`'s layout, from any device (Q-48).
+
+        The tensors are copied to the statistics' device. On error nothing changes.
+
+        Parameters
+        ----------
+        state
+            ``{"g_sum": [N] float32, "count": [N] int32}``, with N the current number of rows.
+
+        Raises
+        ------
+        ValueError
+            If ``state`` doesn't hold exactly ``g_sum`` and ``count``, or one of them has the
+            wrong dtype or shape.
+        """
         n = self.num_gaussians
         if not isinstance(state, Mapping) or set(state) != {"g_sum", "count"}:
             got = sorted(state) if isinstance(state, Mapping) else type(state).__name__
@@ -214,9 +340,28 @@ class GradStats:
     # Q-23: keep is a bool mask; Q-49: append_from indexes the rows before the resize and may
     # repeat a parent (a split's two children); its range is the caller's precondition (Q-44).
     def resize_(self, *, keep: Tensor | None = None, append_from: Tensor | None = None) -> None:
-        """Keep the rows of the bool mask `keep` [N] in order, then append rows that copy the
-        statistics of the rows `append_from` names (§1.3 Growth step 4, D-45). On error nothing
-        changes."""
+        """Keep the rows of ``keep``, then append copies of the rows ``append_from`` names (D-45).
+
+        Kept rows stay in order and new rows go last, each with the statistics of its parent
+        (§1.3 Growth, step 4); a parent may appear more than once, as a split's two children
+        do. On error nothing changes.
+
+        Parameters
+        ----------
+        keep
+            The rows to keep, a bool mask [N] on the statistics' device (Q-23); None, the
+            default, keeps every row.
+        append_from
+            The parents of the new rows, [k] int64 indices of the rows before the resize, in
+            [0, N), repeats allowed; the range is not checked (Q-44, Q-49). None, the default,
+            appends nothing.
+
+        Raises
+        ------
+        ValueError
+            If ``keep`` is not a bool mask [N] on the statistics' device, or ``append_from`` is
+            not a 1-D int64 tensor on it.
+        """
         n = self.num_gaussians
         device = self._g_sum.device
         if keep is not None:
@@ -247,9 +392,34 @@ class GradStats:
 
 # Q-48: ρ for every row; the procedures mask out the dead set.
 def sampling_score(model: FreeTimeGaussians, stats: GradStats, cfg: RelocConfig) -> Tensor:
-    """ρ = λ_g·ĝ + λ_o·σ of E10 for every row, [N] float32. ĝ = min(1, g/Q) with Q the
-    `cfg.grad_quantile` quantile of g over the live rows visible at least once (D-13), and
-    ĝ ≡ 0 when Q is 0 or there is no such row. No host synchronization."""
+    """Compute the relocation sampling score ρ of E10 for every row (E10, D-13).
+
+    ``ρ = λ_g·ĝ + λ_o·σ``, with σ the base opacity and ``ĝ = min(1, g/Q)``: g is the mean
+    gradient of :meth:`GradStats.mean` and Q the ``cfg.grad_quantile`` quantile of g over the
+    live rows visible at least once, interpolated linearly (D-13). ĝ ≡ 0 when Q is 0 or there
+    is no such row. Every row is scored, dead ones included; the procedures mask out the dead
+    set (Q-48). No host synchronization.
+
+    Parameters
+    ----------
+    model
+        The model, for its base opacities and its live set (D-14).
+    stats
+        The gradient statistics, covering the model's rows, on its device.
+    cfg
+        The weights λ_g and λ_o, the quantile and the dead-opacity threshold (E10, D-13,
+        D-14).
+
+    Returns
+    -------
+    torch.Tensor
+        ρ, [N] float32, in [0, λ_g + λ_o], detached from the autograd graph.
+
+    Raises
+    ------
+    ValueError
+        If ``stats`` doesn't hold the model's number of rows or is on another device.
+    """
     _check_stats(model, stats)
     sigma = torch.sigmoid(model.opacity_logits.detach())
     if model.num_gaussians == 0:
@@ -270,9 +440,12 @@ _E11_TABLES: dict[torch.device, Tensor] = {}
 
 
 def _e11_table(device: torch.device) -> Tensor:
-    """[51, 51] float64: row n − 1, column k holds Σ_{i=1}^{n} C(i − 1, k)·(−1)^k/√(k + 1), the
-    coefficient of σ_new^(k+1) in E11's denominator. The binomial sums are exact Python integers;
-    built once per device (its copy to the device is the only host transfer)."""
+    """Return E11's [51, 51] float64 coefficient table on `device`.
+
+    Row n − 1, column k holds Σ_{i=1}^{n} C(i − 1, k)·(−1)^k/√(k + 1), the coefficient of
+    σ_new^(k+1) in E11's denominator. The binomial sums are exact Python integers; built once
+    per device (its copy to the device is the only host transfer).
+    """
     if device not in _E11_TABLES:
         rows = []
         for n in range(1, _N_COPIES_MAX + 1):
@@ -289,9 +462,40 @@ def _e11_table(device: torch.device) -> Tensor:
 # Q-50: computed in float64 and returned in the input's dtype; n clamped for the formula only;
 # the upper bound applied here, the lower bound (D-14) by the callers on the stored logit.
 def mcmc_split(opacity: Tensor, scales: Tensor, n: Tensor) -> tuple[Tensor, Tensor]:
-    """E11 for k targets that each end with n copies: `opacity` σ [k], `scales` a [k, 3] and
-    `n` [k] (integers) give σ_new = 1 − (1 − σ)^(1/n), clamped to at most 1 − 2⁻²³, and a_new,
-    computed from the unclamped σ_new."""
+    """Apply E11 to k targets that each end with n copies (E11).
+
+    ``σ_new = 1 − (1 − σ)^(1/n)``, clamped to at most 1 − 2⁻²³, and a_new from E11's sum,
+    computed from the unclamped σ_new. The formula runs in float64, with n clamped to [1, 51],
+    and the results come back in the input's dtype (Q-50). The lower bound of E11's clamp,
+    the dead-opacity threshold (D-14), is left to the callers, who apply it to the stored
+    logit.
+
+    Parameters
+    ----------
+    opacity
+        The targets' base opacities σ, [k], floating point, in [0, 1].
+    scales
+        The targets' activated scales a, [k, 3], in ``opacity``'s dtype, in world units.
+    n
+        Each target's number of copies, itself included, [k], of an integer dtype.
+
+    Returns
+    -------
+    opacity : torch.Tensor
+        σ_new, [k], in ``opacity``'s dtype, at most 1 − 2⁻²³.
+    scales : torch.Tensor
+        a_new, [k, 3], in ``opacity``'s dtype, in world units.
+
+    Raises
+    ------
+    ValueError
+        If ``opacity`` is not a 1-D floating-point tensor, ``scales`` is not [k, 3] in its
+        dtype, ``n`` is not an integer tensor [k], or the three are not on one device.
+
+    Notes
+    -----
+    Q-50 fixes the precision, the clamping of n and the split of the clamp's two bounds.
+    """
     if not isinstance(opacity, Tensor) or not opacity.is_floating_point() or opacity.dim() != 1:
         _fail("opacity must be a floating-point tensor of shape [k]")
     k = int(opacity.shape[0])
@@ -317,8 +521,11 @@ def mcmc_split(opacity: Tensor, scales: Tensor, n: Tensor) -> tuple[Tensor, Tens
 # Q-50: E11 in float64 from σ and log(1 − σ), so that relocation can form log(1 − σ) from the
 # stored logit and keep E11 exact where the float64 σ of a saturated logit rounds to 1.
 def _e11(sigma: Tensor, log1m_sigma: Tensor, scales: Tensor, n: Tensor) -> tuple[Tensor, Tensor]:
-    """σ_new = 1 − (1 − σ)^(1/n), clamped to at most 1 − 2⁻²³, and a_new from the unclamped σ_new
-    (E11), all float64; n is clamped to [1, 51] for the formula."""
+    """Apply E11 in float64, from σ and log(1 − σ).
+
+    σ_new = 1 − (1 − σ)^(1/n), clamped to at most 1 − 2⁻²³, and a_new from the unclamped σ_new
+    (E11), all float64; n is clamped to [1, 51] for the formula.
+    """
     f64 = torch.float64
     copies = n.clamp(1, _N_COPIES_MAX).to(torch.int64)
     # 1 − (1 − σ)^(1/n), in a form that stays accurate for small σ.
@@ -336,10 +543,37 @@ def _check_generator(generator: object) -> None:
 
 
 def draw_targets(scores: Tensor, count: int, *, generator: torch.Generator) -> Tensor:
-    """`count` rows drawn with replacement, with probability ∝ `scores` (D-15; Q-204), on the
-    generator's device (as in `FreeTimeGaussians.from_init_points`), returned on the scores'
-    device. The scores must be finite with a positive sum (Q-51): otherwise torch.multinomial
-    fails on the CPU and asserts on CUDA."""
+    """Draw ``count`` rows with replacement, with probability ∝ ``scores`` (D-15).
+
+    The draw runs on the generator's device, as in ``FreeTimeGaussians.from_init_points``, and
+    its result comes back on the scores' device. The scores are read on the host, so the call
+    synchronizes.
+
+    Parameters
+    ----------
+    scores
+        The sampling weights, [N], finite and non-negative with a positive sum (Q-51).
+    count
+        The number of rows to draw.
+    generator
+        The generator of the draw, the trainer's relocation generator (D-15).
+
+    Returns
+    -------
+    torch.Tensor
+        The drawn rows, [count] int64 indices in [0, N), on the scores' device.
+
+    Raises
+    ------
+    ValueError
+        If ``generator`` is not a :class:`torch.Generator`, or the scores are not finite with a
+        positive sum (λ_o = 0 with a zero gradient quantile gives all zeros).
+
+    Notes
+    -----
+    Q-204 makes the draw public, for the differential harness. Q-51: without the check on the
+    scores, :func:`torch.multinomial` fails on the CPU and asserts on CUDA.
+    """
     _check_generator(generator)
     if not bool(torch.isfinite(scores).all()) or not bool(scores.sum() > 0):
         _fail(
@@ -357,10 +591,12 @@ def draw_targets(scores: Tensor, count: int, *, generator: torch.Generator) -> T
 def _relocation_move(
     model: FreeTimeGaussians, draws: Tensor, cfg: RelocConfig, generator: torch.Generator
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Apply E11 in place to every target named in `draws` (one entry per row to fill,
-    repeats allowed), with n = 1 + its number of draws, and return the target rows and, one row
-    per draw, the nine tensors of the row to fill: its target's updated tensors, placed per
-    `cfg.copy_position` (D-15)."""
+    """Apply E11 in place to every target in `draws`; return the targets and the rows to fill.
+
+    `draws` holds one entry per row to fill, repeats allowed; each target's n is 1 + its number
+    of draws. Returns the target rows and, one row per draw, the nine tensors of the row to
+    fill: its target's updated tensors, placed per `cfg.copy_position` (D-15).
+    """
     n_rows = model.num_gaussians
     device = model.means.device
     counts = torch.zeros(n_rows, dtype=torch.int64, device=device)
@@ -407,10 +643,51 @@ def relocate(
     *,
     generator: torch.Generator,
 ) -> RelocationReport:
-    """Move every dead primitive onto a live target (§1.3 Relocation, E11, D-14 to D-16), then
-    reset the gradient statistics. `optimizer` must be the model's own (Q-48). `cfg.enabled` is
-    the trainer's switch and isn't read here. Synchronizes with the host: an event does anyway
-    (§2.4 rule 3)."""
+    """Move every dead primitive onto a live target (§1.3 Relocation, E11, D-14 to D-16).
+
+    The dead set is the primitives whose base opacity is below ``cfg.dead_opacity``, tested on
+    the stored logit (D-14); the live set is the rest. One target per dead primitive is drawn
+    from the live set with probability ∝ ρ (E10, :func:`draw_targets`), and E11 is applied
+    once per target, with n = 1 + its number of draws. Each dead primitive then takes its
+    target's updated tensors, its position drawn from the target's Gaussian or left on the
+    target, as ``cfg.copy_position`` says (D-15). The Adam moments of the targets, and of the
+    moved rows when ``cfg.reset_moved_moments`` is set, are zeroed (D-16). Last, the gradient
+    statistics are reset (§1.3 step 7). If the dead or the live set is empty, only the
+    statistics are reset. N doesn't change.
+
+    Parameters
+    ----------
+    model
+        The model, changed in place.
+    optimizer
+        The model's own optimizer, built for it by :func:`~openftgs.optim.build_optimizer`.
+    stats
+        The gradient statistics, covering the model's rows, on its device; reset on return.
+    cfg
+        The relocation settings (E10, E11, D-13 to D-16). ``cfg.enabled`` is the trainer's
+        switch and isn't read here.
+    generator
+        The relocation generator, the trainer's dedicated, checkpointed one (D-15); it draws
+        the targets, then the positions.
+
+    Returns
+    -------
+    RelocationReport
+        The number of dead primitives moved and of distinct targets.
+
+    Raises
+    ------
+    ValueError
+        If ``stats`` doesn't cover the model's rows on its device, ``optimizer`` is not the
+        model's own (Q-48), ``generator`` is not a :class:`torch.Generator`, the model breaks
+        §1.1's validity rules before or after the move (Q-55), or the live primitives' scores
+        have no positive sum.
+
+    Notes
+    -----
+    Synchronizes with the host, as an event does anyway (§2.4 rule 3). Q-51 fixes the
+    procedure's details and Q-55 its validity checks.
+    """
     _check_stats(model, stats)
     _check_optimizer(model, optimizer)
     _check_generator(generator)
@@ -451,8 +728,10 @@ def _resize_all(
     append: Mapping[str, Tensor] | None,
     parents: Tensor | None,
 ) -> None:
-    """Model, optimizer and statistics resized together, with one keep mask (§1.3 Growth step 4;
-    Q-23, Q-44): new rows get zero moments and their parents' statistics (D-45)."""
+    """Resize the model, optimizer and statistics together with one keep mask (§1.3 Growth step 4).
+
+    Q-23, Q-44: new rows get zero moments and their parents' statistics (D-45).
+    """
     model.resize_(keep=keep, append=append)
     optimizer.resize_(keep=keep, n_append=0 if parents is None else int(parents.shape[0]))
     stats.resize_(keep=keep, append_from=parents)
@@ -461,12 +740,36 @@ def _resize_all(
 def growth_masks(
     g: Tensor, scales: Tensor, cfg: GrowthConfig, *, spatial_scale: float
 ) -> tuple[Tensor, Tensor]:
-    """The rows a growth event clones and splits (§1.3 Growth, D-18, D-44; Q-204): candidates have
-    a mean gradient `g` above `cfg.grad_threshold`; when they exceed the room below `cfg.n_max`
-    (N = len(g); a clone and a split each add one row), the largest g that fit are kept, ties to
-    the lower row. A kept candidate is cloned when its largest `scales` entry (the activated
-    scales, [N, 3]) is at most `cfg.split_scale`·S, split otherwise. Returns two bool masks [N].
-    Synchronizes with the host for the cap."""
+    """Choose the rows a growth event clones and splits (§1.3 Growth, D-18, D-44).
+
+    Candidates have a mean gradient ``g`` above ``cfg.grad_threshold``. When they exceed the
+    room below ``cfg.n_max`` (N = len(g); a clone and a split each add one row), the largest g
+    that fit are kept, ties to the lower row (D-44). A kept candidate is cloned when its
+    largest scale is at most ``cfg.split_scale``·S, and split otherwise. The comparisons run
+    in float32. Synchronizes with the host for the cap.
+
+    Parameters
+    ----------
+    g
+        The mean gradients of :meth:`GradStats.mean`, [N] float32.
+    scales
+        The activated scales, [N, 3], in world units.
+    cfg
+        The growth settings: the threshold τ_pos, the split scale and N_max.
+    spatial_scale
+        The scene's spatial scale S (D-27), in world units.
+
+    Returns
+    -------
+    clone : torch.Tensor
+        The rows to clone, a bool mask [N].
+    split : torch.Tensor
+        The rows to split, a bool mask [N].
+
+    Notes
+    -----
+    Q-204 makes the masks public, for the differential harness.
+    """
     n = int(g.shape[0])
     rows = torch.nonzero(g > cfg.grad_threshold).squeeze(1)  # §1.3 Growth step 1, in float32
     room = max(cfg.n_max - n, 0)
@@ -548,11 +851,57 @@ def grow(
     reloc: RelocConfig,
     generator: torch.Generator,
 ) -> GrowthReport:
-    """One growth event in the configured count-control mode (§1.3 Growth and Count-control
-    modes, E17, D-18, D-42 to D-45): "gradient" clones and splits the candidates, "score" appends
-    rows drawn ∝ ρ and initialized by E11, "none" does nothing. Model, optimizer and statistics
-    are resized together; `optimizer` must be the model's own (Q-48). Synchronizes with the host:
-    an event does anyway (§2.4 rule 3)."""
+    """Run one growth event in the configured count-control mode (§1.3 Growth, E17, D-18).
+
+    ``cfg.mode`` picks what the event does (§1.3 Count-control modes, D-42 to D-45):
+
+    - "gradient" clones and splits the candidates of :func:`growth_masks`. A clone copies all
+      nine tensors; a split replaces its parent by two children placed by E17, with scales
+      a/1.6, from one draw of ``generator``.
+    - "score" appends max(0, min(N_max, ⌊(1 + ``cfg.score_rate``)·N⌋) − N) rows drawn ∝ ρ from
+      the live set and initialized by E11, as relocation does; the targets' Adam moments are
+      zeroed (D-16). Nothing is added when no row is live.
+    - "none" does nothing.
+
+    Model, optimizer and statistics are resized together: kept rows stay in order, and new
+    rows go last with zero Adam moments and their parents' statistics (D-45).
+
+    Parameters
+    ----------
+    model
+        The model, changed in place.
+    optimizer
+        The model's own optimizer, built for it by :func:`~openftgs.optim.build_optimizer`.
+    stats
+        The gradient statistics, covering the model's rows, on its device.
+    cfg
+        The growth settings: the mode, τ_pos, the split scale, N_max and the score mode's rate.
+    spatial_scale
+        The scene's spatial scale S (D-27), in world units, finite and > 0.
+    reloc
+        The relocation settings, for the score mode's ρ, live set and E11 (E10, E11, D-14).
+    generator
+        The generator of the split offsets or of the score mode's draws.
+
+    Returns
+    -------
+    GrowthReport
+        What the event did, and N after it.
+
+    Raises
+    ------
+    ValueError
+        If ``stats`` doesn't cover the model's rows on its device, ``optimizer`` is not the
+        model's own (Q-48), ``generator`` is not a :class:`torch.Generator`, ``spatial_scale``
+        is not a finite number > 0, or, in the score mode, the model breaks §1.1's validity
+        rules (Q-55) or the live primitives' scores have no positive sum.
+
+    Notes
+    -----
+    Synchronizes with the host, as an event does anyway (§2.4 rule 3). Q-52 fixes the
+    procedure's details: the candidates, the cap, the clone and split boundary, and the order
+    of the new rows and of the draws.
+    """
     _check_stats(model, stats)
     _check_optimizer(model, optimizer)
     _check_generator(generator)
@@ -601,6 +950,12 @@ def _grow_by_score(
 # also the iteration after which large primitives are pruned (iteration > 3000, as gsplat's
 # step > reset_every).
 OPACITY_RESET_EVERY = 3000
+"""The opacity reset's period in iterations, for the "w/o periodic relocation" ablation (Q-67).
+
+The trainer's calendar resets opacities with :func:`reset_opacity` every 3,000 iterations, and
+:func:`prune` removes large primitives only after this iteration (§1.3 Count-control modes,
+Q-53).
+"""
 _PRUNE_SCALE = 0.1  # × S: larger primitives are pruned after OPACITY_RESET_EVERY
 _RESET_OPACITY = 0.01  # the opacity reset's bound on σ
 
@@ -614,11 +969,46 @@ def prune(
     spatial_scale: float,
     iteration: int,
 ) -> int:
-    """The ablation's pruning (§1.3 Count-control modes): remove the primitives whose base
-    opacity is below `cfg.prune_opacity` (tested on the stored logit, as D-14 tests the dead
-    set) and, after iteration 3,000, those whose largest scale exceeds 0.1·S. Model, optimizer
-    and statistics are resized together. Returns the number removed; with no pruning opacity
-    configured, does nothing. `optimizer` must be the model's own (Q-48)."""
+    """Prune primitives for the "w/o periodic relocation" ablation (§1.3 Count-control modes).
+
+    Remove the primitives whose base opacity is below ``cfg.prune_opacity``, tested on the
+    stored logit as D-14 tests the dead set, and, after iteration :data:`OPACITY_RESET_EVERY`
+    (3,000), those whose largest scale exceeds 0.1·S. Model, optimizer and statistics are
+    resized together. With ``cfg.prune_opacity`` None, the default, nothing changes.
+
+    Parameters
+    ----------
+    model
+        The model, changed in place.
+    optimizer
+        The model's own optimizer, built for it by :func:`~openftgs.optim.build_optimizer`.
+    stats
+        The gradient statistics, covering the model's rows, on its device.
+    cfg
+        The relocation settings, for ``cfg.prune_opacity``.
+    spatial_scale
+        The scene's spatial scale S (D-27), in world units, finite and > 0.
+    iteration
+        The current iteration, an int ≥ 1 (D-41).
+
+    Returns
+    -------
+    int
+        The number of primitives removed.
+
+    Raises
+    ------
+    ValueError
+        If ``stats`` doesn't cover the model's rows on its device, ``optimizer`` is not the
+        model's own (Q-48), ``spatial_scale`` is not a finite number > 0, or ``iteration`` is
+        not an int ≥ 1.
+
+    Notes
+    -----
+    Q-53 fixes the thresholds, as constants with no configuration field (D-72) [L: 3DGS §5.2;
+    thresholds from gsplat 1.5.3 DefaultStrategy]; Q-67 the iteration after which large
+    primitives go.
+    """
     _check_stats(model, stats)
     _check_optimizer(model, optimizer)
     scale = _check_spatial_scale(spatial_scale)
@@ -638,10 +1028,23 @@ def prune(
 
 
 def reset_opacity(model: FreeTimeGaussians, optimizer: FTGSOptimizer) -> None:
-    """The ablation's opacity reset (§1.3 Count-control modes): σ ← min(σ, 0.01), on the stored
-    logit, and the Adam moments of the opacity logits zeroed for every row, keeping the step
-    counters (Q-53, owner answer). `optimizer` must be the model's own (Q-48). No host
-    synchronization."""
+    """Reset opacities for the "w/o periodic relocation" ablation (§1.3 Count-control modes).
+
+    Set σ ← min(σ, 0.01) on the stored logit, and zero the Adam moments of the opacity logits
+    for every row, keeping the step counters (Q-53, owner answer). No host synchronization.
+
+    Parameters
+    ----------
+    model
+        The model, changed in place.
+    optimizer
+        The model's own optimizer, built for it by :func:`~openftgs.optim.build_optimizer`.
+
+    Raises
+    ------
+    ValueError
+        If ``optimizer`` is not the model's own (Q-48).
+    """
     _check_optimizer(model, optimizer)
     with torch.no_grad():
         model.opacity_logits.clamp_(max=_logit_bound(_RESET_OPACITY))

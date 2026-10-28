@@ -8,7 +8,7 @@
   "adam",
   "/home/auss/datasets/openftgs-m15/ci-scene/scene.json",
   "--out",
-  "/home/auss/datasets/openftgs-m15/bench/ci-1/B-5-adam.json"
+  "/home/auss/datasets/openftgs-m15/bench/ci-369-2/B-5-adam.json"
  ],
  "environment": {
   "gpu": {
@@ -21,10 +21,10 @@
   "torch": "2.14.1+cu130",
   "gsplat": "1.5.3",
   "fused_ssim": "1.0.0",
-  "python": "3.14.8",
+  "python": "3.14.9",
   "openftgs": "0.1.0.dev0",
   "cpu": "12th Gen Intel(R) Core(TM) i9-12900",
-  "commit": "c3747016f77722d5a917c62c7eb6e2736b45ed4f",
+  "commit": "4cd737d1da5d405195c08676b3c7fef200b88c66",
   "dirty": false
  },
  "scene": {
@@ -35,7 +35,7 @@
   "width": 1352,
   "height": 1014
  },
- "date": "2026-10-20T00:19:11+00:00",
+ "date": "2026-10-23T04:04:27+00:00",
  "setup": {
   "model": "synthesized (Q-168, Q-181)",
   "seed": 0,
@@ -71,8 +71,8 @@
     "n": 1000000
    },
    "figures": {
-    "step_s": 0.002065918922424319,
-    "first_call_s": 0.0022220329992705956,
+    "step_s": 0.002050044536590574,
+    "first_call_s": 0.0022986740223132074,
     "repetitions": 50,
     "peak_allocated_bytes": 1028635136
    }
@@ -83,8 +83,8 @@
     "n": 1000000
    },
    "figures": {
-    "step_s": 0.004526077270507807,
-    "first_call_s": 0.03834378799365368,
+    "step_s": 0.004503201484680166,
+    "first_call_s": 0.03955301601672545,
     "repetitions": 50,
     "peak_allocated_bytes": 1209340416
    }
@@ -95,8 +95,8 @@
     "n": 1000000
    },
    "figures": {
-    "step_s": 0.0006809601783752447,
-    "first_call_s": 0.05119167099473998,
+    "step_s": 0.0006748155355453497,
+    "first_call_s": 0.05205077299615368,
     "repetitions": 50,
     "peak_allocated_bytes": 1028630528,
     "visible_fraction": 0.173
@@ -108,8 +108,8 @@
     "n": 3000000
    },
    "figures": {
-    "step_s": 0.006066177368164061,
-    "first_call_s": 0.006146326006273739,
+    "step_s": 0.006016141891479494,
+    "first_call_s": 0.006209008977748454,
     "repetitions": 50,
     "peak_allocated_bytes": 3075045888
    }
@@ -120,8 +120,8 @@
     "n": 3000000
    },
    "figures": {
-    "step_s": 0.013638626098632811,
-    "first_call_s": 0.01376254900242202,
+    "step_s": 0.013656143188476633,
+    "first_call_s": 0.013753378007095307,
     "repetitions": 50,
     "peak_allocated_bytes": 3615074304
    }
@@ -132,8 +132,8 @@
     "n": 3000000
    },
    "figures": {
-    "step_s": 0.0020183033943176262,
-    "first_call_s": 0.002067323002847843,
+    "step_s": 0.00199843204021454,
+    "first_call_s": 0.00216685701161623,
     "repetitions": 50,
     "peak_allocated_bytes": 3075041280,
     "visible_fraction": 0.17
@@ -144,7 +144,7 @@
     "n": 1000000
    },
    "figures": {
-    "fused_over_foreach": 0.45644800098442234
+    "fused_over_foreach": 0.4552957634654684
    }
   },
   {
@@ -152,7 +152,7 @@
     "n": 3000000
    },
    "figures": {
-    "fused_over_foreach": 0.44477921194512093
+    "fused_over_foreach": 0.44045902415186117
    }
   }
  ],
@@ -163,7 +163,7 @@
    },
    "figure": "fused_over_foreach",
    "limit": 1.0,
-   "value": 0.45644800098442234,
+   "value": 0.4552957634654684,
    "pass": true,
    "kind": "budget"
   },
@@ -173,7 +173,7 @@
    },
    "figure": "fused_over_foreach",
    "limit": 1.0,
-   "value": 0.44477921194512093,
+   "value": 0.44045902415186117,
    "pass": true,
    "kind": "budget"
   }

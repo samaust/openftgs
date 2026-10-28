@@ -5,12 +5,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openftgs"
-version = "0.1.0.dev0"
+# Q-244: the first release, tagged v0.1.0.
+version = "0.1.0"
 description = "An independent clean-room implementation of FreeTimeGS (Wang et al., CVPR 2025), not affiliated with its authors."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Samuel Austin" }]
+# Q-244: keywords and classifiers. No license classifier: PEP 639's `license` expression above
+# states it. The classifiers are spelled as PyPI's list spells them (source log 471).
+keywords = [
+    "gaussian-splatting",
+    "dynamic-scene-reconstruction",
+    "novel-view-synthesis",
+    "multi-view-video",
+    "4d-reconstruction",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Typing :: Typed",
+]
 # Q-1: Python floor.
 requires-python = ">=3.11"
 # §2.3. Training needs a CUDA build of torch; on Linux x86_64 PyPI's default wheel is one (Q-3).
@@ -33,6 +58,16 @@ ftgs = "openftgs.cli:main"
 # Q-202: the adapter of the differential harness (§3.3).
 ftgs-adapter = "openftgs.cli._adapter:main"
 
+# Q-244: the project URLs. The documentation site is built by Read the Docs (.readthedocs.yaml,
+# Q-241); the changelog is the site's page, read on GitHub, which shows it whatever version the
+# site serves.
+[project.urls]
+Homepage = "https://github.com/samaust/openftgs"
+Source = "https://github.com/samaust/openftgs"
+Documentation = "https://openftgs.readthedocs.io"
+Issues = "https://github.com/samaust/openftgs/issues"
+Changelog = "https://github.com/samaust/openftgs/blob/main/docs/changelog.md"
+
 [project.optional-dependencies]
 # §2.3: the vendored RoMa (D-65) needs torch >= 2.5.1. D-85: fused-local-corr, RoMa's optional
 # speed-up, isn't listed, on any Python; it is built from source against the installed torch
@@ -42,6 +77,10 @@ init = [
     "torchvision",
     "einops",
     "loguru",
+    # Q-276: XFeat's code, which Tiny RoMa loads through torch.hub at its pinned commit
+    # (Q-116), imports tqdm in modules/xfeat.py (source log 480); tqdm left with lpips (#393).
+    # A lower bound only (Q-29's practice): the release the suites ran with on 3.11 to 3.14.
+    "tqdm>=4.70.1",
 ]
 # Q-2: fused-ssim is not on PyPI; the README says how to install it.
 fast = []
@@ -55,6 +94,18 @@ dev = [
     "pip-licenses",
     "scikit-image",
     "opencv-python-headless",
+]
+
+# Q-241: the documentation site's tools, a PEP 735 group, so they never enter the package's
+# metadata: `pip install . --group docs`, with torch installed first (CPU torch builds the site).
+# The floors are the releases that resolve on Python 3.11 and build the site there `-W`-clean.
+[dependency-groups]
+docs = [
+    "sphinx>=9.0.4",
+    "myst-parser>=5.1",
+    "furo>=2025.12.19",
+    "sphinx-autodoc-typehints>=3.6.1",
+    "sphinx-argparse>=0.6.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -92,11 +143,20 @@ skip_empty = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+# Q-241: the documentation site's sources under docs/ (conf.py and the pages) are linted and
+# formatted. The records and notes beside them are not, since ruff would reformat the Python
+# blocks of their Markdown: the spec (never edited), the clean-room records, the agent and module
+# docs, the research notes and the glossary. docs/_build/ is gitignored, which ruff respects.
 # D-65: the vendored RoMa and ꟻLIP, U-23's reference copy of ꟻLIP (Q-252) and the harness's
 # own copy (Q-254) stay as upstream wrote them.
 extend-exclude = [
     ".claude",
-    "docs",
+    "docs/agents",
+    "docs/clean-room",
+    "docs/modules",
+    "docs/research",
+    "docs/spec",
+    "docs/GLOSSARY.md",
     "src/openftgs/_vendor/romatch",
     "src/openftgs/_vendor/flip/flip_loss.py",
     "harness/src/ftgs_harness/_vendor/flip/flip_loss.py",
@@ -104,7 +164,26 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+# Q-243: pydocstyle's D rules under the NumPy convention, plus D417, which the convention leaves
+# out and which must be selected by its full code: once a docstring has a Parameters section,
+# every parameter is documented there. The documentation site's conf.py stays linted.
+select = ["E", "F", "W", "I", "UP", "B", "D", "D417"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+# Q-243: the tests, by the owner's call; they aren't public API and the site doesn't render them.
+"tests/**" = ["D"]
+# Q-243: the package's private modules, the CLI's among them, are not public API and the site
+# doesn't render them. `[!_]` keeps `__init__.py` and `__main__.py` linted.
+"src/openftgs/_[!_]*.py" = ["D"]
+"src/openftgs/cli/_[!_]*.py" = ["D"]
+# Q-5, Q-243: the harness is a separate distribution, ftgs-harness, that this release doesn't
+# publish and the site doesn't document.
+"harness/**" = ["D"]
+# Q-243: the maintainer scripts are tools run from the repository, not packaged or documented.
+"scripts/**" = ["D"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["openftgs", "ftgs_harness"]

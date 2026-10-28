@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# Read the Docs builds the documentation site (PRD #355) on Python 3.11, the floor (Q-1), with
+# CPU torch from the PyTorch CPU index (Q-3) and the package with its `docs` dependency group
+# (Q-241): every public module is imported for real, nothing is mocked. The docs workflow,
+# .github/workflows/docs.yml, installs the same way.
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.11"
+  jobs:
+    # Replaces the default install step, which no longer upgrades pip; `--group` needs pip 25.1.
+    # Torch comes first, so that installing the package never pulls PyPI's CUDA build. No public
+    # module imports torchvision (the vendored RoMa and the DINO networks import it lazily), so
+    # the site builds without it (#432).
+    install:
+      - python -m pip install --upgrade pip
+      - python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - python -m pip install . --group docs
+
+sphinx:
+  configuration: docs/conf.py
+  # -W --keep-going: every warning fails the build, as nitpicky (docs/conf.py) makes every
+  # unresolved cross-reference one.
+  fail_on_warning: true
