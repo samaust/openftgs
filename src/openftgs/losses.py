@@ -504,22 +504,23 @@ class _DinoDistance(torch.nn.Module):
 
 
 class PerceptualLoss(torch.nn.Module):
-    """The perceptual loss L_perc, one of D-89's eight networks on images in [0, 1] (E7, D-9).
+    """The perceptual loss L_perc, one of D-89's eight networks (E7, D-9).
 
     ``net`` selects the network (:data:`openftgs.config.PercNet`); the module computes the
-    network's distance between the render and the training image, as the mean over the batch,
-    the reference without a gradient. The network is frozen and stays in evaluation mode,
-    whatever :meth:`train` is given (D-89). Calling the module, ``loss(pred, gt)``, runs
-    :meth:`forward`. The trainer builds one network and passes it to :func:`total_loss`
-    (D-77); the evaluator builds ``"flip"`` for its ꟻLIP metric (E16).
+    network's distance between the render, which E7 doesn't clamp, and the training image in
+    [0, 1], as the mean over the batch, the reference without a gradient. The network is
+    frozen and stays in evaluation mode, whatever :meth:`train` is given (D-89). Calling the
+    module, ``loss(pred, gt)``, runs :meth:`forward`. The trainer builds one network and
+    passes it to :func:`total_loss` (D-77); the evaluator builds ``"flip"`` for its ꟻLIP
+    metric (E16).
 
     Parameters
     ----------
     net
         The network, ``"flip"`` by default (D-89):
 
-        - ``"flip"``: NVIDIA's LDR-ꟻLIP loss, vendored (D-65), at 67.0 pixels per degree, the
-          mean of its error map; it clamps both images to [0, 1] (Q-259);
+        - ``"flip"``: NVIDIA's LDR-ꟻLIP loss, vendored (D-65), at 67.0 pixels per degree
+          (Q-259), the mean of its error map; it clamps both images to [0, 1] (D-89);
         - ``"haarpsi"``: 1 − HaarPSI at 3 scales, subsampled, c = 30, α = 4.2, the render
           clamped to [0, 1];
         - ``"vgg16_oxford"``, ``"alexnet_bvlc"``: the distance between unit-normalized
@@ -543,17 +544,19 @@ class PerceptualLoss(torch.nn.Module):
     Notes
     -----
     ``"flip"`` and ``"haarpsi"`` have no weights. The six trunk networks download their
-    publisher's weights at first use into torch.hub's cache, ``torch.hub.get_dir()``, and check
-    them against their byte count and SHA-256 before every use; a Caffe file is converted once
-    into a safetensors file beside it (§2.3; Q-258). Their weights are buffers that no
-    ``state_dict`` carries, which ``.to()`` moves and converts (Q-263, Q-265).
+    publisher's weights at first use into torch.hub's cache,
+    ``torch.hub.get_dir()/checkpoints/``, and check them against their byte count and SHA-256
+    before every use; a Caffe file is converted once into a safetensors file beside it (§2.3;
+    Q-258). Their weights are buffers that no ``state_dict`` carries, which ``.to()`` moves and
+    converts (Q-263, Q-265).
 
-    The inputs each network refuses, with a ValueError raised on shapes and dtypes alone,
-    before any work and without a cast (Q-261, Q-263, Q-265): ``"flip"`` takes float32 images
-    only; ``"haarpsi"`` float32 or float64 images whose height and width are at least 16
-    pixels; the trunk networks images of their weights' dtype, float32 as built, and
-    ``"alexnet_bvlc"`` sides of at least 23 pixels, the DINOv2 networks 27 and the DINO
-    networks 31, one patch at half resolution.
+    The inputs each network refuses, with a ValueError raised on shapes and dtypes alone and
+    without a cast, before any work but for ``"haarpsi"``'s size check, which follows the
+    render's clamp (Q-261, Q-263, Q-265): ``"flip"`` takes float32 images only; ``"haarpsi"``
+    float32 or float64 images whose height and width are at least 16 pixels; the trunk
+    networks images of their weights' dtype, float32 as built, and ``"alexnet_bvlc"`` sides of
+    at least 23 pixels, the DINOv2 networks 27 and the DINO networks 31, one patch at half
+    resolution.
 
     Under a caller's :class:`torch.autocast`, ``"flip"`` and ``"haarpsi"`` turn autocast off
     for their own computation, which stays in their images' dtype; the trunk networks run
@@ -766,12 +769,14 @@ def total_loss(
     ------
     ValueError
         If ``it`` is not an int ≥ 1, the resolved λ_perc is positive and ``perceptual`` is
-        None (D-77; Q-249), ``perceptual``'s network differs from ``cfg.perc_net``, or the
-        images fail :func:`l1_loss`'s checks.
+        None (D-77; Q-249), ``perceptual``'s network differs from ``cfg.perc_net``, the
+        images fail :func:`l1_loss`'s checks, H or W is smaller than ``cfg.ssim_window`` with
+        "valid" padding (:func:`ssim`), or the perceptual network refuses the images' dtype or
+        size (:class:`PerceptualLoss`; Q-261, Q-263, Q-265).
 
     Notes
     -----
-    D-77 changes §2.1's signature: the terms stay on the device, so the loss never synchronizes
+    §2.1's signature is D-77's: the terms stay on the device, so the loss never synchronizes
     with the host (§2.4 rule 3), and the perceptual network is passed in rather than built
     here. The trainer accumulates the terms and reads them every ``log_every`` iterations.
     Q-249: D-77's raise reads the resolved weight, so the default configuration, whose
@@ -779,8 +784,15 @@ def total_loss(
 
     Examples
     --------
+    >>> from pathlib import Path
+    >>> import torch
     >>> from openftgs.config import LossConfig
     >>> from openftgs.losses import PerceptualLoss, total_loss
+    >>> from openftgs.model import FreeTimeGaussians
+    >>> model = FreeTimeGaussians.load(Path("run/checkpoint"))
+    >>> pred = torch.rand(480, 640, 3, device="cuda", requires_grad=True)  # a render, say
+    >>> gt = torch.rand(480, 640, 3, device="cuda")
+    >>> t, it = 0.5, 1
     >>> cfg = LossConfig()  # perc_net "flip", lambda_perc None: 0.415
     >>> perceptual = PerceptualLoss(cfg.perc_net).to(pred.device)
     >>> loss, terms = total_loss(pred, gt, model, t, it, cfg, perceptual=perceptual)
