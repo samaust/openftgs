@@ -59,6 +59,15 @@ By Sergey Kastryulin and the piq contributors (the package's metadata names its 
 license file names no copyright holder, and it has no NOTICE file).
 Licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
 
+The documentation site's template docs/_templates/autosummary/module.rst (in the source
+repository only; neither the sdist nor the wheel holds it) follows the layout of Sphinx's
+autosummary/module.rst; its header comment carries Sphinx's license in full.
+
+Sphinx (https://www.sphinx-doc.org/), version 9.2.0,
+sphinx/ext/autosummary/templates/autosummary/module.rst
+Copyright (c) 2007-2026 by the Sphinx team (see AUTHORS file). All rights reserved.
+Licensed under the BSD 2-Clause License.
+
 
 Pretrained weights
 ------------------
