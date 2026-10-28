@@ -366,8 +366,53 @@ uv 0.11.32, build 1.6.1, setuptools 84.2.1 in the isolated build environments (s
 - **The lists**, with Python's `tarfile` and `zipfile` against `git ls-files`: the sdist's 124 files and the wheel's 69 are the same sets as #432's above (the sdist: `LICENSE`, `NOTICE`, `README.md`, `pyproject.toml`, the package's 62 files under `src/openftgs/`, 50 `tests/test*.py` modules, and setuptools' 8 generated files; the wheel: the same 62 package files and 7 `.dist-info` files). Every other sdist file is tracked, and the wheel's package files are the sdist's. None is flagged by the path, `__pycache__`, extension or name checks above, extended with `.caffemodel`, `.svg`, the openftgs-synth scene names (`kitchen`, `courtyard`, `studio`) and `placeholder`: no `docs/paper/`, no dataset file, nothing derived from SelfCap or Neural3DV.
 - **`twine check --strict`** (`uvx twine check --strict`, twine 7.0.0, readme-renderer 46.0): `PASSED` for both, so the README renders as PyPI's description.
 - **CI's wheel assertions** (`ci.yml`'s wheel step, its script run as written against this wheel and a harness wheel built from the same commit): `wheel contents ok`, with the vendored RoMa's and ꟻLIP's license files and VENDOR.json hashes, the core's and `[init]`'s requirements, PEP 639's `License-Expression: Apache-2.0`, no license classifier, and the five project URLs (Q-244). The metadata has no docs extra (Q-241), and `[fast]` is empty (Q-2).
-- **The TestPyPI upload: open.** Q-244's dry run, `twine upload -r testpypi`, is the owner's step; its result is recorded here after the owner's upload, from a rebuild of the reviewed tip of `prd-355-release`, not from the files above.
-- **The smoke install from TestPyPI on Python 3.11: open.** It follows the upload, and its result is recorded here with it.
+
+**The first TestPyPI upload: 0.1.0 from e327e7c, 2026-10-28.** The reviewed tip of `prd-355-release`, e327e7c, was built the same way, in a detached checkout of it, into `.scratch/prd-355-release/build-0.1.0-e327e7c/`: `openftgs-0.1.0.tar.gz` (704,036 bytes, SHA-256 c536af09b9edc4b3d90419fc129dee00386754ed84936b7124749d22d6851a80) and `openftgs-0.1.0-py3-none-any.whl` (361,098 bytes, SHA-256 2f1c8deabfcd872bd9b7efee98bac6ee1f512facda4353201370feeb9264ae22). `twine check --strict` passed, CI's wheel assertions passed, the file lists held 124 and 69 files with nothing flagged, and all 178 archived tracked files were byte-identical to e327e7c. The owner uploaded both files to TestPyPI with their own token (`uvx twine upload --repository testpypi …`), on 2026-10-28. The smoke install (`smoke_testpypi_370b.sh`) passed on Python 3.11 to 3.14, after a first run on 3.11 had stopped at a display line of the script (`pip show | head -3`, a broken pipe), not at a check: CPU torch, the core dependencies from PyPI only, openftgs alone from TestPyPI with `--no-deps`, the downloaded wheel's SHA-256 equal to the build's, `pip check`, `import openftgs` and `ftgs --help`. The CPU suites in CI-like environments on 3.11 to 3.14, run next, then found the tqdm defect: Tiny RoMa failed in a clean `.[dev,init]` install, since XFeat's hub code imports tqdm (Q-276). TestPyPI keeps that 0.1.0, which lacks tqdm in `[init]`; it isn't the release.
+
+**The rebuild from 88d21eb** (`prd-355-release` with Q-276's fix merged), under PRD #355's rule that a rebuild after a TestPyPI upload takes an rcN version there, never on PyPI. Two sets, each built the same way from its own `git archive 88d21eb` copy (so no untracked or ignored file of a checkout can enter), with the four placeholders:
+
+| Set | File | Bytes | SHA-256 |
+| --- | --- | --- | --- |
+| TestPyPI, `.scratch/prd-355-release/build-0.1.0rc1-88d21eb/` | `openftgs-0.1.0rc1.tar.gz` | 703,927 | 09a1f8e290921f6c5aaddafee9cea165df4a685176a0d773726af348f6a11586 |
+| | `openftgs-0.1.0rc1-py3-none-any.whl` | 361,203 | fc88fc9cd3ae53ab4f8e7c3e11e010de14e92e912a52764104ee60d4e42649a0 |
+| PyPI, `.scratch/prd-355-release/build-0.1.0-88d21eb/` | `openftgs-0.1.0.tar.gz` | 703,872 | 0effb652dc020c0a24f223dd658d7c9acf6dfdbae8127b466d862b0b80036580 |
+| | `openftgs-0.1.0-py3-none-any.whl` | 361,154 | 2c5237a8a0a16a02cd1ca72705fb35bfd4a1a20b8d08d02ffcc3e5eb4c0ca48f |
+
+- **The rc1 copy's only change**, in `pyproject.toml`: `version = "0.1.0"` → `version = "0.1.0rc1"`. Its wheel's METADATA differs from the 0.1.0 wheel's only in `Version`. Nothing else in the package states the version except the README's status line, "version 0.1.0", which the rc1 set keeps, so TestPyPI's rc1 page shows it.
+- **The checks, on both sets:** `twine check --strict` passed; CI's wheel assertions printed `wheel contents ok`; the sdist's 124 files and the wheel's 69 are the same sets as above, nothing flagged by the path, `__pycache__`, extension or name checks; all 178 archived tracked files are byte-identical to 88d21eb, apart from the rc1 version line; and both wheels' METADATA and both sdists' PKG-INFO carry `Requires-Dist: tqdm>=4.70.1; extra == "init"` (Q-276).
+- **The merged tree builds the same 0.1.0 set:** no packaged file changed between 88d21eb and 899e2be (`git diff --stat 88d21eb 899e2be -- src tests pyproject.toml README.md LICENSE NOTICE setup.cfg` is empty, the merger's check).
+
+**The rc1 upload and its smoke install, 2026-10-28.** The owner uploaded the rc1 set to TestPyPI with their own token. `smoke_testpypi_rc1.sh` ran on Python 3.11 to 3.14 at 18:33 to 18:34, under the machine ledger with 4 threads (1 min 13 s), all four exit 0: in a clean venv seeded by uv (the system Pythons have no ensurepip), CPU torch from the PyTorch CPU index, the core dependencies from PyPI only, as the built wheel's metadata pins or bounds them, then `openftgs==0.1.0rc1` alone from TestPyPI with `--no-deps`, so no package but openftgs came from TestPyPI.
+
+| Python | torch | Local wheel = fc88fc9c… | Downloaded wheel = fc88fc9c… | `pip check` | `import openftgs` | `ftgs --help` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3.11.17 | 2.15.0+cpu | OK | OK | No broken requirements found. | `venv-smoke-311-rc1/lib/python3.11/site-packages/openftgs/__init__.py`, 0.1.0rc1 | usage line and the eight commands, exit 0 |
+| 3.12.3 | 2.15.0+cpu | OK | OK | No broken requirements found. | `…/python3.12/site-packages/openftgs/__init__.py`, 0.1.0rc1 | the same |
+| 3.13.17 | 2.15.0+cpu | OK | OK | No broken requirements found. | `…/python3.13/site-packages/openftgs/__init__.py`, 0.1.0rc1 | the same |
+| 3.14.9 | 2.15.0+cpu | OK | OK | No broken requirements found. | `…/python3.14/site-packages/openftgs/__init__.py`, 0.1.0rc1 | the same |
+
+**The tests behind the classifiers** (Q-244's Python 3.11 to 3.14; owner, 2026-10-28). The CPU suite ran in one CI-like environment per Python (`venv-suite-3XX-370b`: CPU torch and torchvision from the CPU index, then `-e ".[dev,init]" -e "harness[torch]"`, tqdm arriving through `[init]`), from `ticket-370-release` at 633dccc (Q-276's fix), each under the machine ledger with the whole machine: step 7's `pytest -q -n auto --dist loadgroup -m "not gpu" -rs tests`, then `OPENFTGS_ALLOW_DOWNLOADS=1 pytest -q -m "weights and not gpu" -rs tests`, with the venv's own Python and no PYTHONPATH.
+
+| Python | torch | `-m "not gpu"` | Skipped | Weights |
+| --- | --- | --- | --- | --- |
+| 3.11.17 | 2.15.0+cpu | 2244 passed, 1 failed | 152: 145 weights tests (downloads not allowed), 7 needing the paper's datasets (D-79) | 145 passed |
+| 3.12.3 | 2.15.0+cpu | 2244 passed, 1 failed | 152 (145 + 7) | 145 passed |
+| 3.13.17 | 2.15.0+cpu | 2244 passed, 1 failed | 152 (145 + 7) | 145 passed |
+| 3.14.9 | 2.15.0+cpu | 2244 passed, 1 failed | 152 (145 + 7) | 145 passed |
+
+The one failure is the expected one: `tests/test_environment.py::test_cuda_torch_on_gpu_machine`, Q-3's check that a machine with a GPU has a CUDA torch, which these CPU-torch environments on the RTX 4090 machine don't. With it, the counts are step 7's (2245 passed, 152 skipped, then 145 weights tests passed, on torch 2.14.1+cu130 in the project's `.venv`).
+
+The GPU suite ran once, in `venv-cuda-314-370b` (Python 3.14.9, PyPI's default torch, 2.15.0+cu132 with CUDA 13.2, driver 595.99.02, the RTX 4090), from 633dccc, under the machine ledger with the whole machine and the GPU:
+
+| Run | torch | Passed | Skipped |
+| --- | --- | --- | --- |
+| `pytest -q -m gpu -rs tests` | 2.15.0+cu132 | 301 | 52: 49 weights tests (downloads not allowed), 3 fused-ssim tests (`fused_ssim` isn't installed in a fresh environment: it is installed by hand, Q-2) |
+| `OPENFTGS_ALLOW_DOWNLOADS=1 pytest -q -m "gpu and weights" -rs tests` | 2.15.0+cu132 | 48 | 1 (Q-117: upstream romatch isn't importable) |
+| Step 7, the project's `.venv` | 2.14.1+cu130 | 352 | 1 (Q-117) |
+
+So 349 GPU tests passed on torch 2.15.0, and step 7's 352 are those and the 3 fused-ssim tests, which need fused-ssim installed.
+
+**Still open, for the owner:** the PyPI upload of the 0.1.0 set from 88d21eb (`build-0.1.0-88d21eb/`, above), the annotated tag `v0.1.0` on the merge commit into `main`, and the two pushes, `main` and then the tag. The logs of these runs stay in `.scratch/prd-355-release/` and aren't committed.
 
 ### The S-n fixtures' provenance
 
