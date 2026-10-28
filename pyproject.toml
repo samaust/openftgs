@@ -77,6 +77,10 @@ init = [
     "torchvision",
     "einops",
     "loguru",
+    # Q-276: XFeat's code, which Tiny RoMa loads through torch.hub at its pinned commit
+    # (Q-116), imports tqdm in modules/xfeat.py (source log 480); tqdm left with lpips (#393).
+    # A lower bound only (Q-29's practice): the release the suites ran with on 3.11 to 3.14.
+    "tqdm>=4.70.1",
 ]
 # Q-2: fused-ssim is not on PyPI; the README says how to install it.
 fast = []

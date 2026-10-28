@@ -59,6 +59,16 @@ In all three, gsplat 1.5.3 (`UNKNOWN`) matched its existing sign-off, and no row
 | `venv-ci-311-432` (CI's) | 3.11.17 | 2.14.1+cpu | 59 | Passed (exit 0); as `venv-ci-314-432` |
 | `venv-cuda-314-432` (CUDA) | 3.14.9 | 2.14.1 (cu130) | 78 | **Passed (exit 0)**: gsplat and the 16 rows signed off, nothing stale |
 
+**tqdm comes back with `[init]` (#370, 2026-10-28).** Tiny RoMa failed in a clean `.[dev,init]` install, since XFeat's code imports tqdm, which left with lpips (#393); the owner's answer "Add tqdm to [init]" makes it `[init]`'s, `tqdm>=4.70.1` (Q-276). tqdm 4.70.1 reports "MPL-2.0 AND MIT", which the scan passes without a sign-off (Q-4), and bundles no shared library. The scan, as CI's licenses job runs it (`python scripts/license_scan.py`), and `scripts/bundled_libs.py` ran from `ticket-370-release` at 633dccc, in environments built as CI builds them (`uv venv --seed`, CPU torch and torchvision from the CPU index, then `-e ".[dev,init]" -e "harness[torch]"`), which now resolve torch 2.15.0, and in a CUDA environment with PyPI's default torch, which now is 2.15.0 for CUDA 13.2:
+
+| Environment | Python | torch | Distributions | Result |
+| --- | --- | --- | --- | --- |
+| `venv-suite-311-370b` (CI's) | 3.11.17 | 2.15.0+cpu | 60 | Passed (exit 0): #432's 59 and tqdm; gsplat signed off; the 16 CUDA entries reported as stale, a warning only |
+| `venv-suite-314-370b` (CI's) | 3.14.9 | 2.15.0+cpu | 60 | Passed (exit 0); as `venv-suite-311-370b` |
+| `venv-cuda-314-370b` (CUDA) | 3.14.9 | 2.15.0 (cu132) | 79 | **Failed (exit 1): open, put to the owner.** torch 2.15.0's CUDA 13.2 wheel brings new versions of the NVIDIA runtime wheels, so 12 of the 16 sign-offs are void (version changed) and one wheel is new (`nvidia-cuda-cccl`): `cuda-toolkit` 13.2.2 (`UNKNOWN`) and `nvidia-cublas` 13.4.1.3, `nvidia-cuda-cccl` 13.3.4.3.1, `nvidia-cuda-cupti`, `nvidia-cuda-nvrtc` and `nvidia-cuda-runtime` 13.2.86, `nvidia-cudnn-cu13` 9.26.0.51, `nvidia-cufft` 12.2.0.57, `nvidia-cufile` 1.17.1.22, `nvidia-cusolver` 12.2.0.11, `nvidia-cusparse` 12.7.10.12, `nvidia-nvshmem-cu13` 3.7.2 and `nvidia-nvtx` 13.2.86 (`LicenseRef-NVIDIA-Proprietary`), each installed by torch, directly or through `cuda-toolkit`'s extras. `nvidia-cusparselt-cu13` 0.8.1, `nvidia-nccl-cu13` 2.30.7 and `nvidia-nvjitlink` 13.4.92 still match their sign-offs; `nvidia-curand` is no longer installed. Nothing was signed off |
+
+The bundled-library inventory differs from the one above in the same way: torch 2.15.0 (both builds) now also bundles `torch/lib/libgfortran.so.5`, beside the `libgomp.so.1` signed off for torch 2.14.1; torchvision is 0.29.2 (libcudart and libnvjpeg in its CUDA wheel) and triton 3.9.0 (CUPTI, and a new `triton/backends/amd/lib/libtriton_amd_codegen.so`), where the sign-offs name 0.29.1 and 3.8.0. Open with the owner, with the CUDA rows (Q-4).
+
 The code openftgs now carries from other projects is covered by NOTICE, not by the scan, which sees installed distributions only: the vendored ꟻLIP loss (`openftgs._vendor.flip`, BSD-3-Clause, with its license file and VENDOR.json; D-65, D-89) and the HaarPSI adapted from piq 0.8.0 in `openftgs.losses` (Apache-2.0, attribution in the code; §2.3). Both are named in NOTICE, checked under "The vendored ꟻLIP" below.
 
 ## Libraries bundled in dependency wheels
