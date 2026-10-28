@@ -257,7 +257,12 @@ def write_init_points(
 
     Examples
     --------
+    >>> from pathlib import Path
+    >>> import torch
     >>> from openftgs.io import write_init_points
+    >>> from openftgs.types import InitPoints
+    >>> points = InitPoints(positions=torch.rand(1000, 3), colors=torch.rand(1000, 3),
+    ...                     timestamps=torch.zeros(1000, dtype=torch.float64))
     >>> write_init_points(points, Path("init.safetensors"), time_unit="s", producer="my-tool")
     """
     validate_init_points(points)
@@ -310,6 +315,7 @@ def read_init_points(path: Path, *, time_unit: str | None = None) -> InitPoints:
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import read_init_points
     >>> points = read_init_points(Path("init.safetensors"), time_unit="s")
     >>> points.positions.shape
@@ -530,7 +536,10 @@ def write_exchange(model: ExchangeModel, path: Path) -> None:
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import write_exchange
+    >>> from openftgs.model import FreeTimeGaussians
+    >>> model = FreeTimeGaussians.load(Path("run/checkpoint"), device="cpu")
     >>> write_exchange(model.to_exchange(), Path("model.safetensors"))
     """
     validate_exchange(model)
@@ -599,13 +608,14 @@ def read_exchange(path: Path) -> ExchangeModel:
     ------
     ValueError
         If the file isn't a readable safetensors file or a ``ftgs-if`` file of major version
-        1; if it lacks ``sh_degree``, ``tau0``, ``tau1`` or ``time_unit``, or they aren't
-        numbers; if ``render_conventions`` isn't a JSON object or its background isn't three
+        1; if it lacks ``sh_degree``, ``tau0``, ``tau1`` or ``time_unit``, or the first three
+        aren't numbers; if ``render_conventions`` isn't a JSON object or its background isn't three
         numbers in [0, 1] (D-84, Q-157); or if the model is invalid
         (:func:`validate_exchange`).
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import read_exchange
     >>> exchange = read_exchange(Path("model.safetensors"))
     >>> exchange.sh_degree, exchange.time_unit
@@ -815,9 +825,11 @@ def save_checkpoint(state: TrainerState, directory: Path) -> Path:
 
     Examples
     --------
-    >>> from openftgs.io import save_checkpoint
-    >>> save_checkpoint(trainer.state_dict(), Path("run/checkpoint"))
-    PosixPath('run/checkpoint')
+    >>> from pathlib import Path
+    >>> from openftgs.io import load_checkpoint, save_checkpoint
+    >>> state = load_checkpoint(Path("run/checkpoint"))
+    >>> save_checkpoint(state, Path("copy/checkpoint"))
+    PosixPath('copy/checkpoint')
     """
     directory = Path(directory)
     where = f"checkpoint {directory}"
@@ -962,8 +974,10 @@ def save_run_checkpoint(state: TrainerState, run_dir: Path, *, keep: int = 1) ->
 
     Examples
     --------
-    >>> from openftgs.io import save_run_checkpoint
-    >>> save_run_checkpoint(trainer.state_dict(), Path("run"), keep=3)
+    >>> from pathlib import Path
+    >>> from openftgs.io import load_checkpoint, save_run_checkpoint
+    >>> state = load_checkpoint(Path("old-run/checkpoint"))
+    >>> save_run_checkpoint(state, Path("run"), keep=3)
     PosixPath('run/checkpoint')
     """
     _check_keep(keep)
@@ -1061,6 +1075,7 @@ def load_checkpoint(directory: Path) -> TrainerState:
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import load_checkpoint
     >>> state = load_checkpoint(Path("run/checkpoint"))
     >>> state.iteration
@@ -1251,6 +1266,7 @@ def read_render_request(path: Path) -> RenderRequest:
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import read_render_request
     >>> request = read_render_request(Path("request.json"))
     >>> [item.id for item in request.items]
@@ -1340,7 +1356,12 @@ def write_renders(renders: Renders, path: Path, *, producer: str, request_sha256
     Examples
     --------
     >>> import hashlib
-    >>> from openftgs.io import write_renders
+    >>> from pathlib import Path
+    >>> from openftgs.io import read_render_request, write_renders
+    >>> from openftgs.model import FreeTimeGaussians
+    >>> from openftgs.render import render_request
+    >>> model = FreeTimeGaussians.load(Path("run/checkpoint"))
+    >>> renders = render_request(model, read_render_request(Path("request.json")))
     >>> digest = hashlib.sha256(Path("request.json").read_bytes()).hexdigest()
     >>> write_renders(renders, Path("renders.safetensors"), producer="my-tool",
     ...               request_sha256=digest)
@@ -1388,7 +1409,10 @@ def read_renders(path: Path, *, request_sha256: str | None = None) -> Renders:
 
     Examples
     --------
+    >>> import hashlib
+    >>> from pathlib import Path
     >>> from openftgs.io import read_renders
+    >>> digest = hashlib.sha256(Path("request.json").read_bytes()).hexdigest()
     >>> renders = read_renders(Path("renders.safetensors"), request_sha256=digest)
     >>> renders.rgb["r0000"].shape
     torch.Size([480, 640, 3])
@@ -1455,6 +1479,7 @@ def read_scene_manifest(path: Path) -> SceneManifest:
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import read_scene_manifest
     >>> scene = read_scene_manifest(Path("scene/scene.json"))
     >>> scene.camera_names[:2], len(scene.records)
@@ -1606,6 +1631,7 @@ def write_scene_manifest(
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import read_scene_manifest, write_scene_manifest
     >>> scene = read_scene_manifest(Path("scene/scene.json"))
     >>> train = [r for r in scene.records if r.split == "train"]
@@ -1708,7 +1734,10 @@ def write_ply(
 
     Examples
     --------
+    >>> from pathlib import Path
     >>> from openftgs.io import write_ply
+    >>> from openftgs.model import FreeTimeGaussians
+    >>> model = FreeTimeGaussians.load(Path("run/checkpoint"), device="cpu")
     >>> g = model.at_time(0.5)
     >>> write_ply(Path("t050.ply"), means=g.means_t, scales=g.scales, quats=g.quats_n,
     ...           opacities=g.opacities_t, sh=g.sh)
