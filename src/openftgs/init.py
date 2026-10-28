@@ -235,7 +235,7 @@ def _weight_urls(cfg: RomaInitConfig, zoo: Any) -> list[str]:
 
 
 def roma_weight_files(cfg: RomaInitConfig) -> list[pathlib.Path]:  # Q-198
-    """List the checkpoint files :func:`roma_init` loads for ``cfg`` with its default matcher.
+    """List the checkpoint files the default matcher of :func:`roma_init` loads (Q-198).
 
     The files sit where torch.hub caches them, ``torch.hub.get_dir()/checkpoints/``, each
     under its URL's file name. :func:`roma_init` downloads the ones missing; this only names
@@ -426,7 +426,8 @@ def triangulate_dlt(x1: Tensor, x2: Tensor, P1: Tensor, P2: Tensor) -> Tensor:
     -------
     torch.Tensor
         The points X, [..., 3] float64 in world units, the batch shape being the broadcast of
-        the inputs'; NaN where a system has an entry that isn't finite.
+        the inputs'; NaN where a system has an entry that isn't finite, and ±inf or NaN where
+        the solution's homogeneous coordinate h₄ is 0, a point at infinity (Q-120).
 
     Raises
     ------
@@ -484,8 +485,9 @@ _MIN_ANGLE = math.radians(1.0)  # D-22: triangulation angle
 class DenseMatcher(Protocol):
     """What matches the two images of a camera pair (§1.3 step 2).
 
-    RoMa by default (D-58), or one supplied to :func:`roma_init` through its ``matcher``
-    argument; any callable of this form fits. It is called as ``matcher(image_a, image_b)``
+    RoMa by default (D-58), or one built for each shard by the factory passed to
+    :func:`roma_init` as its ``matcher`` argument, which takes the shard's device and returns
+    a dense matcher; any callable of this form fits. It is called as ``matcher(image_a, image_b)``
     with the images of cameras A and B, each [H, W, 3] float32 in [0, 1] on the CPU, as
     :meth:`openftgs.data.MultiViewVideo.load_image` returns them. It returns
     ``(warp, certainty)``: a warp [M, 4] of rows (x_A, y_A, x_B, y_B) in RoMa's normalized
@@ -982,16 +984,18 @@ def roma_init(
     -------
     openftgs.types.InitPoints
         The initial points on the CPU: positions [N, 3] float32 in world units, colors
-        [N, 3] float32 in [0, 1], timestamps [N] float64 in raw τ, velocities [N, 3] in world
-        units per unit of τ, durations [N] float64 in raw τ units, and frame ids [N] int64,
+        [N, 3] float32 in [0, 1], timestamps [N] float64 in raw τ, velocities [N, 3] float32
+        in world units per unit of τ, durations [N] float64 in raw τ units, and frame ids [N] int64,
         the slot index k of each point's init frame.
 
     Raises
     ------
     ValueError
-        If ``cfg`` fails :class:`RomaInitConfig`'s checks, ``devices`` is None and no CUDA
-        device is visible, a matcher returns malformed matches, or no point survives
-        matching and D-22's filters.
+        If ``cfg`` fails :class:`RomaInitConfig`'s checks, ``devices`` is a string, empty or
+        holds an entry :class:`torch.device` refuses (Q-122), ``devices`` is None and no CUDA
+        device is visible, a training camera is missing from the manifest's ``camera_names``
+        (Q-122), a matcher returns malformed matches, or no point survives matching and
+        D-22's filters.
     ImportError
         If ``matcher`` is None and the ``[init]`` extra isn't installed.
 
@@ -1016,7 +1020,8 @@ def roma_init(
     >>> video = MultiViewVideo.from_manifest(Path("scenes/n3dv/scene.json"))
     >>> cfg = RomaInitConfig()
     >>> points = roma_init(video, cfg, devices=["cuda:0"])
-    >>> write_init_points(points, Path("init.safetensors"), metadata=roma_provenance(cfg))
+    >>> write_init_points(points, Path("init.safetensors"), time_unit=video.manifest.time_unit,
+    ...                   producer="openftgs", metadata=roma_provenance(cfg))
     """
     _check_config(cfg)
     shard_devices = _devices(devices)
