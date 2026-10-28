@@ -50,6 +50,8 @@ The specification and the clean-room records live in the repository, outside thi
   made for them, the Q-n rows (a large file, which GitHub may show only as raw text).
 - {repo}`docs/clean-room/milestones.md`: the order in which the package was built.
 - {repo}`docs/clean-room/validation-runs.md`: the training and evaluation runs on openftgs-synth.
+- {repo}`docs/clean-room/release-checklist.md`: the release-time checks of this version, from the
+  license scan to the pretrained weights' terms and the absence of dataset material.
 - {repo}`docs/GLOSSARY.md`: the project's vocabulary.
 - {repotree}`docs/modules`: how each module meets the spec.
 
