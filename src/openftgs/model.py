@@ -113,7 +113,8 @@ class GaussiansAtTime:
 
     :meth:`FreeTimeGaussians.at_time` returns it: the fields of
     :class:`~openftgs.motion.TemporalSlice` plus the SH coefficients. N is the number of
-    primitives, and every tensor is float32 on the model's device.
+    primitives, and every tensor is on the model's device, float32 but for the bool
+    ``passes_cull``.
 
     Parameters
     ----------
@@ -514,8 +515,9 @@ class FreeTimeGaussians(torch.nn.Module):
         A directory is read as an ftgs-checkpoint, with the SH degree of its stored
         configuration; any other path as an ftgs-if file (§2.2). A checkpoint saved before
         revision 549o, whose configuration names the old perceptual backbone "vgg" or "alex",
-        is read as :func:`openftgs.io.load_checkpoint` reads it, with 549o's loss defaults in
-        memory only, since a model doesn't depend on the loss it trained with (Q-247, Q-271).
+        is read as :func:`openftgs.io.load_checkpoint` reads it, with its ``perc_net`` and
+        ``lambda_perc`` replaced by 549o's defaults in memory only, since a model doesn't depend
+        on the loss it trained with (Q-247, Q-271).
 
         Parameters
         ----------
@@ -743,8 +745,8 @@ class FreeTimeGaussians(torch.nn.Module):
 
         Notes
         -----
-        Q-20 adds ``sh_degree`` and the return type; D-50 and Q-66: the slice's
-        implementation.
+        §2.1 lists ``sh_degree`` and the return type, which Q-20 defines; D-50 and Q-66: the
+        slice's implementation.
         """
         degree = self.sh_degree if sh_degree is None else sh_degree
         degree = _check_sh_degree(degree, tuple(range(self.sh_degree + 1)))

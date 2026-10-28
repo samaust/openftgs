@@ -406,8 +406,8 @@ def fastest_frames(frames: Iterable[Tensor], *, count: int = 10) -> int:
     Raises
     ------
     ValueError
-        If ``count`` isn't an int ≥ 2, there are fewer than ``count`` frames, or a frame's
-        shape or dtype differs from the first's.
+        If ``count`` isn't an int ≥ 2, there are fewer than ``count`` frames, a frame isn't
+        [H, W, 3], or a frame's shape or dtype differs from the first's.
 
     Notes
     -----
@@ -556,8 +556,8 @@ def camera_from_llff(pose: Any, *, name: str = "") -> Camera:
     Raises
     ------
     ValueError
-        If ``pose`` has another shape or a value that isn't finite, H or W isn't an integer,
-        or the rotation isn't one.
+        If ``pose`` has another shape or a value that isn't finite, H or W isn't an integer
+        ≥ 1, the focal length isn't > 0, or the rotation isn't one.
 
     Notes
     -----
@@ -2205,7 +2205,8 @@ def convert_selfcap(
     are decoded by the user's ffmpeg, undistorted by COLMAP (or by the package with
     ``undistort="internal"``), area-resized (D-33) and written as 8-bit RGB PNG under
     ``OUT/images/<camera>/``. A frame's timestamp is τ = n/60 s minus its camera's sync
-    offset. For dance1, the manifest also records the Fastest-10 frames (D-69).
+    offset. For dance1, when the window holds at least 10 frames, the manifest also records
+    the Fastest-10 frames (D-69, Q-94).
 
     Parameters
     ----------
@@ -2221,7 +2222,8 @@ def convert_selfcap(
     window
         (N0, N1), the decode indices taken, 0 ≤ N0 < N1; None means the table's.
     test_camera
-        The test view's four-digit camera name; None means the table's.
+        The test view's camera name, one of the calibrated cameras (the table's are four-digit
+        names); None means the table's.
     undistort
         ``"colmap"`` runs the user's COLMAP, the protocol's way (D-60); ``"internal"`` uses
         the package's own undistortion, which isn't protocol-exact.
@@ -2232,8 +2234,9 @@ def convert_selfcap(
         has the file (D-59).
     masks
         A folder of dynamic-region masks, ``<n:06d>.png`` per test image and ``masks.json``
-        naming their source (D-64); None means no masks, and the dynamic-region metrics are
-        skipped.
+        holding their source and whether they are approximate, ``mask_source`` and
+        ``masks_approximate`` (D-64, Q-87); None means no masks, and the dynamic-region metrics
+        are skipped.
     calib
         A calibration folder holding ``intri.yml``, ``extri.yml`` and optionally
         ``sync.json``, directly or under ``optimized/``; None means the one D-63 names.
@@ -2262,10 +2265,13 @@ def convert_selfcap(
     ValueError
         If an argument is out of range, a scene outside the table lacks ``window`` or
         ``test_camera``, ``dst`` isn't absent or empty, an archive is missing or unreadable, the
-        calibration or ``sync.json`` is missing or fails D-63's checks, a video is missing or
-        shorter than the window, a mask is missing or malformed, ffmpeg, ffprobe or COLMAP is
-        missing or fails, or ffmpeg reports any error while decoding. What the conversion
-        wrote is removed first.
+        calibration is missing or fails D-63's checks, a ``sync.json`` that is there is
+        malformed (a missing one isn't an error: §1.4, Q-101), the test camera isn't among the
+        calibrated cameras, a video is missing or shorter than the window, a camera's ``W_`` and
+        ``H_`` differ from its video's size (Q-96), a camera has more than 8 distortion
+        coefficients with ``undistort="colmap"`` (Q-97), a mask is missing or malformed,
+        ffmpeg, ffprobe or COLMAP is missing or fails, or ffmpeg reports any error while
+        decoding. What the conversion wrote is removed first.
 
     Notes
     -----
@@ -2571,7 +2577,7 @@ class FrameCache:
 
     @staticmethod
     def size_of(dataset: "MultiViewVideo") -> int:
-        """Compute the bytes of a dataset's training images as uint8, the cache's payload.
+        """Compute the bytes of a dataset's training images as uint8, the cache's payload (D-51).
 
         Only the cameras' sizes are read, so the cache need not exist.
 
@@ -2620,6 +2626,9 @@ class FrameCache:
         ValueError
             If a training image can't be read as 8-bit RGB of its camera's size, or one
             camera's training images differ in size.
+        OSError
+            If a training image is missing or isn't an image file Pillow can read, or the
+            cache's folder can't be created or written.
 
         Notes
         -----
@@ -2719,11 +2728,11 @@ class FrameCache:
 
     @property
     def nbytes(self) -> int:
-        """The size of the cache's files on disk, in bytes."""
+        """The size of the cache's files on disk, in bytes (Q-98)."""
         return sum(p.stat().st_size for p in self.directory.glob("*.safetensors"))
 
     def frame(self, index: int) -> Tensor:
-        """Return training image ``index`` from the cache.
+        """Return training image ``index`` from the cache (D-51).
 
         Parameters
         ----------
@@ -2807,7 +2816,7 @@ class Prefetcher:
         self._misses = 0
 
     def schedule(self, indices: Sequence[int]) -> None:
-        """Set the record indices that will be taken next, in order.
+        """Set the record indices that will be taken next, in order (D-51, Q-99).
 
         Images already read ahead are kept when the new schedule starts with them, and
         dropped otherwise.
@@ -2828,7 +2837,7 @@ class Prefetcher:
         self._fill()
 
     def take(self, index: int) -> Tensor:
-        """Return a record's image on the device, ready on the current stream.
+        """Return a record's image on the device, ready on the current stream (D-51).
 
         An image that isn't next in the schedule is read directly, and the rest of the
         schedule is dropped.
@@ -2862,7 +2871,7 @@ class Prefetcher:
         return image
 
     def close(self) -> None:
-        """Drop the images read ahead and stop the reading thread, waiting for it."""
+        """Drop the images read ahead and stop the reading thread, waiting for it (D-51)."""
         self._drop()
         if self._executor is not None:
             self._executor.shutdown(wait=True)

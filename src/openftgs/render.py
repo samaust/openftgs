@@ -3,7 +3,7 @@
 
 render() has two backends, gsplat 1.5.3 (CUDA, float32, production) and reference (pure PyTorch,
 the readable oracle for tests); render_request() answers a render request with cameras batched per
-time; and, from M15, rendering uses the temporal index (D-55).
+time and, from M15, uses the temporal index (D-55), which render() doesn't.
 
 Spec: E2, E5, E6, D-3, D-4, D-6, D-12, D-28, D-31, D-32, D-34, D-55, D-57. Band: Core model
 (§2.1).

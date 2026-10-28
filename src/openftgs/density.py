@@ -136,7 +136,7 @@ class GradStats:
     num_gaussians
         The number of primitives N, an int ≥ 0.
     device
-        The device that holds the statistics, the model's.
+        The device that holds the statistics, the model's; ``"cpu"`` by default.
 
     Raises
     ------
@@ -157,7 +157,7 @@ class GradStats:
 
     @property
     def num_gaussians(self) -> int:
-        """The number of primitives N the statistics cover."""
+        """The number of primitives N the statistics cover (Q-48)."""
         return int(self._g_sum.shape[0])
 
     @property
@@ -220,8 +220,9 @@ class GradStats:
 
         Notes
         -----
-        Q-49 adds the keyword-only pair ``visible`` and ``gaussian_ids`` to §2.1's signature.
-        Packed rows are scatter-added, since every row is a visible pair (D-75, D-76).
+        §2.1's signature lists the keyword-only pair ``visible`` and ``gaussian_ids``, whose
+        shapes and rules Q-49 defines. Packed rows are scatter-added, since every row is a
+        visible pair (D-75, D-76).
         """
         self._check_update(means2d_grad, width, height, visible, gaussian_ids)
         # D-12: x scaled by W/2 and y by H/2; Python floats, so nothing is built on the host.

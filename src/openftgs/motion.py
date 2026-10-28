@@ -41,8 +41,9 @@ _IMPLS: tuple[str, ...] = get_args(_Impl)
 class TemporalSlice:
     """The per-time arrays, activations, E8 terms and culling mask of a model at one time (Q-12).
 
-    :func:`temporal_slice` returns it; N is the number of primitives, and every tensor is in the
-    dtype and on the device of the stored tensors it was computed from (float32 for a model).
+    :func:`temporal_slice` returns it; N is the number of primitives, every tensor is on the
+    device of the stored tensors it was computed from, and every tensor but the bool
+    ``passes_cull`` is in their dtype (float32 for a model).
 
     Parameters
     ----------

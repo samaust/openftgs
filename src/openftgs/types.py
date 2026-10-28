@@ -60,8 +60,8 @@ class Camera:
     height
         Image height H, in pixels.
     name
-        The camera's name, as the key of the scene manifest's ``cameras`` object; empty by
-        default.
+        The camera's name, as the key of the scene manifest's ``cameras`` object, or a render
+        request's item id for a camera built from a request (Q-56); empty by default.
     """
 
     K: Tensor  # [3, 3] float32, continuous pixel convention (§1.4)
@@ -261,26 +261,28 @@ class TimeNormalizer:
 
 @dataclass
 class RenderOutput:
-    """The images of one call of :func:`openftgs.render.render`, with optional statistics.
+    """The images of one :func:`openftgs.render.render` call, and its statistics (§2.1, D-75).
 
     C is the number of cameras rendered at once, H × W their image size, N the number of
-    primitives and nnz the number of rows in packed mode. The last three fields are set only when
-    the render is asked for them (``return_aux``) and are None otherwise.
+    primitives and nnz the number of rows in packed mode. The floating-point fields are in the
+    model's dtype, float32 for training and the gsplat backend. The last three fields are set
+    only when the render is asked for them (``return_aux``) and are None otherwise.
 
     Parameters
     ----------
     image
-        The rendered colors, [C, H, W, 3].
+        The rendered colors composited over the background, [C, H, W, 3], not clamped to 1.
     alpha
-        The accumulated opacity, [C, H, W, 1].
+        The accumulated opacity 1 − T_final, [C, H, W, 1], in [0, 1].
     means2d
-        The projected 2D means, [C, N, 2] unpacked or [nnz, 2] packed, kept for the gradient
-        statistics; None unless asked for.
+        The projected 2D means, in pixels, [C, N, 2] unpacked or [nnz, 2] packed, 0 where a
+        primitive isn't visible, kept for the gradient statistics; None unless asked for.
     visible
         Which primitives each camera sees, [C, N] bool, in both layouts, packed and unpacked
         (D-75); None unless asked for.
     gaussian_ids
-        In packed mode, the primitive behind each row of ``means2d``, [nnz] int; None otherwise.
+        In packed mode, the primitive behind each row of ``means2d``, [nnz] int64; None
+        otherwise.
     """
 
     image: Tensor  # [C, H, W, 3]
@@ -309,7 +311,8 @@ class ExchangeModel:  # FTGS-IF contents (§2.2): physical values, raw time unit
         - ``time_center``: τ₀ + μt·T_τ, [N] float64, raw τ;
         - ``duration``: s·T_τ, [N] float64, units of τ, > 0;
         - ``velocity``: v/T_τ, [N, 3] float32, world units per unit of τ;
-        - ``scale``: exp(â), [N, 3] float32, > 0;
+        - ``scale``: exp(â), [N, 3] float32, > 0, in world units (the Gaussian's standard
+          deviations along its axes);
         - ``rotation``: unit quaternions (w, x, y, z) with w ≥ 0, [N, 4] float32;
         - ``opacity``: sigmoid(ô), [N] float32, in (0, 1);
         - ``sh``: SH coefficients in gsplat's basis order, [N, (L + 1)², 3] float32.

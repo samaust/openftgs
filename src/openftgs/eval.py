@@ -371,10 +371,10 @@ class Evaluator:
 
     Notes
     -----
-    Q-60: every metric is computed in IEEE float32, ꟻLIP's only dtype (D-52, Q-261), with
-    cuDNN's TF32 flag cleared and matrix products at "highest" precision, and the DSSIMs come
-    from the same SSIM values. ꟻLIP sees the clamped render against the reference and reports
-    the mean of its error map (E16, D-67).
+    Q-60: the images are scored in IEEE float32, ꟻLIP's only dtype (D-52, Q-261), with
+    cuDNN's TF32 flag cleared and matrix products at "highest" precision; PSNR takes its MSE
+    in float64 (:func:`psnr`), and the DSSIMs come from the same SSIM values. ꟻLIP sees the
+    clamped render against the reference and reports the mean of its error map (E16, D-67).
     """
 
     def __init__(self, *, device: str | torch.device = "cuda") -> None:
@@ -525,8 +525,10 @@ def evaluate_images(
     Raises
     ------
     ValueError
-        If the split holds no images, or ``renders`` lacks an image of the split or holds one
-        that isn't finite.
+        If the split holds no images, ``devices`` is a string, empty or holds an entry that
+        isn't a device (Q-175, Q-186), ``renders`` lacks an image of the split or holds one
+        that isn't finite, or a render doesn't match its ground truth's shape, or a mask
+        doesn't fit it (:class:`Evaluator`).
     FloatingPointError
         If a render of the model isn't finite, in its colors or its alpha. It is not scored,
         nor is anything after it: once the whole data split is rendered, the error names up to

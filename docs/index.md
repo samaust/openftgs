@@ -20,7 +20,10 @@ renderer the paper's project page links was read for a documentation-only survey
 and nothing from it is in the package.
 
 openftgs includes a copy of RoMa's inference code, under the MIT License, with the DINOv2 layers it
-carries under the Apache License 2.0; `NOTICE` lists it and the code it credits.
+carries under the Apache License 2.0; a copy of NVIDIA's ꟻLIP loss, under the BSD 3-Clause
+License, in `openftgs._vendor.flip`; and, in `openftgs.losses`, HaarPSI adapted from piq 0.8.0,
+under the Apache License 2.0. `NOTICE` lists them, the code RoMa credits and the pretrained weights
+whose terms ask for attribution.
 
 ## Citing the method
 

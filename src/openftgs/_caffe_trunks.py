@@ -72,7 +72,8 @@ _MIN_SIDE = {"vgg16_oxford": 1, "alexnet_bvlc": 23}
 
 # D-89: each release's mean pixel, BGR on Caffe's 0 to 255 scale: Oxford's as published
 # (source log 420); BVLC's the per-channel means of Caffe's ilsvrc_2012_mean.npy (source log
-# 426) to eight decimals, as #374 tested them, which D-89's table rounds to three (Q-264).
+# 426, which records them to three decimals) to eight decimals (source log 449), as #374
+# tested them, which D-89's table rounds to three (Q-264).
 _MEAN_BGR = {
     "vgg16_oxford": (103.939, 116.779, 123.68),
     "alexnet_bvlc": (104.00698793, 116.66876762, 122.67891434),  # Q-264

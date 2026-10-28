@@ -30,7 +30,7 @@ def _fail(reason: str) -> NoReturn:
 
 @dataclass(frozen=True)
 class _GroupSchedule:
-    """One parameter group's stored tensor, base rates η₀, η₁ and learning-rate schedule."""
+    """One parameter group's stored tensor, rates η₀, η₁ (scaled by S or S/Δt_f) and schedule."""
 
     name: str
     eta0: float
@@ -106,7 +106,8 @@ class FTGSOptimizer:
 
     One parameter group per stored tensor of a :class:`~openftgs.model.FreeTimeGaussians`, in
     §1.1's tensor order, with Adam's β₁, β₂ and ε from the configuration, no weight decay and
-    dense updates (§1.3, "Optimizer and learning rates"). A tensor that takes no updates has no
+    dense updates (§1.3, "Optimizer and learning rates"), except that gsplat's selective Adam
+    (D-53) updates only the visible rows. A tensor that takes no updates has no
     group: ``shN`` at SH degree 0 (U-26), and ``times`` and ``velocities`` when the training set
     has a single timestamp (D-71, Q-45). Build it with :func:`build_optimizer`; the rates of
     iteration 1 are set from the start.
@@ -142,7 +143,8 @@ class FTGSOptimizer:
 
     Notes
     -----
-    Q-44 makes the class public and adds ``adam``. The Adam state, moments and step counters, is
+    §2.1 lists the class and its methods; Q-44 sets its constructor's arguments, those of
+    :func:`build_optimizer`, ``adam`` among them. The Adam state, moments and step counters, is
     created at construction (Q-45), so that a moment reset, a resize or :meth:`state_dict` works
     before the first step.
     """
@@ -179,7 +181,7 @@ class FTGSOptimizer:
     # Q-48 (owner answer): public, so that density can check it was given the model's optimizer.
     @property
     def model(self) -> FreeTimeGaussians:
-        """The model this optimizer was built for, whose stored tensors its groups update."""
+        """The model this optimizer was built for, whose stored tensors its groups update (Q-48)."""
         return self._model
 
     @property
@@ -482,8 +484,9 @@ class FTGSOptimizer:
         dict
             ``{tensor name: {"exp_avg", "exp_avg_sq", "step", "lr", "schedule", "iterations",
             "betas", "eps"}}`` for each tensor with a parameter group: the two Adam moments,
-            shaped and typed like the tensor; the step counter, a 0-d float32 tensor; the base
-            rates ``[η₀, η₁]``; the schedule, "exponential", "annealed" or "constant"; the run's
+            shaped and typed like the tensor; the step counter, a 0-d float32 tensor; the rates
+            ``[η₀, η₁]`` after scaling, ``means``' by S and ``velocities``' by S/Δt_f (Q-46);
+            the schedule, "exponential", "annealed" or "constant"; the run's
             iteration count; Adam's ``[β₁, β₂]``; and ε.
         """
         return {
@@ -494,7 +497,7 @@ class FTGSOptimizer:
             for schedule, _, state in self._groups()
         }
 
-    # Q-46: the base rates and settings must equal this optimizer's own; step counters are
+    # Q-46: the scaled rates and settings must equal this optimizer's own; step counters are
     # placed as the current Adam kind needs, so state saved under one kind loads under another.
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Restore the Adam moments and step counters from :meth:`state_dict`'s layout (Q-46).
@@ -507,7 +510,8 @@ class FTGSOptimizer:
         ----------
         state
             A state in :meth:`state_dict`'s layout, holding exactly this optimizer's groups; its
-            base rates, schedules, iteration count, betas and ε must equal this optimizer's own.
+            rates (scaled by S and Δt_f, Q-46), schedules, iteration count, betas and ε must
+            equal this optimizer's own.
 
         Raises
         ------
@@ -610,9 +614,13 @@ def build_optimizer(
     --------
     One iteration's update, after the loss's backward pass (§1.3, step 6):
 
+    >>> from pathlib import Path
     >>> from openftgs.config import OptimConfig
+    >>> from openftgs.model import FreeTimeGaussians
     >>> from openftgs.optim import build_optimizer
+    >>> model = FreeTimeGaussians.load(Path("run/checkpoint"))
     >>> optimizer = build_optimizer(model, OptimConfig(), spatial_scale=2.0, frame_dt=1 / 299)
+    >>> it = 1
     >>> rates = optimizer.set_iteration(it)
     >>> optimizer.step()
     >>> optimizer.zero_grad()

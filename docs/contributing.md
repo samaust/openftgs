@@ -42,9 +42,14 @@ Every name in a public module's `__all__`, and every public method of a public c
 docstring (Q-243); the API pages render them.
 
 - A one-line imperative summary that cites the governing spec item, then an extended summary.
-- `Parameters`, and `Returns` or `Yields`. Parameters carry no types: the annotations supply them.
-  The type line under `Returns` is a resolvable name (`torch.Tensor`, `int`,
-  `openftgs.render.RenderOutput`), never a description.
+- `Parameters`, and `Returns` or `Yields` for a function that returns or yields a value.
+  Parameters carry no types: the annotations supply them. The type line under `Returns` is a
+  resolvable name (`torch.Tensor`, `int`, `openftgs.render.RenderOutput`), never a description.
+  A function that returns None has no `Returns` section, except where the Python 3.11 build
+  needs one: there sphinx-autodoc-typehints 3.6.1 can put its "Return type" line under the
+  `Notes` heading and fail the build, which a `Returns` section holding just `None` prevents
+  (`FTGSOptimizer.step`, `reset_rows` and `resize_`, `GradStats.update`, `write_metrics` and
+  `Trainer.load_state_dict`).
 - `Raises` where the code raises for user input; `Notes` for the other spec citations;
   `Examples` on the entry points users call directly. Examples are shown, not run.
 - Tensors and arrays state their shape, dtype and range or units, as `[N, 3] float32`. Config
@@ -78,7 +83,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     int
         The exit code: 0 success (``--help`` included), 2 invalid input or environment (a
         usage error included), 3 a numerical failure, and 128 plus the signal's number when
-        SIGINT or SIGTERM stops ``ftgs train`` after it saved its checkpoint.
+        SIGINT or SIGTERM stops ``ftgs train`` after it saved its checkpoint. Exit 2 covers a
+        trunk network's weights that can't be downloaded, fail their check or can't be
+        converted (Q-142, Q-258), a DINO network without the ``[init]`` extra (Q-248), and
+        resuming from a checkpoint saved before revision 549o (Q-247).
 
     Notes
     -----
@@ -120,3 +128,8 @@ python scripts/no_runtime_change.py --ref v0.1.0 src/openftgs/render.py
 
 It exits 0 when every file matches the ref, 1 when one differs (naming it) and 2 for invalid input.
 Comments aren't in the syntax tree, so leaving them alone is up to you.
+
+The CLI's help text is not a docstring: `help=` and `description=` values are runtime strings,
+shown by `--help` (Q-242). Against a ref older than that help text, the check therefore names
+`src/openftgs/cli/__init__.py` and `src/openftgs/cli/_bench.py`; for them, compare the diff by
+hand and check that only those values and docstrings differ.
