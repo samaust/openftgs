@@ -104,7 +104,7 @@ class CalendarEntry:
 
     @property
     def event(self) -> bool:
-        """Whether the iteration has an event, after which the gradient statistics are reset.
+        """Whether the iteration has an event, which resets the gradient statistics (§1.3, D-45).
 
         A growth, relocation or pruning event (§1.3 step 7, D-45); the ablation's opacity reset
         alone is not one.
@@ -738,7 +738,10 @@ class Trainer:
     ------
     ValueError
         If a model passed as ``init`` doesn't fit the run, ``init`` is neither initial points
-        nor a model, the configuration sets ``reloc.prune_opacity`` with relocation on (Q-71),
+        nor a model, ``init`` is initial points that
+        :meth:`~openftgs.model.FreeTimeGaussians.from_init_points` refuses (F·B above N_max,
+        D-74), the training images have fewer than two distinct camera centres (D-27), the
+        configuration sets ``reloc.prune_opacity`` with relocation on (Q-71),
         ``perf.perc_precision`` is "bf16" with ``loss.perc_net`` "flip" or "haarpsi" and the
         network is built (Q-250, Q-267), or an explicitly placed frame cache can't be made
         (D-51).
@@ -754,7 +757,8 @@ class Trainer:
 
     Notes
     -----
-    Initial points become a model as §1.3 steps 7 to 9 say (D-24, D-74; Q-16), with the run's
+    Initial points become a model as steps 7 to 9 of §1.3's Initialization say (D-24, D-74;
+    Q-16), with the run's
     own initialization generator. A model passed in is copied, never modified or moved (Q-69).
     The spatial scale S comes from the dataset and ``cfg.scene_scale_factor`` (D-27).
 
@@ -888,6 +892,12 @@ class Trainer:
             fit the dataset (:meth:`load_state_dict`), if ``perf`` differs from the
             checkpoint's where it must match, or if the constructor would refuse its
             configuration (bf16 with a weight-free network, Q-250).
+        ImportError
+            If ``loss.perc_net`` is a DINO network and the ``[init]`` extra isn't installed, as
+            for the constructor (Q-248).
+        OSError
+            If a trunk network's weights can't be downloaded, fail their check, or can't be
+            converted, as for the constructor (Q-258).
         NotImplementedError
             If the performance settings ask for an option that isn't built, as for the
             constructor.
@@ -1016,7 +1026,7 @@ class Trainer:
         weakref.finalize(self, self._frames.close)  # the reader thread ends with the trainer
 
     def _await_placement(self) -> None:
-        """Decode PNGs until `_PlacementWait` says "auto" decides on CUDA (Q-232, #348).
+        """Decode PNGs until `_PlacementWait` says "auto" decides on CUDA (Q-232 changed, #348).
 
         Counting from this process's first iteration.
         """
@@ -1332,7 +1342,11 @@ class Trainer:
         Raises
         ------
         ValueError
-            If the split holds no images.
+            If the split holds no images, or the manifest's metadata holds a
+            ``masks_approximate`` that isn't a bool or a ``fastest_10`` that isn't
+            [n0, n0 + 10) (:func:`~openftgs.eval.metrics_report`).
+        OSError
+            If METRICS.json can't be written to ``out_dir`` (Q-161).
         FloatingPointError
             If a render isn't finite, raised by :func:`~openftgs.eval.evaluate_images` before
             anything is written (Q-129, Q-147).
