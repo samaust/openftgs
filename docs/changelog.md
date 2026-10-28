@@ -66,8 +66,8 @@ on one RTX 4090, its test-view evaluation included, and scored a PSNR of 28.32 d
   paper's perceptual columns (E16). ꟻLIP takes LPIPS's place in the loss and the metrics since
   revision 549o.
 - **Checkpoints saved before revision 549o** can be read, by `ftgs eval`, `ftgs render`,
-  `ftgs export` and `ftgs bench render --model`, with 549o's loss defaults in memory, but training
-  can't resume from them (Q-247).
+  `ftgs export` and `ftgs bench render --model`, with their legacy `perc_net` and `lambda_perc`
+  replaced by 549o's defaults in memory, but training can't resume from them (Q-247).
 - **METRICS.json is version 2** (Q-256): psnr, ssim1, ssim2, dssim1, dssim2 and flip, with no
   LPIPS keys. Files of version 1, written before 549o, are still read by the repository's
   run-summary script and render viewer.
