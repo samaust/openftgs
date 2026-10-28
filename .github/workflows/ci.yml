@@ -68,7 +68,7 @@ jobs:
         run: |
           python -m pip wheel . ./harness --no-deps -w dist
           python - <<'PY'
-          import glob, hashlib, json, re, zipfile
+          import email, glob, hashlib, json, re, zipfile
           wheel = zipfile.ZipFile(glob.glob("dist/openftgs-*.whl")[0])
           names = wheel.namelist()
           for required in ("openftgs/py.typed", "licenses/LICENSE", "licenses/NOTICE"):
@@ -101,6 +101,15 @@ jobs:
           assert not core & {"torchvision", "einops", "loguru", "lpips", "tqdm"}, sorted(core)
           assert {"torchvision", "einops", "loguru"} <= init, sorted(init)
           assert not {named(r) for r in requires} & {"lpips", "tqdm", "torchmetrics"}, requires
+          # Q-244 (#370): PEP 639's license expression and no license classifier, Q-244's
+          # classifiers among them, and the project URLs.
+          headers = email.message_from_bytes(metadata)
+          assert headers["License-Expression"] == "Apache-2.0", headers["License-Expression"]
+          classifiers = headers.get_all("Classifier", [])
+          assert not [c for c in classifiers if c.startswith("License ::")], classifiers
+          assert "Development Status :: 3 - Alpha" in classifiers, classifiers
+          labels = {u.split(",", 1)[0] for u in headers.get_all("Project-URL", [])}
+          assert labels == {"Homepage", "Source", "Documentation", "Issues", "Changelog"}, labels
           wheel = zipfile.ZipFile(glob.glob("dist/ftgs_harness-*.whl")[0])
           names = wheel.namelist()
           for required in ("ftgs_harness/py.typed", "licenses/LICENSE"):
