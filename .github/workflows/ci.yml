@@ -87,8 +87,8 @@ jobs:
                   digest = hashlib.sha256(wheel.read(vendored + entry["path"])).hexdigest()
                   assert digest == entry["sha256"], entry["path"]
           # Q-248, §2.3 (#393): the core requires no lpips, no tqdm and none of the [init]
-          # extra's packages, which only RoMa and the DINO networks need; no extra names lpips,
-          # tqdm or torchmetrics.
+          # extra's packages, which only RoMa and the DINO networks need; no extra names lpips
+          # or torchmetrics. Q-T370.1: tqdm is [init]'s alone, for XFeat's hub code (Tiny RoMa).
           metadata = wheel.read(next(n for n in names if n.endswith(".dist-info/METADATA")))
           requires = [
               line.split(":", 1)[1].strip()
@@ -99,8 +99,14 @@ jobs:
           core = {named(r) for r in requires if not re.search(r"\bextra\s*==", r)}
           init = {named(r) for r in requires if re.search(r"\bextra\s*==\s*['\"]init['\"]", r)}
           assert not core & {"torchvision", "einops", "loguru", "lpips", "tqdm"}, sorted(core)
-          assert {"torchvision", "einops", "loguru"} <= init, sorted(init)
-          assert not {named(r) for r in requires} & {"lpips", "tqdm", "torchmetrics"}, requires
+          assert {"torchvision", "einops", "loguru", "tqdm"} <= init, sorted(init)
+          assert not {named(r) for r in requires} & {"lpips", "torchmetrics"}, requires
+          other_extras = {
+              named(r) for r in requires
+              if re.search(r"\bextra\s*==", r)
+              and not re.search(r"\bextra\s*==\s*['\"]init['\"]", r)
+          }
+          assert "tqdm" not in other_extras, requires
           # Q-244 (#370): PEP 639's license expression and no license classifier, Q-244's
           # classifiers among them, and the project URLs.
           headers = email.message_from_bytes(metadata)
