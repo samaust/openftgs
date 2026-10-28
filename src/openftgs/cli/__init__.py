@@ -1064,7 +1064,8 @@ def _parser() -> argparse.ArgumentParser:
         "--calib",
         type=Path,
         metavar="DIR",
-        help="selfcap: a calibration folder that overrides the archives' calibration",
+        help="selfcap: a calibration folder that overrides either calibration source, the "
+        "scene's release archive or the hair-calib archive (D-63)",
     )
     p.set_defaults(run=_convert)
 
@@ -1146,7 +1147,9 @@ def _parser() -> argparse.ArgumentParser:
         "--resume",
         type=Path,
         metavar="CKPT_DIR",
-        help="continue from a checkpoint, on its own configuration",
+        help="continue from a checkpoint, on its own configuration: a --config or --seed "
+        "must give that configuration, except the performance settings that change no number "
+        "(Q-134)",
     )
     p.add_argument(
         "--force",
