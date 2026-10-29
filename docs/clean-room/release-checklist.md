@@ -412,7 +412,20 @@ The GPU suite ran once, in `venv-cuda-314-370b` (Python 3.14.9, PyPI's default t
 
 So 349 GPU tests passed on torch 2.15.0, and step 7's 352 are those and the 3 fused-ssim tests, which need fused-ssim installed.
 
-**Still open, for the owner:** the PyPI upload of the 0.1.0 set from 88d21eb (`build-0.1.0-88d21eb/`, above), the annotated tag `v0.1.0` on the merge commit into `main`, and the two pushes, `main` and then the tag. The logs of these runs stay in `.scratch/prd-355-release/` and aren't committed.
+**The release, 2026-10-28.** Each step below was taken on its own yes from the owner:
+
+- **The merge into `main`:** 479366e (`git merge --no-ff prd-355-release`, from 2948255, whose tree it equals). No packaged file differs from 88d21eb's, so the 0.1.0 set above is what this commit builds. Pushed to origin (0efc6b2..479366e).
+- **The tag:** the annotated tag `v0.1.0` on 479366e, whose message records the two files' SHA-256 values. Pushed to origin.
+- **PyPI:** the owner uploaded the 0.1.0 set from 88d21eb with their own token. PyPI's JSON API for `openftgs` 0.1.0 lists both files, uploaded at 23:52 UTC, with the sizes and SHA-256 values in the table above, `requires_python` `>=3.11`, and the project URLs of Q-244.
+- **The install from PyPI:** passed on Python 3.11.17 and 3.14.9, under the machine ledger with 4 threads. Each run, in a clean venv seeded by uv:
+  1. installed CPU torch from the PyTorch CPU index (2.15.0+cpu);
+  2. installed `openftgs==0.1.0` with its dependencies from PyPI;
+  3. checked the downloaded wheel's SHA-256 against 2c5237a8…;
+  4. ran `pip check` (no broken requirements), `import openftgs` (0.1.0, from site-packages) and `ftgs --help`.
+- **The GitHub release:** "openftgs 0.1.0", for `v0.1.0`. Its notes are the changelog's 0.1.0 entry, with its page references turned into links to the `v0.1.0` documentation and the repository. The same two files are attached, and GitHub's SHA-256 digests match.
+- **The documentation:** Read the Docs builds `latest`, `stable` and `v0.1.0` at https://openftgs.readthedocs.io, with repository links at the tag on `stable` and `v0.1.0` (#439).
+
+The logs of these runs were kept in `.scratch/prd-355-release/` and never committed. After the release, the owner had that folder deleted (2026-10-28), along with the environments and build folders this checklist names there.
 
 ### The S-n fixtures' provenance
 
