@@ -4,8 +4,11 @@ figure gets more than 10% worse than its stored baseline"; Q-170, Q-179, Q-196; 
 
 Added tests, not §3 rows (PRD #220, "The baseline comparison script"): 9.9 % worse passes and
 10.1 % worse fails; a missing baseline fails; a GPU-model mismatch fails; B-6 is judged against
-its absolute < 1 %. The script is called at its command line, `main(argv)`, on BENCH.json files
-written here. Last, the GPU job's workflow file is read for Q-179's trigger and runner.
+its absolute < 1 %. #379 adds B-3's rule (Q-246 as changed, Q-170): only the cases whose
+baseline is at least 1.4 times the smallest of their implementation are judged, the others are
+notes; and B-3's kernel count (Q-277). The script is called at its command line, `main(argv)`,
+on BENCH.json files written here. Last, the GPU job's workflow file is read for Q-179's trigger
+and runner.
 """
 
 import importlib.util
@@ -248,6 +251,142 @@ def test_update_stores_the_baselines(tmp_path: Path) -> None:
     stored = baselines / "nvidia-geforce-rtx-4090" / "B-5-adam.json"
     assert stored.read_bytes() == run.read_bytes()
     assert compare.main([str(run.parent), "--baselines", str(baselines)]) == 0
+
+
+# B-3 as the RTX 4090's baseline has it (#369's medians, in ms): both implementations sit at
+# the host's floor of about 0.31 ms up to 5·10⁵ rows, then grow with N where the GPU sets the
+# time; at 1.4 × each implementation's smallest time, eager is judged from 10⁶ rows and compiled
+# from 1.5·10⁶, 7 of the 22 cases (Q-246).
+B3_MS = {
+    "eager": (0.308, 0.318, 0.320, 0.314, 0.317, 0.329, 0.386, 0.605, 0.991, 1.342, 2.277),
+    "compiled": (0.310, 0.314, 0.312, 0.309, 0.308, 0.309, 0.325, 0.324, 0.510, 0.784, 1.239),
+}
+B3_SIZES = (100_000, 150_000, 200_000, 300_000, 400_000, 500_000)
+B3_SIZES += (700_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000)
+B3_JUDGED = {("eager", n) for n in B3_SIZES[7:]} | {("compiled", n) for n in B3_SIZES[8:]}
+B3_KERNELS = {"eager": 50, "compiled": 12}
+
+
+def _slice(
+    scale: dict[tuple[str, int], float] | None = None,
+    kernels: dict[tuple[str, int], int | None] | None = None,
+    *,
+    with_kernels: bool = True,
+) -> dict[str, Any]:
+    """B-3 (Q-182): the 22 timed cases at B3_MS, each scaled by `scale` where given, with the
+    kernel counts of B3_KERNELS or `kernels` (Q-277), and the untimed recompilations case."""
+    cases = []
+    for impl, times in B3_MS.items():
+        for n, ms in zip(B3_SIZES, times, strict=True):
+            figures: dict[str, Any] = {
+                "forward_backward_s": ms * 1e-3 * (scale or {}).get((impl, n), 1.0),
+                "first_call_s": 1.0,
+            }
+            if with_kernels:
+                figures["kernels"] = (kernels or {}).get((impl, n), B3_KERNELS[impl])
+            cases.append({"case": {"impl": impl, "n": n}, "figures": figures})
+    resizes = {"impl": "compiled", "resizes": 10}
+    cases.append({"case": resizes, "figures": {"unique_graphs": 2, "recompilations": 1}})
+    return _bench("B-3", cases)
+
+
+def _lines(capsys: pytest.CaptureFixture[str], tag: str) -> list[str]:
+    return [line for line in capsys.readouterr().out.splitlines() if line.startswith(f"  {tag}")]
+
+
+def _slice_case(line: str) -> tuple[str, int]:
+    case = json.loads(line[line.index("{") : line.index("}") + 1])
+    return case["impl"], case["n"]
+
+
+def test_b3_judges_only_the_cases_the_gpu_sets(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-246, Q-170: a B-3 case is judged only when its baseline's forward_backward_s is at
+    least 1.4 × the smallest of its implementation in that baseline file. With every case 30 %
+    slower, exactly those 7 cases fail; the other 15 are notes, not checks."""
+    slower = {(impl, n): 1.3 for impl in B3_MS for n in B3_SIZES}
+    runs = {"B-3-slice.json": _slice(slower)}
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice()}}
+    assert _run(tmp_path, runs, baselines) == 1
+    out = capsys.readouterr().out.splitlines()
+    failed = {_slice_case(x) for x in out if x.startswith("  FAIL") and "forward_backward_s" in x}
+    noted = {_slice_case(x) for x in out if x.startswith("  note") and "not judged" in x}
+    assert failed == B3_JUDGED
+    assert noted == {(impl, n) for impl in B3_MS for n in B3_SIZES} - B3_JUDGED
+
+
+def test_b3_cases_the_host_sets_30_percent_slower_pass(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-246: a run whose unjudged cases, those the host sets, are 30 % above their baselines,
+    as the host's slow level makes them, passes; they are reported as notes."""
+    slower = {(impl, n): 1.3 for impl in B3_MS for n in B3_SIZES if (impl, n) not in B3_JUDGED}
+    runs = {"B-3-slice.json": _slice(slower)}
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice()}}
+    assert _run(tmp_path, runs, baselines) == 0
+    notes = [x for x in capsys.readouterr().out.splitlines() if "not judged" in x]
+    assert len(notes) == 15 and all("+30.0 %" in x for x in notes)
+
+
+@pytest.mark.parametrize(("worse", "code"), [(0.09, 0), (0.11, 1)])
+def test_b3_eager_at_a_million_rows_is_judged(tmp_path: Path, worse: float, code: int) -> None:
+    """Q-246, §3.4: eager at 10⁶ rows, the first eager size the GPU sets (0.605 against a
+    0.308 ms floor), is judged at 1.10 × its baseline: 9 % above passes, 11 % above fails."""
+    runs = {"B-3-slice.json": _slice({("eager", 1_000_000): 1 + worse})}
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice()}}
+    assert _run(tmp_path, runs, baselines) == code
+
+
+@pytest.mark.parametrize(
+    ("count", "code", "tag"), [(13, 1, "FAIL"), (12, 0, "ok"), (11, 0, "note")]
+)
+def test_b3_kernel_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], count: int, code: int, tag: str
+) -> None:
+    """Q-277: a case that launches more kernels than its baseline fails, judged or not; an
+    equal count passes, and a lower one is reported as a note."""
+    runs = {"B-3-slice.json": _slice(kernels={("compiled", 100_000): count})}
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice()}}
+    assert _run(tmp_path, runs, baselines) == code
+    (line,) = [
+        x
+        for x in capsys.readouterr().out.splitlines()
+        if '{"impl": "compiled", "n": 100000} kernels' in x
+    ]
+    assert line.startswith(f"  {tag}")
+
+
+@pytest.mark.parametrize("count", [None, 0, "12"])
+def test_b3_run_without_a_kernel_count_fails(tmp_path: Path, count: Any) -> None:
+    """Q-277: against a baseline with a count, a run whose count is null (two counted calls
+    that disagreed), zero or not an integer fails, so the guard can't switch itself off."""
+    runs = {"B-3-slice.json": _slice(kernels={("eager", 100_000): count})}
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice()}}
+    assert _run(tmp_path, runs, baselines) == 1
+    missing = _slice()
+    del missing["cases"][0]["figures"]["kernels"]
+    assert _run(tmp_path / "b", {"B-3-slice.json": missing}, baselines) == 1
+
+
+def test_b3_baseline_without_kernel_counts_is_a_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-277: a baseline recorded before B-3 counted kernels (#369's) gives a note per case
+    until it is refreshed, and the run passes."""
+    runs = {"B-3-slice.json": _slice()}
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice(with_kernels=False)}}
+    assert _run(tmp_path, runs, baselines) == 0
+    notes = [x for x in capsys.readouterr().out.splitlines() if "kernels" in x]
+    assert len(notes) == 22 and all(x.startswith("  note") for x in notes)
+
+
+def test_b3_case_the_host_sets_on_one_side_only_fails(tmp_path: Path) -> None:
+    """Q-196: an unjudged B-3 case is still matched; one the run didn't measure fails."""
+    run = _slice()
+    run["cases"] = [c for c in run["cases"] if c["case"] != {"impl": "eager", "n": 100_000}]
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice()}}
+    assert _run(tmp_path, {"B-3-slice.json": run}, baselines) == 1
 
 
 def test_gpu_workflow_is_hand_started_on_a_self_hosted_gpu_runner() -> None:
