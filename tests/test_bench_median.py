@@ -2,9 +2,10 @@
 """The candidate baselines of Q-196's refresh, `scripts/bench_median.py` (§3.4; Q-170, Q-196,
 Q-245; #369): the per-case median of an odd number of runs of B-2 to B-6.
 
-Added tests, not §3 rows: each judged case of the output is the whole entry of the run whose
-judged figure is the middle one; the rest of each file is the first run's; runs that disagree
-on what was measured are invalid input. The script is called at its command line, `main(argv)`,
+Added tests, not §3 rows: each timed case of the output is the whole entry of the run whose
+compared figure is the middle one, in B-3 every timed case whether the comparison judges it or
+not (#379); the rest of each file is the first run's; runs that disagree on what was measured
+are invalid input. The script is called at its command line, `main(argv)`,
 on BENCH.json files written here, and its output is read back with the comparison's loader.
 """
 
@@ -269,3 +270,76 @@ def test_out_with_bench_files_is_invalid(tmp_path: Path) -> None:
     runs = [{"B-5-adam.json": _adam(k * 1e-3, 1e-3)} for k in (1, 2, 3)]
     assert _run(tmp_path, runs) == 2
     assert not (tmp_path / "out" / "B-5-adam.json").exists()
+
+
+# B-3 (Q-182) as the RTX 4090's baseline has it, in ms (#369's medians): at the host's floor of
+# about 0.31 ms up to 5·10⁵ rows, then growing with N; bench_compare judges eager from 10⁶ rows
+# and compiled from 1.5·10⁶ (Q-246).
+B3_MS = {
+    "eager": (0.308, 0.318, 0.320, 0.314, 0.317, 0.329, 0.386, 0.605, 0.991, 1.342, 2.277),
+    "compiled": (0.310, 0.314, 0.312, 0.309, 0.308, 0.309, 0.325, 0.324, 0.510, 0.784, 1.239),
+}
+B3_SIZES = (100_000, 150_000, 200_000, 300_000, 400_000, 500_000)
+B3_SIZES += (700_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000)
+B3_JUDGED = {("eager", n) for n in B3_SIZES[7:]} | {("compiled", n) for n in B3_SIZES[8:]}
+
+
+def _slice(scale: float = 1.0, *, host: float = 1.0, run: int = 0) -> dict[str, Any]:
+    """B-3: the 22 timed cases at B3_MS × `scale`, the cases the host sets × `host` more, each
+    with a figure naming the run and a kernel count (Q-277)."""
+    cases = []
+    for impl, times in B3_MS.items():
+        for n, ms in zip(B3_SIZES, times, strict=True):
+            factor = scale * (1.0 if (impl, n) in B3_JUDGED else host)
+            figures = {"forward_backward_s": ms * 1e-3 * factor, "run": run, "kernels": 12}
+            cases.append({"case": {"impl": impl, "n": n}, "figures": figures})
+    resizes = {"impl": "compiled", "resizes": 10}
+    cases.append({"case": resizes, "figures": {"recompilations": 1, "run": run}})
+    return _bench("B-3", cases)
+
+
+def _runs_of(out: dict[str, Any]) -> dict[tuple[str, int], int]:
+    return {
+        (e["case"]["impl"], e["case"]["n"]): e["figures"]["run"]
+        for e in out["cases"]
+        if "n" in e["case"]
+    }
+
+
+def test_b3_every_timed_case_takes_its_median(tmp_path: Path) -> None:
+    """Q-245 as changed (#379): every B-3 case with forward_backward_s takes the entry of its
+    median run, the cases bench_compare judges and those it only reports alike; the untimed
+    recompilations case is the first run's."""
+    runs = [
+        {"B-3-slice.json": _slice(1.02, run=0)},
+        {"B-3-slice.json": _slice(1.00, run=1)},
+        {"B-3-slice.json": _slice(0.98, run=2)},
+    ]
+    assert _run(tmp_path, runs) == 0
+    out = _out(tmp_path, "B-3-slice.json")
+    assert set(_runs_of(out).values()) == {1}
+    assert len(_runs_of(out)) == 22
+    (resizes,) = [e for e in out["cases"] if "resizes" in e["case"]]
+    assert resizes["figures"]["run"] == 0
+
+
+def test_b3_refresh_with_a_slow_first_run_judges_the_same_cases(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q-245 as changed, Q-246: a refresh whose first run is slow in every case the host sets
+    (0.45 ms against 0.31, the slow level #377 found) gives a candidate that bench_compare
+    judges on the same 7 cases as the baseline it replaces, since the floor the rule reads is a
+    median; the report names them."""
+    runs = [
+        {"B-3-slice.json": _slice(host=0.45 / 0.31, run=0)},
+        {"B-3-slice.json": _slice(1.01, run=1)},
+        {"B-3-slice.json": _slice(0.99, run=2)},
+    ]
+    assert _run(tmp_path, runs) == 0
+    out = _out(tmp_path, "B-3-slice.json")
+    judged = {(json.loads(k)["impl"], json.loads(k)["n"]) for k in compare.judged(out)}
+    assert judged == B3_JUDGED
+    taken = _runs_of(out)  # the host-set cases: 1.45, 1.01 and 0.99 × their times, run 1's
+    assert {taken[case] for case in taken.keys() - B3_JUDGED} == {1}
+    lines = capsys.readouterr().out.splitlines()
+    assert any("judged by bench_compare (Q-246): 7 of 22" in line for line in lines)
