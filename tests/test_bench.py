@@ -631,6 +631,12 @@ def test_b3_times_both_slices_at_every_size_and_counts_recompilations(
             assert figures["repetitions"] == 50
             for name in ("forward_backward_s", "forward_s", "backward_s", "first_call_s"):
                 assert 0.0 < figures[name] < 60.0, (impl, n, name)
+            # Q-277: the kernels one call launches, counted outside the timed calls; null when
+            # two counted calls disagree, so a positive integer is a count that repeated.
+            kernels = figures["kernels"]
+            assert isinstance(kernels, int) and not isinstance(kernels, bool), (impl, n)
+            assert kernels > 0, (impl, n)
+    assert "Q-277" in setup["kernels"]
     compiled = cases[("compiled", sizes[0])]
     assert compiled["first_call_s"] > compiled["forward_backward_s"]  # compilation included
     resized = [c for c in slice_bench["cases"] if c["case"] == {"impl": "compiled", "resizes": 10}]
@@ -647,6 +653,36 @@ def test_b3_times_both_slices_at_every_size_and_counts_recompilations(
             "kind": "limit",
         }
     ]
+
+
+@pytest.mark.gpu
+def test__count_kernels_is_the_same_on_repeated_calls(slice_bench: dict[str, Any]) -> None:
+    """Q-277, a private test: the kernel count of one B-3 call is the same on repeated calls of
+    both implementations, at 10⁵ rows as B-3 builds them, and equal to the figure the benchmark
+    recorded there; the slice's compiled path launches fewer kernels than its eager one."""
+    import random
+
+    from openftgs.cli._bench import _count_kernels, _slice_call, _slice_inputs
+
+    n = 100_000
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    stored = [
+        torch.randn(n, *shape, device="cuda", generator=generator)
+        for shape in ((3,), (), (), (3,), (3,), (4,), ())
+    ]
+    leaves, grads = _slice_inputs(stored, n)
+    recorded = {
+        c["case"]["impl"]: c["figures"]["kernels"]
+        for c in slice_bench["cases"]
+        if c["case"].get("n") == n
+    }
+    counts = {}
+    for impl in ("eager", "compiled"):
+        call = _slice_call(leaves, grads, impl, random.Random(0))
+        call()  # compiles, outside the counted calls
+        counts[impl] = {_count_kernels(call) for _ in range(3)}
+        assert counts[impl] == {recorded[impl]}, (impl, counts[impl], recorded[impl])
+    assert recorded["compiled"] < recorded["eager"]
 
 
 # B-2, `ftgs bench raster` (§3.4, D-32, D-57; U-8, Q-187), run once on the GPU for the tests
