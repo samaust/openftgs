@@ -16,8 +16,8 @@ GeForce RTX 4090" gives `nvidia-geforce-rtx-4090`); DIR defaults to `benchmarks/
   baseline file, a time the GPU sets; the others, at the host's floor, are reported as notes
   (Q-246).
 - B-3's kernel counts (Q-277): a timed case fails when it launches more kernels than its
-  baseline's, or has no count against a baseline with one; a lower count, and a baseline
-  without counts, are notes.
+  baseline's, or has no count against a baseline with one, or its baseline's count is there but
+  null or not positive; a lower count, and a baseline recorded without counts, are notes.
 - B-6 (Q-170): each budgeted data share fails unless it is under 1 % (§3.4), whatever the
   baseline's; the baseline names the cases that must be budgeted.
 - Also failures: a run without a baseline, a baseline of that GPU without a run, a baseline
@@ -129,21 +129,8 @@ def _key(case: Any) -> str:
     return json.dumps(case, sort_keys=True)
 
 
-def _timed(body: dict[str, Any]) -> dict[str, float]:
-    """The compared median time of every timed case (Q-170), by case."""
-    figure, marks = _TIMED[body["benchmark"]]
-    times: dict[str, float] = {}
-    for entry in body["cases"]:
-        case, figures = entry.get("case"), entry.get("figures")
-        if isinstance(case, dict) and marks <= case.keys() and isinstance(figures, dict):
-            value = figures.get(figure)
-            if isinstance(value, int | float) and not isinstance(value, bool):
-                times[_key(case)] = float(value)
-    return times
-
-
 def _figures(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """The figures of every timed case (Q-170), by case."""
+    """The figures of every timed case (Q-170), by case, in the file's order."""
     marks = _TIMED[body["benchmark"]][1]
     return {
         _key(e["case"]): e["figures"]
@@ -152,6 +139,17 @@ def _figures(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
         and marks <= e["case"].keys()
         and isinstance(e.get("figures"), dict)
     }
+
+
+def _timed(body: dict[str, Any]) -> dict[str, float]:
+    """The compared median time of every timed case (Q-170), by case."""
+    figure = _TIMED[body["benchmark"]][0]
+    times: dict[str, float] = {}
+    for case, figures in _figures(body).items():
+        value = figures.get(figure)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            times[case] = float(value)
+    return times
 
 
 def judged(baseline: dict[str, Any]) -> set[str]:
@@ -196,7 +194,7 @@ def _compare_times(run: dict[str, Any], baseline: dict[str, Any], report: Report
     on one side only fails, judged or not."""
     figure = _TIMED[run["benchmark"]][0]
     ours, theirs = _timed(run), _timed(baseline)
-    rule = judged(baseline)
+    judged_cases = judged(baseline)
     if not ours:
         report.fail(f"no {figure} in the run")
     for case, value in ours.items():
@@ -206,7 +204,7 @@ def _compare_times(run: dict[str, Any], baseline: dict[str, Any], report: Report
         base = theirs[case]
         change = f"{(value / base - 1) * 100:+.1f} %" if base > 0 else "baseline 0"
         text = f"{case} {figure} {_ms(value)} against {_ms(base)} ({change}"
-        if case in rule:
+        if case in judged_cases:
             report.check(value <= _REGRESSION * base, f"{text}, limit +10 %)")
         else:
             report.note(f"{text}), not judged: the host sets this time (Q-246)")
@@ -215,14 +213,19 @@ def _compare_times(run: dict[str, Any], baseline: dict[str, Any], report: Report
 
 
 def _compare_kernels(run: dict[str, Any], baseline: dict[str, Any], report: Report) -> None:
-    """Q-277: each B-3 case measured on both sides launches at most its baseline's kernels; a
-    run without a count fails against a baseline with one; a lower count, and a baseline
-    without one, are notes."""
+    """Q-277: each B-3 case measured on both sides, in the run's order, launches at most its
+    baseline's kernels; a run without a count fails against a baseline with one, as does a
+    baseline whose count is there but null or not positive; a lower count, and a baseline
+    recorded before B-3 counted kernels, are notes."""
     ours, theirs = _figures(run), _figures(baseline)
-    for case in ours.keys() & theirs.keys():
-        base = _count(theirs[case].get(_KERNELS))
-        if base is None:
+    for case in (key for key in ours if key in theirs):
+        if _KERNELS not in theirs[case]:
             report.note(f"{case} {_KERNELS}: none in the baseline; refresh it to judge (Q-277)")
+            continue
+        base = _count(theirs[case][_KERNELS])
+        if base is None:
+            got = theirs[case][_KERNELS]
+            report.fail(f"{case} {_KERNELS}: the baseline's count is {got}; refresh it (Q-277)")
             continue
         count = _count(ours[case].get(_KERNELS))
         if count is None:

@@ -17,7 +17,7 @@ run's (Q-245).
 
 Invalid input, exit 2 and nothing written: an even count or fewer than three runs, run folders
 holding different files, runs of one file that differ in benchmark, GPU model, scene size or
-scene SHA-256, or in the cases they judge, and an output folder that already holds BENCH.json
+scene SHA-256, or in the cases they measure, and an output folder that already holds BENCH.json
 files. Exit 0 once the candidates are written; the report prints each such case's figure in
 every run, its median and the spread, (max − min) / median, and for B-3 the cases the
 comparison judges against the candidate.

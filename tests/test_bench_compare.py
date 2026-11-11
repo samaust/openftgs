@@ -290,10 +290,6 @@ def _slice(
     return _bench("B-3", cases)
 
 
-def _lines(capsys: pytest.CaptureFixture[str], tag: str) -> list[str]:
-    return [line for line in capsys.readouterr().out.splitlines() if line.startswith(f"  {tag}")]
-
-
 def _slice_case(line: str) -> tuple[str, int]:
     case = json.loads(line[line.index("{") : line.index("}") + 1])
     return case["impl"], case["n"]
@@ -379,6 +375,30 @@ def test_b3_baseline_without_kernel_counts_is_a_note(
     assert _run(tmp_path, runs, baselines) == 0
     notes = [x for x in capsys.readouterr().out.splitlines() if "kernels" in x]
     assert len(notes) == 22 and all(x.startswith("  note") for x in notes)
+
+
+@pytest.mark.parametrize("count", [None, 0])
+def test_b3_baseline_with_a_null_kernel_count_fails(tmp_path: Path, count: Any) -> None:
+    """Q-277: a baseline whose count is there but null or zero (a refresh stored after two
+    counted calls disagreed) fails, rather than switching the guard off for that case; only a
+    baseline recorded before B-3 counted kernels, with no `kernels` at all, is a note."""
+    runs = {"B-3-slice.json": _slice()}
+    stored = _slice(kernels={("eager", 1_000_000): count})
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": stored}}
+    assert _run(tmp_path, runs, baselines) == 1
+
+
+def test_b3_kernel_lines_follow_the_cases_order(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The kernel counts print in the run's case order, as the times do, so two reports of the
+    same files read alike."""
+    runs = {"B-3-slice.json": _slice()}
+    baselines = {"nvidia-geforce-rtx-4090": {"B-3-slice.json": _slice()}}
+    assert _run(tmp_path, runs, baselines) == 0
+    lines = [x for x in capsys.readouterr().out.splitlines() if "} kernels" in x]
+    order = [json.loads(x[x.index("{") : x.index("}") + 1]) for x in lines]
+    assert order == [{"impl": impl, "n": n} for impl in B3_MS for n in B3_SIZES]
 
 
 def test_b3_case_the_host_sets_on_one_side_only_fails(tmp_path: Path) -> None:
