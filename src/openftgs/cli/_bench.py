@@ -622,6 +622,7 @@ def _slice(ctx: _Context) -> _Result:
     torch.compiler.reset()  # the first compiled call compiles, whatever ran before
     counters.clear()
     cases: list[dict[str, Any]] = []
+    timed: dict[tuple[str, int], dict[str, Any]] = {}  # each timed case's figures
     for n in _SLICE_SIZES:
         leaves, grads = _slice_inputs(stored, n)
         for impl in _SLICE_IMPLS:
@@ -644,18 +645,19 @@ def _slice(ctx: _Context) -> _Result:
             if impl == "compiled":
                 figures["unique_graphs"] = int(counters["stats"]["unique_graphs"])
             cases.append({"case": {"impl": impl, "n": n}, "figures": figures})
+            timed[(impl, n)] = figures
         del leaves
     graphs = int(counters["stats"]["unique_graphs"])
     resizes = len(_SLICE_SIZES) - 1
     recompilations = graphs - 1
     # Q-277: a pass of its own after every timed call and the recompilations' count, so no
     # profiler session comes before a figure that is timed or counted; its times are its own.
-    counted = random.Random(_SEED)
-    for k, n in enumerate(_SLICE_SIZES):
+    count_times = random.Random(_SEED)
+    for n in _SLICE_SIZES:
         leaves, grads = _slice_inputs(stored, n)
-        for j, impl in enumerate(_SLICE_IMPLS):
-            call = _slice_call(leaves, grads, impl, counted)
-            cases[k * len(_SLICE_IMPLS) + j]["figures"]["kernels"] = _count_kernels(call)
+        for impl in _SLICE_IMPLS:
+            call = _slice_call(leaves, grads, impl, count_times)
+            timed[(impl, n)]["kernels"] = _count_kernels(call)
         del leaves
     cases.append(
         {
@@ -688,7 +690,8 @@ def _slice(ctx: _Context) -> _Result:
         "recompile_limit": _RECOMPILE_LIMIT,
         "kernels": (
             f"Q-277: the CUDA kernel events PyTorch's profiler records for one call, on "
-            f"{_KERNEL_COUNTS} calls per case after every timed call; null when they disagree"
+            f"{_KERNEL_COUNTS} calls per case after every timed call; null when they "
+            "disagree or are 0"
         ),
     }
     return _Result(setup, cases, budgets)
