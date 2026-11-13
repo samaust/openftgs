@@ -707,12 +707,16 @@ One of the eleven §3.2 recovery tests that train on a scene with known ground t
 _Avoid_: toy scene, end-to-end test, smoke test (only S-10 and U-26's runs are that)
 
 **Benchmark B-n**:
-One of the eight §3.4 measurements of speed and memory, run by `ftgs bench`, which writes BENCH.json, never of correctness; a budgeted one fails CI when more than 10 % worse than its baseline. §3.4
+One of the eight §3.4 measurements of speed and memory, run by `ftgs bench`, which writes BENCH.json, never of correctness; CI fails a run of B-2 to B-6 when a budgeted figure is more than 10 % worse than its baseline, and B-3 also when a kernel count rises. §3.4, Q-170, Q-246, Q-277
 _Avoid_: perf test, profile, timing
 
 **Baseline**:
-A stored BENCH.json from a reference run on one GPU model, against which a later run of the same benchmark fails when a budgeted figure is more than 10 % worse. §3.4
+A stored BENCH.json from a reference run on one GPU model, against which a later run of the same benchmark fails when a budgeted figure is more than 10 % worse, or a kernel count higher; in B-3 a time is a budgeted figure only in the cases whose baseline time the GPU sets, not the host's launch floor. §3.4, Q-170, Q-246, Q-277
 _Avoid_: golden file, reference run (a run, not its stored result), snapshot
+
+**Kernel count**:
+The number of CUDA kernels one forward-plus-backward call of the temporal slice launches in a B-3 case, memory copies and sets excluded; the figure that guards the slice's launch overhead in the cases whose time the host sets. §3.4 B-3, Q-277
+_Avoid_: launch count, op count (the dispatcher's operators, which miss the compiled slice's fusion), kernels (unqualified: the slice's eager, compiled and CUDA implementations, §2.4 Kernels)
 
 **Calibrated threshold**:
 A pass criterion or budget marked "calibrated" in the spec: set once from analytic expectations or the first reference run, then frozen; the first measured values go to the Calibration data table of questions.md, and changing it needs a logged reason. §3.2, §3.4
