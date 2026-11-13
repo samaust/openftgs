@@ -8,9 +8,16 @@ Every `*.json` file in RUN_DIR is one BENCH.json of `ftgs bench`. Its baseline i
 same name in `DIR/<gpu>/`, where <gpu> is the GPU model the run recorded, as a slug ("NVIDIA
 GeForce RTX 4090" gives `nvidia-geforce-rtx-4090`); DIR defaults to `benchmarks/baselines`.
 
-- B-2, B-3, B-4 and B-5 (Q-170): each timed case's median time fails when it is more than 10 %
-  above the baseline's, `value > 1.10 × baseline`: B-2's and B-3's and B-4's `forward_backward_s`
-  per combination, size and implementation, or variant, and B-5's `step_s` per kind and size.
+- B-2, B-3, B-4 and B-5 (Q-170): each judged case's median time fails when it is more than
+  10 % above the baseline's, `value > 1.10 × baseline`: B-2's and B-3's and B-4's
+  `forward_backward_s` per combination, size and implementation, or variant, and B-5's `step_s`
+  per kind and size. Every timed case is judged, except in B-3, where a case is judged only
+  when its baseline's time is at least 1.4 × the smallest of its implementation in that
+  baseline file, a time the GPU sets; the others, at the host's floor, are reported as notes
+  (Q-246).
+- B-3's kernel counts (Q-277): a timed case fails when it launches more kernels than its
+  baseline's, or has no count against a baseline with one, or its baseline's count is there but
+  null or not positive; a lower count, and a baseline recorded without counts, are notes.
 - B-6 (Q-170): each budgeted data share fails unless it is under 1 % (§3.4), whatever the
   baseline's; the baseline names the cases that must be budgeted.
 - Also failures: a run without a baseline, a baseline of that GPU without a run, a baseline
@@ -50,6 +57,11 @@ _TIMED: dict[str, tuple[str, frozenset[str]]] = {
     "B-4": ("forward_backward_s", frozenset({"loss"})),
     "B-5": ("step_s", frozenset({"adam"})),
 }
+# Q-246: a B-3 case is judged when its baseline is at least this many times the smallest time
+# of its implementation in that baseline file, where the GPU, not the host, sets the time.
+_B3_JUDGED_RATIO = 1.4
+_B3_IMPL = "impl"
+_KERNELS = "kernels"  # Q-277: the kernels one B-3 call launches
 _BUDGETED = {"B-6": "data_share"}  # Q-170: judged against §3.4's absolute budget
 _SCENE_SIZE = ("cameras", "frames", "width", "height")
 _REPORTED = ("driver", "cuda", "cudnn", "torch", "gsplat", "fused_ssim", "python")
@@ -117,17 +129,47 @@ def _key(case: Any) -> str:
     return json.dumps(case, sort_keys=True)
 
 
+def _figures(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The figures of every timed case (Q-170), by case, in the file's order."""
+    marks = _TIMED[body["benchmark"]][1]
+    return {
+        _key(e["case"]): e["figures"]
+        for e in body["cases"]
+        if isinstance(e.get("case"), dict)
+        and marks <= e["case"].keys()
+        and isinstance(e.get("figures"), dict)
+    }
+
+
 def _timed(body: dict[str, Any]) -> dict[str, float]:
     """The compared median time of every timed case (Q-170), by case."""
-    figure, marks = _TIMED[body["benchmark"]]
+    figure = _TIMED[body["benchmark"]][0]
     times: dict[str, float] = {}
-    for entry in body["cases"]:
-        case, figures = entry.get("case"), entry.get("figures")
-        if isinstance(case, dict) and marks <= case.keys() and isinstance(figures, dict):
-            value = figures.get(figure)
-            if isinstance(value, int | float) and not isinstance(value, bool):
-                times[_key(case)] = float(value)
+    for case, figures in _figures(body).items():
+        value = figures.get(figure)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            times[case] = float(value)
     return times
+
+
+def judged(baseline: dict[str, Any]) -> set[str]:
+    """The timed cases of a baseline that the 10 % rule judges (Q-170): every one, except in
+    B-3, where only those whose time is at least 1.4 × the smallest of their implementation in
+    the same file, the cases whose time the GPU sets (Q-246)."""
+    times = _timed(baseline)
+    if baseline["benchmark"] != "B-3":
+        return set(times)
+    impls = {key: json.loads(key).get(_B3_IMPL) for key in times}
+    floors: dict[Any, float] = {}
+    for key, value in times.items():
+        floors[impls[key]] = min(value, floors.get(impls[key], value))
+    return {key for key, value in times.items() if value >= _B3_JUDGED_RATIO * floors[impls[key]]}
+
+
+def _count(value: Any) -> int | None:
+    """A kernel count (Q-277): a positive integer, else None."""
+    ok = isinstance(value, int) and not isinstance(value, bool) and value > 0
+    return value if ok else None
 
 
 def _budgeted(body: dict[str, Any]) -> dict[str, float]:
@@ -148,9 +190,11 @@ def _ms(seconds: float) -> str:
 
 
 def _compare_times(run: dict[str, Any], baseline: dict[str, Any], report: Report) -> None:
-    """Q-170: each timed case against 1.10 × its baseline; a case on one side only fails."""
+    """Q-170: each judged case against 1.10 × its baseline, the others reported (Q-246); a case
+    on one side only fails, judged or not."""
     figure = _TIMED[run["benchmark"]][0]
     ours, theirs = _timed(run), _timed(baseline)
+    judged_cases = judged(baseline)
     if not ours:
         report.fail(f"no {figure} in the run")
     for case, value in ours.items():
@@ -159,12 +203,38 @@ def _compare_times(run: dict[str, Any], baseline: dict[str, Any], report: Report
             continue
         base = theirs[case]
         change = f"{(value / base - 1) * 100:+.1f} %" if base > 0 else "baseline 0"
-        report.check(
-            value <= _REGRESSION * base,
-            f"{case} {figure} {_ms(value)} against {_ms(base)} ({change}, limit +10 %)",
-        )
+        text = f"{case} {figure} {_ms(value)} against {_ms(base)} ({change}"
+        if case in judged_cases:
+            report.check(value <= _REGRESSION * base, f"{text}, limit +10 %)")
+        else:
+            report.note(f"{text}), not judged: the host sets this time (Q-246)")
     for case in theirs.keys() - ours.keys():
         report.fail(f"{case} {figure}: in the baseline, not measured by the run")
+
+
+def _compare_kernels(run: dict[str, Any], baseline: dict[str, Any], report: Report) -> None:
+    """Q-277: each B-3 case measured on both sides, in the run's order, launches at most its
+    baseline's kernels; a run without a count fails against a baseline with one, as does a
+    baseline whose count is there but null or not positive; a lower count, and a baseline
+    recorded before B-3 counted kernels, are notes."""
+    ours, theirs = _figures(run), _figures(baseline)
+    for case in (key for key in ours if key in theirs):
+        if _KERNELS not in theirs[case]:
+            report.note(f"{case} {_KERNELS}: none in the baseline; refresh it to judge (Q-277)")
+            continue
+        base = _count(theirs[case][_KERNELS])
+        if base is None:
+            got = theirs[case][_KERNELS]
+            report.fail(f"{case} {_KERNELS}: the baseline's count is {got}; refresh it (Q-277)")
+            continue
+        count = _count(ours[case].get(_KERNELS))
+        if count is None:
+            got = ours[case].get(_KERNELS, "missing")
+            report.fail(f"{case} {_KERNELS} {got}: no count, the baseline's {base}")
+        elif count < base:
+            report.note(f"{case} {_KERNELS} {count}, fewer than the baseline's {base}")
+        else:
+            report.check(count == base, f"{case} {_KERNELS} {count}, the baseline's {base}")
 
 
 def _judge_budget(run: dict[str, Any], baseline: dict[str, Any], report: Report) -> None:
@@ -206,6 +276,8 @@ def compare_one(run: dict[str, Any], baseline: dict[str, Any], report: Report) -
             report.note(f"{key} {ours}, the baseline's {theirs}")
     if run["benchmark"] in _TIMED:
         _compare_times(run, baseline, report)
+        if run["benchmark"] == "B-3":
+            _compare_kernels(run, baseline, report)
     else:
         _judge_budget(run, baseline, report)
 

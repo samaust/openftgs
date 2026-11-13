@@ -521,6 +521,7 @@ _SLICE_GRADIENTS = ("means_t", "opacities_t", "quats_n", "scales", "reg_terms")
 _RECOMPILE_LIMIT = 2  # U-28: at most 2 recompilations over 10 resizes
 _SEED = 0  # Q-168: the synthesized models are seeded
 _SLICE_ACTIVE = 0.2  # Q-182: the share active at any time, as B-1's main cases
+_KERNEL_COUNTS = 2  # Q-277: the counted calls per case, which must agree
 
 
 def _slice_call(
@@ -557,11 +558,55 @@ def _slice_call(
     return call
 
 
+def _slice_inputs(stored: Sequence[Tensor], n: int) -> tuple[list[Tensor], list[Tensor]]:
+    """One B-3 size (Q-182): the first `n` rows of the seven stored tensors as fresh leaves, and
+    fixed standard-normal upstream gradients shaped as the five outputs, seeded by `n`, the same
+    for both implementations."""
+    import torch
+
+    leaves = [p[:n].clone().requires_grad_() for p in stored]
+    g = torch.Generator(device="cuda").manual_seed(n)
+    like = dict(zip(_SLICE_INPUTS, leaves, strict=True))
+    shapes = {"means_t": "means", "opacities_t": "times", "quats_n": "quats"}
+    shapes |= {"scales": "log_scales", "reg_terms": "times"}
+    grads = [
+        torch.randn(like[shapes[name]].shape, generator=g, device="cuda")
+        for name in _SLICE_GRADIENTS
+    ]
+    return leaves, grads
+
+
+def _count_kernels(body: Callable[[], None]) -> int | None:
+    """Q-277: the CUDA kernels one call of `body` launches, as PyTorch's profiler records them
+    on CUDA activity around the call and a synchronize (its kernel events; its memory copies
+    and sets are not kernels), on `_KERNEL_COUNTS` calls; the count when they agree and are
+    positive, else None."""
+    import torch
+    from torch.profiler import DeviceType, ProfilerActivity, profile
+
+    counts: set[int] = set()
+    for _ in range(_KERNEL_COUNTS):
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            body()
+            torch.cuda.synchronize()
+        kernels = [
+            event
+            for event in prof.events()
+            if event.device_type == DeviceType.CUDA
+            and not event.name.startswith(("Memcpy", "Memset"))
+        ]
+        counts.add(len(kernels))
+    count = counts.pop() if len(counts) == 1 else 0
+    return count if count > 0 else None
+
+
 def _slice(ctx: _Context) -> _Result:
     """B-3: the forward and backward of `motion.temporal_slice`, eager and compiled, at N from
     10⁵ to 3·10⁶, grown as at growth events: the time of the first call at each size, which
     includes compilation, then the medians of 50 calls after a warm-up; the recompilations over
-    the 10 resizes, counted as Q-13 counts them, against U-28's limit."""
+    the 10 resizes, counted as Q-13 counts them, against U-28's limit; then, after every timed
+    call, the kernels one call of each case launches (Q-277)."""
     import random
 
     import torch
@@ -577,17 +622,9 @@ def _slice(ctx: _Context) -> _Result:
     torch.compiler.reset()  # the first compiled call compiles, whatever ran before
     counters.clear()
     cases: list[dict[str, Any]] = []
+    timed: dict[tuple[str, int], dict[str, Any]] = {}  # each timed case's figures
     for n in _SLICE_SIZES:
-        leaves = [p[:n].clone().requires_grad_() for p in stored]
-        # Fixed upstream gradients, the same for both implementations, shaped as the outputs.
-        g = torch.Generator(device="cuda").manual_seed(n)
-        like = dict(zip(_SLICE_INPUTS, leaves, strict=True))
-        shapes = {"means_t": "means", "opacities_t": "times", "quats_n": "quats"}
-        shapes |= {"scales": "log_scales", "reg_terms": "times"}
-        grads = [
-            torch.randn(like[shapes[name]].shape, generator=g, device="cuda")
-            for name in _SLICE_GRADIENTS
-        ]
+        leaves, grads = _slice_inputs(stored, n)
         for impl in _SLICE_IMPLS:
             call = _slice_call(leaves, grads, impl, times)
             torch.cuda.reset_peak_memory_stats()
@@ -608,10 +645,20 @@ def _slice(ctx: _Context) -> _Result:
             if impl == "compiled":
                 figures["unique_graphs"] = int(counters["stats"]["unique_graphs"])
             cases.append({"case": {"impl": impl, "n": n}, "figures": figures})
+            timed[(impl, n)] = figures
         del leaves
     graphs = int(counters["stats"]["unique_graphs"])
     resizes = len(_SLICE_SIZES) - 1
     recompilations = graphs - 1
+    # Q-277: a pass of its own after every timed call and the recompilations' count, so no
+    # profiler session comes before a figure that is timed or counted; its times are its own.
+    count_times = random.Random(_SEED)
+    for n in _SLICE_SIZES:
+        leaves, grads = _slice_inputs(stored, n)
+        for impl in _SLICE_IMPLS:
+            call = _slice_call(leaves, grads, impl, count_times)
+            timed[(impl, n)]["kernels"] = _count_kernels(call)
+        del leaves
     cases.append(
         {
             "case": {"impl": "compiled", "resizes": resizes},
@@ -641,6 +688,11 @@ def _slice(ctx: _Context) -> _Result:
         "times": "uniform in [0, 1], seeded",
         "clock": "CUDA events: slice.kernel (forward), backward",
         "recompile_limit": _RECOMPILE_LIMIT,
+        "kernels": (
+            f"Q-277: the CUDA kernel events PyTorch's profiler records for one call, on "
+            f"{_KERNEL_COUNTS} calls per case after every timed call; null when they "
+            "disagree or are 0"
+        ),
     }
     return _Result(setup, cases, budgets)
 

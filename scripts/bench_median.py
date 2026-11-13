@@ -6,18 +6,21 @@ median of an odd number of runs of B-2 to B-6.
 
 Each RUN_DIR holds the BENCH.json files of one run of the GPU job's commands, as
 `scripts/bench_compare.py` takes them. For every file they share, the candidate is the first
-run's file (in the order of the arguments) in which each judged case, the figure the comparison
+run's file (in the order of the arguments) in which each case with the figure the comparison
 reads (Q-170, Q-196: `forward_backward_s` of B-2 to B-4, `step_s` of B-5, B-6's budgeted
-`data_share`), takes its `cases` and `budgets` entries from the run whose figure is the median.
-The count of runs is odd, so the median is one run's measurement and every figure stored with
-it comes from that measurement. The cases nothing judges, the environment, the scene, the date
-and the setup are the first run's (Q-245).
+`data_share`) takes its `cases` and `budgets` entries from the run whose figure is the median.
+In B-3 that is every timed case, those the comparison judges and those it only reports alike
+(Q-246), so the smallest time its rule reads is a median too. The count of runs is odd, so the
+median is one run's measurement and every figure stored with it comes from that measurement.
+The cases without that figure, the environment, the scene, the date and the setup are the first
+run's (Q-245).
 
 Invalid input, exit 2 and nothing written: an even count or fewer than three runs, run folders
 holding different files, runs of one file that differ in benchmark, GPU model, scene size or
-scene SHA-256, or in the cases they judge, and an output folder that already holds BENCH.json
-files. Exit 0 once the candidates are written; the report prints each judged case's figure in
-every run, its median and the spread, (max − min) / median.
+scene SHA-256, or in the cases they measure, and an output folder that already holds BENCH.json
+files. Exit 0 once the candidates are written; the report prints each such case's figure in
+every run, its median and the spread, (max − min) / median, and for B-3 the cases the
+comparison judges against the candidate.
 
 `python scripts/bench_compare.py DIR` then compares the candidates with the stored baselines,
 and `--update` stores them, only once the owner has decided to (Q-196; #369).
@@ -36,8 +39,9 @@ import bench_compare as bc
 from bench_compare import InputError
 
 
-def _judged(body: dict[str, Any]) -> dict[str, float]:
-    """The figure the comparison reads of every judged case (Q-170), by case."""
+def _taken(body: dict[str, Any]) -> dict[str, float]:
+    """The figure the comparison reads (Q-170), by case: of every timed case, judged or only
+    reported (B-3's, Q-246), or of every budgeted one."""
     if body["benchmark"] in bc._TIMED:
         return bc._timed(body)
     return bc._budgeted(body)
@@ -58,11 +62,11 @@ def _check(name: str, bodies: list[dict[str, Any]]) -> None:
         for key in (*bc._SCENE_SIZE, "sha256"):
             if body["scene"].get(key) != first["scene"].get(key):
                 raise InputError(f"{name}: the runs' scenes differ in {key}")
-    figures = [_judged(body) for body in bodies]
+    figures = [_taken(body) for body in bodies]
     if not figures[0]:
-        raise InputError(f"{name}: no judged case")
+        raise InputError(f"{name}: no timed or budgeted case")
     if any(f.keys() != figures[0].keys() for f in figures):
-        raise InputError(f"{name}: the runs judge different cases")
+        raise InputError(f"{name}: the runs measured different cases")
     for key in figures[0]:
         for field in ("cases", "budgets"):
             counts = {len(_entries(body[field], key)) for body in bodies}
@@ -71,12 +75,12 @@ def _check(name: str, bodies: list[dict[str, Any]]) -> None:
 
 
 def _summary(bodies: list[dict[str, Any]]) -> list[str]:
-    """Each judged case's figure in every run, in the order of the arguments, its median and
-    the spread between the runs, (max − min) / median."""
+    """Each case's figure in every run, in the order of the arguments, its median and the
+    spread between the runs, (max − min) / median."""
     benchmark = bodies[0]["benchmark"]
     timed = benchmark in bc._TIMED
     figure = bc._TIMED[benchmark][0] if timed else bc._BUDGETED[benchmark]
-    figures = [_judged(body) for body in bodies]
+    figures = [_taken(body) for body in bodies]
     lines = []
     for key in figures[0]:
         values = [f[key] for f in figures]
@@ -90,10 +94,10 @@ def _summary(bodies: list[dict[str, Any]]) -> list[str]:
 
 
 def median_file(bodies: list[dict[str, Any]]) -> dict[str, Any]:
-    """One BENCH.json from the same file of every run: the first run's, each judged case's
-    entries replaced by those of the run whose judged figure is the median (Q-245)."""
-    out = copy.deepcopy(bodies[0])  # Q-245: the first run's file, judged cases replaced
-    figures = [_judged(body) for body in bodies]
+    """One BENCH.json from the same file of every run: the first run's, each timed or budgeted
+    case's entries replaced by those of the run whose figure is the median (Q-245)."""
+    out = copy.deepcopy(bodies[0])  # Q-245: the first run's file, those cases replaced
+    figures = [_taken(body) for body in bodies]
     chosen: dict[str, dict[str, Any]] = {}
     for key in figures[0]:
         order = sorted(range(len(bodies)), key=lambda k: figures[k][key])
@@ -129,6 +133,12 @@ def write_medians(run_dirs: list[Path], out: Path) -> list[str]:
         _check(name, bodies)
         medians[name] = median_file(bodies)
         report += [f"{name} ({bodies[0]['benchmark']}, {bc._gpu(bodies[0])})", *_summary(bodies)]
+        if bodies[0]["benchmark"] == "B-3":  # Q-246: the cases the candidate's floor makes judged
+            judged = bc.judged(medians[name])
+            report.append(
+                f"  judged by bench_compare (Q-246): {len(judged)} of {len(_taken(bodies[0]))}: "
+                + ", ".join(sorted(judged))
+            )
     out.mkdir(parents=True, exist_ok=True)
     for name, body in medians.items():
         target = out / name
